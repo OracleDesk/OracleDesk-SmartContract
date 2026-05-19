@@ -164,7 +164,7 @@ async function main() {
 
   // ── Step 4: Call createMarket ─────────────────────────────────────────────
   const createMarketCalldata = encodeCall(
-    "createMarket(string,address,uint256,uint256,uint256,address,string,bytes32)",
+    "createMarket(string,address,uint256,uint256,uint256,address,string,bytes32,uint256)",
     [
       question,
       ORACLE_ADDR,
@@ -174,6 +174,7 @@ async function main() {
       AGENT_ADDR,
       reasoningCid,
       sha256Hash,
+      500,
     ]
   );
   await sendTx("MarketFactory.createMarket()", FACTORY, createMarketCalldata);

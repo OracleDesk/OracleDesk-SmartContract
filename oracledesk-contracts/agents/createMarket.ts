@@ -80,7 +80,8 @@ async function callCreateMarket(params: {
       uint256 _liquiditySeedUsdc,
       address _agentWallet,
       string calldata _reasoningCid,
-      bytes32 _sha256Hash
+      bytes32 _sha256Hash,
+      uint256 _confidenceIntervalBps
     ) returns (address)`
   ]);
 
@@ -93,6 +94,7 @@ async function callCreateMarket(params: {
     AGENT_ADDRESS,
     params.reasoningCid,
     sha256Hash,
+    500,
   ]);
 
   const tx = await client.createContractExecutionTransaction({

@@ -66,6 +66,34 @@ contract PredictionMarket is ReentrancyGuard {
     // Initialization flag
     bool public initialized;
 
+    // ── Dynamic spread and liquidity management ───────────────────────────────────
+    // Add these below the existing state variables in PredictionMarket.sol
+
+    /// @notice Agent's current probability estimate in basis points (6800 = 68%)
+    /// Updated by the Market Maker Agent as new signals arrive
+    uint256 public agentProbabilityBps;
+
+    /// @notice Agent's confidence interval — determines spread width
+    /// Wider interval = wider spread = higher cost to trade
+    uint256 public confidenceIntervalBps; // e.g. 800 = ±8% confidence interval
+
+    /// @notice Minimum spread in basis points (floor)
+    /// Prevents liquidity from being extracted in extremely thin markets
+    uint256 public constant MIN_SPREAD_BPS = 50;   // 0.5% minimum spread
+
+    /// @notice Maximum spread in basis points (ceiling)
+    uint256 public constant MAX_SPREAD_BPS = 1000; // 10% maximum spread
+
+    /// @notice Timestamp when agent last updated its probability estimate
+    uint256 public lastAgentUpdate;
+
+    /// @notice Fee collected from trades — stays in pool, benefits liquidity providers
+    uint256 public accumulatedFees;
+
+    /// @notice Rebalance threshold — how far price must drift before agent rebalances
+    /// 500 = agent rebalances if market price drifts more than 5% from its estimate
+    uint256 public rebalanceThresholdBps = 500;
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     // Emitted on deployment — indexed by the Trader Agent scanner
@@ -102,6 +130,20 @@ contract PredictionMarket is ReentrancyGuard {
         uint256 blockTimestamp
     );
 
+    event AgentProbabilityUpdated(
+        uint256 newProbabilityBps,
+        uint256 newConfidenceIntervalBps,
+        uint256 timestamp
+    );
+
+    event LiquidityRebalanced(
+        uint256 oldYesReserve,
+        uint256 oldNoReserve,
+        uint256 newYesReserve,
+        uint256 newNoReserve,
+        uint256 agentProbabilityBps
+    );
+
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
     modifier onlyOracle() {
@@ -135,7 +177,8 @@ contract PredictionMarket is ReentrancyGuard {
         uint256        _liquiditySeedUsdc,  // in USDC (6 decimals): 100_000000 = 100 USDC
         address        _agentWallet,
         string  memory _reasoningCid,
-        bytes32        _sha256Hash
+        bytes32        _sha256Hash,
+        uint256        _confidenceIntervalBps
     ) {
         require(_oracle != address(0),            "Oracle cannot be zero address");
         require(_expiryTimestamp > block.timestamp,"Expiry must be in the future");
@@ -149,6 +192,9 @@ contract PredictionMarket is ReentrancyGuard {
         initialYesPrice = _initialYesPrice;
         factory         = msg.sender;
         reasoningCid    = _reasoningCid;
+        agentProbabilityBps      = _initialYesPrice;
+        confidenceIntervalBps    = _confidenceIntervalBps;
+        lastAgentUpdate          = block.timestamp;
 
         // Deploy YES and NO share tokens
         // Names are derived from the question for readability in the explorer
@@ -244,13 +290,15 @@ contract PredictionMarket is ReentrancyGuard {
 
     // ── Trading ───────────────────────────────────────────────────────────────
 
-    // Buy YES or NO shares with USDC
-    // Uses constant-product AMM: (x + dx) * (y - dy) = x * y
-    // so dy = y * dx / (x + dx)
-    //
-    // _buyYes: true to buy YES shares, false for NO shares
-    // _usdcIn: amount of USDC to spend (6 decimals)
-    // _minSharesOut: slippage protection — revert if fewer shares than this
+    /// @notice Buy YES or NO shares with USDC.
+    ///         Applies dynamic spread — a portion of USDC goes to the fee pool,
+    ///         the rest enters the AMM. This makes the effective price slightly
+    ///         worse than raw AMM price, with spread width determined by
+    ///         agent confidence, liquidity depth, and time to expiry.
+    ///
+    /// @param _buyYes       true = buy YES shares, false = buy NO shares
+    /// @param _usdcIn       USDC to spend (6 decimals)
+    /// @param _minSharesOut Slippage protection — revert if fewer shares than this
 
     function buy(
         bool    _buyYes,
@@ -263,16 +311,31 @@ contract PredictionMarket is ReentrancyGuard {
         notExpired
         returns (uint256 sharesOut)
     {
-        require(initialized, "Market not yet initialized");
-        require(_usdcIn >= 1e4, "Minimum trade is 0.01 USDC"); // 0.01 USDC minimum
+        require(_usdcIn >= 1e4, "Minimum trade is 0.01 USDC");
 
         IERC20(USDC).safeTransferFrom(msg.sender, address(this), _usdcIn);
 
+        // ── Apply dynamic spread ───────────────────────────────────────────────
+        // Spread fee is taken from usdcIn before entering the AMM.
+        // This makes the trade slightly more expensive than raw AMM,
+        // with the fee staying in the pool as accumulated reserves.
+        //
+        // Example: 10 USDC trade with 100 bps spread →
+        //   fee = 10 * 100 / 10000 = 0.10 USDC
+        //   AMM input = 9.90 USDC
+        //
+        uint256 spreadBps    = currentSpreadBps();
+        uint256 spreadFee    = (_usdcIn * spreadBps) / 10000;
+        uint256 usdcForAMM   = _usdcIn - spreadFee;
+
+        // Fee stays in the contract, split evenly between reserves
+        // This gradually deepens the pool over time
+        accumulatedFees += spreadFee;
+        uint256 feePerReserve = spreadFee / 2;
+
         if (_buyYes) {
-            // Buying YES: USDC increases yesReserve, decreases noReserve (shares go to buyer)
-            // AMM: (yesReserve + usdcIn) * noReserve_after = yesReserve * noReserve
-            uint256 k = noReserve * yesReserve;
-            uint256 newYesReserve = yesReserve + _usdcIn;
+            uint256 k = yesReserve * noReserve;
+            uint256 newYesReserve  = yesReserve + usdcForAMM + feePerReserve;
             uint256 newNoReserve = k / newYesReserve;
             sharesOut = noReserve - newNoReserve;
 
@@ -280,10 +343,9 @@ contract PredictionMarket is ReentrancyGuard {
             noReserve  = newNoReserve;
             yesToken.mint(msg.sender, sharesOut);
         } else {
-            // Buying NO: USDC increases noReserve, decreases yesReserve
-            uint256 k = noReserve * yesReserve;
-            uint256 newNoReserve = noReserve + _usdcIn;
-            uint256 newYesReserve  = k / newNoReserve;
+            uint256 k = yesReserve * noReserve;
+            uint256 newNoReserve  = noReserve + usdcForAMM + feePerReserve;
+            uint256 newYesReserve = k / newNoReserve;
             sharesOut = yesReserve - newYesReserve;
 
             yesReserve = newYesReserve;
@@ -316,7 +378,7 @@ contract PredictionMarket is ReentrancyGuard {
             // Selling YES shares back: burns shares, releases USDC from yesReserve
             yesToken.burn(msg.sender, _sharesIn);
 
-            uint256 k = noReserve * yesReserve;
+            uint256 k = yesReserve * noReserve;
             uint256 newYesReserve = yesReserve - _sharesIn;
             uint256 newNoReserve  = k / newYesReserve;
             usdcOut = newNoReserve - noReserve;
@@ -326,7 +388,7 @@ contract PredictionMarket is ReentrancyGuard {
         } else {
             noToken.burn(msg.sender, _sharesIn);
 
-            uint256 k = noReserve * yesReserve;
+            uint256 k = yesReserve * noReserve;
             uint256 newNoReserve  = noReserve - _sharesIn;
             uint256 newYesReserve = k / newNoReserve;
             usdcOut = newYesReserve - yesReserve;
@@ -413,4 +475,147 @@ contract PredictionMarket is ReentrancyGuard {
             block.timestamp
         );
     }
+
+    /// @notice Calculates the current spread in basis points.
+    ///
+    /// Spread has three components:
+    ///   1. Confidence spread: wider when agent is less certain
+    ///   2. Liquidity spread:  wider when pool is thin
+    ///   3. Time spread:       wider as market approaches expiry
+    ///      (approaching expiry = high information asymmetry risk)
+    ///
+    /// Final spread = max(MIN_SPREAD_BPS, min(MAX_SPREAD_BPS, sum of components))
+    function currentSpreadBps() public view returns (uint256 spread) {
+        // ── Component 1: confidence spread ────────────────────────────────────
+        // confidenceIntervalBps of 800 (±8%) → spread contribution of 80 bps
+        // Intuition: if agent is uncertain, charge more to trade against it
+        uint256 confidenceSpread = confidenceIntervalBps / 10;
+
+        // ── Component 2: liquidity spread ─────────────────────────────────────
+        // Thin pools get a wider spread to prevent full extraction
+        // Pool < 50 USDC → 200 bps extra spread
+        // Pool < 200 USDC → 100 bps extra spread
+        // Pool >= 200 USDC → 0 extra spread
+        uint256 poolDepth = totalLiquidity();
+        uint256 liquiditySpread;
+        if (poolDepth < 50 * 1e6) {
+            liquiditySpread = 200;
+        } else if (poolDepth < 200 * 1e6) {
+            liquiditySpread = 100;
+        } else {
+            liquiditySpread = 0;
+        }
+
+        // ── Component 3: time spread ───────────────────────────────────────────
+        // Markets within 24 hours of expiry get a 150 bps premium
+        // Markets within 6 hours get a 300 bps premium
+        // Rationale: informed traders have maximum edge near resolution
+        uint256 timeSpread;
+        if (block.timestamp >= expiryTimestamp) {
+            timeSpread = 0; // expired — no more trading
+        } else {
+            uint256 timeRemaining = expiryTimestamp - block.timestamp;
+            if (timeRemaining < 6 hours) {
+                timeSpread = 300;
+            } else if (timeRemaining < 24 hours) {
+                timeSpread = 150;
+            } else {
+                timeSpread = 0;
+            }
+        }
+
+        // ── Combine and clamp ─────────────────────────────────────────────────
+        uint256 rawSpread = confidenceSpread + liquiditySpread + timeSpread;
+        spread = rawSpread < MIN_SPREAD_BPS ? MIN_SPREAD_BPS
+        : rawSpread > MAX_SPREAD_BPS ? MAX_SPREAD_BPS
+        : rawSpread;
+    }
+
+    /// @notice Called by the Market Maker Agent when its probability estimate changes.
+    ///         Updates the confidence interval, which directly controls spread width.
+    ///         Only the factory (agent) can call this.
+    ///
+    /// @param _newProbabilityBps       Updated probability estimate (6800 = 68%)
+    /// @param _newConfidenceIntervalBps Updated confidence interval (800 = ±8%)
+
+    function updateAgentProbability(
+        uint256 _newProbabilityBps,
+        uint256 _newConfidenceIntervalBps
+    )
+        external
+    {
+        require(msg.sender == factory, "Only factory");
+        require(_newProbabilityBps > 0 && _newProbabilityBps < 10000, "Invalid probability");
+        require(_newConfidenceIntervalBps <= 3000, "Confidence interval too wide");
+
+        agentProbabilityBps      = _newProbabilityBps;
+        confidenceIntervalBps    = _newConfidenceIntervalBps;
+        lastAgentUpdate          = block.timestamp;
+
+        emit AgentProbabilityUpdated(
+            _newProbabilityBps,
+            _newConfidenceIntervalBps,
+            block.timestamp
+        );
+    }
+
+    /// @notice Rebalances the AMM reserves to align with the agent's current
+    ///         probability estimate. Called when market price drifts beyond
+    ///         rebalanceThresholdBps from the agent's estimate.
+    ///
+    /// Does NOT add or remove USDC — total liquidity stays constant.
+    /// Only shifts the split between yesReserve and noReserve.
+    ///
+    /// Example:
+    ///   Agent says 74%, market at 61% (13% drift, above 5% threshold)
+    ///   Before: yesReserve=61, noReserve=39 (total=100)
+    ///   After:  yesReserve=74, noReserve=26 (total=100, price now at 74%)
+    ///   Note: price = noReserve / (yesReserve + noReserve)
+    ///         so to get price=74%: noReserve = 74, yesReserve = 26
+
+    function rebalanceLiquidity() external notResolved {
+        require(msg.sender == factory, "Only factory");
+
+        uint256 marketPriceBps = currentYesPrice();
+
+        // Only rebalance if drift exceeds threshold
+        uint256 drift = marketPriceBps > agentProbabilityBps
+            ? marketPriceBps - agentProbabilityBps
+            : agentProbabilityBps - marketPriceBps;
+
+        require(drift >= rebalanceThresholdBps, "Drift below threshold, no rebalance needed");
+
+        uint256 oldYesReserve = yesReserve;
+        uint256 oldNoReserve  = noReserve;
+        uint256 total         = totalLiquidity();
+
+        // Rebalance: set reserves proportional to agent probability
+        // Price of YES = noReserve / total → to get price = agentP/10000:
+        //   noReserve = total * agentP / 10000
+        //   yesReserve = total - noReserve
+        uint256 newNoReserve  = (total * agentProbabilityBps) / 10000;
+        uint256 newYesReserve = total - newNoReserve;
+
+        yesReserve = newYesReserve;
+        noReserve  = newNoReserve;
+
+        emit LiquidityRebalanced(
+            oldYesReserve,
+            oldNoReserve,
+            newYesReserve,
+            newNoReserve,
+            agentProbabilityBps
+        );
+    }
+
+    /// @notice PRICING CURVE UPGRADE PATH
+    /// Current: Constant-product AMM (x * y = k) with dynamic spread overlay
+    ///   Simple, battle-tested, sufficient for demonstration
+    ///
+    /// Production: LMSR (Logarithmic Market Scoring Rule)
+    ///   cost(q) = b * log(e^(q_yes/b) + e^(q_no/b))
+    ///   Better price stability near 0% and 100%
+    ///   Standard for academic prediction market research
+    ///   Requires PRBMath or equivalent fixed-point library
+    ///   Estimated implementation: 3-4 days + audit
 }

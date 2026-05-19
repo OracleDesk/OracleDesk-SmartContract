@@ -49,6 +49,22 @@ contract MarketFactory is Ownable {
     //   _reasoningCid     — IPFS CID of the creation reasoning trace
     //   _sha256Hash       — SHA-256 hash of the reasoning trace JSON
 
+
+    /// @notice ORACLE UPGRADE PATH
+    /// Current (hackathon): MultiSigOracle — team manually verifies and resolves
+    ///   after checking official data sources (BLS, Fed, AP Elections)
+    ///
+    /// Production v1: Chainlink Functions adapter
+    ///   → Fetches official data endpoint → parses result → calls resolve()
+    ///   → Requires Chainlink Functions on Arc (roadmap item)
+    ///
+    /// Production v2: UMA Optimistic Oracle
+    ///   → 48-hour dispute window → community verification
+    ///   → Already used by Polymarket for complex event resolution
+    ///
+    /// The oracle address is set per-market at creation time.
+    /// Upgrading oracle type = updating the address passed to createMarket().
+    /// No contract redeployment needed.
     function createMarket(
         string  calldata _question,
         address          _oracle,
@@ -57,7 +73,8 @@ contract MarketFactory is Ownable {
         uint256          _liquiditySeedUsdc,
         address          _agentWallet,
         string  calldata _reasoningCid,
-        bytes32          _sha256Hash
+        bytes32          _sha256Hash,
+        uint256          _confidenceIntervalBps
     )
         external
         onlyOwner
@@ -87,7 +104,8 @@ contract MarketFactory is Ownable {
             _liquiditySeedUsdc,
             _agentWallet,
             _reasoningCid,
-            _sha256Hash
+            _sha256Hash,
+            _confidenceIntervalBps
         );
 
         marketAddress = address(market);
@@ -158,5 +176,22 @@ contract MarketFactory is Ownable {
             _ipfsCid,
             _sha256Hash
         );
+    }
+
+    /// @notice Agent updates its probability estimate on a live market
+    function updateMarketProbability(
+        address _market,
+        uint256 _newProbabilityBps,
+        uint256 _newConfidenceIntervalBps
+    ) external onlyOwner {
+        PredictionMarket(_market).updateAgentProbability(
+            _newProbabilityBps,
+            _newConfidenceIntervalBps
+        );
+    }
+
+    /// @notice Agent rebalances liquidity if market has drifted
+    function rebalanceMarket(address _market) external onlyOwner {
+        PredictionMarket(_market).rebalanceLiquidity();
     }
 }

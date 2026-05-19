@@ -57,6 +57,30 @@ contract PredictionMarketTest is Test {
         );
     }
 
+    function _deployMarket(uint256 initialYesPrice, uint256 confidenceBps)
+        internal
+        returns (address marketAddr)
+    {
+        address usdcAddr = 0x3600000000000000000000000000000000000000;
+        string memory question = "Will the Fed raise rates?";
+
+        vm.startPrank(agent);
+        IERC20(usdcAddr).approve(address(factory), SEED_AMOUNT);
+        factory.depositLiquidity(SEED_AMOUNT);
+        marketAddr = factory.createMarket(
+            question,
+            oracle,
+            block.timestamp + 30 days,
+            initialYesPrice,
+            SEED_AMOUNT,
+            agent,
+            "QmTestCid123",
+            bytes32(0),
+            confidenceBps
+        );
+        vm.stopPrank();
+    }
+
     // ── Test: Basic market creation ───────────────────────────────────────────
 
     function test_CreateMarket() public {
@@ -76,7 +100,8 @@ contract PredictionMarketTest is Test {
             SEED_AMOUNT,
             agent,
             "QmTestCid123",
-            keccak256("test reasoning trace content")
+            keccak256("test reasoning trace content"),
+            400
         );
         vm.stopPrank();
 
@@ -120,7 +145,8 @@ contract PredictionMarketTest is Test {
             SEED_AMOUNT,
             agent,
             "QmTestCid123",
-            bytes32(0)
+            bytes32(0),
+            400
         );
         vm.stopPrank();
 
@@ -152,12 +178,12 @@ contract PredictionMarketTest is Test {
         factory.depositLiquidity(SEED_AMOUNT * 2);
 
         factory.createMarket(q, oracle, block.timestamp + 30 days,
-            6800, SEED_AMOUNT, agent, "QmCid1", bytes32(0));
+            6800, SEED_AMOUNT, agent, "QmCid1", bytes32(0), 400);
 
         // Second attempt with same question should revert
         vm.expectRevert("Market for this question already exists");
         factory.createMarket(q, oracle, block.timestamp + 30 days,
-            6800, SEED_AMOUNT, agent, "QmCid2", bytes32(0));
+            6800, SEED_AMOUNT, agent, "QmCid2", bytes32(0), 400);
 
         vm.stopPrank();
     }
@@ -178,7 +204,8 @@ contract PredictionMarketTest is Test {
             SEED_AMOUNT,
             agent,
             "QmCid",
-            bytes32(0)
+            bytes32(0),
+            400
         );
         vm.stopPrank();
 
@@ -206,5 +233,92 @@ contract PredictionMarketTest is Test {
 
         assertTrue(traderUsdcAfter > traderUsdcBefore);
         assertEq(market.yesToken().balanceOf(trader), 0);
+    }
+
+    // ── Test: dynamic spread widens with low confidence ───────────────────────────
+    function test_DynamicSpread() public {
+        // Create market with tight confidence interval (200 bps = ±2%)
+        address marketAddr = _deployMarket(6800, 200);
+        PredictionMarket market = PredictionMarket(marketAddr);
+
+        uint256 tightSpread = market.currentSpreadBps();
+        console.log("Tight confidence spread:", tightSpread);
+
+        // Update to wide confidence interval (2000 bps = ±20%)
+        vm.prank(agent);
+        factory.updateMarketProbability(marketAddr, 6800, 2000);
+
+        uint256 wideSpread = market.currentSpreadBps();
+        console.log("Wide confidence spread:", wideSpread);
+
+        // Wide confidence must produce wider spread
+        assertGt(wideSpread, tightSpread);
+    }
+
+    // ── Test: spread increases near expiry ───────────────────────────────────────
+    function test_TimeSpread() public {
+        address marketAddr = _deployMarket(6800, 400);
+        PredictionMarket market = PredictionMarket(marketAddr);
+
+        uint256 farSpread = market.currentSpreadBps();
+
+        // Warp to 12 hours before expiry
+        vm.warp(market.expiryTimestamp() - 12 hours);
+        uint256 nearSpread = market.currentSpreadBps();
+
+        // Warp to 3 hours before expiry
+        vm.warp(market.expiryTimestamp() - 3 hours);
+        uint256 veryNearSpread = market.currentSpreadBps();
+
+        assertGt(nearSpread,     farSpread);
+        assertGt(veryNearSpread, nearSpread);
+    }
+
+    // ── Test: rebalance anchors price to agent estimate ───────────────────────────
+    function test_LiquidityRebalance() public {
+        address usdcAddr  = 0x3600000000000000000000000000000000000000;
+        address marketAddr = _deployMarket(5000, 500); // 50/50 market
+        PredictionMarket market = PredictionMarket(marketAddr);
+
+        // Trader buys a lot of YES, pushing price up to ~70%
+        uint256 bigBuy = 80 * ONE_USDC;
+        vm.startPrank(trader);
+        IERC20(usdcAddr).approve(marketAddr, bigBuy);
+        market.buy(true, bigBuy, 0);
+        vm.stopPrank();
+
+        uint256 priceAfterBuy = market.currentYesPrice();
+        console.log("Price after big buy:", priceAfterBuy);
+        assertGt(priceAfterBuy, 5500); // price moved up
+
+        // Agent updates estimate and rebalances
+        vm.startPrank(agent);
+        factory.updateMarketProbability(marketAddr, 5000, 500); // agent still thinks 50%
+        factory.rebalanceMarket(marketAddr);
+        vm.stopPrank();
+
+        uint256 priceAfterRebalance = market.currentYesPrice();
+        console.log("Price after rebalance:", priceAfterRebalance);
+
+        // Price should be back near 50%
+        assertApproxEqAbs(priceAfterRebalance, 5000, 100);
+    }
+
+    // ── Test: spread fee stays in pool ───────────────────────────────────────────
+    function test_SpreadFeeAccumulation() public {
+        address usdcAddr  = 0x3600000000000000000000000000000000000000;
+        address marketAddr = _deployMarket(6800, 800);
+        PredictionMarket market = PredictionMarket(marketAddr);
+
+        uint256 liquidityBefore = market.totalLiquidity();
+
+        vm.startPrank(trader);
+        IERC20(usdcAddr).approve(marketAddr, 10 * ONE_USDC);
+        market.buy(true, 10 * ONE_USDC, 0);
+        vm.stopPrank();
+
+        // Total liquidity grew because spread fee stayed in pool
+        assertGt(market.totalLiquidity(), liquidityBefore);
+        assertGt(market.accumulatedFees(), 0);
     }
 }
