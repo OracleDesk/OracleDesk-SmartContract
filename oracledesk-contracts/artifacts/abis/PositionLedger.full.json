@@ -1,0 +1,632 @@
+{
+  "contractName": "PositionLedger",
+  "abi": [
+    {
+      "type": "constructor",
+      "inputs": [
+        {
+          "name": "_owner",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "allPositionIds",
+      "inputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "closePosition",
+      "inputs": [
+        {
+          "name": "_positionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "_state",
+          "type": "uint8",
+          "internalType": "enum PositionLedger.PositionState"
+        },
+        {
+          "name": "_usdcReturned",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "getAllPositionIds",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bytes32[]",
+          "internalType": "bytes32[]"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "getOpenPositionIds",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bytes32[]",
+          "internalType": "bytes32[]"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "getPosition",
+      "inputs": [
+        {
+          "name": "_positionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "tuple",
+          "internalType": "struct PositionLedger.Position",
+          "components": [
+            {
+              "name": "polymarketConditionId",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "polymarketTokenId",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "side",
+              "type": "uint8",
+              "internalType": "enum PositionLedger.Side"
+            },
+            {
+              "name": "usdcSpent",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "sharesReceived",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "entryPriceBps",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "kellyFractionBps",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "edgeBps",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "openedAt",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "closedAt",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "reasoningCid",
+              "type": "string",
+              "internalType": "string"
+            },
+            {
+              "name": "sha256Hash",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "state",
+              "type": "uint8",
+              "internalType": "enum PositionLedger.PositionState"
+            },
+            {
+              "name": "realisedPnl",
+              "type": "int256",
+              "internalType": "int256"
+            },
+            {
+              "name": "polygonTxHash",
+              "type": "string",
+              "internalType": "string"
+            },
+            {
+              "name": "cctpNonce",
+              "type": "uint64",
+              "internalType": "uint64"
+            }
+          ]
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "getPositionsByCondition",
+      "inputs": [
+        {
+          "name": "_conditionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bytes32[]",
+          "internalType": "bytes32[]"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "openPosition",
+      "inputs": [
+        {
+          "name": "_conditionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "_tokenId",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_side",
+          "type": "uint8",
+          "internalType": "enum PositionLedger.Side"
+        },
+        {
+          "name": "_usdcSpent",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_sharesReceived",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_entryPriceBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_kellyFractionBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_edgeBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "_reasoningCid",
+          "type": "string",
+          "internalType": "string"
+        },
+        {
+          "name": "_sha256Hash",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "_polygonTxHash",
+          "type": "string",
+          "internalType": "string"
+        },
+        {
+          "name": "_cctpNonce",
+          "type": "uint64",
+          "internalType": "uint64"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "owner",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "positions",
+      "inputs": [
+        {
+          "name": "",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "polymarketConditionId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "polymarketTokenId",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "side",
+          "type": "uint8",
+          "internalType": "enum PositionLedger.Side"
+        },
+        {
+          "name": "usdcSpent",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "sharesReceived",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "entryPriceBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "kellyFractionBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "edgeBps",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "openedAt",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "closedAt",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "reasoningCid",
+          "type": "string",
+          "internalType": "string"
+        },
+        {
+          "name": "sha256Hash",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "state",
+          "type": "uint8",
+          "internalType": "enum PositionLedger.PositionState"
+        },
+        {
+          "name": "realisedPnl",
+          "type": "int256",
+          "internalType": "int256"
+        },
+        {
+          "name": "polygonTxHash",
+          "type": "string",
+          "internalType": "string"
+        },
+        {
+          "name": "cctpNonce",
+          "type": "uint64",
+          "internalType": "uint64"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "positionsByCondition",
+      "inputs": [
+        {
+          "name": "",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "renounceOwnership",
+      "inputs": [],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "totalPositions",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "totalRealisedPnl",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "pnl",
+          "type": "int256",
+          "internalType": "int256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "transferOwnership",
+      "inputs": [
+        {
+          "name": "newOwner",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "event",
+      "name": "OwnershipTransferred",
+      "inputs": [
+        {
+          "name": "previousOwner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "newOwner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "PositionClosed",
+      "inputs": [
+        {
+          "name": "positionId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "state",
+          "type": "uint8",
+          "indexed": false,
+          "internalType": "enum PositionLedger.PositionState"
+        },
+        {
+          "name": "realisedPnl",
+          "type": "int256",
+          "indexed": false,
+          "internalType": "int256"
+        },
+        {
+          "name": "closedAt",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "PositionOpened",
+      "inputs": [
+        {
+          "name": "positionId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "conditionId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "tokenId",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "side",
+          "type": "uint8",
+          "indexed": false,
+          "internalType": "enum PositionLedger.Side"
+        },
+        {
+          "name": "usdcSpent",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "entryPriceBps",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "edgeBps",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "reasoningCid",
+          "type": "string",
+          "indexed": false,
+          "internalType": "string"
+        },
+        {
+          "name": "sha256Hash",
+          "type": "bytes32",
+          "indexed": false,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "polygonTxHash",
+          "type": "string",
+          "indexed": false,
+          "internalType": "string"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "ReasoningPublished",
+      "inputs": [
+        {
+          "name": "positionId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agentWallet",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "ipfsCid",
+          "type": "string",
+          "indexed": false,
+          "internalType": "string"
+        },
+        {
+          "name": "sha256Hash",
+          "type": "bytes32",
+          "indexed": false,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "blockTimestamp",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "error",
+      "name": "OwnableInvalidOwner",
+      "inputs": [
+        {
+          "name": "owner",
+          "type": "address",
+          "internalType": "address"
+        }
+      ]
+    },
+    {
+      "type": "error",
+      "name": "OwnableUnauthorizedAccount",
+      "inputs": [
+        {
+          "name": "account",
+          "type": "address",
+          "internalType": "address"
+        }
+      ]
+    }
+  ],
+  "bytecode": "0x6080346100b957601f6114f338819003918201601f19168301916001600160401b038311848410176100bd578084926020946040528339810103126100b957516001600160a01b0390818116908190036100b95780156100a1575f80546001600160a01b03198116831782556040519316907f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e09080a361142190816100d28239f35b604051631e4fbdf760e01b81525f6004820152602490fd5b5f80fd5b634e487b7160e01b5f52604160045260245ffdfe60a0806040526004361015610012575f80fd5b5f3560e01c908163019e18cb1461107d57508063111b65b7146110465780631928b3cb14610de65780632e3fa9b914610da05780634bd0626014610c6a578063514ea4bf14610b1d578063715018a614610ac657806378a1ebd81461090b5780638da5cb5b146108e4578063aca1c8771461028b578063ceb5a9b8146101db578063cfadbcdd14610163578063f2fde38b146100d75763fda1fa5f146100b6575f80fd5b346100d3575f3660031901126100d3576020600254604051908152f35b5f80fd5b346100d35760203660031901126100d3576004356001600160a01b03818116918290036100d3576101066113c0565b811561014b575f54826bffffffffffffffffffffffff60a01b8216175f55167f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e05f80a3005b604051631e4fbdf760e01b81525f6004820152602490fd5b346100d3576020806003193601126100d3576004355f52600360205260405f20906040519081602084549182815201935f5260205f20915f905b8282106101c4576101c0856101b481890382611222565b604051918291826110f1565b0390f35b83548652948501946001938401939091019061019d565b346100d3575f3660031901126100d3575f80600254905b81811061020457602083604051908152f35b61020d8161112c565b90549060031b1c5f52600160205260405f2060ff600c8201541660048110156102775761023e575b506001016101f2565b600d0154909280820191821280155f9092129182169115161761026357916001610235565b634e487b7160e01b5f52601160045260245ffd5b634e487b7160e01b5f52602160045260245ffd5b346100d3576101803660031901126100d357600260443510156100d357610104356001600160401b0381116100d3576102c89036906004016112e5565b90610144356001600160401b0381116100d3576102e99036906004016112e5565b61016493919335926001600160401b03841684036100d3576103096113c0565b604051936004356020860152602435604086015260443560f81b60608601524260618601523360601b6081860152607585528460a08101106001600160401b0360a0870111176107015760a085016040528451602086012094855f526001602052600860405f2001546108a557506001600160401b036040519161038c83611206565b600435835260243560208401526103a860443560408501611312565b6064356060840152608435608084015260a43560a084015260c43560c084015260e43560e0840152426101008401525f6101208401526103e936878661135b565b610140840152610124356101608401525f6101808401525f6101a084015261041236868a61135b565b6101c0840152166101e0820152845f52600160205260405f208151815560208201516001820155604082015160028110156102775760ff80196002840154169116176002820155606082015160038201556080820151600482015560a0820151600582015560c0820151600682015560e08201516007820155610100820151600882015561012082015160098201556101408201518051906001600160401b0382116107015781906104c7600a8501546111ce565b601f8111610855575b50602090601f83116001146107e7575f926107dc575b50508160011b915f199060031b1c191617600a8201555b610160820151600b82015561018082015160048110156102775761052490600c8301611343565b6101a0820151600d8201556101c08201518051906001600160401b03821161070157610553600e8401546111ce565b601f8111610798575b50602090601f83116001146107205792826101e093600f936001600160401b03965f92610715575b50508160011b915f199060031b1c191617600e8201555b01920151166001600160401b0319825416179055600254600160401b811015610701576105e86105d282600188940160025561112c565b819391549060031b91821b915f19901b19161790565b90556004355f52600360205260405f2090815490600160401b82101561070157602096867fde8cebcfe4163801fce0ff661dc73ffc3d80b39a119c5e504b80485733b348596106cf82978361066a6105d2897f88772036b705f1ce71a59b57c5a98867524b72c8eb37508c8a09d0bd8af20dc89b60016106e49c018155611161565b905560405191829160243583526106858e8401604435611176565b606435604084015260a435606084015260e435608084015261010060a08401526106b461010084018d8a6113a0565b906101243560c085015283820360e0850152600435976113a0565b0390a3604051946060865260608601916113a0565b9261012435868201524260408201528033940390a3604051908152f35b634e487b7160e01b5f52604160045260245ffd5b015190508c80610584565b90601f19831691600e85015f5260205f20925f5b818110610780575093600f936001600160401b039693600193836101e09810610768575b505050811b01600e82015561059b565b01515f1960f88460031b161c191690558c8080610758565b92936020600181928786015181550195019301610734565b600e84015f5260205f20601f840160051c8101602085106107d5575b601f830160051c820181106107ca57505061055c565b5f81556001016107b4565b50806107b4565b0151905089806104e6565b9250600a84015f5260205f20905f935b601f198416851061083a576001945083601f19811610610822575b505050811b01600a8201556104fd565b01515f1960f88460031b161c19169055898080610812565b818101518355602094850194600190930192909101906107f7565b909150600a84015f5260205f20601f840160051c81016020851061089e575b90849392915b601f830160051c820181106108905750506104d0565b5f815585945060010161087a565b5080610874565b60a060649162461bcd60e51b82820152602060a4820152601560c4820152742837b9b4ba34b7b71024a21031b7b63634b9b4b7b760591b60e482015201fd5b346100d3575f3660031901126100d3575f546040516001600160a01b039091168152602090f35b346100d35760603660031901126100d357600435602480359060048210156100d357604435906109396113c0565b835f52600160205260405f2090600882015415610a8d57600c820160ff8154166004811015610a7a57610a365784156109f2578461097691611343565b4260098301556003820154925f84820394128185128116918513901516176109df57509181606092600d7fd7a77ec4f8dec2f87d7c8110b8f25407c5c0e5228b843e88e4624c90fdc16b6c9501556109d160405180936111c1565b6020820152426040820152a2005b634e487b7160e01b5f9081526011600452fd5b60405162461bcd60e51b815260206004820152601a818401527f43616e6e6f7420636c6f736520746f204f50454e2073746174650000000000006044820152606490fd5b60405162461bcd60e51b8152602060048201526017818401527f506f736974696f6e20616c726561647920636c6f7365640000000000000000006044820152606490fd5b82634e487b7160e01b5f5260216004525ffd5b60649060126040519162461bcd60e51b83526020600484015282015271141bdcda5d1a5bdb881b9bdd08199bdd5b9960721b6044820152fd5b346100d3575f3660031901126100d357610ade6113c0565b5f80546001600160a01b0319811682556001600160a01b03167f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e08280a3005b346100d35760203660031901126100d3576004355f52600160205260405f2080549060018101549181600281015460ff16600382015492600483015490600584015460068501546007860154600887015491600988015493600a8901610b8290611243565b96600b8a01549a600c8b015460ff1699600d8c01549b600e01610ba490611243565b9d600f01546001600160401b03169e604051608052610200996080515260805160200152608051604001610bd791611176565b608051606001526080516080015260805160a0015260805160c0015260805160e001526080516101000152608051610120015280608051610140015260805101610c2091611183565b92608051610160015260805161018001610c39916111c1565b6080516101a0015260805181036080516101c00152610c5791611183565b906080516101e001526080519003608051f35b346100d3575f3660031901126100d3576002545f805b828110610d535750610caa610c948261132c565b91610ca26040519384611222565b80835261132c565b60209290601f190136838501375f925f5b828110610cd057604051806101c086826110f1565b610cd98161112c565b9054600391821b1c5f526001835260ff600c60405f2001541660048110156102775715610d0a575b50600101610cbb565b610d1582969261112c565b9054911b1c94610d248261131e565b958551831015610d3f578360019360051b8701015290610d01565b634e487b7160e01b5f52603260045260245ffd5b610d5c8161112c565b90549060031b1c5f52600160205260ff600c60405f2001541660048110156102775715610d8c575b600101610c80565b90610d9860019161131e565b919050610d84565b346100d35760403660031901126100d3576024356004355f52600360205260405f2080548210156100d357602091610dd791611161565b90549060031b1c604051908152f35b346100d35760203660031901126100d3575f6101e0604051610e0781611206565b8281528260208201528260408201528260608201528260808201528260a08201528260c08201528260e0820152826101008201528261012082015260606101408201528261016082015282610180820152826101a082015260606101c082015201526004355f52600160205260405f2060405190610e8482611206565b8054825260018101546020830152610ea660ff60028301541660408401611312565b6003810154606083015260048101546080830152600581015460a0830152600681015460c0830152600781015460e083015260088101546101008301526009810154610120830152610efa600a8201611243565b610140830152600b81015461016083015260ff600c820154166004811015610277576001600160401b0391600f91610180850152600d8101546101a0850152610f45600e8201611243565b6101c08501520154166101e08201526040518091602082528051602083015260208101516040830152610f8060408201516060840190611176565b60608101516080830152608081015160a083015260a081015160c083015260c081015160e083015260e08101516101008301526101008101516101208301526101208101516101408301526101408101516001600160401b036101e061103a610ff86102009485610160890152610220880190611183565b6101608601516101808801526110186101808701516101a08901906111c1565b6101a08601516101c08801526101c0860151601f198883030184890152611183565b93015116908301520390f35b346100d35760203660031901126100d3576004356002548110156100d35761106f60209161112c565b90546040519160031b1c8152f35b346100d3575f3660031901126100d3576002549081815260208082019260025f527f405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace915f905b8282106110da576101c0856101b481890382611222565b8354865294850194600193840193909101906110c3565b60209060206040818301928281528551809452019301915f5b828110611118575050505090565b83518552938101939281019260010161110a565b600254811015610d3f5760025f527f405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace01905f90565b8054821015610d3f575f5260205f2001905f90565b9060028210156102775752565b91908251928382525f5b8481106111ad575050825f602080949584010152601f8019910116010190565b60208183018101518483018201520161118d565b9060048210156102775752565b90600182811c921680156111fc575b60208310146111e857565b634e487b7160e01b5f52602260045260245ffd5b91607f16916111dd565b61020081019081106001600160401b0382111761070157604052565b90601f801991011681019081106001600160401b0382111761070157604052565b9060405191825f8254611255816111ce565b908184526020946001916001811690815f146112c35750600114611285575b50505061128392500383611222565b565b5f90815285812095935091905b8183106112ab57505061128393508201015f8080611274565b85548884018501529485019487945091830191611292565b9250505061128394925060ff191682840152151560051b8201015f8080611274565b9181601f840112156100d3578235916001600160401b0383116100d357602083818601950101116100d357565b60028210156102775752565b5f1981146102635760010190565b6001600160401b0381116107015760051b60200190565b9060048110156102775760ff80198354169116179055565b9291926001600160401b0382116107015760405191611384601f8201601f191660200184611222565b8294818452818301116100d3578281602093845f960137010152565b908060209392818452848401375f828201840152601f01601f1916010190565b5f546001600160a01b031633036113d357565b60405163118cdaa760e01b8152336004820152602490fdfea2646970667358221220995345426a85bd4462064d4d8eb7275d8a62c02375bffc691fecf8de8b8f41d964736f6c63430008180033"
+}
