@@ -348,29 +348,6 @@ If they match → trace is authentic and was published at Arc block timestamp,
 before the market resolved. If they don't match → content was altered after
 publication. This is cryptographically unforgeable.
 
-#### `ReasoningFeedAPI` (Express server)
-
-x402-gated API serving full reasoning trace content.
-
-```
-GET /traces           → paginated trace list (free, preview only)
-GET /traces/:id       → full trace + IPFS content (gated: $0.001 USDC via x402)
-GET /traces/:id/verify → tamper verification (free, public)
-POST /internal/traces  → agent writes traces (API_SECRET protected)
-```
-
-x402 payment flow per trace read:
-
-```
-1. Subscriber: GET /traces/:id  (no payment)
-2. Server:     402 Payment Required + { price: "$0.001", network: "arcTestnet" }
-3. Subscriber: GatewayClient signs EIP-3009 auth (zero gas, offchain)
-4. Subscriber: GET /traces/:id + PAYMENT-SIGNATURE header
-5. Server:     Circle Gateway verifies + settles payment in batch
-6. Server:     returns full trace + PAYMENT-RESPONSE header
-7. Server:     records access on ReasoningRegistry (async, audit trail)
-```
-
 ---
 
 ## Deployed Contract Addresses
@@ -379,11 +356,11 @@ x402 payment flow per trace read:
 
 | Contract | Address | Explorer |
 |---|---|---|
-| MarketFactory | `0xf5b7e790168af77418ab9ec37cb7eb7851e4a36a` | [View](https://testnet.arcscan.app/address/0xf5b7e790168af77418ab9ec37cb7eb7851e4a36a) |
-| TreasuryManager | *(fill after deploy)* | — |
-| PositionLedger | *(fill after deploy)* | — |
-| ReasoningRegistry | *(fill after deploy)* | — |
-| MultiSigOracle | *(fill after deploy)* | — |
+| MarketFactory | `0xA24BB6956D722Ed0dc67D2Bd9f0b67C3A02A838a` | [View](https://testnet.arcscan.app/address/0xA24BB6956D722Ed0dc67D2Bd9f0b67C3A02A838a) |
+| TreasuryManager | `0xb326E280D2e115B6BEC25154142970a90074e7F8` | [View](https://testnet.arcscan.app/address/0xb326E280D2e115B6BEC25154142970a90074e7F8) |
+| PositionLedger | `0x4ac9c8A1F68c6d8979343746825Df09DD1907b44` | [View](https://testnet.arcscan.app/address/0x4ac9c8A1F68c6d8979343746825Df09DD1907b44) |
+| ReasoningRegistry | `0xE3188B3b4E14d74E6110137FF91f12B981A82257` | [View](https://testnet.arcscan.app/address/0xE3188B3b4E14d74E6110137FF91f12B981A82257) |
+| MultiSigOracle | `0xD21251d0f66245C1B259d720F3795633a803b8B9` | [View](https://testnet.arcscan.app/address/0xD21251d0f66245C1B259d720F3795633a803b8B9) |
 
 ### Arc Testnet — Fixed Infrastructure
 
@@ -413,7 +390,6 @@ x402 payment flow per trace read:
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)
 - Node.js v22+
 - A Circle developer account ([console.circle.com](https://console.circle.com))
-- A Pinata account ([pinata.cloud](https://pinata.cloud)) for IPFS pinning
 
 ### Install
 
@@ -454,13 +430,6 @@ POLYGON_PRIVATE_KEY=
 # MultiSig oracle signers (optional — defaults to AGENT_WALLET_ADDRESS if unset)
 TEAM_MEMBER_2=
 TEAM_MEMBER_3=
-
-# Layer 3 — IPFS + API
-PINATA_API_KEY=
-PINATA_SECRET_KEY=
-TREASURY_ADDRESS=   # same as AGENT_WALLET_ADDRESS
-PORT=3001
-API_SECRET=         # random string: openssl rand -hex 32
 
 # Polymarket
 POLYMARKET_BUILDER_CODE=
