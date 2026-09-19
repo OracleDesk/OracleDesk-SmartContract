@@ -1,0 +1,3 @@
+[workspace]
+members = ["market-core"]
+resolver = "2"
