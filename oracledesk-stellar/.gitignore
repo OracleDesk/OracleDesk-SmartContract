@@ -28,6 +28,9 @@ yarn-error.log*
 .soroban/
 .stellar/
 
+# Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
+.traces/
+
 # IDE / OS
 .vscode/
 .idea/
