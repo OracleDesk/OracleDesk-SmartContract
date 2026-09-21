@@ -1,0 +1,34 @@
+# Rust / Soroban
+target/
+Cargo.lock.bak
+# soroban-sdk auto-generates these per test run; they are regenerable and
+# noisy in diffs, so they are not committed.
+test_snapshots/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# The parent OracleDesk-SmartContract repo's root .gitignore blanket-ignores
+# package-lock.json (leftover from its Foundry/Solidity template). Lockfiles
+# should be committed for reproducible installs, so this repo un-ignores its
+# own.
+!package-lock.json
+!x402/package-lock.json
+
+# Environment variables — never commit real secrets, only the template.
+.env
+.env.*
+!.env.example
+
+# Stellar / Soroban CLI local state (funded testnet identities, RPC caches)
+.soroban/
+.stellar/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
