@@ -82,22 +82,16 @@ anywhere under `oracledesk-stellar/`.
   then confirmed to pass again with the fix restored; (3) the real,
   unmocked testnet transaction for `agent_create_market` succeeded, which
   would have failed with the same auth error had the fix been wrong.
-- `packages/bindings/market-core`: generated, then `npm install && npm run
-  build` completed with no errors — a full round-trip, not just generation.
+- **All four** `packages/bindings/*` packages: generated, then `npm install
+  && npm run build` completed with no errors for every one of them
+  (`market-core`, `reasoning-registry`, `resolver`, `treasury`) — a full
+  round-trip, not just generation. `resolver`'s and `treasury`'s installs
+  were slower (each ~4 minutes against this sandbox's npm registry) and so
+  were run later in the session than the other two, but all four are now
+  confirmed.
 
 ## What's implemented but not fully round-trip verified
 
-- **`packages/bindings/{resolver,treasury,reasoning-registry}`**: generated
-  by the same `stellar contract bindings typescript` command as
-  `market-core`, and `reasoning-registry`'s was also `npm install`ed and
-  built successfully. Their method signatures (`agent_buy`,
-  `agent_create_market`, `publish_trace`, `get_trace`) were read directly
-  from the generated `src/index.ts` and cross-checked by hand against
-  `agents/stellar/adapter.ts`'s and `x402/registry-trace-repository.ts`'s
-  usage — they match exactly. `resolver`'s and `treasury`'s packages were
-  not independently `npm install`ed in this session (each `@stellar/
-  stellar-sdk` install took several minutes against this sandbox's
-  registry, and the pattern was already exercised twice).
 - **x402's registry-backed `TraceRepository`**
   (`x402/registry-trace-repository.ts`): unit-tested with a
   dependency-injected fake reader (its real interface, verified against the
