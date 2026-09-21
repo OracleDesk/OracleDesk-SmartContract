@@ -9,6 +9,7 @@
     "test": "tsx --test *.test.ts"
   },
   "dependencies": {
+    "@oracledesk/bindings-reasoning-registry": "file:../packages/bindings/reasoning-registry",
     "@x402/core": "^2.23.0",
     "@x402/express": "^2.23.0",
     "@x402/stellar": "^2.23.0",
