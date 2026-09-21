@@ -3,10 +3,15 @@
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
 # README.md's Prerequisites section.
+# Bindings must be installed *and built* (dist/index.d.ts etc.) before
+# agents/ and x402/ install, since both depend on them by local file: path
+# and need real type declarations, not just a package.json, to typecheck.
 setup:
-	cd x402 && npm ci
-	cd agents && npm ci
-	cd packages/bindings && npm ci
+	for pkg in market-core resolver treasury reasoning-registry; do \
+		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
+	done
+	cd agents && npm install
+	cd x402 && npm install
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI, keeping
 # resolver/treasury's vendored copy of market-core.wasm in sync first (see
@@ -23,6 +28,7 @@ test: build
 	cargo test --workspace
 	python3 model/fpmm_model.py
 	cd x402 && npm test
+	cd agents && npm test
 
 lint:
 	cargo fmt --check
@@ -45,4 +51,5 @@ bindings: build
 
 clean:
 	cargo clean
-	rm -rf x402/node_modules agents/node_modules packages/bindings/node_modules
+	rm -rf x402/node_modules agents/node_modules
+	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist
