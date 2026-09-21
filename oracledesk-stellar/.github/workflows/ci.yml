@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test, wasm build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Installed the same way this repo's contributors install it locally
+      # (`cargo install stellar-cli` — verified against the actual crate
+      # name behind the `stellar` binary, not a guessed GitHub Action).
+      - name: Install stellar CLI
+        run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Build all contracts to wasm
+        run: |
+          stellar contract build
+          cp target/wasm32v1-none/release/market_core.wasm contracts/resolver/market_core.wasm
+          cp target/wasm32v1-none/release/market_core.wasm contracts/treasury/market_core.wasm
+          stellar contract build
+
+      - name: Fail if vendored market-core.wasm drifted from the build
+        run: git diff --exit-code -- contracts/resolver/market_core.wasm contracts/treasury/market_core.wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: target/wasm32v1-none/release/*.wasm
+
+  python-model:
+    name: Python FPMM model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 model/fpmm_model.py
+
+  node:
+    name: Node (x402, agents)
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm
+          path: target/wasm32v1-none/release
+
+      - name: Generate bindings from the built wasm
+        run: |
+          chmod +x scripts/gen-bindings.sh
+          ./scripts/gen-bindings.sh
+
+      - name: Fail if committed bindings are stale
+        run: git diff --exit-code -- packages/bindings
+
+      - name: Install and build bindings packages
+        run: |
+          for pkg in market-core resolver treasury reasoning-registry; do
+            (cd "packages/bindings/$pkg" && npm install && npm run build)
+          done
+
+      - name: x402 — install, typecheck, test
+        run: |
+          cd x402
+          npm ci
+          npm run build
+          npm test
+
+      - name: agents — install, typecheck, test
+        run: |
+          cd agents
+          npm install
+          npm run build
+          npm test

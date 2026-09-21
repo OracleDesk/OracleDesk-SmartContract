@@ -1,0 +1,18 @@
+[package]
+name = "resolver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+# experimental_spec_shaking_v2 re-exports types pulled in via contractimport!
+# (Outcome, Category) into this contract's own spec, so generated TS bindings
+# see them instead of an opaque/missing type. See docs/adr/0002-cross-contract-calls.md.
+soroban-sdk = { version = "27.0.6", features = ["experimental_spec_shaking_v2"] }
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }

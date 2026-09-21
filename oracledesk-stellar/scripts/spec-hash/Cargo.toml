@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "spec-hash"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev tool only — never deployed. Computes the same sha256(XDR(ResolutionSpec))
+# hash that contracts/resolver verifies revealed specs against, so
+# scripts/seed-market.sh and scripts/demo.sh can commit to a resolution spec
+# off-chain before creating a market. Not a workspace member: it links
+# soroban-sdk's `testutils` host to run off-chain, which contract crates must
+# never do outside `#[cfg(test)]`.
+[dependencies]
+resolver = { path = "../../contracts/resolver" }
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }

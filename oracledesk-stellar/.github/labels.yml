@@ -1,0 +1,60 @@
+# Repository labels. Apply with a labeler action or `gh label create` — not
+# applied automatically by anything in this repo yet.
+#
+# NOTE: complexity labels are a reasonable default, not verified against the
+# live Drips Stellar Wave Program terms/label conventions (no network access
+# to their docs in the session that authored this file). Before relying on
+# these for Wave point values or eligibility, check drips.network's current
+# maintainer docs and adjust — see docs/STATUS.md.
+
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working as documented
+
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or request
+
+- name: good-first-issue
+  color: "7057ff"
+  description: Scoped and well-defined for a first-time contributor
+
+- name: documentation
+  color: "0075ca"
+  description: Docs-only change
+
+- name: security
+  color: "b60205"
+  description: Security-relevant — see SECURITY.md before discussing publicly
+
+- name: complexity/small
+  color: "c2e0c6"
+  description: A few hours; one file or a small, self-contained addition
+
+- name: complexity/medium
+  color: "fef2c0"
+  description: A day or two; touches a few files or one contract's interface
+
+- name: complexity/large
+  color: "f9d0c4"
+  description: Multi-day; touches multiple contracts, or needs new infrastructure
+
+- name: contracts
+  color: "5319e7"
+  description: Soroban contract code (contracts/)
+
+- name: agents
+  color: "1d76db"
+  description: agents/ (TypeScript)
+
+- name: x402
+  color: "0e8a16"
+  description: x402/ trace API
+
+- name: bindings
+  color: "bfd4f2"
+  description: packages/bindings/ or scripts/gen-bindings.sh
+
+- name: infra
+  color: "d4c5f9"
+  description: CI, scripts, deployment tooling
