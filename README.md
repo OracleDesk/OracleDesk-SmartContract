@@ -3,8 +3,6 @@
 > Autonomous prediction market creation, agent-driven trading, and
 > tamper-evident on-chain reasoning — natively on Stellar/Soroban.
 
-**Status: testnet only · unaudited · pre-alpha**
-
 OracleDesk is an autonomous prediction-market system: a Market Maker agent
 seeds markets from signals it observes, a Trader agent trades mispricings
 against a fair-value estimate, and every decision either agent makes is
