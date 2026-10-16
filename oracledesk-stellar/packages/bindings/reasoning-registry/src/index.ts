@@ -60,11 +60,16 @@ export type DataKey = {tag: "Admin", values: void} | {tag: "NextId", values: voi
 export interface Client {
   /**
    * Construct and simulate a get_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Extends `Trace` on read, as before (a write in a view: simulation
+   * footprints are read-write, kept for compatibility and noted in
+   * `docs/architecture.md`).
    */
   get_trace: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Trace>>>
 
   /**
    * Construct and simulate a trace_count transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Reads the instance's `NextId`; the bump keeps the instance (and with
+   * it the whole contract) alive under view-only traffic.
    */
   trace_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
 
@@ -75,6 +80,8 @@ export interface Client {
 
   /**
    * Construct and simulate a is_registered transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Read-only view: no TTL writes, so an indexer's simulation stays cheap.
+   * The `Agent` entry is refreshed by `register_agent`/`publish_trace`.
    */
   is_registered: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
 
@@ -130,11 +137,11 @@ export class Client extends ContractClient {
         "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABgAAAAAAAAAAAAAABUFkbWluAAAAAAAAAAAAAAAAAAAGTmV4dElkAAAAAAABAAAAAAAAAAVBZ2VudAAAAAAAAAEAAAATAAAAAQAAAAAAAAAFVHJhY2UAAAAAAAABAAAABgAAAAEAAAC+TnVtYmVyIG9mIHRyYWNlcyBwdWJsaXNoZWQgZm9yIGEgbWFya2V0LCBzbyBhIGNsaWVudCBjYW4gcGFnZSB0aHJvdWdoCmBNYXJrZXRUcmFjZShtYXJrZXRfaWQsIDAuLmNvdW50KWAgd2l0aG91dCB0aGUgY29udHJhY3QgZXZlciBob2xkaW5nCmFuIHVuYm91bmRlZCBWZWMgb2YgdHJhY2UgaWRzIGluIG9uZSBzdG9yYWdlIGVudHJ5LgAAAAAAEE1hcmtldFRyYWNlQ291bnQAAAABAAAABgAAAAEAAAAAAAAAC01hcmtldFRyYWNlAAAAAAIAAAAGAAAABg==",
         "AAAABQAAAAAAAAAAAAAADlRyYWNlUHVibGlzaGVkAAAAAAABAAAAD3RyYWNlX3B1Ymxpc2hlZAAAAAAHAAAAAAAAAAh0cmFjZV9pZAAAAAYAAAABAAAAAAAAAAltYXJrZXRfaWQAAAAAAAAGAAAAAQAAAAAAAAAFYWdlbnQAAAAAAAATAAAAAQAAAAAAAAAGYWN0aW9uAAAAAAAQAAAAAAAAAAAAAAAKdHJhY2VfaGFzaAAAAAAD7gAAACAAAAAAAAAAAAAAAAhpcGZzX2NpZAAAABAAAAAAAAAAAAAAAAxwdWJsaXNoZWRfYXQAAAAGAAAAAAAAAAI=",
         "AAAABQAAAAAAAAAAAAAAD0FnZW50UmVnaXN0ZXJlZAAAAAABAAAAEGFnZW50X3JlZ2lzdGVyZWQAAAABAAAAAAAAAAVhZ2VudAAAAAAAABMAAAABAAAAAg==",
-        "AAAAAAAAAAAAAAAJZ2V0X3RyYWNlAAAAAAAAAQAAAAAAAAAIdHJhY2VfaWQAAAAGAAAAAQAAA+kAAAfQAAAABVRyYWNlAAAAAAAAAw==",
-        "AAAAAAAAAAAAAAALdHJhY2VfY291bnQAAAAAAAAAAAEAAAAG",
+        "AAAAAAAAAJlFeHRlbmRzIGBUcmFjZWAgb24gcmVhZCwgYXMgYmVmb3JlIChhIHdyaXRlIGluIGEgdmlldzogc2ltdWxhdGlvbgpmb290cHJpbnRzIGFyZSByZWFkLXdyaXRlLCBrZXB0IGZvciBjb21wYXRpYmlsaXR5IGFuZCBub3RlZCBpbgpgZG9jcy9hcmNoaXRlY3R1cmUubWRgKS4AAAAAAAAJZ2V0X3RyYWNlAAAAAAAAAQAAAAAAAAAIdHJhY2VfaWQAAAAGAAAAAQAAA+kAAAfQAAAABVRyYWNlAAAAAAAAAw==",
+        "AAAAAAAAAHpSZWFkcyB0aGUgaW5zdGFuY2UncyBgTmV4dElkYDsgdGhlIGJ1bXAga2VlcHMgdGhlIGluc3RhbmNlIChhbmQgd2l0aAppdCB0aGUgd2hvbGUgY29udHJhY3QpIGFsaXZlIHVuZGVyIHZpZXctb25seSB0cmFmZmljLgAAAAAAC3RyYWNlX2NvdW50AAAAAAAAAAABAAAABg==",
         "AAAAAAAAAAAAAAAMdmVyaWZ5X3RyYWNlAAAAAgAAAAAAAAAIdHJhY2VfaWQAAAAGAAAAAAAAAA1yZWNlaXZlZF9oYXNoAAAAAAAD7gAAACAAAAABAAAD6QAAAAEAAAAD",
         "AAAAAAAAAAAAAAANX19jb25zdHJ1Y3RvcgAAAAAAAAEAAAAAAAAABWFkbWluAAAAAAAAEwAAAAA=",
-        "AAAAAAAAAAAAAAANaXNfcmVnaXN0ZXJlZAAAAAAAAAEAAAAAAAAABWFnZW50AAAAAAAAEwAAAAEAAAAB",
+        "AAAAAAAAAIpSZWFkLW9ubHkgdmlldzogbm8gVFRMIHdyaXRlcywgc28gYW4gaW5kZXhlcidzIHNpbXVsYXRpb24gc3RheXMgY2hlYXAuClRoZSBgQWdlbnRgIGVudHJ5IGlzIHJlZnJlc2hlZCBieSBgcmVnaXN0ZXJfYWdlbnRgL2BwdWJsaXNoX3RyYWNlYC4AAAAAAA1pc19yZWdpc3RlcmVkAAAAAAAAAQAAAAAAAAAFYWdlbnQAAAAAAAATAAAAAQAAAAE=",
         "AAAAAAAAAAAAAAANcHVibGlzaF90cmFjZQAAAAAAAAUAAAAAAAAABWFnZW50AAAAAAAAEwAAAAAAAAAJbWFya2V0X2lkAAAAAAAABgAAAAAAAAAGYWN0aW9uAAAAAAAQAAAAAAAAAAp0cmFjZV9oYXNoAAAAAAPuAAAAIAAAAAAAAAAIaXBmc19jaWQAAAAQAAAAAQAAA+kAAAAGAAAAAw==",
         "AAAAAAAAAAAAAAAOcmVnaXN0ZXJfYWdlbnQAAAAAAAEAAAAAAAAABWFnZW50AAAAAAAAEwAAAAEAAAPpAAAAAgAAAAM=",
         "AAAAAAAAAEFUaGUgYGluZGV4YC10aCAoMC1iYXNlZCwgcHVibGlzaCBvcmRlcikgdHJhY2UgaWQgZm9yIGBtYXJrZXRfaWRgLgAAAAAAAA9tYXJrZXRfdHJhY2VfYXQAAAAAAgAAAAAAAAAJbWFya2V0X2lkAAAAAAAABgAAAAAAAAAFaW5kZXgAAAAAAAAGAAAAAQAAA+kAAAAGAAAAAw==",

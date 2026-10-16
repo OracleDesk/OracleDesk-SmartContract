@@ -131,6 +131,15 @@ def settle_value(kind: str, yes: int, no: int) -> int:
     raise ValueError(f"unknown settlement kind {kind!r}")
 
 
+def settle_upper(kind: str, yes: int, no: int) -> int:
+    """Mirror of `math::settle_upper`: an upper bound on the total
+    `settle_value` pays out for a set of per-holder (yes, no) claims. Exact
+    for yes/no; for void, per-holder floors sum to at most the floor of the
+    summed halves, so `finalize_market` reserving the aggregate never
+    under-reserves (see `_check_void_sum_of_floors`)."""
+    return settle_value(kind, yes, no)
+
+
 def gross_for_shares(r_sold: int, r_other: int, shares_in: int, fee_bps: int) -> int:
     """Off-chain inverse of calc_sell: how many complete sets (`gross`) the
     pool must burn so that selling exactly `shares_in` shares balances the
@@ -247,12 +256,31 @@ def _check_void_never_overpays():
     assert settle_value("void", 5, 5) <= 5
 
 
+def _check_void_sum_of_floors(trials: int = 2_000, seed: int = 13):
+    """A void market's finalize must reserve at least what remaining holders
+    can still redeem. Each holder's claim floors its own half, so the sum of
+    per-holder floors is at most the aggregate floor `settle_upper`:
+    floor(a/2) + floor(b/2) <= floor((a + b)/2) for all a, b >= 0."""
+    rng = random.Random(seed)
+    for _ in range(trials):
+        a = rng.randint(0, 1_000_000_000)
+        b = rng.randint(0, 1_000_000_000)
+        part = settle_value("void", a, 0) + settle_value("void", 0, b)
+        assert part <= settle_upper("void", a, b), (a, b, part)
+        assert settle_upper("yes", a, b) == settle_value("yes", a, b)
+        assert settle_upper("no", a, b) == settle_value("no", a, b)
+    # Boundary shapes around odd sums.
+    assert settle_value("void", 1, 0) + settle_value("void", 0, 1) <= 1
+    assert settle_value("void", 1, 1) + settle_value("void", 0, 1) <= 1
+
+
 def run_all():
     _check_known_values()
     _check_seed_opens_at_requested_probability()
     _check_k_never_decreases_and_round_trip_never_profits()
     _check_gross_for_shares_inverts_calc_sell()
     _check_void_never_overpays()
+    _check_void_sum_of_floors()
     print("fpmm_model: all property checks passed")
 
 

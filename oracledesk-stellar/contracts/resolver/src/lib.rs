@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod ttl;
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, xdr::ToXdr, Address,
     BytesN, Env, Symbol, Vec,
@@ -20,9 +22,6 @@ mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
 use market_core::{Client as MarketCoreClient, Outcome};
-
-const BUMP_THRESHOLD: u32 = 30 * 17_280;
-const BUMP_TO: u32 = 60 * 17_280;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,16 +181,15 @@ impl Resolver {
         if spec.threshold < 0 || spec.max_staleness == 0 {
             return Err(Error::InvalidConfig);
         }
-        Self::assert_matches_commitment(&env, market_id, &ResolutionSpec::Price(spec.clone()))?;
+        let close_time =
+            Self::assert_matches_commitment(&env, market_id, &ResolutionSpec::Price(spec.clone()))?;
 
         let key = DataKey::Price(market_id);
         env.storage().persistent().set(&key, &spec);
         env.storage()
             .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-        env.storage()
-            .persistent()
             .set(&DataKey::State(market_id), &ResolutionState::Unconfigured);
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -205,16 +203,18 @@ impl Resolver {
         {
             return Err(Error::InvalidConfig);
         }
-        Self::assert_matches_commitment(&env, market_id, &ResolutionSpec::Signers(spec.clone()))?;
+        let close_time = Self::assert_matches_commitment(
+            &env,
+            market_id,
+            &ResolutionSpec::Signers(spec.clone()),
+        )?;
 
         let key = DataKey::Signers(market_id);
         env.storage().persistent().set(&key, &spec);
         env.storage()
             .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-        env.storage()
-            .persistent()
             .set(&DataKey::State(market_id), &ResolutionState::SignersPending);
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -227,7 +227,9 @@ impl Resolver {
         if !env.storage().persistent().has(&key) {
             return Err(Error::NoProposal);
         }
+        let close_time = Self::market_close_time(&env, market_id)?;
         env.storage().persistent().remove(&key);
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -240,10 +242,12 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
         MarketCoreClient::new(&env, &market_core).void_market(&market_id);
         env.storage()
             .persistent()
             .set(&DataKey::State(market_id), &ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         Ok(())
     }
 
@@ -299,6 +303,7 @@ impl Resolver {
         env.storage()
             .persistent()
             .set(&DataKey::State(market_id), &ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         PriceResolution {
             market_id,
             price: data.price,
@@ -335,9 +340,12 @@ impl Resolver {
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
-        env.storage().persistent().set(
-            &DataKey::Attestation(market_id, outcome.clone(), signer),
-            &true,
+        let attestation_key = DataKey::Attestation(market_id, outcome.clone(), signer);
+        env.storage().persistent().set(&attestation_key, &true);
+        ttl::bump_persistent(
+            &env,
+            &attestation_key,
+            ttl::market_target(&env, market.close_time),
         );
         let count_key = DataKey::Count(market_id, outcome.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -358,6 +366,7 @@ impl Resolver {
             }
             .publish(&env);
         }
+        Self::bump_market_entries(&env, market_id, market.close_time);
         Ok(())
     }
 
@@ -377,10 +386,19 @@ impl Resolver {
             return Err(Error::ThresholdNotReached);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let target = ttl::market_target(&env, market.close_time);
+        for signer in config.signers.iter() {
+            let key = DataKey::Attestation(market_id, proposal.outcome.clone(), signer);
+            if env.storage().persistent().has(&key) {
+                ttl::bump_persistent(&env, &key, target);
+            }
+        }
         MarketCoreClient::new(&env, &market_core).resolve(&market_id, &proposal.outcome);
         env.storage()
             .persistent()
             .set(&DataKey::State(market_id), &ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         ResolutionFinalized {
             market_id,
             outcome: proposal.outcome.clone(),
@@ -390,6 +408,9 @@ impl Resolver {
         Ok(proposal.outcome)
     }
 
+    /// Pure view: no TTL extensions. The instance and the market's entries
+    /// are kept alive by the mutating entrypoints above, so a view-only
+    /// simulation stays read-only.
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
     }
@@ -400,6 +421,7 @@ impl Resolver {
         env: &Env,
         key: DataKey,
     ) -> Result<V, Error> {
+        ttl::bump_instance(env);
         env.storage()
             .instance()
             .get(&key)
@@ -447,12 +469,14 @@ impl Resolver {
         Ok(())
     }
 
-    /// Verifies `spec` hashes to the market's `resolution_hash` commitment.
+    /// Verifies `spec` hashes to the market's `resolution_hash` commitment and
+    /// returns the market's `close_time`, which callers need for TTL bumps —
+    /// reusing this market-core call avoids a second `get_market` cross-call.
     fn assert_matches_commitment(
         env: &Env,
         market_id: u64,
         spec: &ResolutionSpec,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
         let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
         let bytes = spec.clone().to_xdr(env);
@@ -460,7 +484,37 @@ impl Resolver {
         if hash != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
-        Ok(())
+        Ok(market.close_time)
+    }
+
+    fn market_close_time(env: &Env, market_id: u64) -> Result<u64, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        Ok(MarketCoreClient::new(env, &market_core)
+            .get_market(&market_id)
+            .close_time)
+    }
+
+    /// Extends every per-market entry to the market's close-time-aware target.
+    /// Called after each mutating entrypoint so an in-progress vote or a
+    /// finalized market cannot archive mid-settlement. `Attestation` entries
+    /// are not enumerable — each is extended where it is written, plus the
+    /// configured signers' in `finalize_signers` — so they are handled
+    /// separately. Absent keys are skipped: `extend_ttl` panics on them.
+    fn bump_market_entries(env: &Env, market_id: u64, close_time: u64) {
+        let target = ttl::market_target(env, close_time);
+        let keys = [
+            DataKey::Price(market_id),
+            DataKey::Signers(market_id),
+            DataKey::Proposal(market_id),
+            DataKey::State(market_id),
+            DataKey::Count(market_id, Outcome::Yes),
+            DataKey::Count(market_id, Outcome::No),
+        ];
+        for key in keys {
+            if env.storage().persistent().has(&key) {
+                ttl::bump_persistent(env, &key, target);
+            }
+        }
     }
 }
 
@@ -470,7 +524,10 @@ mod test {
     use market_core::{Category, MarketStatus};
     use soroban_sdk::{
         contract, contractimpl,
-        testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Ledger, MockAuth, MockAuthInvoke,
+        },
         token::StellarAssetClient,
         BytesN, IntoVal,
     };
@@ -700,5 +757,108 @@ mod test {
             .try_guardian_void_market(&f.market_id)
             .is_err());
         let _ = f.admin;
+    }
+
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    #[test]
+    fn signer_vote_entries_survive_dispute_period() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
+
+        // 61 days of silence — past the old 60-day cap and past any default
+        // persistent TTL. Without the write-time extension the tally would be
+        // archived here and the second attest would read `Count` == 0.
+        advance_ledgers(&f.env, 61 * ttl::DAY_SECS);
+        let count_key = DataKey::Count(f.market_id, Outcome::No);
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &count_key) > 0,
+            "vote tally archived during the dispute period"
+        );
+
+        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
+        let count: Option<u32> = f.env.as_contract(&f.resolver_id, || {
+            f.env.storage().persistent().get(&count_key)
+        });
+        assert_eq!(count, Some(2), "tally silently reset after archival");
+
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + 200);
+        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::No)
+        );
+    }
+
+    #[test]
+    fn instance_survives_after_long_idle() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+
+        // 25 days idle drains the instance TTL below the 7-day threshold...
+        advance_ledgers(&f.env, 25 * ttl::DAY_SECS);
+        assert!(instance_ttl(&f.env, &f.resolver_id) < ttl::INSTANCE_THRESHOLD);
+
+        // ...and the next entrypoint call re-extends it.
+        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+    }
+
+    #[test]
+    fn bump_market_entries_skips_missing_keys() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &spec);
+
+        // Price and State exist; Signers, Proposal and both Counts do not.
+        // The sweep must skip absent keys — `extend_ttl` traps on them.
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::bump_market_entries(&f.env, f.market_id, 2_000);
+        });
+
+        let horizon_ledgers = (ttl::SETTLEMENT_HORIZON_SECS / ttl::LEDGER_SECS) as u32;
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::Price(f.market_id)) >= horizon_ledgers
+        );
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::State(f.market_id)) >= horizon_ledgers
+        );
+        assert!(!f.env.as_contract(&f.resolver_id, || f
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::Signers(f.market_id))));
     }
 }

@@ -12,12 +12,29 @@ import { buildTrace, LocalTraceStore } from "../core/trace.js";
 import { decideTrade, type MarketState } from "../core/strategy.js";
 import { loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 
-/** Placeholder in place of a real market read + reference-price lookup —
- * see docs/wave-issues for wiring get_market/get_price and a
- * ReferencePriceSource as open issues. */
-async function fetchMarketAndFairValue(): Promise<{ market: MarketState; fairValueBps: number }> {
+const PRICE_SOURCE = (process.env.PRICE_SOURCE ?? "spot") as "spot" | "twap";
+const TWAP_WINDOW_SECS = Number(process.env.TWAP_WINDOW_SECS ?? 900);
+
+/** Reads the market on-chain (`readMarket`); the fair-value estimate is
+ * still a placeholder — wiring a read-only ReferencePriceSource (e.g. a
+ * Polymarket mid-price) is tracked in docs/wave-issues. */
+async function fetchMarketAndFairValue(
+  adapter: StellarAdapter,
+): Promise<{ market: MarketState; fairValueBps: number }> {
+  if (PRICE_SOURCE !== "spot" && PRICE_SOURCE !== "twap") {
+    throw new Error(`PRICE_SOURCE must be "spot" or "twap", got "${PRICE_SOURCE}"`);
+  }
+  const read = await adapter.readMarket(BigInt(process.env.MARKET_ID ?? "0"), {
+    useTwapSecs: PRICE_SOURCE === "twap" ? TWAP_WINDOW_SECS : undefined,
+  });
   return {
-    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: Math.floor(Date.now() / 1000) + 3600 },
+    market: {
+      marketId: read.marketId,
+      question: read.metaUri,
+      yesBps: read.yesBps,
+      twapBps: read.twapBps,
+      closeTime: read.closeTime,
+    },
     fairValueBps: 6000,
   };
 }
@@ -34,11 +51,12 @@ async function main() {
   });
   const traceStore = new LocalTraceStore(process.env.TRACE_STORE_DIR ?? "./.traces");
 
-  console.log(`[trader] mode=${mode}`);
-  const { market, fairValueBps } = await fetchMarketAndFairValue();
+  console.log(`[trader] mode=${mode} priceSource=${PRICE_SOURCE}`);
+  const { market, fairValueBps } = await fetchMarketAndFairValue(adapter);
   const decision = decideTrade(market, fairValueBps, {
     minEdgeBps: Number(process.env.MIN_EDGE_BPS ?? 500),
     tradeSizeStroops: BigInt(process.env.TRADE_SIZE_STROOPS ?? "100000000"),
+    priceSource: PRICE_SOURCE,
   });
   console.log(`[trader] ${decision.action}: ${decision.reasoning}`);
   if (decision.action === "skip") return;

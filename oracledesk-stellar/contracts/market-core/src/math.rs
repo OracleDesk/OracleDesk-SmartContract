@@ -203,6 +203,23 @@ pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
     }
 }
 
+/// Upper bound on the total collateral `settle_value` will pay out for a
+/// set of per-holder (yes, no) claims. Exact for `Yes`/`No`; for `Void`
+/// each individual claim floors its own half, so the sum of what holders
+/// can still redeem is at most the floor of the summed halves:
+/// `floor(a/2) + floor(b/2) <= floor((a + b)/2)` for all `a, b >= 0`
+/// (the floors give back at most 1 unit and `a + b` is integral, so the
+/// per-holder rounding never lets redemptions exceed this bound).
+/// `finalize_market` reserves exactly this much for outstanding claims;
+/// anything the rounding then leaves unclaimed is swept, never stranded.
+pub fn settle_upper(kind: Settlement, yes: i128, no: i128) -> i128 {
+    match kind {
+        Settlement::Yes => yes,
+        Settlement::No => no,
+        Settlement::Void => (yes + no) / 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +281,35 @@ mod tests {
     fn void_never_overpays() {
         assert_eq!(settle_value(Settlement::Void, 3, 4), 3);
         assert!(settle_value(Settlement::Void, 5, 5) <= 5);
+    }
+
+    #[test]
+    fn settle_upper_exact_for_yes_no() {
+        assert_eq!(settle_upper(Settlement::Yes, 7, 3), 7);
+        assert_eq!(settle_upper(Settlement::No, 7, 3), 3);
+    }
+
+    #[test]
+    fn void_sum_of_floors_le_floor_of_sum() {
+        // The per-holder floor in `settle_value` must never add up to more
+        // than the single floor over the summed claims, or finalize would
+        // reserve less than holders can redeem.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let a = next() % 1_000_000_000;
+            let b = next() % 1_000_000_000;
+            let summed = settle_upper(Settlement::Void, a, b);
+            let part = settle_value(Settlement::Void, a, 0) + settle_value(Settlement::Void, 0, b);
+            assert!(part <= summed, "a={a} b={b} part={part} summed={summed}");
+        }
+        // Boundary shapes around odd sums.
+        assert!(settle_value(Settlement::Void, 1, 0) + settle_value(Settlement::Void, 0, 1) <= 1);
+        assert!(settle_value(Settlement::Void, 1, 1) + settle_value(Settlement::Void, 0, 1) <= 1);
     }
 }

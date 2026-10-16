@@ -27,7 +27,45 @@ time — see [ADR 0001](adr/0001-resolution-commitment.md) for why.
 
 Lifecycle: `create_market` → `buy`/`sell` (while open) → `resolve` or
 `void_market` (resolver-only) → `redeem` per holder, `claim_pool_remainder`
-for the creator/LP, `sweep_fees` (permissionless) to the treasury.
+for the creator/LP, `sweep_fees` (permissionless) to the treasury →
+`finalize_market` (permissionless, after the redemption deadline) closes the
+market and sweeps the residual.
+
+A per-market `SettleState` side entry (views `settle_state` and
+`redeem_deadline`) tracks user-held outstanding shares, the finality
+timestamp, a per-market redemption horizon snapshotted at creation (default
+365 days; admin-set default bounded to 180–1825 days), what has already been
+paid out, and whether the market is closed. `redeem` and
+`claim_pool_remainder` maintain it on every payout. Once
+`finalized_at + horizon_secs` has passed, anyone can call `finalize_market`:
+it reserves exactly what the outstanding shares can still claim
+(`settle_upper` — for void markets the aggregate floor, which is at least
+the sum of the per-holder floors) plus any unclaimed LP remainder, then
+sweeps the market's **entire** remaining balance — expired user claims,
+void rounding dust, the unclaimed remainder and accrued fees — to the
+treasury, marks the market `RedemptionClosed`, and zeroes the market's
+balance. A holder who redeems before the deadline is paid the exact
+`settle_value` they would have received without finalization; expired claims
+go to the treasury rather than the LP, so the LP cannot profit from
+suppressing redemptions. Markets created before this bookkeeping existed
+have no `Settle` entry: they have no deadline and cannot be finalized
+(`NotSupported`), and stay redeemable through the old paths.
+
+A per-market **TWAP accumulator** records a time-weighted price. Every trade
+(`buy`/`sell`) folds the market's pre-trade price into a cumulative
+`price × time` value before reserves move (Uniswap-v2 semantics), with state
+in `Oracle(id)` and a 16-slot ring of `Obs(id, k)` observations so the
+`Market` entry's XDR is unchanged. `observe(id, seconds_ago)`,
+`twap(id, window_secs)` and `price_cumulative(id)` read it back: between two
+bracketing observations the cumulative is interpolated (exact — the
+cumulative is piecewise-linear between trades, since no price moves inside
+an interval), past the newest observation the last price
+is extended counterfactually, and a time earlier than the oldest surviving
+observation fails with `ObservationTooOld`. Same-timestamp trades only
+refresh the spot price — nothing is accumulated within one ledger, so a
+manipulator cannot move the TWAP without holding the price across a ledger
+boundary. Markets created before the accumulator existed return
+`NotSupported` from these views.
 
 ### resolver
 
@@ -81,6 +119,39 @@ unbounded `Vec`, so the index never has an unbounded-growth storage cost.
 events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is
 one of the seeded `docs/wave-issues/`.
+
+## Storage TTL policy
+
+Soroban archives persistent/instance entries once their TTL runs out, and an
+archived entry cannot be read or written until it is restored. Every contract
+carries an identical `src/ttl.rs` (duplicated because contract crates cannot
+depend on each other — [ADR 0002](adr/0002-cross-contract-calls.md)) with the
+shared policy:
+
+- Per-market entries (`Market`, `Position`, resolver configs, treasury
+  exposure) are extended to `close_time` plus a 90-day settlement horizon,
+  clamped to the network's `max_ttl()`. The threshold is half the target, so
+  a frequently touched entry is only rewritten when its remaining TTL halves.
+- Instance TTL is extended by every entrypoint that reads instance storage
+  (30-day target, 7-day threshold); pure views over persistent entries stay
+  read-only so indexer simulations keep read-only footprints.
+- The registry additionally refreshes an agent's registration on every
+  successful `publish_trace`.
+- The market-core `Settle` entry (outstanding shares, redemption deadline) is
+  kept to the long-lived target — 365 days, clamped to `max_ttl()`. A market
+  whose redemption deadline is more than one network-max TTL away can archive
+  before it is finalized and needs touches or a restore first;
+  `finalize_market` works after a restore, and the deadline is computed from
+  on-chain state (`finalized_at + horizon_secs`), so a late finalization is
+  still exact.
+- The market-core `Oracle` entry and every written `Obs` slot are extended to
+  the same close-time-aware target as the market's other entries. Unwritten
+  ring slots are never extended and the read path skips missing slots, so a
+  half-used ring costs nothing and never fails a read.
+- Markets whose `close_time` is further out than `max_ttl` cannot be kept
+  alive by a single bump and need periodic touches or the keeper described in
+  [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),
+  which also covers TTL monitoring and the rent cost model.
 
 ## Off-chain pieces
 
