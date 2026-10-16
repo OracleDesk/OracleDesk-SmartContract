@@ -18,6 +18,8 @@ base units (USDC on Stellar = 7 decimals). Rounding always favours the pool.
 """
 
 from dataclasses import dataclass
+import json
+import os
 from math import isqrt
 import random
 
@@ -25,6 +27,8 @@ BPS = 10_000
 MAX_SETS = 1_000_000_000_000_000  # 1e15 = 100M USDC (7 dp)
 MIN_PROB_BPS = 100
 MAX_PROB_BPS = 9_900
+MAX_RAMP_SECS = 30 * 86_400
+MAX_SKEW_MULT_BPS = 1_000
 
 
 class MathError(Exception):
@@ -206,6 +210,217 @@ def sell_within_limit(collateral_out: int, shares_in: int, limit_bps: int) -> bo
 
 
 # ---------------------------------------------------------------------------
+# Categorical (N-outcome) FPMM — mirrors math_categorical.rs.
+# The binary invariant k = r_yes * r_no generalises to the product of all
+# reserves; the iterative ceil accumulation keeps k non-decreasing with at
+# most n-1 units of pool-favouring drift per trade (see the rounding proof in
+# math_categorical.rs::calc_buy).
+# ---------------------------------------------------------------------------
+
+MAX_MARKET_OUTCOMES = 8
+PRICE_SCALE = 1_000_000_000_000_000_000  # 1e18, same reciprocal scale as math_categorical.rs
+
+
+def _cat_n(reserves) -> int:
+    n = len(reserves)
+    if not 2 <= n <= MAX_MARKET_OUTCOMES:
+        raise MathError("invalid input")
+    if any(r <= 0 for r in reserves):
+        raise MathError("invalid input")
+    return n
+
+
+def _cat_index(n: int, outcome_index: int) -> int:
+    if not 0 <= outcome_index < n:
+        raise MathError("invalid input")
+    return outcome_index
+
+
+@dataclass(frozen=True)
+class CatBuyQuote:
+    shares_out: int
+    fee: int
+    net: int
+    new_reserves: list
+
+
+def cat_calc_buy(reserves, outcome_index: int, collateral_in: int, fee_bps: int) -> CatBuyQuote:
+    """Buy `collateral_in` of outcome `outcome_index`: mint `net` sets into
+    every other reserve and shrink the bought reserve so the product of all
+    reserves holds. Mirrors math_categorical.rs::calc_buy."""
+    n = _cat_n(reserves)
+    j = _cat_index(n, outcome_index)
+    if collateral_in <= 0:
+        raise MathError("invalid input")
+    fee = mul_div_ceil(collateral_in, fee_bps, BPS)
+    net = collateral_in - fee
+    if net <= 0:
+        raise MathError("invalid input")
+    new_reserves = list(reserves)
+    acc = reserves[j]
+    for i in range(n):
+        if i == j:
+            continue
+        new_other = reserves[i] + net
+        new_reserves[i] = new_other
+        acc = mul_div_ceil(acc, reserves[i], new_other)
+    new_reserves[j] = acc
+    shares_out = reserves[j] + net - acc
+    if shares_out <= 0:
+        raise MathError("invalid input")
+    return CatBuyQuote(shares_out, fee, net, new_reserves)
+
+
+@dataclass(frozen=True)
+class CatSellQuote:
+    shares_in: int
+    fee: int
+    gross: int
+    new_reserves: list
+
+
+def cat_calc_sell(reserves, outcome_index: int, collateral_out: int, fee_bps: int) -> CatSellQuote:
+    """Sell `outcome_index` for an exact `collateral_out` (Gnosis-style, so
+    no square root on-chain). Mirrors math_categorical.rs::calc_sell."""
+    n = _cat_n(reserves)
+    j = _cat_index(n, outcome_index)
+    if collateral_out <= 0 or fee_bps >= BPS:
+        raise MathError("invalid input")
+    gross = mul_div_ceil(collateral_out, BPS, BPS - fee_bps)
+    fee = gross - collateral_out
+    new_reserves = list(reserves)
+    acc = reserves[j]
+    for i in range(n):
+        if i == j:
+            continue
+        if reserves[i] <= gross:
+            raise MathError("insufficient liquidity")
+        new_other = reserves[i] - gross
+        new_reserves[i] = new_other
+        acc = mul_div_ceil(acc, reserves[i], new_other)
+    new_reserves[j] = acc
+    shares_in = acc + gross - reserves[j]
+    if shares_in <= 0:
+        raise MathError("invalid input")
+    return CatSellQuote(shares_in, fee, gross, new_reserves)
+
+
+def cat_prices(reserves) -> list:
+    """Spot price of every outcome in bps, `p_j = (1/r_j) / Σ(1/r_i)`
+    evaluated on integer reciprocals. Each price floors, so the n prices sum
+    to at most BPS and at least BPS - n (display-only; never trade math).
+    Mirrors math_categorical.rs::prices_bps."""
+    n = _cat_n(reserves)
+    recs = [PRICE_SCALE // reserves[i] for i in range(n)]
+    total = sum(recs)
+    if total <= 0:
+        raise MathError("insufficient liquidity")
+    return [mul_div_floor(BPS, rec, total) for rec in recs]
+
+
+@dataclass(frozen=True)
+class CatSeed:
+    reserves: list
+    creator_shares: list
+
+
+def cat_seed(seed: int, probs_bps) -> CatSeed:
+    """Open a pool at the requested probabilities: each reserve is
+    `seed * p_min / p_i` (floored), the creator keeps `seed - r_i` of every
+    outcome. `probs_bps` must have length 2..=MAX_MARKET_OUTCOMES, every
+    entry >= MIN_PROB_BPS, and the entries must sum to exactly BPS.
+    Mirrors math_categorical.rs::seed_reserves."""
+    n = len(probs_bps)
+    if not 2 <= n <= MAX_MARKET_OUTCOMES or seed <= 0:
+        raise MathError("invalid input")
+    if any(p < MIN_PROB_BPS for p in probs_bps):
+        raise MathError("invalid input")
+    if sum(probs_bps) != BPS:
+        raise MathError("invalid input")
+    p_min = min(probs_bps)
+    reserves = []
+    creator_shares = []
+    for p in probs_bps:
+        r = mul_div_floor(seed, p_min, p)
+        if r <= 0:
+            raise MathError("invalid input")
+        reserves.append(r)
+        creator_shares.append(seed - r)
+    return CatSeed(reserves, creator_shares)
+
+
+def cat_settle_value(resolved, balances) -> int:
+    """Collateral value of one holder's per-outcome balances once final.
+    `resolved=w` pays the winning balance; `resolved=None` (void) pays
+    `floor(Σ balances / n)`. Every complete set is worth exactly 1 and every
+    rounding floors, so the total paid across holders never exceeds
+    sets_minted. Mirrors math_categorical.rs::settle_value."""
+    n = len(balances)
+    if not 2 <= n <= MAX_MARKET_OUTCOMES:
+        raise MathError("invalid input")
+    if resolved is None:
+        if any(b < 0 for b in balances):
+            raise MathError("invalid input")
+        return sum(balances) // n
+    _cat_index(n, resolved)
+    return balances[resolved]
+
+
+# ---------------------------------------------------------------------------
+# Scalar (range) market settlement — mirrors math.rs::scalar_payout, which
+# backs the Rust `Settlement::Scalar(p)` variant. Kept as its own function
+# here because the Python `settle_value(kind, yes, no)` has no slot for the
+# resolved payout; `scalar_payout(BPS, ...)` == yes and `(0, ...)` == no.
+# ---------------------------------------------------------------------------
+
+
+def scalar_payout(payout_long_bps: int, yes: int, no: int) -> int:
+    """Collateral value of a (yes, no) share pair when the resolved value
+    maps to `payout_long_bps` LONG per complete set. Both legs floor
+    independently, so no holder ever beats their exact rational share."""
+    return (yes * payout_long_bps) // BPS + (no * (BPS - payout_long_bps)) // BPS
+
+
+# ---------------------------------------------------------------------------
+# Dynamic fee schedule — mirrors math.rs::effective_fee_bps. Deterministic
+# integer math shared with the contract and agents/core/fpmm.ts via
+# model/fee_fixtures.json; every floor rounds toward the trader (a lower fee
+# never harms the pool, whose protection is calc_* rounding).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FeeSchedule:
+    base_bps: int
+    max_bps: int
+    ramp_secs: int
+    skew_mult_bps: int
+
+
+def effective_fee_bps(schedule: FeeSchedule, now: int, close_time: int, r_yes: int, r_no: int) -> int:
+    """Fee in bps for a trade at `now` with the given pre-trade reserves:
+    `min(max, base + time_ramp + skew)`. The ramp adds up to `max - base`
+    linearly over the last `ramp_secs` before close (0 disables it, and any
+    timestamp at or past close clamps to the full ramp); the skew term adds
+    `skew_mult_bps` per 1000 bps of distance from a 50/50 price. Guaranteed
+    `base <= result <= max`, and `max < BPS` is validated so `calc_sell` is
+    always well-defined."""
+    if schedule.base_bps > schedule.max_bps or schedule.max_bps >= BPS:
+        raise MathError("invalid input")
+    if schedule.ramp_secs == 0:
+        t = 0
+    else:
+        if now >= close_time:
+            into_ramp = schedule.ramp_secs
+        else:
+            into_ramp = max(0, schedule.ramp_secs - (close_time - now))
+        t = mul_div_floor(into_ramp, schedule.max_bps - schedule.base_bps, schedule.ramp_secs)
+    p = price_yes_bps(r_yes, r_no)
+    skew = mul_div_floor(abs(p - BPS // 2), schedule.skew_mult_bps, 1_000)
+    return min(schedule.max_bps, schedule.base_bps + t + skew)
+
+
+# ---------------------------------------------------------------------------
 # Property tests. No pytest/hypothesis dependency: run directly.
 # ---------------------------------------------------------------------------
 
@@ -325,6 +540,202 @@ def _check_limits_boundary_and_symmetry():
     assert not buy_within_limit(1, 1, 0)
 
 
+def _check_cat_known_values():
+    """Pins the same worked examples as math_categorical.rs's unit test: a
+    3-outcome 1000/1000/1000 pool, buying/selling 100 of outcome 0 with no
+    fee."""
+    q = cat_calc_buy([1000, 1000, 1000], 0, 100, 0)
+    assert (q.shares_out, q.new_reserves) == (272, [828, 1100, 1100]), q
+    s = cat_calc_sell([1000, 1000, 1000], 0, 100, 0)
+    assert (s.shares_in, s.new_reserves) == (336, [1236, 900, 900]), s
+
+    # A 2-outcome categorical pool is the binary FPMM: same fee and net, and
+    # a bought-reserve result within one unit of rounding.
+    for amt, fee in ((100, 0), (100_000_000, 100), (7, 30)):
+        bin_q = calc_buy(1_000_000, 3_000_000, amt, fee)
+        cat_q = cat_calc_buy([1_000_000, 3_000_000], 0, amt, fee)
+        assert cat_q.fee == bin_q.fee and cat_q.net == bin_q.net
+        assert cat_q.new_reserves[1] == bin_q.new_reserve_other
+        assert abs(cat_q.shares_out - bin_q.shares_out) <= 1
+
+
+def _check_cat_k_never_decreases_and_round_trip_never_profits(trials: int = 2_000, seed: int = 13):
+    rng = random.Random(seed)
+    for _ in range(trials):
+        n = rng.randint(2, MAX_MARKET_OUTCOMES)
+        reserves = [100 + rng.randint(0, 9_999) for _ in range(n)]
+        j = rng.randint(0, n - 1)
+        amt = 100 + rng.randint(0, 99)
+        fee = rng.randint(0, 299)
+
+        k0 = 1
+        for r in reserves:
+            k0 *= r
+        q = cat_calc_buy(reserves, j, amt, fee)
+        k1 = 1
+        for r in q.new_reserves:
+            k1 *= r
+        assert k1 >= k0, (reserves, j, amt, fee)
+        for i, r in enumerate(reserves):
+            if i != j:
+                assert q.new_reserves[i] == r + q.net
+
+        try:
+            s = cat_calc_sell(q.new_reserves, j, amt, fee)
+        except MathError:
+            continue
+        assert s.shares_in >= q.shares_out, "free money"
+
+
+def _check_cat_prices_sum_within_n_of_bps(trials: int = 2_000, seed: int = 17):
+    rng = random.Random(seed)
+    for _ in range(trials):
+        n = rng.randint(2, MAX_MARKET_OUTCOMES)
+        reserves = [1_000 + rng.randint(0, 999_999_999_999) for _ in range(n)]
+        prices = cat_prices(reserves)
+        assert BPS - n <= sum(prices) <= BPS, (reserves, prices)
+    # Equal reserves -> equal prices, each exactly floor(BPS / n).
+    for n in range(2, MAX_MARKET_OUTCOMES + 1):
+        prices = cat_prices([7_777] * n)
+        assert prices == [BPS // n] * n
+
+
+def _check_cat_seed_matches_requested_probs():
+    for probs in ([5000, 5000], [6800, 3200], [5000, 3000, 2000], [9000, 500, 400, 100]):
+        s = cat_seed(1_000_000_000, probs)
+        prices = cat_prices(s.reserves)
+        for i, p in enumerate(probs):
+            assert abs(prices[i] - p) <= 2, (probs, prices)
+            assert s.reserves[i] + s.creator_shares[i] == 1_000_000_000
+        # The least likely outcome is fully held by the pool.
+        assert s.creator_shares[probs.index(min(probs))] == 0
+    # 8 equal outcomes: prices sum to exactly BPS, creator holds nothing.
+    s = cat_seed(1_000_000_000, [1250] * 8)
+    assert cat_prices(s.reserves) == [1250] * 8
+    assert s.reserves == [1_000_000_000] * 8
+    assert s.creator_shares == [0] * 8
+    # Validation: sum != BPS, below MIN_PROB_BPS, n out of range, seed 0.
+    for probs, seed in (([6000, 3000], 1_000), ([9950, 50], 1_000), ([10_000], 1_000), ([1250] * 9, 1_000), ([5000, 5000], 0)):
+        try:
+            cat_seed(seed, probs)
+        except MathError:
+            continue
+        raise AssertionError(f"cat_seed accepted {probs} seed={seed}")
+
+
+def _check_cat_settle_never_overpays(trials: int = 1_000, seed: int = 23):
+    rng = random.Random(seed)
+    for _ in range(trials):
+        n = rng.randint(2, MAX_MARKET_OUTCOMES)
+        sets = 1_000_000
+        # Three holders share each outcome's `sets` shares with the pool.
+        held = [[0] * 3 for _ in range(n)]
+        for i in range(n):
+            rest = sets
+            for h in range(3):
+                take = rest if h == 2 else rng.randint(0, rest)
+                held[i][h] = take
+                rest -= take
+        w = rng.randint(0, n - 1)
+        resolved_total = 0
+        void_total = 0
+        for h in range(3):
+            balances = [held[i][h] for i in range(n)]
+            resolved_total += cat_settle_value(w, balances)
+            void_total += cat_settle_value(None, balances)
+        assert resolved_total <= sets
+        assert void_total <= sets, (held, void_total)
+    # Worked shape checks, mirroring the Rust unit test.
+    assert cat_settle_value(1, [3, 7, 11]) == 7
+    assert cat_settle_value(None, [3, 7, 11]) == 7  # 21 / 3
+    assert cat_settle_value(None, [1] * 7) == 1
+
+
+def _check_scalar_payout_never_overpays(trials: int = 1_000, seed: int = 29):
+    rng = random.Random(seed)
+    # Extremes reduce to the binary legs.
+    assert scalar_payout(BPS, 5, 7) == settle_value("yes", 5, 7)
+    assert scalar_payout(0, 5, 7) == settle_value("no", 5, 7)
+    # A complete set is worth exactly 1 mid-range; rounding always floors.
+    assert scalar_payout(5_000, 1_000, 1_000) == 1_000
+    assert scalar_payout(3_333, 1_000, 1_000) == 999
+    for _ in range(trials):
+        sets = rng.randint(1, 1_000_000)
+        payout = rng.randint(0, BPS)
+        # Three holders split `sets` YES and `sets` NO shares among them
+        # (the last holder takes the remainder, so the split is exact).
+        total = 0
+        yes_left = sets
+        no_left = sets
+        for h in range(3):
+            take_y = yes_left if h == 2 else rng.randint(0, yes_left)
+            take_n = no_left if h == 2 else rng.randint(0, no_left)
+            yes_left -= take_y
+            no_left -= take_n
+            total += scalar_payout(payout, take_y, take_n)
+        # Both legs floor, so Σ paid <= Σ(yes*p + no*(BPS-p))/BPS == sets.
+        assert total <= sets, (sets, payout, total)
+
+
+def _check_effective_fee_bounds(trials: int = 2_000, seed: int = 31):
+    rng = random.Random(seed)
+    for _ in range(trials):
+        base = rng.randint(0, 999)
+        max_bps = rng.randint(base, 1_000)
+        ramp = rng.randint(0, MAX_RAMP_SECS)
+        skew_mult = rng.randint(0, MAX_SKEW_MULT_BPS)
+        close = rng.randint(1_000, 2_000_000_000)
+        now = rng.randint(0, close + 10_000)
+        r_yes = rng.randint(1, 10**15)
+        r_no = rng.randint(1, 10**15)
+        fee = effective_fee_bps(FeeSchedule(base, max_bps, ramp, skew_mult), now, close, r_yes, r_no)
+        assert base <= fee <= max_bps <= 1_000, (base, max_bps, ramp, skew_mult, now, close, fee)
+    # Ramp monotonic in time: the fee never decreases as close approaches.
+    sched = FeeSchedule(100, 800, 10_000, 0)
+    prev = -1
+    for t in range(2_000_000 - 20_000, 2_000_000 + 5_000 + 1, 137):
+        fee = effective_fee_bps(sched, t, 2_000_000, 1_000, 1_000)
+        assert fee >= prev
+        prev = fee
+    assert prev == 800  # any timestamp at/past close applies the full ramp
+    # Zero ramp means "no ramp": the fee is flat all the way to close.
+    flat = FeeSchedule(100, 800, 0, 0)
+    assert effective_fee_bps(flat, 0, 2_000_000, 1_000, 1_000) == 100
+    assert effective_fee_bps(flat, 2_000_000, 2_000_000, 1_000, 1_000) == 100
+    # Skew symmetric around 50/50 for representable ratios.
+    for q in ((1000, 3000), (900, 1100), (5000, 5000), (1, 4), (7, 3), (1, 1)):
+        sched_s = FeeSchedule(100, 1_000, 0, 500)
+        left = effective_fee_bps(sched_s, 0, 1, q[0], q[1])
+        right = effective_fee_bps(sched_s, 0, 1, q[1], q[0])
+        assert left == right, (q, left, right)
+    # The pure function only requires base <= max < BPS; the tighter
+    # MAX_FEE_BPS cap is the contract layer's job (validate_schedule), so a
+    # (1_000, 1_000) schedule is valid here.
+    assert effective_fee_bps(FeeSchedule(1_000, 1_000, 0, 0), 0, 1, 1_000, 1_000) == 1_000
+    for bad in (FeeSchedule(500, 100, 0, 0), FeeSchedule(0, 10_000, 0, 0)):
+        try:
+            effective_fee_bps(bad, 0, 1, 1_000, 1_000)
+        except MathError:
+            continue
+        raise AssertionError(f"effective_fee_bps accepted {bad}")
+
+
+def _check_effective_fee_known_values():
+    """Shared cross-language table (also read by math.rs's
+    effective_fee_matches_fixtures and agents/core/fpmm.test.ts): one row per
+    fixture, nine numbers — [base_bps, max_bps, ramp_secs, skew_mult_bps,
+    now, close, r_yes, r_no, expected_fee_bps]."""
+    fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fee_fixtures.json")
+    with open(fixtures, encoding="utf-8") as f:
+        rows = json.load(f)
+    assert rows, "fee_fixtures.json has no rows"
+    for row in rows:
+        assert len(row) == 9, row
+        sched = FeeSchedule(row[0], row[1], row[2], row[3])
+        fee = effective_fee_bps(sched, row[4], row[5], row[6], row[7])
+        assert fee == row[8], (row, fee)
+
+
 def run_all():
     _check_known_values()
     _check_seed_opens_at_requested_probability()
@@ -333,6 +744,14 @@ def run_all():
     _check_void_never_overpays()
     _check_price_after_maps_both_sides()
     _check_limits_boundary_and_symmetry()
+    _check_cat_known_values()
+    _check_cat_k_never_decreases_and_round_trip_never_profits()
+    _check_cat_prices_sum_within_n_of_bps()
+    _check_cat_seed_matches_requested_probs()
+    _check_cat_settle_never_overpays()
+    _check_scalar_payout_never_overpays()
+    _check_effective_fee_bounds()
+    _check_effective_fee_known_values()
     print("fpmm_model: all property checks passed")
 
 

@@ -100,6 +100,50 @@ const tx = await contract.buy_v2({
 `buy` / `sell` remain for backward compatibility but carry no deadline or
 limit; the share-count bound alone does not stop a stale transaction.
 
+## Dynamic fees: quote at the fee you will pay
+
+A market may charge a **dynamic fee** (#9): `base_bps` ramping toward
+`max_bps` over the last `ramp_secs` before `close_time`, plus a skew
+surcharge the further the pre-trade price sits from 50/50. The fee is fixed
+inside the trade, so plain `quote_buy` (fee as of *now*) can understate what
+a slightly later submission pays — near the close, or with a skewed pool,
+the drift can exceed a few bps of slippage. Quote with the timestamp you
+expect the transaction to land at instead:
+
+```ts
+const now = BigInt(Math.floor(Date.now() / 1000));
+const at = now + 30n; // expected simulation + signing + inclusion latency
+const quote = (await contract.quote_buy_at({
+  market_id, outcome, collateral_in, at_timestamp: at,
+})).result;
+```
+
+- `quote_buy_at(market_id, outcome, collateral_in, at_timestamp)` — the
+  shares a buy would get with the schedule's fee at `at_timestamp`;
+  it still uses the reserves read at call time, so keep your usual slippage
+  margin on `min_shares_out`.
+- `current_fee_bps(market_id)` — the effective fee right now, for display.
+- `fee_schedule(market_id)` — the snapshotted schedule, or `null` for
+  legacy flat-fee markets.
+
+`TradeV2` carries the fee actually paid (`fee_bps`) per trade — index that
+for "realised fee" displays rather than recomputing it. There is no
+`quote_sell_at`, so a sell should either quote as late as possible or pad
+`max_shares_in` to absorb the drift.
+
+## Market kinds
+
+`get_market(market_id)` reads binary and scalar markets only. Check
+`market_kind(market_id)` when the id's kind is not already known: a
+categorical id answers `MarketNotFound` there — read
+`get_cat_market(market_id)` for reserves/status, `get_prices_cat(market_id)`
+for implied probabilities (they sum to ~10000 bps), trade with
+`buy_cat` / `sell_cat` (the same share-count bound, no `_v2` variant yet),
+and settle with `redeem_cat` / `claim_pool_remainder_cat`. Scalar markets
+are binary markets plus `get_scalar_meta(market_id)` (`{ lower, upper }`,
+display only); their resolution arrives in `get_market`'s status as
+`ResolvedScalar(payout_long_bps)`.
+
 ## Circuit breakers
 
 Markets can carry per-market breakers (snapshotted at creation): a maximum

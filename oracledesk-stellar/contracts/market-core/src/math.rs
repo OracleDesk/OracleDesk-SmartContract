@@ -17,6 +17,13 @@ pub const BPS: i128 = 10_000;
 pub const MAX_SETS: i128 = 1_000_000_000_000_000; // 1e15 = 100M USDC (7 dp)
 pub const MIN_PROB_BPS: u32 = 100; // 1%
 pub const MAX_PROB_BPS: u32 = 9_900; // 99%
+/// Longest dynamic-fee ramp: 30 days. Caps how far before close an admin
+/// can start the time component.
+pub const MAX_RAMP_SECS: u64 = 30 * 86_400;
+/// Largest skew multiplier: 1_000 means the skew term grows 1 bp per
+/// 1_000 bps (10 points) of price distance from 50%, up to 5x the
+/// multiplier at the extreme prices.
+pub const MAX_SKEW_MULT_BPS: u32 = 1_000;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MathError {
@@ -30,6 +37,10 @@ pub enum Settlement {
     Yes,
     No,
     Void,
+    /// Scalar market: LONG pays `floor(yes * p / BPS)`, SHORT pays
+    /// `floor(no * (BPS - p) / BPS)`, `p` in bps in `0..=BPS`.
+    /// `Scalar(BPS)` is equivalent to `Yes`, `Scalar(0)` to `No`.
+    Scalar(u32),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -109,6 +120,76 @@ pub fn price_after(
     } else {
         price_yes_bps(r_other_after, r_after)
     }
+}
+
+/// Pure mirror of the contract's `FeeSchedule` (see `lib.rs`), phrased with
+/// plain numbers so `model/fpmm_model.py` and `agents/core/fpmm.ts` can
+/// reproduce `effective_fee_bps` bit-for-bit. Field order mirrors the XDR.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct FeeScheduleM {
+    pub base_bps: u32,
+    pub max_bps: u32,
+    pub ramp_secs: u64,
+    pub skew_mult_bps: u32,
+}
+
+/// The fee rate a trade pays under `s` at time `now` with the pool at
+/// `(r_yes, r_no)`: `min(max, base + t + skew)` where
+///
+/// - `t` ramps linearly from 0 to `max - base` over the last `ramp_secs`
+///   before `close` (0 when `ramp_secs == 0` or the window has not opened;
+///   `max - base` once `now >= close`), and
+/// - `skew = |p - 5_000| * skew_mult_bps / 1_000` with `p` the floored
+///   pre-trade YES price — so a balanced pool pays `base` and a one-sided
+///   pool pays up to `base + 5 * skew_mult_bps`.
+///
+/// Both floors round **down**, i.e. towards the trader: unlike the pool
+/// math (`calc_buy`/`calc_sell` always round for the pool) the fee only
+/// needs to be deterministic across the contract, the Python model and the
+/// TS mirror, and a sub-bp gift to the trader cannot break the invariant.
+/// The pre-trade price keeps the fee independent of the trade being priced
+/// (a post-trade price would be circular with `calc_buy`).
+///
+/// Guarantees `base <= result <= max` for every schedule with
+/// `base <= max < BPS`; any other schedule is rejected. `now >= close`
+/// (possible in quotes) clamps to the ramp end. All arithmetic is `i128`,
+/// so no input pair can overflow.
+pub fn effective_fee_bps(
+    s: &FeeScheduleM,
+    now: u64,
+    close: u64,
+    r_yes: i128,
+    r_no: i128,
+) -> Result<u32, MathError> {
+    if s.base_bps > s.max_bps || s.max_bps as i128 >= BPS {
+        return Err(MathError::InvalidInput);
+    }
+    let base = s.base_bps as i128;
+    let max = s.max_bps as i128;
+    let delta = max - base;
+    let t = if s.ramp_secs == 0 {
+        0
+    } else {
+        let ramp = s.ramp_secs as i128;
+        let into_ramp = if now >= close {
+            ramp
+        } else {
+            s.ramp_secs.saturating_sub(close - now) as i128
+        };
+        mul_div_floor(into_ramp, delta, ramp)?
+    };
+    let p = price_yes_bps(r_yes, r_no)?;
+    let d = (p - 5_000).abs();
+    let skew = mul_div_floor(d, s.skew_mult_bps as i128, 1_000)?;
+    let total = base
+        .checked_add(t)
+        .and_then(|v| v.checked_add(skew))
+        .ok_or(MathError::Overflow)?;
+    Ok(if total > max {
+        max as u32
+    } else {
+        total as u32
+    })
 }
 
 /// Pool opens at `yes_bps` probability with `seed` complete sets minted.
@@ -260,7 +341,23 @@ pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
         Settlement::Yes => yes,
         Settlement::No => no,
         Settlement::Void => (yes + no) / 2,
+        Settlement::Scalar(p) => scalar_payout(p, yes, no),
     }
+}
+
+/// Collateral value of a (yes, no) share pair in a scalar market whose
+/// resolved value maps to `payout_long_bps` LONG per complete set. Both legs
+/// floor independently, so no holder ever receives more than their exact
+/// rational share, and since `Σyes == Σno == sets_minted` across holders and
+/// the pool the total paid out never exceeds `sets_minted`.
+///
+/// `payout_long_bps` must be `<= BPS`; the market layer validates that in
+/// `resolve_scalar` before any payout can be settled.
+pub fn scalar_payout(payout_long_bps: u32, yes: i128, no: i128) -> i128 {
+    let p = payout_long_bps as i128;
+    let long = yes * p / BPS;
+    let short = no * (BPS - p) / BPS;
+    long + short
 }
 
 #[cfg(test)]
@@ -327,6 +424,73 @@ mod tests {
     }
 
     #[test]
+    fn scalar_extremes_match_binary() {
+        for (yes, no) in [(0i128, 7i128), (3, 4), (1_000_000, 250_000)] {
+            assert_eq!(
+                settle_value(Settlement::Scalar(BPS as u32), yes, no),
+                settle_value(Settlement::Yes, yes, no)
+            );
+            assert_eq!(
+                settle_value(Settlement::Scalar(0), yes, no),
+                settle_value(Settlement::No, yes, no)
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_rounding_favours_pool() {
+        let mut x: u64 = 0x0DDC_0FFE_E0DD_F00D;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let yes = next() % 1_000_000_000_000;
+            let no = next() % 1_000_000_000_000;
+            let p = (next() % (BPS + 1)) as u32;
+            let paid = scalar_payout(p, yes, no);
+            // floor + floor never exceeds the exact rational amount
+            assert!(paid * BPS <= yes * p as i128 + no * (BPS - p as i128));
+        }
+    }
+
+    #[test]
+    fn scalar_payout_never_exceeds_sets() {
+        let mut x: u64 = 0x5EED_5EED_5EED_5EED;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let sets = 1 + next() % 1_000_000_000_000;
+            let p = (next() % (BPS + 1)) as u32;
+            // three holders split `sets` complete sets independently per leg
+            let (mut rest_y, mut rest_n) = (sets, sets);
+            let mut total: i128 = 0;
+            for h in 0..3 {
+                let take_y = if h == 2 {
+                    rest_y
+                } else {
+                    next() % (rest_y + 1)
+                };
+                let take_n = if h == 2 {
+                    rest_n
+                } else {
+                    next() % (rest_n + 1)
+                };
+                rest_y -= take_y;
+                rest_n -= take_n;
+                total += scalar_payout(p, take_y, take_n);
+            }
+            assert!(total <= sets, "scalar overpaid: {total} > {sets} at p={p}");
+        }
+    }
+
+    #[test]
     fn split_fee_sums_exactly() {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
@@ -387,5 +551,156 @@ mod tests {
             price_after(false, 910, 1_100).unwrap(),
             price_yes_bps(1_100, 910).unwrap()
         );
+    }
+
+    fn sched(base_bps: u32, max_bps: u32, ramp_secs: u64, skew_mult_bps: u32) -> FeeScheduleM {
+        FeeScheduleM {
+            base_bps,
+            max_bps,
+            ramp_secs,
+            skew_mult_bps,
+        }
+    }
+
+    #[test]
+    fn effective_fee_within_bounds() {
+        let mut x: u64 = 0xFEE1_0BEE_FEE1_0BEE;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for _ in 0..2_000 {
+            let base = (next() % 1_001) as u32;
+            let max = base + (next() % (1_001 - base as u64)) as u32;
+            let s = sched(
+                base,
+                max,
+                next() % (MAX_RAMP_SECS + 1),
+                (next() % (MAX_SKEW_MULT_BPS as u64 + 1)) as u32,
+            );
+            let close = 1_000_000 + next() % 1_000_000_000;
+            let now = next();
+            let r_yes = 1 + (next() % 1_000_000_000_000) as i128;
+            let r_no = 1 + (next() % 1_000_000_000_000) as i128;
+            let fee = effective_fee_bps(&s, now, close, r_yes, r_no).unwrap();
+            assert!(fee >= base, "fee {fee} < base {base}");
+            assert!(fee <= max, "fee {fee} > max {max}");
+            assert!(max <= 1_000);
+        }
+    }
+
+    #[test]
+    fn effective_fee_ramp_monotonic_in_time() {
+        let s = sched(100, 800, 10_000, 250);
+        let (close, r_yes, r_no) = (500_000u64, 1_000i128, 3_000i128);
+        let mut prev = 0u32;
+        let mut t = close - 20_000;
+        while t <= close + 5_000 {
+            let fee = effective_fee_bps(&s, t, close, r_yes, r_no).unwrap();
+            assert!(fee >= prev, "fee fell from {prev} to {fee} at t={t}");
+            prev = fee;
+            t += 137;
+        }
+        assert_eq!(prev, 800, "past close the fee clamps to max");
+    }
+
+    #[test]
+    fn effective_fee_symmetric_in_skew() {
+        let s = sched(200, 1_000, 0, 100);
+        // exactly representable ratios: p and 10_000 - p both hold, so the
+        // floored distance d is identical on either side and the fee must
+        // be exactly equal
+        for (a, b) in [
+            (1_000i128, 3_000i128),
+            (900, 1_100),
+            (5_000, 5_000),
+            (1, 4),
+            (7, 3),
+            (1, 1),
+        ] {
+            assert_eq!(
+                effective_fee_bps(&s, 0, 1, a, b).unwrap(),
+                effective_fee_bps(&s, 0, 1, b, a).unwrap(),
+                "asymmetric at {a}/{b}"
+            );
+        }
+        // inexact ratios can shift the floored price distance by 1, which
+        // the floored scaling bounds by one bp while skew_mult <= 1_000
+        let mut x: u64 = 0x5CE1_5CE1_5CE1_5CE1;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for _ in 0..2_000 {
+            let a = 1 + (next() % 1_000_000_000_000) as i128;
+            let b = 1 + (next() % 1_000_000_000_000) as i128;
+            let f1 = effective_fee_bps(&s, 0, 1, a, b).unwrap();
+            let f2 = effective_fee_bps(&s, 0, 1, b, a).unwrap();
+            assert!((f1 as i64 - f2 as i64).abs() <= 1, "{a}/{b}: {f1} vs {f2}");
+        }
+    }
+
+    #[test]
+    fn effective_fee_zero_ramp() {
+        let s = sched(120, 900, 0, 300);
+        let far = effective_fee_bps(&s, 0, u64::MAX, 1_000, 1_000).unwrap();
+        let at_close = effective_fee_bps(&s, 5_000_000, 5_000_000, 1_000, 1_000).unwrap();
+        let past = effective_fee_bps(&s, 6_000_000, 5_000_000, 1_000, 1_000).unwrap();
+        assert_eq!(far, 120);
+        assert_eq!(far, at_close);
+        assert_eq!(far, past);
+    }
+
+    #[test]
+    fn effective_fee_rejects_unbounded_schedule() {
+        assert_eq!(
+            effective_fee_bps(&sched(500, 400, 0, 0), 0, 1, 1, 1),
+            Err(MathError::InvalidInput)
+        );
+        // max must stay strictly below BPS (calc_sell requires fee < BPS)
+        assert_eq!(
+            effective_fee_bps(&sched(0, 10_000, 0, 0), 0, 1, 1, 1),
+            Err(MathError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn effective_fee_matches_fixtures() {
+        // Shared cross-language table (also read by model/fpmm_model.py and
+        // agents/core/fpmm.ts): one row per fixture, nine numbers —
+        // [base_bps, max_bps, ramp_secs, skew_mult_bps,
+        //  now, close, r_yes, r_no, expected_fee_bps]
+        let raw = include_str!("../../../model/fee_fixtures.json");
+        let mut nums = [0i128; 512];
+        let mut n = 0usize;
+        let mut cur: Option<i128> = None;
+        for b in raw.bytes() {
+            if b.is_ascii_digit() {
+                let d = (b - b'0') as i128;
+                cur = Some(cur.map_or(d, |v| v * 10 + d));
+            } else if let Some(v) = cur.take() {
+                assert!(n < 512, "fee_fixtures.json holds too many numbers");
+                nums[n] = v;
+                n += 1;
+            }
+        }
+        if let Some(v) = cur.take() {
+            assert!(n < 512, "fee_fixtures.json holds too many numbers");
+            nums[n] = v;
+            n += 1;
+        }
+        assert!(
+            n > 0 && n.is_multiple_of(9),
+            "expected 9 numbers per row, got {n}"
+        );
+        for row in nums[..n].chunks(9) {
+            let s = sched(row[0] as u32, row[1] as u32, row[2] as u64, row[3] as u32);
+            let fee = effective_fee_bps(&s, row[4] as u64, row[5] as u64, row[6], row[7]).unwrap();
+            assert_eq!(fee, row[8] as u32, "fixture {row:?}");
+        }
     }
 }

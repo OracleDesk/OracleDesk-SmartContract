@@ -56,6 +56,14 @@ The commitment format is extended by [ADR 0004](0004-spec-versioning.md): a
 salted, versioned, domain-separated `ResolutionSpecV2` envelope accepted
 alongside the legacy format described above.
 
+The `ResolutionSpec` enum gains two **appended** variants —
+`CategoricalSigners` (tag 4, for n-outcome markets) and `Scalar` (tag 5, a
+price spec that resolves to a payout in basis points rather than an
+outcome). Appending preserves the disjointness argument above: existing
+variants keep their tags, so every already-committed hash is unchanged, and
+each new rule lives in its own hash space. See
+[ADR 0005](0005-market-kind-storage-split.md).
+
 ## Liveness fallback
 
 A market whose spec is never revealed, whose committed feed is permanently

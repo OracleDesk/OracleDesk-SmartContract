@@ -22,7 +22,7 @@ use soroban_sdk::{
 mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
-use market_core::{Client as MarketCoreClient, Outcome};
+use market_core::{Client as MarketCoreClient, MarketKind, Outcome};
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
@@ -36,6 +36,12 @@ pub const MAX_WEIGHTED_SIGNERS: u32 = 32;
 /// (`max_sigs_per_call_budget`) shows this size stays far below the 400M
 /// instruction / 40 MiB transaction limits.
 pub const MAX_SIGS_PER_CALL: u32 = MAX_WEIGHTED_SIGNERS;
+/// Outcome-count cap of a categorical market, mirroring market-core's
+/// `MAX_MARKET_OUTCOMES`. Duplicated (not imported) because market-core is
+/// consumed through `contractimport!`, which exposes no constants.
+pub const MAX_CAT_OUTCOMES: u32 = 8;
+/// Basis-point denominator shared by scalar payouts and the categorical caps.
+pub const BPS: i128 = 10_000;
 /// Domain tag of the message weighted-key signers sign (20 bytes).
 const ATTEST_DOMAIN: &[u8] = b"oracledesk-attest-v1";
 
@@ -93,6 +99,8 @@ pub enum ExpiryMode {
     Unrevealed,
     Price,
     Signers,
+    /// Scalar counterpart of `Price` (appended).
+    Scalar,
 }
 
 #[contracttype]
@@ -191,10 +199,53 @@ pub struct WeightedKeyConfig {
     pub dispute_window: u64,
 }
 
+/// Categorical signer committee: like [`SignerConfig`], but signers attest one
+/// outcome *index* of a categorical market instead of Yes/No. `outcome_count`
+/// binds the market's outcome set to the commitment (2..=[`MAX_CAT_OUTCOMES`],
+/// mirroring market-core's cap), so a reveal cannot silently change how many
+/// outcomes signers are voting on.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatSignerConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+    pub dispute_window: u64,
+    pub outcome_count: u32,
+}
+
+/// A categorical winner once `threshold` signers have attested the index.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatProposal {
+    pub outcome_index: u32,
+    pub proposed_at: u64,
+}
+
+/// Scalar (range) counterpart of [`PriceConfig`]. The market settles on the
+/// fractional position of `price` inside `[lower, upper]`:
+/// `payout_long_bps = (clamped_price - lower) / (upper - lower)`, and the
+/// SHORT side pays the complement. A reading below the range clamps to
+/// `lower` (LONG pays 0), above to `upper` (LONG pays 1.0); a non-positive
+/// reading is an invalid price, never a clamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarPriceConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    /// Bottom of the staked range. Validated `0 <= lower < upper`, with
+    /// `upper` capped so `upper * BPS` cannot overflow.
+    pub lower: i128,
+    pub upper: i128,
+    pub max_staleness: u64,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
 /// otherwise collide. See `docs/adr/0001-resolution-commitment.md`.
+///
+/// Variants are append-only: the XDR tag is the variant position, so a new
+/// mode goes at the end and existing commitments never move.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolutionSpec {
@@ -202,6 +253,11 @@ pub enum ResolutionSpec {
     Signers(SignerConfig),
     WeightedKeys(WeightedKeyConfig),
     SignersDisputable(DisputableSignerConfig),
+    /// Categorical counterpart of `Signers` (appended, tag 4).
+    CategoricalSigners(CatSignerConfig),
+    /// Scalar counterpart of `Price` (appended, tag 5): the binary pool
+    /// settles at a fractional LONG payout instead of a side.
+    Scalar(ScalarPriceConfig),
 }
 
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
@@ -266,6 +322,8 @@ pub enum Error {
     TooManySignatures = 23,
     DisputeWindowClosed = 24,
     NoDispute = 25,
+    /// `attest_cat` outcome index not below the committed `outcome_count`.
+    InvalidOutcomeIndex = 26,
 }
 
 #[contracttype]
@@ -289,6 +347,17 @@ pub enum DataKey {
     Dispute(u64),
     EscalationVote(u64, Address),
     EscalationCount(u64, Verdict),
+    // appended (new variants only ever go at the end — the XDR tag is the
+    // variant position)
+    /// Registered `CatSignerConfig` of a categorical market.
+    CatSigners(u64),
+    /// A signer's attestation of one categorical outcome index.
+    CatAttestation(u64, u32, Address),
+    /// Attestation count for (market, outcome index).
+    CatCount(u64, u32),
+    CatProposal(u64),
+    /// Registered `ScalarPriceConfig` of a scalar market.
+    Scalar(u64),
 }
 
 /// The registered signer committee, whichever kind the market committed to.
@@ -374,6 +443,38 @@ pub struct MarketExpired {
     pub mode: ExpiryMode,
 }
 
+/// Categorical counterpart of `ResolutionProposed`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatResolutionProposed {
+    #[topic]
+    pub market_id: u64,
+    pub outcome_index: u32,
+    pub proposed_at: u64,
+}
+
+/// Categorical counterpart of `ResolutionFinalized`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatResolutionFinalized {
+    #[topic]
+    pub market_id: u64,
+    pub outcome_index: u32,
+    pub finalized_at: u64,
+}
+
+/// Scalar counterpart of `PriceResolution`: the settled market carries a
+/// fractional LONG payout instead of a side.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarPriceResolution {
+    #[topic]
+    pub market_id: u64,
+    pub price: i128,
+    pub price_timestamp: u64,
+    pub payout_long_bps: u32,
+}
+
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
@@ -429,6 +530,32 @@ impl Resolver {
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
     }
 
+    /// See `register_price_spec` — same commit/reveal rule, categorical
+    /// outcome-index committee. Only meaningful for markets whose
+    /// `resolution_hash` commits to `ResolutionSpec::CategoricalSigners` with
+    /// this exact `outcome_count`; the reveal target's `resolution_hash` is
+    /// read from whichever market kind owns the id.
+    pub fn register_cat_signer_spec(
+        env: Env,
+        market_id: u64,
+        spec: CatSignerConfig,
+    ) -> Result<(), Error> {
+        let rule = ResolutionSpec::CategoricalSigners(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
+    /// See `register_price_spec` — same commit/reveal rule, scalar mode:
+    /// the market settles fractionally from the feed price clamped into
+    /// `[lower, upper]` (see `resolve_scalar_price`).
+    pub fn register_scalar_spec(
+        env: Env,
+        market_id: u64,
+        spec: ScalarPriceConfig,
+    ) -> Result<(), Error> {
+        let rule = ResolutionSpec::Scalar(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
     /// Reveals a rule committed to through a [`ResolutionSpecV2`] envelope.
     /// The envelope must name this network and this resolver's market-core
     /// (`DomainMismatch`), use a non-zero salt and the current `version`
@@ -451,16 +578,19 @@ impl Resolver {
     /// evidence surfaced during the dispute window that it is wrong. For
     /// address-based signers voting can restart once the counts are cleared by
     /// re-attesting; a weighted-key market moves to a fresh round, which makes
-    /// every signature collected so far unusable.
+    /// every signature collected so far unusable. Works for both the binary
+    /// and the categorical proposal slot.
     pub fn cancel_proposal(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_admin(&env)?;
         Self::assert_not_disputed(&env, market_id)?;
         let storage = env.storage().persistent();
         let key = DataKey::Proposal(market_id);
-        if !storage.has(&key) {
+        let cat_key = DataKey::CatProposal(market_id);
+        if !storage.has(&key) && !storage.has(&cat_key) {
             return Err(Error::NoProposal);
         }
         storage.remove(&key);
+        storage.remove(&cat_key);
         if storage.has(&DataKey::WeightedKeys(market_id)) {
             Self::persist(
                 &env,
@@ -501,13 +631,35 @@ impl Resolver {
         Ok(outcome)
     }
 
-    /// When `expire_market` becomes callable for `market_id`: `close_time` plus
-    /// [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it
-    /// is known before (and without) a spec reveal.
-    pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
+    /// Resolves a scalar market from its Reflector feed. The reading is
+    /// clamped into the committed `[lower, upper]` range and settled as the
+    /// fractional LONG payout `(clamped - lower) / (upper - lower)` in bps
+    /// (SHORT pays the complement). Returns the payout.
+    ///
+    /// A non-positive reading is `InvalidPrice` rather than a clamp: it means
+    /// the feed is broken, not that the value sits at the bottom of the
+    /// range. Same close-time, staleness and terminal-state rules as
+    /// `resolve_price`.
+    pub fn resolve_scalar_price(env: Env, market_id: u64) -> Result<u32, Error> {
+        let config: ScalarPriceConfig = Self::load(&env, DataKey::Scalar(market_id))?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
-        Ok(Self::deadline(&market))
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let (payout, data) = Self::try_scalar_payout(&env, &config, market.close_time)?;
+        Self::settle_scalar(&env, &market_core, market_id, payout, &data);
+        Ok(payout)
+    }
+
+    /// When `expire_market` becomes callable for `market_id`: `close_time` plus
+    /// [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it
+    /// is known before (and without) a spec reveal, for either market kind.
+    pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
+        Self::market_deadline(&env, market_id)
     }
 
     /// Permissionless liveness fallback: once `resolution_deadline` has passed,
@@ -517,17 +669,15 @@ impl Resolver {
     /// Resolution is preferred over voiding. A price market whose feed is
     /// valid right now is *resolved* instead (so a stalled caller can never
     /// force a void on a resolvable market), and a market with a pending
-    /// signer proposal is refused with `ResolutionAvailable` until
-    /// `finalize_signers` settles it.
+    /// signer or categorical proposal is refused with `ResolutionAvailable`
+    /// until it is finalized.
     pub fn expire_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::assert_not_disputed(&env, market_id)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
-        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let core = MarketCoreClient::new(&env, &market_core);
-        let market = core.get_market(&market_id);
-        let deadline = Self::deadline(&market);
+        let close_time = Self::market_close_time(&env, market_id)?;
+        let deadline = close_time.saturating_add(RESOLUTION_GRACE_SECS);
         if env.ledger().timestamp() < deadline {
             return Err(Error::DeadlineNotReached);
         }
@@ -536,8 +686,9 @@ impl Resolver {
         match mode {
             ExpiryMode::Price => {
                 let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
-                match Self::try_price_outcome(&env, &config, market.close_time) {
+                match Self::try_price_outcome(&env, &config, close_time) {
                     Ok((outcome, data)) => {
+                        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
                         Self::settle_price(&env, &market_core, market_id, &outcome, &data);
                         return Ok(());
                     }
@@ -547,17 +698,35 @@ impl Resolver {
                     Err(other) => return Err(other),
                 }
             }
-            ExpiryMode::Signers if Self::has_valid_proposal(&env, market_id)? => {
+            ExpiryMode::Signers
+                if Self::has_valid_proposal(&env, market_id)?
+                    || Self::has_valid_cat_proposal(&env, market_id)? =>
+            {
                 return Err(Error::ResolutionAvailable);
+            }
+            ExpiryMode::Scalar => {
+                let config: ScalarPriceConfig = Self::load(&env, DataKey::Scalar(market_id))?;
+                match Self::try_scalar_payout(&env, &config, close_time) {
+                    Ok((payout, data)) => {
+                        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+                        Self::settle_scalar(&env, &market_core, market_id, payout, &data);
+                        return Ok(());
+                    }
+                    // A broken feed (missing, stale or non-positive) lets the
+                    // market expire; any other error is a real fault.
+                    Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                    Err(other) => return Err(other),
+                }
             }
             ExpiryMode::Signers | ExpiryMode::Unrevealed => {}
         }
 
-        core.void_market(&market_id);
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        MarketCoreClient::new(&env, &market_core).void_market(&market_id);
         Self::set_state(&env, market_id, ResolutionState::Expired);
         MarketExpired {
             market_id,
-            close_time: market.close_time,
+            close_time,
             deadline,
             mode,
         }
@@ -726,6 +895,95 @@ impl Resolver {
         }
         .publish(&env);
         Ok(proposal.outcome)
+    }
+
+    /// Categorical counterpart of `attest`: `signer` attests that
+    /// `outcome_index` is the winner. `outcome_index` must be below the
+    /// `outcome_count` the market's commitment fixed. Once `threshold`
+    /// members have attested an index it becomes the proposal and the
+    /// dispute window opens.
+    pub fn attest_cat(
+        env: Env,
+        market_id: u64,
+        signer: Address,
+        outcome_index: u32,
+    ) -> Result<(), Error> {
+        signer.require_auth();
+        let config: CatSignerConfig = Self::load(&env, DataKey::CatSigners(market_id))?;
+        if !Self::contains(&config.signers, &signer) {
+            return Err(Error::NotSigner);
+        }
+        Self::assert_not_disputed(&env, market_id)?;
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        if outcome_index >= config.outcome_count {
+            return Err(Error::InvalidOutcomeIndex);
+        }
+        if env.storage().persistent().has(&DataKey::CatAttestation(
+            market_id,
+            outcome_index,
+            signer.clone(),
+        )) {
+            return Err(Error::AlreadyAttested);
+        }
+        if env.ledger().timestamp() < Self::market_close_time(&env, market_id)? {
+            return Err(Error::MarketNotClosed);
+        }
+        Self::persist(
+            &env,
+            &DataKey::CatAttestation(market_id, outcome_index, signer),
+            &true,
+        );
+        let count_key = DataKey::CatCount(market_id, outcome_index);
+        let count = Self::cat_attestation_count(&env, market_id, outcome_index) + 1;
+        Self::persist(&env, &count_key, &count);
+        if count >= config.threshold
+            && !env
+                .storage()
+                .persistent()
+                .has(&DataKey::CatProposal(market_id))
+        {
+            let proposal = CatProposal {
+                outcome_index,
+                proposed_at: env.ledger().timestamp(),
+            };
+            Self::persist(&env, &DataKey::CatProposal(market_id), &proposal);
+            CatResolutionProposed {
+                market_id,
+                outcome_index,
+                proposed_at: proposal.proposed_at,
+            }
+            .publish(&env);
+        }
+        Ok(())
+    }
+
+    /// Categorical counterpart of `finalize_signers`: once the dispute window
+    /// of a proposal has passed and its index still has `threshold`
+    /// attestations, resolves the market in market-core and returns the
+    /// winning index.
+    pub fn finalize_cat(env: Env, market_id: u64) -> Result<u32, Error> {
+        Self::assert_not_disputed(&env, market_id)?;
+        let config: CatSignerConfig = Self::load(&env, DataKey::CatSigners(market_id))?;
+        let proposal: CatProposal =
+            Self::load(&env, DataKey::CatProposal(market_id)).map_err(|_| Error::NoProposal)?;
+        if env.ledger().timestamp() < proposal.proposed_at + config.dispute_window {
+            return Err(Error::DisputeWindowOpen);
+        }
+        if Self::cat_attestation_count(&env, market_id, proposal.outcome_index) < config.threshold {
+            return Err(Error::ThresholdNotReached);
+        }
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        MarketCoreClient::new(&env, &market_core).resolve_cat(&market_id, &proposal.outcome_index);
+        Self::set_state(&env, market_id, ResolutionState::Finalized);
+        CatResolutionFinalized {
+            market_id,
+            outcome_index: proposal.outcome_index,
+            finalized_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(proposal.outcome_index)
     }
 
     /// Challenges the current proposal of a `SignersDisputable` market while
@@ -923,17 +1181,43 @@ impl Resolver {
             .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
     }
 
-    fn deadline(market: &market_core::Market) -> u64 {
-        market.close_time.saturating_add(RESOLUTION_GRACE_SECS)
+    /// `close_time` of either market kind, so spec-independent entrypoints
+    /// (`expire_market`, `resolution_deadline`, `attest_cat`) work for
+    /// categorical markets too.
+    fn market_close_time(env: &Env, market_id: u64) -> Result<u64, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        let core = MarketCoreClient::new(env, &market_core);
+        Ok(match core.market_kind(&market_id) {
+            MarketKind::Binary => core.get_market(&market_id).close_time,
+            MarketKind::Categorical(_) => core.get_cat_market(&market_id).close_time,
+        })
+    }
+
+    /// Committed `resolution_hash` of either market kind.
+    fn market_resolution_hash(env: &Env, market_id: u64) -> Result<BytesN<32>, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        let core = MarketCoreClient::new(env, &market_core);
+        Ok(match core.market_kind(&market_id) {
+            MarketKind::Binary => core.get_market(&market_id).resolution_hash,
+            MarketKind::Categorical(_) => core.get_cat_market(&market_id).resolution_hash,
+        })
+    }
+
+    /// `close_time + RESOLUTION_GRACE_SECS` for either market kind.
+    fn market_deadline(env: &Env, market_id: u64) -> Result<u64, Error> {
+        Ok(Self::market_close_time(env, market_id)?.saturating_add(RESOLUTION_GRACE_SECS))
     }
 
     fn expiry_mode(env: &Env, market_id: u64) -> ExpiryMode {
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Price(market_id)) {
             ExpiryMode::Price
+        } else if storage.has(&DataKey::Scalar(market_id)) {
+            ExpiryMode::Scalar
         } else if storage.has(&DataKey::Signers(market_id))
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
+            || storage.has(&DataKey::CatSigners(market_id))
         {
             ExpiryMode::Signers
         } else {
@@ -1059,6 +1343,32 @@ impl Resolver {
             market_id,
             &proposal.outcome,
         ))
+    }
+
+    fn cat_attestation_count(env: &Env, market_id: u64, outcome_index: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CatCount(market_id, outcome_index))
+            .unwrap_or(0)
+    }
+
+    /// Categorical counterpart of `has_valid_proposal`: a `CatProposal` exists
+    /// whose attested count still meets the configured threshold, so
+    /// `finalize_cat` will succeed once the dispute window elapses.
+    fn has_valid_cat_proposal(env: &Env, market_id: u64) -> Result<bool, Error> {
+        let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, CatProposal>(&DataKey::CatProposal(market_id))
+        else {
+            return Ok(false);
+        };
+        let config: CatSignerConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CatSigners(market_id))
+            .ok_or(Error::MarketNotConfigured)?;
+        Ok(Self::cat_attestation_count(env, market_id, proposal.outcome_index) >= config.threshold)
     }
 
     /// Sets a persistent entry and extends its TTL.
@@ -1213,6 +1523,50 @@ impl Resolver {
         .publish(env);
     }
 
+    /// Scalar counterpart of `try_price_outcome`: same feed read and
+    /// staleness rules, then the clamped in-range position as bps. The
+    /// multiply cannot overflow `i128` because `validate_rule` caps `upper`
+    /// at `i128::MAX / BPS` and `lower >= 0`, so
+    /// `0 <= clamped - lower <= upper - lower <= i128::MAX / BPS`.
+    fn try_scalar_payout(
+        env: &Env,
+        config: &ScalarPriceConfig,
+        close_time: u64,
+    ) -> Result<(u32, PriceData), Error> {
+        let Ok(Ok(Some(data))) =
+            ReflectorPriceClient::new(env, &config.reflector).try_price(&config.asset, &close_time)
+        else {
+            return Err(Error::PriceUnavailable);
+        };
+        if data.timestamp > close_time || close_time - data.timestamp > config.max_staleness {
+            return Err(Error::StalePrice);
+        }
+        if data.price <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let clamped = data.price.clamp(config.lower, config.upper);
+        let payout = (clamped - config.lower) * BPS / (config.upper - config.lower);
+        Ok((payout as u32, data))
+    }
+
+    fn settle_scalar(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        payout_long_bps: u32,
+        data: &PriceData,
+    ) {
+        MarketCoreClient::new(env, market_core).resolve_scalar(&market_id, &payout_long_bps);
+        Self::set_state(env, market_id, ResolutionState::Finalized);
+        ScalarPriceResolution {
+            market_id,
+            price: data.price,
+            price_timestamp: data.timestamp,
+            payout_long_bps,
+        }
+        .publish(env);
+    }
+
     fn contains(list: &Vec<Address>, address: &Address) -> bool {
         list.iter().any(|candidate| candidate == *address)
     }
@@ -1226,6 +1580,8 @@ impl Resolver {
             || storage.has(&DataKey::Signers(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::Disputable(market_id))
+            || storage.has(&DataKey::CatSigners(market_id))
+            || storage.has(&DataKey::Scalar(market_id))
         {
             return Err(Error::MarketAlreadyConfigured);
         }
@@ -1261,6 +1617,21 @@ impl Resolver {
             }
             ResolutionSpec::WeightedKeys(cfg) => Self::weighted_config_is_valid(cfg),
             ResolutionSpec::SignersDisputable(cfg) => Self::disputable_config_is_valid(cfg),
+            ResolutionSpec::CategoricalSigners(cfg) => {
+                !cfg.signers.is_empty()
+                    && cfg.threshold != 0
+                    && cfg.threshold <= cfg.signers.len()
+                    && cfg.dispute_window != 0
+                    && (2..=MAX_CAT_OUTCOMES).contains(&cfg.outcome_count)
+            }
+            // `upper <= i128::MAX / BPS` keeps `try_scalar_payout`'s multiply
+            // provably overflow-free.
+            ResolutionSpec::Scalar(cfg) => {
+                cfg.lower >= 0
+                    && cfg.lower < cfg.upper
+                    && cfg.upper <= i128::MAX / BPS
+                    && cfg.max_staleness != 0
+            }
         };
         if valid {
             Ok(())
@@ -1292,20 +1663,29 @@ impl Resolver {
                 storage.set(&key, cfg);
                 (key, ResolutionState::SignersPending)
             }
+            ResolutionSpec::CategoricalSigners(cfg) => {
+                let key = DataKey::CatSigners(market_id);
+                storage.set(&key, cfg);
+                (key, ResolutionState::SignersPending)
+            }
+            ResolutionSpec::Scalar(cfg) => {
+                let key = DataKey::Scalar(market_id);
+                storage.set(&key, cfg);
+                (key, ResolutionState::Unconfigured)
+            }
         };
         storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         Self::set_state(env, market_id, state);
     }
 
-    /// Verifies `commitment` equals the market's `resolution_hash`.
+    /// Verifies `commitment` equals the market's `resolution_hash`, read from
+    /// whichever market kind owns the id (binary or categorical).
     fn assert_matches_commitment(
         env: &Env,
         market_id: u64,
         commitment: &BytesN<32>,
     ) -> Result<(), Error> {
-        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
-        if *commitment != market.resolution_hash {
+        if *commitment != Self::market_resolution_hash(env, market_id)? {
             return Err(Error::SpecHashMismatch);
         }
         Ok(())
@@ -1315,13 +1695,14 @@ impl Resolver {
 #[cfg(test)]
 mod test {
     use super::*;
-    use market_core::{Category, MarketStatus};
+    use market_core::{CatStatus, Category, MarketStatus};
     use soroban_sdk::{
         contract, contractimpl,
         testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
         token::{self, StellarAssetClient},
         BytesN, IntoVal,
     };
+    use std::format;
 
     #[contract]
     struct MockReflector;
@@ -1491,6 +1872,163 @@ mod test {
         })
     }
 
+    fn cat_signer_spec(env: &Env, a: &Address, b: &Address, outcome_count: u32) -> CatSignerConfig {
+        CatSignerConfig {
+            signers: Vec::from_array(env, [a.clone(), b.clone()]),
+            threshold: 2,
+            dispute_window: 100,
+            outcome_count,
+        }
+    }
+
+    /// A fixture whose market is categorical (3 outcomes, seeded from
+    /// [5000, 3000, 2000] bps) and whose commitment is the legacy hash of the
+    /// `CategoricalSigners` rule `spec_fn` returns.
+    fn cat_fixture(spec_fn: impl FnOnce(&Env, &Address, &Address) -> CatSignerConfig) -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(MockReflector, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let spec = ResolutionSpec::CategoricalSigners(spec_fn(&env, &signer_a, &signer_b));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                10_000u32,
+            ),
+        );
+        let resolution_hash = legacy_spec_hash(&env, &spec);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let market_id = market_core.create_categorical_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-cat-test"),
+            &Category::Crypto,
+            &2_000,
+            &1_000_000_000_i128,
+            &Vec::from_array(&env, [5_000u32, 3_000, 2_000]),
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        Fixture {
+            env,
+            admin,
+            resolver,
+            resolver_id,
+            market_core,
+            market_id,
+            signer_a,
+            signer_b,
+            reflector_id,
+            spec,
+        }
+    }
+
+    fn scalar_spec(env: &Env, reflector: &Address) -> ScalarPriceConfig {
+        ScalarPriceConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            lower: 100,
+            upper: 250,
+            max_staleness: 10,
+        }
+    }
+
+    /// A fixture whose market is scalar over `[100, 250]` and whose commitment
+    /// is the legacy hash of the `Scalar` rule `spec_fn` returns.
+    fn scalar_fixture(spec_fn: impl FnOnce(&Env, &Address) -> ScalarPriceConfig) -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(MockReflector, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let spec = ResolutionSpec::Scalar(spec_fn(&env, &reflector_id));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                10_000u32,
+            ),
+        );
+        let resolution_hash = legacy_spec_hash(&env, &spec);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let ResolutionSpec::Scalar(cfg) = &spec else {
+            unreachable!()
+        };
+        let market_id = market_core.create_scalar_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-scalar-test"),
+            &Category::Crypto,
+            &2_000,
+            &1_000_000_000_i128,
+            &5000u32,
+            &cfg.lower,
+            &cfg.upper,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        Fixture {
+            env,
+            admin,
+            resolver,
+            resolver_id,
+            market_core,
+            market_id,
+            signer_a,
+            signer_b,
+            reflector_id,
+            spec,
+        }
+    }
+
     #[test]
     fn price_mode_resolves_from_historical_reflector_price() {
         let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
@@ -1531,6 +2069,388 @@ mod test {
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
             MarketStatus::Resolved(Outcome::No)
+        );
+    }
+
+    #[test]
+    fn cat_signer_mode_requires_threshold_and_waits_for_dispute_window() {
+        let f = cat_fixture(|env, a, b| cat_signer_spec(env, a, b, 3));
+        let ResolutionSpec::CategoricalSigners(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_cat_signer_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        f.resolver.attest_cat(&f.market_id, &f.signer_a, &2u32);
+        f.resolver.attest_cat(&f.market_id, &f.signer_b, &2u32);
+
+        assert_eq!(
+            f.resolver.try_finalize_cat(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(f.resolver.finalize_cat(&f.market_id), 2u32);
+        assert_eq!(
+            f.market_core.get_cat_market(&f.market_id).status,
+            CatStatus::Resolved(2)
+        );
+    }
+
+    #[test]
+    fn cat_attest_validations() {
+        let f = cat_fixture(|env, a, b| cat_signer_spec(env, a, b, 3));
+
+        // Nothing revealed yet: attestations cannot be recorded.
+        assert_eq!(
+            f.resolver.try_attest_cat(&f.market_id, &f.signer_a, &0u32),
+            Err(Ok(Error::MarketNotConfigured))
+        );
+
+        let ResolutionSpec::CategoricalSigners(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        // Outcome counts outside 2..=8 and a zero threshold are rejected by
+        // validation before the commitment is checked.
+        for bad_count in [1u32, 9] {
+            let mut bad = spec.clone();
+            bad.outcome_count = bad_count;
+            assert_eq!(
+                f.resolver.try_register_cat_signer_spec(&f.market_id, &bad),
+                Err(Ok(Error::InvalidConfig))
+            );
+        }
+        let mut bad = spec.clone();
+        bad.threshold = 0;
+        assert_eq!(
+            f.resolver.try_register_cat_signer_spec(&f.market_id, &bad),
+            Err(Ok(Error::InvalidConfig))
+        );
+        // A valid-but-different rule does not match the committed hash.
+        let mut wrong = spec.clone();
+        wrong.threshold = 1;
+        assert_eq!(
+            f.resolver
+                .try_register_cat_signer_spec(&f.market_id, &wrong),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+        f.resolver.register_cat_signer_spec(&f.market_id, &spec);
+        // One reveal per market.
+        assert_eq!(
+            f.resolver.try_register_cat_signer_spec(&f.market_id, &spec),
+            Err(Ok(Error::MarketAlreadyConfigured))
+        );
+
+        // Attesting before close is rejected.
+        f.env.ledger().set_timestamp(1_500);
+        assert_eq!(
+            f.resolver.try_attest_cat(&f.market_id, &f.signer_a, &0u32),
+            Err(Ok(Error::MarketNotClosed))
+        );
+        f.env.ledger().set_timestamp(2_000);
+        // Only configured signers can attest.
+        let outsider = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_attest_cat(&f.market_id, &outsider, &0u32),
+            Err(Ok(Error::NotSigner))
+        );
+        // Indices at or above the committed outcome count are rejected.
+        assert_eq!(
+            f.resolver.try_attest_cat(&f.market_id, &f.signer_a, &3u32),
+            Err(Ok(Error::InvalidOutcomeIndex))
+        );
+        // An attestation is recorded at most once per signer and index.
+        f.resolver.attest_cat(&f.market_id, &f.signer_a, &1u32);
+        assert_eq!(
+            f.resolver.try_attest_cat(&f.market_id, &f.signer_a, &1u32),
+            Err(Ok(Error::AlreadyAttested))
+        );
+    }
+
+    #[test]
+    fn cat_proposal_opens_with_quorum_and_guards_expiry() {
+        let f = cat_fixture(|env, a, b| cat_signer_spec(env, a, b, 3));
+        let ResolutionSpec::CategoricalSigners(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_cat_signer_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        // No proposal until `threshold` signers attest the same index.
+        assert_eq!(
+            f.resolver.try_finalize_cat(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+        f.resolver.attest_cat(&f.market_id, &f.signer_a, &0u32);
+        f.resolver.attest_cat(&f.market_id, &f.signer_b, &1u32);
+        assert_eq!(
+            f.resolver.try_finalize_cat(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+        f.resolver.attest_cat(&f.market_id, &f.signer_b, &0u32);
+
+        // Past the grace deadline a live proposal still blocks expiry...
+        f.env
+            .ledger()
+            .set_timestamp(2_000 + RESOLUTION_GRACE_SECS + 1);
+        assert_eq!(
+            f.resolver.try_expire_market(&f.market_id),
+            Err(Ok(Error::ResolutionAvailable))
+        );
+        // ...until the guardian cancels it, after which the market voids.
+        f.resolver.cancel_proposal(&f.market_id);
+        f.resolver.expire_market(&f.market_id);
+        assert_eq!(
+            f.market_core.get_cat_market(&f.market_id).status,
+            CatStatus::Void
+        );
+    }
+
+    #[test]
+    fn scalar_price_mode_resolves_mid_range() {
+        let f = scalar_fixture(scalar_spec);
+        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
+        reflector.set_price(&176_i128, &1_999_u64);
+
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        // (176 - 100) / (250 - 100) in bps: 760_000 / 150 = 5066.67 -> 5066.
+        assert_eq!(f.resolver.resolve_scalar_price(&f.market_id), 5_066);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::ResolvedScalar(5_066)
+        );
+        // One-shot: the market is terminal after resolution.
+        assert_eq!(
+            f.resolver.try_resolve_scalar_price(&f.market_id),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+    }
+
+    #[test]
+    fn scalar_price_clamps_below_lower() {
+        let f = scalar_fixture(scalar_spec);
+        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
+        // 50 is below `lower` (100): the payout clamps to zero instead of
+        // reverting, so the market always resolves.
+        reflector.set_price(&50_i128, &1_999_u64);
+
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert_eq!(f.resolver.resolve_scalar_price(&f.market_id), 0);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::ResolvedScalar(0)
+        );
+    }
+
+    #[test]
+    fn scalar_price_clamps_above_upper() {
+        let f = scalar_fixture(scalar_spec);
+        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
+        // 400 is above `upper` (250): the payout saturates at 10_000 bps.
+        reflector.set_price(&400_i128, &1_999_u64);
+
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert_eq!(f.resolver.resolve_scalar_price(&f.market_id), 10_000);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::ResolvedScalar(10_000)
+        );
+    }
+
+    #[test]
+    fn scalar_rejects_non_positive_price() {
+        let f = scalar_fixture(scalar_spec);
+        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
+
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        // A non-positive reading is a broken feed, not a value at the bottom
+        // of the range, so it must not clamp silently.
+        for bad in [0_i128, -5] {
+            reflector.set_price(&bad, &1_999_u64);
+            assert_eq!(
+                f.resolver.try_resolve_scalar_price(&f.market_id),
+                Err(Ok(Error::InvalidPrice))
+            );
+            assert_eq!(
+                f.market_core.get_market(&f.market_id).status,
+                MarketStatus::Open
+            );
+        }
+
+        // The rejection is recoverable: a healthy reading resolves normally.
+        reflector.set_price(&200_i128, &1_999_u64);
+        assert_eq!(f.resolver.resolve_scalar_price(&f.market_id), 6_666);
+    }
+
+    #[test]
+    fn scalar_rejects_stale_price() {
+        let f = scalar_fixture(scalar_spec);
+        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
+
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+
+        // One second older than `max_staleness` (10) is stale...
+        reflector.set_price(&176_i128, &1_989_u64);
+        assert_eq!(
+            f.resolver.try_resolve_scalar_price(&f.market_id),
+            Err(Ok(Error::StalePrice))
+        );
+        // ...a future-dated reading is stale too...
+        reflector.set_price(&176_i128, &2_001_u64);
+        assert_eq!(
+            f.resolver.try_resolve_scalar_price(&f.market_id),
+            Err(Ok(Error::StalePrice))
+        );
+        // ...and exactly `max_staleness` old is the last accepted age.
+        reflector.set_price(&176_i128, &1_990_u64);
+        assert_eq!(f.resolver.resolve_scalar_price(&f.market_id), 5_066);
+    }
+
+    #[test]
+    fn scalar_spec_registration_validations() {
+        let f = scalar_fixture(scalar_spec);
+        let ResolutionSpec::Scalar(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+
+        // The reveal is validated before the commitment is checked.
+        for (lower, upper, max_staleness) in [
+            (100_i128, 100_i128, 10u64), // empty range
+            (250, 100, 10),              // inverted range
+            (-1, 250, 10),               // negative lower
+            (0, i128::MAX / BPS + 1, 10),
+            (100, 250, 0), // staleness window disabled
+        ] {
+            let mut bad = spec.clone();
+            bad.lower = lower;
+            bad.upper = upper;
+            bad.max_staleness = max_staleness;
+            assert_eq!(
+                f.resolver.try_register_scalar_spec(&f.market_id, &bad),
+                Err(Ok(Error::InvalidConfig))
+            );
+        }
+
+        // A valid-but-different rule does not match the committed hash.
+        let mut wrong = spec.clone();
+        wrong.upper = 251;
+        assert_eq!(
+            f.resolver.try_register_scalar_spec(&f.market_id, &wrong),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+
+        f.resolver.register_scalar_spec(&f.market_id, &spec);
+        // One reveal per market, even with the identical rule.
+        assert_eq!(
+            f.resolver.try_register_scalar_spec(&f.market_id, &spec),
+            Err(Ok(Error::MarketAlreadyConfigured))
+        );
+    }
+
+    #[test]
+    fn scalar_spec_hash_disjoint_from_price() {
+        // A price rule revealed against a scalar commitment mismatches...
+        let f = scalar_fixture(scalar_spec);
+        let as_price = PriceConfig {
+            reflector: f.reflector_id.clone(),
+            asset: OracleAsset::Other(Symbol::new(&f.env, "XLM")),
+            threshold: 100,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        };
+        assert_eq!(
+            f.resolver.try_register_price_spec(&f.market_id, &as_price),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+
+        // ...and a scalar rule cannot be revealed against a price commitment.
+        let g = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let as_scalar = ScalarPriceConfig {
+            reflector: g.reflector_id.clone(),
+            asset: OracleAsset::Other(Symbol::new(&g.env, "XLM")),
+            lower: 100,
+            upper: 250,
+            max_staleness: 10,
+        };
+        assert_eq!(
+            g.resolver
+                .try_register_scalar_spec(&g.market_id, &as_scalar),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+    }
+
+    /// Appending `ResolutionSpec::Scalar` must not move the commitment of any
+    /// variant that existed before it. These hashes pre-date scalar support;
+    /// they are re-pinned here through the production `legacy_spec_hash` path
+    /// (the `golden` module pins the same bytes via raw `sha256(to_xdr)`).
+    #[test]
+    fn existing_spec_hashes_unchanged() {
+        let env = Env::default();
+        let hex = |h: &BytesN<32>| -> std::string::String {
+            h.to_array().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        let g1 = Address::from_str(
+            &env,
+            "GBAKBHXK7SV7C3HGY3DDYB4QWUEGL52SEF6OO77LAD672JVXD4QCYJLF",
+        );
+
+        let price = ResolutionSpec::Price(PriceConfig {
+            reflector: Address::from_str(
+                &env,
+                "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+            ),
+            asset: OracleAsset::Other(Symbol::new(&env, "XLM")),
+            threshold: 2_000,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        });
+        assert_eq!(
+            hex(&legacy_spec_hash(&env, &price)),
+            "b6f2458326d5f76bd9b53a93a103ea6c0fed7129c5496e91e3faef9a9a23d469",
+        );
+
+        let signers = ResolutionSpec::Signers(SignerConfig {
+            signers: Vec::from_array(&env, [g1.clone()]),
+            threshold: 1,
+            dispute_window: 5,
+        });
+        assert_eq!(
+            hex(&legacy_spec_hash(&env, &signers)),
+            "b935a3beeebdbf7b9defc916410f19a1740a3920623230152e41a812b6f141c4",
+        );
+
+        let cat = ResolutionSpec::CategoricalSigners(CatSignerConfig {
+            signers: Vec::from_array(&env, [g1]),
+            threshold: 1,
+            dispute_window: 5,
+            outcome_count: 2,
+        });
+        assert_eq!(
+            hex(&legacy_spec_hash(&env, &cat)),
+            "16db57d51742d266dccd1a70539afc160971c942605a0ae8f15b5a18cd1b2837",
         );
     }
 
@@ -2867,6 +3787,25 @@ mod golden {
         })
     }
 
+    fn cat_signers(
+        env: &Env,
+        keys: &[&str],
+        outcome_count: u32,
+        threshold: u32,
+        dispute_window: u64,
+    ) -> ResolutionSpec {
+        let mut signers = Vec::new(env);
+        for key in keys {
+            signers.push_back(Address::from_str(env, key));
+        }
+        ResolutionSpec::CategoricalSigners(CatSignerConfig {
+            signers,
+            threshold,
+            dispute_window,
+            outcome_count,
+        })
+    }
+
     fn price(
         env: &Env,
         asset: OracleAsset,
@@ -2883,9 +3822,53 @@ mod golden {
         })
     }
 
+    fn scalar(
+        env: &Env,
+        asset: OracleAsset,
+        lower: i128,
+        upper: i128,
+        max_staleness: u64,
+    ) -> ResolutionSpec {
+        ResolutionSpec::Scalar(ScalarPriceConfig {
+            reflector: Address::from_str(env, C1),
+            asset,
+            lower,
+            upper,
+            max_staleness,
+        })
+    }
+
     fn hex_of(env: &Env, spec: &ResolutionSpec) -> String {
         let hash: BytesN<32> = env.crypto().sha256(&spec.clone().to_xdr(env)).into();
         hash.to_array().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Shared byte-for-byte with `golden_scalar_vectors` in
+    /// `scripts/spec-hash`: the scalar variant (tag 5) mirrors the price
+    /// fields, so it must be pinned against drifting into the price hash
+    /// space.
+    #[test]
+    fn golden_legacy_scalar_spec_hashes() {
+        let env = Env::default();
+        let xlm = || OracleAsset::Other(Symbol::new(&env, "XLM"));
+        let asset = |id: &str| OracleAsset::Stellar(Address::from_str(&env, id));
+        let vectors = [
+            (
+                scalar(&env, xlm(), 100, 250, 10),
+                "e97c4bccc39a4538850b22e703019c3b69971a00b99bc73117cc67e044e26822",
+            ),
+            (
+                scalar(&env, asset(C2), 0, 1_000_000_000_000, 300),
+                "1d94380e9112c6f80f7542106dcc75ffc1426a634da2a07440fac72d2033fa08",
+            ),
+        ];
+        for (spec, expected) in vectors {
+            assert_eq!(hex_of(&env, &spec), expected);
+        }
+        assert_ne!(
+            hex_of(&env, &scalar(&env, xlm(), 2_000, 2_000, 10)),
+            hex_of(&env, &price(&env, xlm(), 2_000, PriceDirection::Above, 10)),
+        );
     }
 
     #[test]
@@ -2904,6 +3887,32 @@ mod golden {
         for (spec, expected) in vectors {
             assert_eq!(hex_of(&env, &spec), expected);
         }
+    }
+
+    /// Shared byte-for-byte with `golden_cat_signers_vectors` in
+    /// `scripts/spec-hash`: the CLI parsers and the contract types must produce
+    /// byte-identical commitments, and the appended variant must not collide
+    /// with any existing one.
+    #[test]
+    fn golden_legacy_cat_signer_spec_hashes() {
+        let env = Env::default();
+        let vectors = [
+            (
+                cat_signers(&env, &[G1], 2, 1, 5),
+                "16db57d51742d266dccd1a70539afc160971c942605a0ae8f15b5a18cd1b2837",
+            ),
+            (
+                cat_signers(&env, &[G1, G2, G3], 3, 2, 3_600),
+                "21b750237b5cb3f54bdc71ec55a1d8073a3b860f6cb3cb3b9717570dc42092e7",
+            ),
+        ];
+        for (spec, expected) in vectors {
+            assert_eq!(hex_of(&env, &spec), expected);
+        }
+        assert_ne!(
+            hex_of(&env, &cat_signers(&env, &[G1], 2, 1, 5)),
+            hex_of(&env, &signers(&env, &[G1], 1, 5)),
+        );
     }
 
     #[test]

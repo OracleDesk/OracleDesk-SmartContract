@@ -16,16 +16,47 @@
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
 import { buildTrace, LocalTraceStore } from "../core/trace.js";
-import { BPS } from "../core/fpmm.js";
+import { BPS, priceYesBps } from "../core/fpmm.js";
 import { decideTrade, type MarketState } from "../core/strategy.js";
 import { loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 
-/** Placeholder in place of a real market read + reference-price lookup —
- * see docs/wave-issues for wiring get_market/get_price and a
- * ReferencePriceSource as open issues. */
-async function fetchMarketAndFairValue(): Promise<{ market: MarketState; fairValueBps: number }> {
+/**
+ * Reads the market to trade and the fair value to compare it against.
+ *
+ * In live mode the market is a real chain read (`get_market` plus
+ * `current_fee_bps`) for `MARKET_ID`. The effective fee — not the flat
+ * `Market.fee_bps` snapshot, which ignores dynamic fee schedules — is fed
+ * into the strategy's market state so every off-chain quote and impact
+ * estimate uses the number the contract will actually charge.
+ *
+ * The fair-value estimate stays a placeholder: wiring a real
+ * ReferencePriceSource (and the question lookup it needs) is an open issue —
+ * see docs/wave-issues.
+ */
+async function fetchMarketAndFairValue(
+  adapter: StellarAdapter,
+  env: NodeJS.ProcessEnv,
+  now: () => number,
+): Promise<{ market: MarketState; fairValueBps: number }> {
+  if (adapter.mode === "live") {
+    const marketId = BigInt(env.MARKET_ID ?? "0");
+    const m = await adapter.getMarket({ market_id: marketId });
+    const feeBps = await adapter.currentFeeBps({ market_id: marketId });
+    return {
+      market: {
+        marketId: Number(marketId),
+        question: "live market",
+        yesBps: Number(priceYesBps(m.reserve_yes, m.reserve_no)),
+        closeTime: Number(m.close_time),
+        reserveYesStroops: m.reserve_yes,
+        reserveNoStroops: m.reserve_no,
+        feeBps,
+      },
+      fairValueBps: 6000,
+    };
+  }
   return {
-    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: Math.floor(Date.now() / 1000) + 3600 },
+    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: now() + 3600 },
     fairValueBps: 6000,
   };
 }
@@ -42,7 +73,7 @@ export async function main(
   const traceStore = new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces");
 
   console.log(`[trader] mode=${adapter.mode}`);
-  const { market, fairValueBps } = await fetchMarketAndFairValue();
+  const { market, fairValueBps } = await fetchMarketAndFairValue(adapter, env, now);
   const decision = decideTrade(market, fairValueBps, {
     minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
     tradeSizeStroops: BigInt(env.TRADE_SIZE_STROOPS ?? "100000000"),

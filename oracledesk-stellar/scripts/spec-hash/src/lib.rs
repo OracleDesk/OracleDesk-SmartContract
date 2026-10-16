@@ -6,8 +6,9 @@
 //! `spec_v2_hash`, so the tool cannot drift from the contract.
 
 use resolver::{
-    legacy_spec_hash, spec_v2_hash, DisputableSignerConfig, Escalation, OracleAsset, PriceConfig,
-    PriceDirection, ResolutionSpec, ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
+    legacy_spec_hash, spec_v2_hash, CatSignerConfig, DisputableSignerConfig, Escalation,
+    OracleAsset, PriceConfig, PriceDirection, ResolutionSpec, ResolutionSpecV2, ScalarPriceConfig,
+    SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec as SorobanVec};
 
@@ -21,7 +22,12 @@ usage:
   spec-hash [V2 FLAGS] signers-disputable <threshold> <dispute_window_secs> <bond_stroops>
       <escalation_timeout_secs> <escalation> <signer_G_address>...
     <escalation> is `guardian` or `committee:<k>:<G_address>,<G_address>...`
-  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable> <args>...
+  spec-hash [V2 FLAGS] cat-signers <outcome_count> <threshold> <dispute_window_secs> <signer_G_address>...
+    <outcome_count> is 2..=8, the number of outcomes of the categorical market
+  spec-hash [V2 FLAGS] scalar <reflector_C_address> <asset> <lower> <upper> <max_staleness_secs>
+    <asset> is `stellar:<G_or_C_address>` or `other:<symbol>`
+    LONG pays `(price - lower) / (upper - lower)` in bps, clamped into the range
+  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable|cat-signers|scalar> <args>...
   spec-hash gen-salt
 
 V2 FLAGS (all four are required together; without them the legacy hash is printed):
@@ -109,19 +115,23 @@ pub fn parse_signers(env: &Env, args: &[String]) -> Result<ResolutionSpec, Strin
     }))
 }
 
+fn parse_asset(env: &Env, value: &str) -> Result<OracleAsset, String> {
+    if let Some(address) = value.strip_prefix("stellar:") {
+        Ok(OracleAsset::Stellar(parse_address(env, address)?))
+    } else if let Some(symbol) = value.strip_prefix("other:") {
+        Ok(OracleAsset::Other(Symbol::new(env, symbol)))
+    } else {
+        Err("asset must be `stellar:<address>` or `other:<symbol>`".into())
+    }
+}
+
 pub fn parse_price(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
     let [reflector, asset, threshold, direction, max_staleness] = args else {
         return Err(
             "price needs <reflector> <asset> <threshold> <direction> <max_staleness>".into(),
         );
     };
-    let asset = if let Some(address) = asset.strip_prefix("stellar:") {
-        OracleAsset::Stellar(parse_address(env, address)?)
-    } else if let Some(symbol) = asset.strip_prefix("other:") {
-        OracleAsset::Other(Symbol::new(env, symbol))
-    } else {
-        return Err("asset must be `stellar:<address>` or `other:<symbol>`".into());
-    };
+    let asset = parse_asset(env, asset)?;
     let direction = match direction.as_str() {
         "above" => PriceDirection::Above,
         "at-or-above" => PriceDirection::AtOrAbove,
@@ -140,6 +150,25 @@ pub fn parse_price(env: &Env, args: &[String]) -> Result<ResolutionSpec, String>
             .parse()
             .map_err(|_| "threshold must be an i128".to_string())?,
         direction,
+        max_staleness: max_staleness
+            .parse()
+            .map_err(|_| "max_staleness must be a u64".to_string())?,
+    }))
+}
+
+pub fn parse_scalar(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
+    let [reflector, asset, lower, upper, max_staleness] = args else {
+        return Err("scalar needs <reflector> <asset> <lower> <upper> <max_staleness>".into());
+    };
+    Ok(ResolutionSpec::Scalar(ScalarPriceConfig {
+        reflector: parse_address(env, reflector)?,
+        asset: parse_asset(env, asset)?,
+        lower: lower
+            .parse()
+            .map_err(|_| "lower must be an i128".to_string())?,
+        upper: upper
+            .parse()
+            .map_err(|_| "upper must be an i128".to_string())?,
         max_staleness: max_staleness
             .parse()
             .map_err(|_| "max_staleness must be a u64".to_string())?,
@@ -229,13 +258,45 @@ pub fn parse_signers_disputable(env: &Env, args: &[String]) -> Result<Resolution
     }))
 }
 
+pub fn parse_cat_signers(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
+    let [outcome_count, threshold, dispute_window, signers @ ..] = args else {
+        return Err(
+            "cat-signers needs <outcome_count> <threshold> <dispute_window_secs> <signer>...".into(),
+        );
+    };
+    if signers.is_empty() {
+        return Err("cat-signers needs at least one signer address".into());
+    }
+    let mut list = SorobanVec::new(env);
+    for signer in signers {
+        list.push_back(parse_address(env, signer)?);
+    }
+    Ok(ResolutionSpec::CategoricalSigners(CatSignerConfig {
+        signers: list,
+        threshold: threshold
+            .parse()
+            .map_err(|_| "threshold must be a u32".to_string())?,
+        dispute_window: dispute_window
+            .parse()
+            .map_err(|_| "dispute_window must be a u64".to_string())?,
+        outcome_count: outcome_count
+            .parse()
+            .map_err(|_| "outcome_count must be a u32".to_string())?,
+    }))
+}
+
 fn parse_rule(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
     match args {
         [kind, rest @ ..] if kind == "signers" => parse_signers(env, rest),
         [kind, rest @ ..] if kind == "price" => parse_price(env, rest),
         [kind, rest @ ..] if kind == "weighted-keys" => parse_weighted_keys(env, rest),
         [kind, rest @ ..] if kind == "signers-disputable" => parse_signers_disputable(env, rest),
-        _ => Err("expected `signers`, `price`, `weighted-keys` or `signers-disputable`".into()),
+        [kind, rest @ ..] if kind == "cat-signers" => parse_cat_signers(env, rest),
+        [kind, rest @ ..] if kind == "scalar" => parse_scalar(env, rest),
+        _ => Err(
+            "expected `signers`, `price`, `weighted-keys`, `signers-disputable`, `cat-signers` or `scalar`"
+                .into(),
+        ),
     }
 }
 
@@ -408,6 +469,26 @@ mod tests {
         );
     }
 
+    /// The same vectors as `golden_legacy_cat_signer_spec_hashes` in
+    /// contracts/resolver: CLI parsing and the contract types must produce
+    /// byte-identical commitments.
+    #[test]
+    fn golden_cat_signers_vectors() {
+        let vectors: [(&[&str], &str); 2] = [
+            (
+                &["cat-signers", "2", "1", "5", G1],
+                "16db57d51742d266dccd1a70539afc160971c942605a0ae8f15b5a18cd1b2837",
+            ),
+            (
+                &["cat-signers", "3", "2", "3600", G1, G2, G3],
+                "21b750237b5cb3f54bdc71ec55a1d8073a3b860f6cb3cb3b9717570dc42092e7",
+            ),
+        ];
+        for (spec, expected) in vectors {
+            assert_eq!(hash_of(spec), expected);
+        }
+    }
+
     /// Re-derived from hand-built XDR (no Soroban) when these vectors were added.
     #[test]
     fn golden_signers_disputable_vectors() {
@@ -441,6 +522,38 @@ mod tests {
         for (spec, expected) in vectors {
             assert_eq!(hash_of(spec), expected);
         }
+    }
+
+    /// The same vectors as `golden_legacy_scalar_spec_hashes` in
+    /// contracts/resolver: CLI parsing and the contract types must produce
+    /// byte-identical commitments, and the scalar space must not collide with
+    /// the price space it mirrors.
+    #[test]
+    fn golden_scalar_vectors() {
+        let vectors: [(&[&str], &str); 2] = [
+            (
+                &["scalar", C1, "other:XLM", "100", "250", "10"],
+                "e97c4bccc39a4538850b22e703019c3b69971a00b99bc73117cc67e044e26822",
+            ),
+            (
+                &[
+                    "scalar",
+                    C1,
+                    &format!("stellar:{C2}"),
+                    "0",
+                    "1000000000000",
+                    "300",
+                ],
+                "1d94380e9112c6f80f7542106dcc75ffc1426a634da2a07440fac72d2033fa08",
+            ),
+        ];
+        for (spec, expected) in vectors {
+            assert_eq!(hash_of(spec), expected);
+        }
+        assert_ne!(
+            hash_of(&["scalar", C1, "other:XLM", "100", "250", "10"]),
+            hash_of(&["price", C1, "other:XLM", "2000", "above", "10"]),
+        );
     }
 
     const SALT: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
@@ -530,6 +643,13 @@ mod tests {
             args(&["signers", "x", "5", G1]),
             args(&["signers", "1", "5", "not-an-address"]),
             args(&["price", C1, "bogus", "1", "above", "1"]),
+            args(&["cat-signers", "3", "2", "100"]),
+            args(&["cat-signers", "x", "2", "100", G1]),
+            args(&["cat-signers", "3", "2", "100", "not-an-address"]),
+            args(&["scalar", C1, "other:XLM", "100", "250"]),
+            args(&["scalar", C1, "bogus", "100", "250", "10"]),
+            args(&["scalar", C1, "other:XLM", "x", "250", "10"]),
+            args(&["scalar", C1, "other:XLM", "100", "250", "x"]),
             args(&["weighted-keys", "2", "60", "nocolon"]),
             args(&["weighted-keys", "2", "60", "zz:1"]),
             args(&[

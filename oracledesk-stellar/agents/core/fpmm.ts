@@ -230,3 +230,240 @@ export function sellWithinLimit(collateralOut: bigint, sharesIn: bigint, limitBp
   if (collateralOut < 0n || sharesIn <= 0n) throw new MathError("invalid input");
   return collateralOut * BPS >= sharesIn * limitBps;
 }
+
+// ---------------------------------------------------------------------------
+// Categorical (N-outcome) FPMM — mirrors math_categorical.rs. The binary
+// invariant k = rYes * rNo generalises to the product of all reserves; the
+// iterative ceil accumulation keeps k non-decreasing with at most n-1 units
+// of pool-favouring drift per trade (see the rounding proof in
+// math_categorical.rs::calc_buy).
+// ---------------------------------------------------------------------------
+
+export const MAX_MARKET_OUTCOMES = 8;
+export const PRICE_SCALE = 10n ** 18n; // same reciprocal scale as math_categorical.rs
+
+function catN(reserves: bigint[]): number {
+  const n = reserves.length;
+  if (n < 2 || n > MAX_MARKET_OUTCOMES) throw new MathError("invalid input");
+  for (const r of reserves) if (r <= 0n) throw new MathError("invalid input");
+  return n;
+}
+
+function catIndex(n: number, outcomeIndex: number): number {
+  if (outcomeIndex < 0 || outcomeIndex >= n) throw new MathError("invalid input");
+  return outcomeIndex;
+}
+
+export interface CatBuyQuote {
+  sharesOut: bigint;
+  fee: bigint;
+  net: bigint;
+  newReserves: bigint[];
+}
+
+/**
+ * Buy `collateralIn` of outcome `outcomeIndex`: mint `net` sets into every
+ * other reserve and shrink the bought reserve so the product of all
+ * reserves holds. Mirrors math_categorical.rs::calc_buy.
+ */
+export function catCalcBuy(
+  reserves: bigint[],
+  outcomeIndex: number,
+  collateralIn: bigint,
+  feeBps: bigint,
+): CatBuyQuote {
+  const n = catN(reserves);
+  const j = catIndex(n, outcomeIndex);
+  if (collateralIn <= 0n) throw new MathError("invalid input");
+  const fee = mulDivCeil(collateralIn, feeBps, BPS);
+  const net = collateralIn - fee;
+  if (net <= 0n) throw new MathError("invalid input");
+  const newReserves = [...reserves];
+  let acc = reserves[j];
+  for (let i = 0; i < n; i++) {
+    if (i === j) continue;
+    const newOther = reserves[i] + net;
+    newReserves[i] = newOther;
+    acc = mulDivCeil(acc, reserves[i], newOther);
+  }
+  newReserves[j] = acc;
+  const sharesOut = reserves[j] + net - acc;
+  if (sharesOut <= 0n) throw new MathError("invalid input");
+  return { sharesOut, fee, net, newReserves };
+}
+
+export interface CatSellQuote {
+  sharesIn: bigint;
+  fee: bigint;
+  gross: bigint;
+  newReserves: bigint[];
+}
+
+/**
+ * Sell `outcomeIndex` for an exact `collateralOut` (Gnosis-style, so no
+ * square root on-chain). Mirrors math_categorical.rs::calc_sell.
+ */
+export function catCalcSell(
+  reserves: bigint[],
+  outcomeIndex: number,
+  collateralOut: bigint,
+  feeBps: bigint,
+): CatSellQuote {
+  const n = catN(reserves);
+  const j = catIndex(n, outcomeIndex);
+  if (collateralOut <= 0n || feeBps >= BPS) throw new MathError("invalid input");
+  const gross = mulDivCeil(collateralOut, BPS, BPS - feeBps);
+  const fee = gross - collateralOut;
+  const newReserves = [...reserves];
+  let acc = reserves[j];
+  for (let i = 0; i < n; i++) {
+    if (i === j) continue;
+    if (reserves[i] <= gross) throw new MathError("insufficient liquidity");
+    const newOther = reserves[i] - gross;
+    newReserves[i] = newOther;
+    acc = mulDivCeil(acc, reserves[i], newOther);
+  }
+  newReserves[j] = acc;
+  const sharesIn = acc + gross - reserves[j];
+  if (sharesIn <= 0n) throw new MathError("invalid input");
+  return { sharesIn, fee, gross, newReserves };
+}
+
+/**
+ * Spot price of every outcome in bps, `p_j = (1/r_j) / Σ(1/r_i)` evaluated
+ * on integer reciprocals. Each price floors, so the n prices sum to at most
+ * BPS and at least BPS - n (display-only; never trade math). Mirrors
+ * math_categorical.rs::prices_bps.
+ */
+export function catPrices(reserves: bigint[]): bigint[] {
+  const n = catN(reserves);
+  const recs = reserves.slice(0, n).map((r) => PRICE_SCALE / r);
+  let total = 0n;
+  for (const rec of recs) total += rec;
+  if (total <= 0n) throw new MathError("insufficient liquidity");
+  return recs.map((rec) => mulDivFloor(BPS, rec, total));
+}
+
+export interface CatSeed {
+  reserves: bigint[];
+  creatorShares: bigint[];
+}
+
+/**
+ * Open a pool at the requested probabilities: each reserve is
+ * `seed * pMin / p_i` (floored), the creator keeps `seed - r_i` of every
+ * outcome. `probsBps` must have length 2..=MAX_MARKET_OUTCOMES, every entry
+ * >= MIN_PROB_BPS, and the entries must sum to exactly BPS. Mirrors
+ * math_categorical.rs::seed_reserves.
+ */
+export function catSeed(seed: bigint, probsBps: number[]): CatSeed {
+  const n = probsBps.length;
+  if (n < 2 || n > MAX_MARKET_OUTCOMES || seed <= 0n) throw new MathError("invalid input");
+  let sum = 0;
+  for (const p of probsBps) {
+    if (BigInt(p) < MIN_PROB_BPS) throw new MathError("invalid input");
+    sum += p;
+  }
+  if (sum !== 10_000) throw new MathError("invalid input");
+  const pMin = BigInt(Math.min(...probsBps));
+  const reserves: bigint[] = [];
+  const creatorShares: bigint[] = [];
+  for (const p of probsBps) {
+    const r = mulDivFloor(seed, pMin, BigInt(p));
+    if (r <= 0n) throw new MathError("invalid input");
+    reserves.push(r);
+    creatorShares.push(seed - r);
+  }
+  return { reserves, creatorShares };
+}
+
+/**
+ * Collateral value of one holder's per-outcome balances once final.
+ * `resolved = w` pays the winning balance; `resolved = null` (void) pays
+ * `floor(Σ balances / n)`. Every complete set is worth exactly 1 and every
+ * rounding floors, so the total paid across holders never exceeds
+ * setsMinted. Mirrors math_categorical.rs::settle_value.
+ */
+export function catSettleValue(resolved: number | null, balances: bigint[]): bigint {
+  const n = balances.length;
+  if (n < 2 || n > MAX_MARKET_OUTCOMES) throw new MathError("invalid input");
+  if (resolved === null) {
+    let sum = 0n;
+    for (const b of balances) {
+      if (b < 0n) throw new MathError("invalid input");
+      sum += b;
+    }
+    return sum / BigInt(n);
+  }
+  catIndex(n, resolved);
+  return balances[resolved];
+}
+
+// ---------------------------------------------------------------------------
+// Scalar (range) market settlement — mirrors math.rs::scalarPayout, which
+// backs the Rust `Settlement::Scalar(p)` variant. `scalarPayout(BPS, ...)`
+// equals YES and `(0, ...)` equals NO.
+// ---------------------------------------------------------------------------
+
+/**
+ * Collateral value of a (yes, no) share pair when the resolved value maps
+ * to `payoutLongBps` LONG per complete set. Both legs floor independently,
+ * so no holder ever beats their exact rational share.
+ */
+export function scalarPayout(payoutLongBps: bigint, yes: bigint, no: bigint): bigint {
+  return (yes * payoutLongBps) / BPS + (no * (BPS - payoutLongBps)) / BPS;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic fee schedule — mirrors math.rs::effectiveFeeBps. Deterministic
+// integer math shared with the contract and model/fpmm_model.py via
+// model/fee_fixtures.json; every floor rounds toward the trader (a lower
+// fee never harms the pool, whose protection is calc* rounding).
+// ---------------------------------------------------------------------------
+
+export const MAX_RAMP_SECS = 30n * 86_400n;
+export const MAX_SKEW_MULT_BPS = 1_000n;
+
+export interface FeeSchedule {
+  baseBps: bigint;
+  maxBps: bigint;
+  rampSecs: bigint;
+  skewMultBps: bigint;
+}
+
+/**
+ * Fee in bps for a trade at `now` with the given pre-trade reserves:
+ * `min(max, base + timeRamp + skew)`. The ramp adds up to `max - base`
+ * linearly over the last `rampSecs` before close (0 disables it, and any
+ * timestamp at or past close clamps to the full ramp); the skew term adds
+ * `skewMultBps` per 1000 bps of distance from a 50/50 price. Guaranteed
+ * `base <= result <= max`, and `max < BPS` is validated so `calcSell` is
+ * always well-defined.
+ */
+export function effectiveFeeBps(
+  schedule: FeeSchedule,
+  now: bigint,
+  closeTime: bigint,
+  rYes: bigint,
+  rNo: bigint,
+): bigint {
+  if (schedule.baseBps > schedule.maxBps || schedule.maxBps >= BPS) {
+    throw new MathError("invalid input");
+  }
+  let t = 0n;
+  if (schedule.rampSecs !== 0n) {
+    const intoRamp =
+      now >= closeTime
+        ? schedule.rampSecs
+        : closeTime - now >= schedule.rampSecs
+          ? 0n
+          : schedule.rampSecs - (closeTime - now);
+    t = mulDivFloor(intoRamp, schedule.maxBps - schedule.baseBps, schedule.rampSecs);
+  }
+  const p = priceYesBps(rYes, rNo);
+  const midpoint = BPS / 2n;
+  const d = p >= midpoint ? p - midpoint : midpoint - p;
+  const skew = mulDivFloor(d, schedule.skewMultBps, 1_000n);
+  const total = schedule.baseBps + t + skew;
+  return total > schedule.maxBps ? schedule.maxBps : total;
+}

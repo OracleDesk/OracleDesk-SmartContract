@@ -8,21 +8,33 @@ responsibilities and the invariants that hold across them.
 
 ### market-core
 
-The hub: every binary market lives here as one entry in persistent storage,
-keyed by `market_id`. Pricing is a Gnosis-style constant-product FPMM over
-internal YES/NO share accounting — no external LP token, no AMM pool
-contract per market. `contracts/market-core/src/math.rs` is the entire
-pricing engine, pure integer arithmetic, no `Env` dependency, so it's
+The hub: every market — binary, categorical, scalar — lives here as one
+entry in persistent storage, keyed by `market_id`. Pricing is a Gnosis-style
+constant-product FPMM over internal share accounting — no external LP token,
+no AMM pool contract per market. `contracts/market-core/src/math.rs` is the
+entire pricing engine, pure integer arithmetic, no `Env` dependency, so it's
 natively unit-testable and mirrored line-for-line in
 [`model/fpmm_model.py`](../model/fpmm_model.py) and
 `agents/core/fpmm.ts` for property testing and off-chain quoting.
+
+**Three market kinds, one id space.** A market is binary (the original
+`Market`), categorical (#6, 2–8 outcomes), or scalar (#7, a range bet on a
+price feed). The XDR of the original `Market` struct is never changed: each
+new kind is *side storage* keyed by the same `market_id` (`DataKey::Kind`
+records which kind an id is; `market_kind` exposes it), and new enum
+variants are appended after the existing tags so deployed readers keep
+decoding old values. Readers dispatch on `market_kind` first: `get_market`
+returns `MarketNotFound` for a categorical id, whose shape lives in
+`get_cat_market`. See [ADR 0005](adr/0005-market-kind-storage-split.md) for
+the full argument and the alternatives rejected.
 
 **Solvency invariant** (holds after every state transition — see the test
 suite for the ones exercised): the contract's own SEP-41 token balance for a
 market equals `sets_minted + fees_accrued + lp_fees` (`fees_accrued` is the
 protocol's pending share of trading fees, `lp_fees` the creator's — see the
 fee split below), and `reserve_yes + Σ(user yes positions) == sets_minted`
-(symmetrically for `no`).
+(symmetrically for `no`). The same invariant holds for categorical markets
+on `CatMarket`.
 
 **Fee split and recipient snapshot.** `create_market` snapshots a
 `FeeTerms { recipient, protocol_share_bps }` side entry per market, so
@@ -41,6 +53,30 @@ fully backward compatible, no migration transaction needed. The separate
 LP balance (rather than adding fees to the reserves) is deliberate: it does
 not move `k` or the price and maps directly onto the per-LP fee accumulator
 of the future multi-LP design ([wave-issue 02](wave-issues/02-multi-lp-liquidity.md)).
+
+**Dynamic fee schedules (#9).** A market can charge a scheduled fee instead
+of a flat one. `FeeSchedule { base_bps, max_bps, ramp_secs, skew_mult_bps }`
+is snapshotted at creation — from `DataKey::DefaultFeeSchedule` (set by the
+admin's `set_default_fee_schedule`, which only affects markets created after
+it) or from an explicit `create_market_with_fees`, whose schedule is
+validated against the default's `max_bps` cap before a market id is
+allocated. The effective fee is recomputed per trade by
+`math::effective_fee_bps(schedule, now, close_time, r_yes, r_no)`:
+`min(max_bps, base_bps + ramp + skew)`, where `ramp` rises linearly from
+`base_bps` to `max_bps` over the last `ramp_secs` before `close_time` (and
+stays at `max_bps` afterwards), and `skew` adds `skew_mult_bps` per 1000 bps
+the pre-trade YES price sits away from 50/50. Every floor rounds in the
+trader's favour; the contract layer bounds `max_bps <= MAX_FEE_BPS`,
+`ramp_secs <= MAX_RAMP_SECS` (30 days) and `skew_mult_bps <= MAX_SKEW_MULT_BPS`
+(1000), while the pure math only requires `base_bps <= max_bps < BPS`.
+`buy` / `sell` / `quote_buy` / `quote_sell`, the `_v2` twins, and the fee
+split all use the effective fee; `current_fee_bps` exposes it now, and
+`quote_buy_at(market_id, outcome, collateral_in, at_timestamp)` quotes with
+the fee that will apply at a *future* timestamp — the client-side latency
+hedge described in [frontend-integration.md](frontend-integration.md).
+`TradeV2` carries the realised `fee_bps` next to the existing `Trade` event.
+Legacy markets have no schedule and keep their flat `fee_bps`; categorical
+markets always charge the flat fee.
 
 **Trade bounds and circuit breakers.** Two layers of protection beyond the
 share-count slippage parameters:
@@ -86,14 +122,50 @@ emits `LpTransferred`. Both preserve the solvency invariant by
 construction; the position mapping is unchanged down to the "remove
 zero entries" rule.
 
+**Categorical markets (#6).** `create_categorical_market` opens an
+n-outcome market (`2 <= n <= 8`, `MAX_MARKET_OUTCOMES`) seeded from
+`probs_bps` — one probability per outcome, each within
+`MIN_PROB_BPS..=MAX_PROB_BPS` and summing to exactly 10000; the creator/LP
+receives the leftover shares of the likelier outcomes. The pool is the
+generalized FPMM: reserves `[r_0..r_n]` with the binary invariant
+`k = r_yes * r_no` replaced by `k = Π(r_i)`; a `buy_cat` of outcome `i`
+moves `r_i` in and renormalizes the other reserves down so the product is
+preserved (`sell_cat` is the inverse). The math uses the same iterative
+floor/ceil scheme as the binary path — rounding never pays the trader and
+`k` never decreases — and is property-tested in all three mirrors.
+`get_prices_cat` reports implied probabilities that sum to within `n` of
+10000 bps; settlement pays one unit per winning share and a void pays half
+per share, exactly like the binary path. Categorical markets keep a flat
+snapshotted `fee_bps` (no dynamic schedule) and no price-based breakers;
+collateral, pause switch, `FeeTerms` and the `resolution_hash` commitment
+are shared with `create_market`. Worst case (`n = 8`) `buy_cat` costs
+444,604 instructions / 64,092 B memory / 1,640 write bytes across 5 storage
+entries — under 60% of the network limits, asserted by
+`cat_eight_outcomes_resource_budget`. Events: `CatTrade`,
+`CatMarketResolved`.
+
+**Scalar markets (#7).** `create_scalar_market` is a binary market
+(LONG = YES, SHORT = NO) plus a `ScalarMeta { lower, upper }` display side
+entry — trading, fees (dynamic schedules included), breakers and the whole
+solvency story are inherited unchanged. Resolution writes
+`MarketStatus::ResolvedScalar(payout_long_bps)` (an appended status variant;
+0 = full SHORT, 10000 = full LONG) via `resolve_scalar`, and redemption
+pays each holder `floor(yes·p / 10000) + floor(no·(10000 − p) / 10000)` —
+both legs floor, so total payouts stay within `sets_minted` and a scalar
+market cannot overpay. `get_scalar_meta` exposes the bounds; the meta is
+display-only and never affects payouts.
+
 **Resolution commitment**: `resolution_hash` is fixed at `create_market`
 time — see [ADR 0001](adr/0001-resolution-commitment.md) for why.
 
-Lifecycle: `create_market` → `buy`/`sell` (while open; `buy_v2`/`sell_v2`
-with bounds) → `resolve` or `void_market` (resolver-only) → `redeem` per
-holder, `claim_pool_remainder` for the creator/LP, `sweep_fees`
-(permissionless) to the snapshotted fee recipient. Positions and LP
-ownership can change hands at any point via `transfer_position` /
+Lifecycle: `create_market` / `create_market_with_fees` /
+`create_categorical_market` / `create_scalar_market` → `buy`/`sell`
+(`buy_v2`/`sell_v2` with bounds; `buy_cat`/`sell_cat`) while open →
+`resolve` / `resolve_cat` / `resolve_scalar` or `void_market`
+(resolver-only) → `redeem` / `redeem_cat` per holder,
+`claim_pool_remainder` / `claim_pool_remainder_cat` for the creator/LP,
+`sweep_fees` (permissionless) to the snapshotted fee recipient. Positions
+and LP ownership can change hands at any point via `transfer_position` /
 `transfer_lp`.
 
 ### resolver
@@ -112,11 +184,26 @@ Independent resolution modes, all ultimately calling
   signatures to `submit_signatures` in one transaction; the weight threshold
   starts the same dispute window. `cancel_proposal` moves the market to a new
   round, invalidating earlier signatures. Message format: ADR 0001.
+- **Categorical signers**: the n-outcome counterpart of Attested.
+  `register_cat_signer_spec` reveals a `CategoricalSigners` spec (signer
+  set, `threshold`, `dispute_window`, and the committed `outcome_count`);
+  signers call `attest_cat(market_id, outcome_index)` — the first index to
+  reach `threshold` attestations becomes the proposal and opens the dispute
+  window — and anyone calls `finalize_cat` after the window to resolve the
+  winning index through market-core's `resolve_cat`. The guardian's
+  `cancel_proposal` clears a categorical proposal too.
+- **Scalar price**: `register_scalar_spec` reveals a `Scalar` spec
+  (`ScalarPriceConfig`: a Reflector feed plus `lower` / `upper`). After
+  `close_time`, `resolve_scalar_price` reads the feed — a non-positive
+  reading is `InvalidPrice` (a broken feed, not a value at the bottom of the
+  range), with the same staleness window as `resolve_price` — clamps it into
+  `[lower, upper]` and settles the fractional LONG payout
+  `(clamped − lower) / (upper − lower)` in bps, flooring toward the pool.
 
-Neither mode can be configured until the revealed spec's hash matches the
-market's commitment (`register_price_spec` / `register_signer_spec` — see
-ADR 0001). A guardian can also `guardian_void_market` an unresolvable
-market directly.
+No rule can be configured until the revealed spec's hash matches the
+market's commitment, via the `register_*_spec` entrypoint matching the
+committed variant — see ADR 0001. A guardian can also `guardian_void_market`
+an unresolvable market directly.
 
 #### Bonded disputes (`SignersDisputable`)
 
@@ -167,9 +254,9 @@ off.
 
 Holds the agents' pooled USDC and is the *only* path that spends it: an
 agent calls `agent_create_market` / `agent_buy` / `agent_sell` /
-`agent_buy_v2` / `agent_sell_v2`, the treasury checks its own
-per-trade/per-market/daily caps, then calls `market-core` itself as the
-trader/creator. This means the caps are a real on-chain limit on what the
+`agent_buy_v2` / `agent_sell_v2` (and `agent_buy_cat`, the categorical
+forwarder), the treasury checks its own per-trade/per-market/daily caps,
+then calls `market-core` itself as the trader/creator. This means the caps are a real on-chain limit on what the
 automated agent can deploy — an agent's own key calling `market-core`
 directly would just be trading its own separate funds, not bypassing a cap
 on the treasury's money. The `*_v2` twins forward the same caps plus
@@ -247,7 +334,9 @@ one of the seeded `docs/wave-issues/`.
   is the only part that knows about Soroban, wrapping the generated
   bindings with a dry-run/live switch. The trader always quotes
   (`quote_buy`) immediately before submitting and derives non-zero
-  `min_shares_out` / `limit_price_bps` bounds plus a deadline from it.
+  `min_shares_out` / `limit_price_bps` bounds plus a deadline from it. In
+  live mode it reads `get_market` and `current_fee_bps` first, and sizes the
+  trade under the market's price-impact breaker when one is configured.
 - **packages/bindings/**: generated TypeScript clients (`scripts/gen-bindings.sh`).
 
 ## Known limitations (see docs/STATUS.md for the full, current list)
