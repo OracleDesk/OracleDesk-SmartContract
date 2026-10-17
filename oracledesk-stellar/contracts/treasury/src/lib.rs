@@ -15,7 +15,8 @@ mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
 use market_core::{
-    Category, Client as MarketCoreClient, Error as MarketCoreError, MarketStatus, Outcome,
+    Category, Client as MarketCoreClient, Error as MarketCoreError, MarketStatus, OperatingMode,
+    Outcome,
 };
 
 pub mod correlation;
@@ -156,6 +157,21 @@ pub struct MarketExposure {
 pub struct DailyUsage {
     pub day_start: u64,
     pub amount: i128,
+}
+
+/// Which market-core entrypoint a treasury agent call would reach, used only
+/// to pre-check market-core's `OperatingMode` (#20). Deliberately not a
+/// `#[contracttype]`: it never crosses a contract boundary, so it stays out of
+/// the spec and the generated bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarketCoreAction {
+    Create,
+    Buy,
+    Sell,
+    Redeem,
+    ClaimRemainder,
+    ClaimLpFees,
+    SweepFees,
 }
 
 /// Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400
@@ -319,13 +335,7 @@ pub struct BlendPositions {
 
 #[soroban_sdk::contractclient(name = "BlendPoolClient")]
 pub trait BlendPool {
-    fn submit(
-        env: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<BlendRequest>,
-    );
+    fn submit(env: Env, from: Address, spender: Address, to: Address, requests: Vec<BlendRequest>);
     fn get_positions(env: Env, address: Address) -> BlendPositions;
 }
 
@@ -458,6 +468,11 @@ pub enum Error {
     CategoryCapExceeded = 29,
     /// Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 30,
+    /// market-core's `OperatingMode` (#20) forbids the action the agent asked
+    /// for. Reported here rather than bubbling market-core's code, which
+    /// would collide with treasury's own numbering (market-core's `Paused` is
+    /// 2, the same number as treasury's `Unauthorized`).
+    MarketCoreRestricted = 44,
 }
 
 #[contractevent]
@@ -1617,6 +1632,7 @@ impl Treasury {
         Self::assert_not_paused(&env)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_CREATE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Create)?;
         if seed_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1784,6 +1800,7 @@ impl Treasury {
     pub fn redeem(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Redeem)?;
         Self::settle_redeem(&env, &global.market_core, market_id)
     }
 
@@ -1792,6 +1809,11 @@ impl Treasury {
     pub fn claim_pool_remainder(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
+        Self::assert_market_core_allows(
+            &env,
+            &global.market_core,
+            MarketCoreAction::ClaimRemainder,
+        )?;
         Self::settle_claim(&env, &global.market_core, market_id)
     }
 
@@ -1826,6 +1848,7 @@ impl Treasury {
     pub fn agent_claim_lp_fees(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::ClaimLpFees)?;
         let amount = MarketCoreClient::new(&env, &global.market_core).claim_lp_fees(&market_id);
         Self::record_return(&env, &global.market_core, market_id, amount)?;
         Ok(amount)
@@ -1841,6 +1864,7 @@ impl Treasury {
     pub fn collect_market_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         Self::require_admin(&env)?;
         let global = Self::load_global(&env)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::SweepFees)?;
         let amount = MarketCoreClient::new(&env, &global.market_core).sweep_fees(&market_id);
         FeesCollected { market_id, amount }.publish(&env);
         Ok(amount)
@@ -2335,6 +2359,60 @@ impl Treasury {
         Ok(())
     }
 
+    /// The market-core actions the treasury takes on its agent's behalf,
+    /// mirroring market-core's own matrix (`assert_mode_allows` in
+    /// `contracts/market-core/src/lib.rs`, table in `docs/architecture.md`).
+    /// Internal only, never part of a public signature. Market-core stays the
+    /// enforcement authority — this table only decides what the treasury is
+    /// willing to *forward*, so a drift here costs an extra round trip, not
+    /// safety.
+    fn market_core_allows(mode: OperatingMode, action: MarketCoreAction) -> bool {
+        match (mode, action) {
+            (OperatingMode::Normal, _) => true,
+            (
+                OperatingMode::ReduceOnly,
+                MarketCoreAction::Create | MarketCoreAction::Buy | MarketCoreAction::SweepFees,
+            ) => false,
+            (OperatingMode::ReduceOnly, _) => true,
+            (
+                OperatingMode::SettleOnly,
+                MarketCoreAction::Create
+                | MarketCoreAction::Buy
+                | MarketCoreAction::Sell
+                | MarketCoreAction::SweepFees,
+            ) => false,
+            (OperatingMode::SettleOnly, _) => true,
+            (OperatingMode::Halted, _) => false,
+        }
+    }
+
+    /// Pre-checks market-core's emergency mode (#20) before the treasury
+    /// forwards an agent action, so the agent sees treasury's own
+    /// `MarketCoreRestricted` (44) instead of a nested market-core code.
+    ///
+    /// Exactly one cross-contract read (`get_mode`) — callers pass the
+    /// market-core address from the config they already loaded, so this never
+    /// re-reads it. A market-core that cannot be read at all is treated as
+    /// restricted: the treasury must not deploy capital into a contract it
+    /// cannot interrogate. Deliberately *not* wired into the `legacy_*`
+    /// settle paths: a pre-#20 legacy core has no `get_mode` to read, and
+    /// upstream added those paths precisely so legacy positions are never
+    /// stranded.
+    fn assert_market_core_allows(
+        env: &Env,
+        core: &Address,
+        action: MarketCoreAction,
+    ) -> Result<(), Error> {
+        let mode = match MarketCoreClient::new(env, core).try_get_mode() {
+            Ok(Ok(mode)) => mode,
+            _ => return Err(Error::MarketCoreRestricted),
+        };
+        if Self::market_core_allows(mode, action) {
+            return Ok(());
+        }
+        Err(Error::MarketCoreRestricted)
+    }
+
     fn put_persistent<V: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
         env.storage().persistent().set(key, value);
         env.storage()
@@ -2602,6 +2680,7 @@ impl Treasury {
         Self::assert_not_paused(&env)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Buy)?;
         Self::check_trade_size(&global, &policy, collateral_in)?;
         Self::ensure_unreserved(&env, &global, collateral_in)?;
 
@@ -2675,6 +2754,7 @@ impl Treasury {
         }
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Sell)?;
         let prices = Self::load_price_policy(&env);
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(&env, &global.market_core);
@@ -3345,13 +3425,7 @@ impl Treasury {
         Ok(())
     }
 
-    fn authorize_transfer(
-        env: &Env,
-        token: &Address,
-        from: &Address,
-        to: &Address,
-        amount: i128,
-    ) {
+    fn authorize_transfer(env: &Env, token: &Address, from: &Address, to: &Address, amount: i128) {
         env.authorize_as_current_contract(vec![
             env,
             InvokerContractAuthEntry::Contract(SubContractInvocation {
@@ -3389,7 +3463,10 @@ impl Treasury {
         }
     }
 
-    fn validate_creation_policy(global: &GlobalConfig, policy: &CreationPolicy) -> Result<(), Error> {
+    fn validate_creation_policy(
+        global: &GlobalConfig,
+        policy: &CreationPolicy,
+    ) -> Result<(), Error> {
         if policy.max_seed <= 0 || policy.max_seed > global.max_market {
             return Err(Error::InvalidConfig);
         }
@@ -3452,7 +3529,10 @@ impl Treasury {
             let last_idx = active_buckets.len() - 1;
             let mut last = active_buckets.get(last_idx).unwrap();
             if last.bucket_start == cur_start {
-                last.count = last.count.checked_add(1).ok_or(Error::CreationRateExceeded)?;
+                last.count = last
+                    .count
+                    .checked_add(1)
+                    .ok_or(Error::CreationRateExceeded)?;
                 active_buckets.set(last_idx, last);
                 updated = true;
             }
@@ -3500,7 +3580,9 @@ impl Treasury {
     }
 
     fn save_pnl(env: &Env, market_id: u64, pnl: &MarketPnl) {
-        env.storage().persistent().set(&DataKey::Pnl(market_id), pnl);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pnl(market_id), pnl);
         Self::bump_persistent(env, &DataKey::Pnl(market_id));
     }
 
@@ -3672,7 +3754,11 @@ impl Treasury {
         if liquid >= needed {
             return Ok(());
         }
-        let venue: YieldVenue = match env.storage().instance().get::<_, YieldVenue>(&DataKey::YieldVenue) {
+        let venue: YieldVenue = match env
+            .storage()
+            .instance()
+            .get::<_, YieldVenue>(&DataKey::YieldVenue)
+        {
             Some(v) if v.enabled => v,
             _ => return Err(Error::InsufficientBalance),
         };
@@ -5052,11 +5138,11 @@ mod test {
     }
 
     /// Stand-in market-core exposing only what a price-checked buy needs:
-    /// `get_price` (a flat 50%), `quote_buy` and `buy`, which pulls the
-    /// collateral like the real one and returns one share per stroop. If
-    /// `agent_buy` made any other market-core call (a valuation read such as
-    /// `get_market`/`get_position` on the hot path), it would fail against
-    /// this contract.
+    /// `get_price` (a flat 50%), `quote_buy`, `get_mode` (the #20 pre-check)
+    /// and `buy`, which pulls the collateral like the real one and returns
+    /// one share per stroop. If `agent_buy` made any other market-core call (a
+    /// valuation read such as `get_market`/`get_position` on the hot path), it
+    /// would fail against this contract.
     #[contract]
     struct BuyOnlyMarketCore;
 
@@ -5068,6 +5154,13 @@ mod test {
 
         pub fn calls(env: Env) -> u32 {
             env.storage().instance().get(&1u32).unwrap_or(0)
+        }
+
+        /// View for the #20 mode pre-check: always `Normal`, and it does not
+        /// touch the `calls` counter, so `proxy.calls()` keeps measuring the
+        /// trade path alone.
+        pub fn get_mode(_env: Env) -> OperatingMode {
+            OperatingMode::Normal
         }
 
         pub fn get_price(_env: Env, _market_id: u64, _outcome: Outcome) -> u32 {
@@ -7464,9 +7557,7 @@ mod test {
         let f = fixture_with_policy(100 * USDC, 500 * USDC, 500 * USDC, policy);
 
         for day in 0..30 {
-            f.env
-                .ledger()
-                .set_timestamp(1_000 + (day as u64) * 86_400);
+            f.env.ledger().set_timestamp(1_000 + (day as u64) * 86_400);
             let close = f.env.ledger().timestamp() + 1000;
             let mut byte_arr = [0u8; 32];
             byte_arr[0] = (day + 1) as u8;
@@ -7823,5 +7914,215 @@ mod test {
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
-}
 
+    // ----- #20: market-core's emergency mode is pre-checked ----------------
+
+    /// An agent asking for something market-core's mode forbids gets
+    /// treasury's own `MarketCoreRestricted` (44), not market-core's code 2
+    /// (which is treasury's `Unauthorized`) or code 23.
+    #[test]
+    fn agent_buy_rejected_with_market_core_restricted_in_reduce_only() {
+        let f = fixture();
+        f.market_core.set_mode(&OperatingMode::ReduceOnly);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        // Creating a market is new risk as well.
+        assert_eq!(
+            f.treasury.try_agent_create_market(
+                &f.agent,
+                &BytesN::from_array(&f.env, &[13u8; 32]),
+                &BytesN::from_array(&f.env, &[113u8; 32]),
+                &String::from_str(&f.env, "ipfs://agent-created"),
+                &Category::Macro,
+                &MARKET_CLOSE,
+                &(100 * USDC),
+                &5000u32
+            ),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        // No cap was consumed by the rejected calls.
+        assert_eq!(f.treasury.daily_usage().amount, 0);
+
+        // The treasury's own pause still wins: a paused treasury reports
+        // `Paused` (10) even when market-core is `Halted`.
+        f.treasury.set_paused(&true);
+        f.market_core.set_mode(&OperatingMode::Halted);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::Paused))
+        );
+    }
+
+    #[test]
+    fn agent_sell_allowed_in_reduce_only() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0);
+
+        f.market_core.set_mode(&OperatingMode::ReduceOnly);
+        assert!(f
+            .treasury
+            .try_agent_sell(
+                &f.agent,
+                &f.market_id,
+                &Outcome::Yes,
+                &(5 * USDC),
+                &i128::MAX
+            )
+            .is_ok());
+
+        // `SettleOnly` closes the exit path too.
+        f.market_core.set_mode(&OperatingMode::SettleOnly);
+        assert_eq!(
+            f.treasury
+                .try_agent_sell(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &i128::MAX),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+
+        // `Halted` restricts everything, including the payout paths — and the
+        // pre-check fires before market-core is called, so an unfinalized
+        // market is not even looked at.
+        f.market_core.set_mode(&OperatingMode::Halted);
+        assert_eq!(
+            f.treasury.try_redeem(&f.agent, &f.market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            f.treasury.try_claim_pool_remainder(&f.agent, &f.market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+    }
+
+    /// Settlement keeps working while trading is frozen, so the treasury can
+    /// still take its payouts.
+    #[test]
+    fn redeem_and_claim_remainder_allowed_in_settle_only() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0);
+        f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+
+        f.market_core.set_mode(&OperatingMode::SettleOnly);
+        assert!(f.treasury.try_redeem(&f.agent, &f.market_id).is_ok());
+        assert_eq!(
+            f.market_core.get_position(&f.market_id, &f.treasury_id),
+            market_core::Position { yes: 0, no: 0 }
+        );
+    }
+
+    /// All 4 modes × 7 forwarded actions of the treasury-side mirror, checked
+    /// against the table written out independently here (and in
+    /// `docs/architecture.md`) rather than against `market_core_allows` itself.
+    #[test]
+    fn market_core_matrix_mirror_is_the_documented_one() {
+        let documented = |mode: OperatingMode, action: MarketCoreAction| match action {
+            MarketCoreAction::Create | MarketCoreAction::Buy | MarketCoreAction::SweepFees => {
+                mode == OperatingMode::Normal
+            }
+            MarketCoreAction::Sell => {
+                matches!(mode, OperatingMode::Normal | OperatingMode::ReduceOnly)
+            }
+            MarketCoreAction::Redeem
+            | MarketCoreAction::ClaimRemainder
+            | MarketCoreAction::ClaimLpFees => mode != OperatingMode::Halted,
+        };
+        let cells = [
+            (MarketCoreAction::Create, "create"),
+            (MarketCoreAction::Buy, "buy"),
+            (MarketCoreAction::Sell, "sell"),
+            (MarketCoreAction::Redeem, "redeem"),
+            (MarketCoreAction::ClaimRemainder, "claim_pool_remainder"),
+            (MarketCoreAction::ClaimLpFees, "claim_lp_fees"),
+            (MarketCoreAction::SweepFees, "sweep_fees"),
+        ];
+        let mut checked = 0u32;
+        for mode in [
+            OperatingMode::Normal,
+            OperatingMode::ReduceOnly,
+            OperatingMode::SettleOnly,
+            OperatingMode::Halted,
+        ] {
+            for (action, name) in cells {
+                checked += 1;
+                let allows = Treasury::market_core_allows(mode, action);
+                assert_eq!(allows, documented(mode, action), "{mode:?} / {name}");
+            }
+        }
+        assert_eq!(checked, 4 * 7, "the mirror test must stay exhaustive");
+    }
+
+    /// The two fee paths follow the same table: sweeping protocol fees is
+    /// protocol revenue (stopped first, in every non-Normal mode), while
+    /// claiming LP fees is the creator's own money (only stopped when
+    /// market-core halts payouts entirely). The market here is agent-created,
+    /// so the treasury *is* its creator and `claim_lp_fees` is its own claim
+    /// (see `agent_claims_lp_fees_for_own_market` for the same setup).
+    #[test]
+    fn fee_paths_follow_market_core_matrix() {
+        let f = fixture_with_caps(150 * USDC, 300 * USDC, 300 * USDC);
+        // Split the fee 50/50 so both the protocol and the LP side have a real
+        // balance to sweep or claim.
+        f.market_core.set_protocol_fee_share_bps(&5000u32);
+        let market_id = f.treasury.agent_create_market(
+            &f.agent,
+            &BytesN::from_array(&f.env, &[17u8; 32]),
+            &BytesN::from_array(&f.env, &[117u8; 32]),
+            &String::from_str(&f.env, "ipfs://mode-fee-paths"),
+            &Category::Macro,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        );
+        let trader = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &f.token).mint(&trader, &(100 * USDC));
+        f.market_core
+            .buy(&trader, &market_id, &Outcome::Yes, &(10 * USDC), &0_i128);
+        let accrued = f.market_core.get_market(&market_id).fees_accrued;
+        assert!(accrued > 0);
+
+        // ReduceOnly: the LP gets its fees, the protocol does not get theirs.
+        f.market_core.set_mode(&OperatingMode::ReduceOnly);
+        assert_eq!(
+            f.treasury.try_collect_market_fees(&market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert!(f
+            .treasury
+            .try_agent_claim_lp_fees(&f.agent, &market_id)
+            .is_ok());
+
+        // SettleOnly: unchanged — payouts yes, protocol revenue no.
+        f.market_core.set_mode(&OperatingMode::SettleOnly);
+        assert_eq!(
+            f.treasury.try_collect_market_fees(&market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert!(f
+            .treasury
+            .try_agent_claim_lp_fees(&f.agent, &market_id)
+            .is_ok());
+        // Nothing has been swept, so the accrual is still whole.
+        assert_eq!(f.market_core.get_market(&market_id).fees_accrued, accrued);
+
+        // Halted: even the LP claim is refused, with treasury's own code.
+        f.market_core.set_mode(&OperatingMode::Halted);
+        assert_eq!(
+            f.treasury.try_agent_claim_lp_fees(&f.agent, &market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            f.treasury.try_collect_market_fees(&market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+
+        // Normal again: the full accrual moves in one sweep.
+        f.market_core.set_mode(&OperatingMode::Normal);
+        assert_eq!(f.treasury.collect_market_fees(&market_id), accrued);
+        assert_eq!(f.market_core.get_market(&market_id).fees_accrued, 0);
+    }
+}

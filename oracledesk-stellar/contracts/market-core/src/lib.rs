@@ -58,6 +58,44 @@ pub enum MarketStatus {
     Void,
 }
 
+/// The contract-wide emergency state, replacing the old `paused` boolean
+/// (#20). Each entrypoint is mapped to the modes it may run in by
+/// `assert_mode_allows`; the table lives in `docs/architecture.md` and is
+/// locked in by the `mode_matrix_is_enforced` test.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatingMode {
+    /// Everything is allowed.
+    Normal,
+    /// No new risk: creation and buys stop, but holders can still exit via
+    /// `sell`, and resolution/settlement keeps working.
+    ReduceOnly,
+    /// Trading is over: only resolution, voiding and payout of what already
+    /// exists is allowed. Protocol fee revenue is *not* withdrawn (`sweep_fees`
+    /// is blocked), so the shared collateral balance is never reduced.
+    SettleOnly,
+    /// Nothing state-changing runs, except the admin moving to another mode.
+    Halted,
+}
+
+/// The state-changing entrypoints, as seen by the mode matrix. Internal only:
+/// deliberately not a `#[contracttype]`, so it never reaches the spec or the
+/// generated bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Action {
+    Create,
+    Buy,
+    Sell,
+    Resolve,
+    Void,
+    Redeem,
+    ClaimRemainder,
+    /// The creator-side counterpart of `ClaimRemainder`: it pays out LP fees,
+    /// i.e. user funds, so it follows the same row.
+    ClaimLpFees,
+    SweepFees,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Market {
@@ -170,6 +208,11 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // Appended last (#20): instance keys are XDR-encoded enum discriminants,
+    // so existing variants must never be reordered or inserted before them.
+    // The graduated emergency state; when absent (an instance deployed
+    // before #20) it is derived from `Paused`.
+    Mode,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +251,10 @@ pub enum Error {
     PriceImpactTooHigh = 21,
     /// Cumulative same-ledger movement would exceed `band_bps`.
     PriceBandExceeded = 22,
+    /// The contract's `OperatingMode` forbids this entrypoint (#20). Note
+    /// that `create_market` / `buy` / `sell` while `Halted` still report
+    /// `Paused` (2), so clients matching on that legacy code keep working.
+    ModeRestricted = 23,
 }
 
 impl From<MathError> for Error {
@@ -317,6 +364,15 @@ pub struct ProtocolFeeShareChanged {
     pub new: u32,
 }
 
+/// Emergency-mode transition (#20). Emitted by `set_mode`, and therefore also
+/// by the `set_paused` shim, which delegates to it.
+#[contractevent]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModeChanged {
+    pub old: OperatingMode,
+    pub new: OperatingMode,
+}
+
 /// Positions moved between holders. Indexers that track balances from
 /// `Trade`/`Redeemed` must also apply this event (see docs/architecture.md).
 #[contractevent]
@@ -374,15 +430,50 @@ impl MarketCore {
         s.set(&DataKey::DefaultFeeBps, &default_fee_bps);
         s.set(&DataKey::ProtocolFeeShareBps, &protocol_fee_share_bps);
         s.set(&DataKey::Paused, &false);
+        s.set(&DataKey::Mode, &OperatingMode::Normal);
         s.set(&DataKey::NextId, &0u64);
     }
 
     // ----- admin ----------------------------------------------------------
 
+    /// Legacy one-switch pause (#20 shim): `true` is `Halted`, `false` is
+    /// `Normal`. Delegates to `set_mode`, so it emits `ModeChanged` too.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+        Self::set_mode(
+            env,
+            if paused {
+                OperatingMode::Halted
+            } else {
+                OperatingMode::Normal
+            },
+        )
+    }
+
+    /// Moves the contract to `mode`, gating every state-changing entrypoint by
+    /// the matrix in `docs/architecture.md`. Admin-only; emits `ModeChanged`.
+    ///
+    /// `Halted` blocks payouts, so it is reversible: the admin can always move
+    /// to `SettleOnly` (or `Normal`) and let holders redeem — see the
+    /// `halted_then_settle_only_allows_redeem` test.
+    pub fn set_mode(env: Env, mode: OperatingMode) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Paused, &paused);
+        let old: OperatingMode = Self::mode(&env)?;
+        let s = env.storage().instance();
+        s.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        s.set(&DataKey::Mode, &mode);
+        // Kept in sync so anything still reading the legacy boolean (an older
+        // version of this contract after a downgrade, or a direct storage
+        // reader) sees the same thing as `get_config().paused`.
+        s.set(&DataKey::Paused, &(mode != OperatingMode::Normal));
+        ModeChanged { old, new: mode }.publish(&env);
         Ok(())
+    }
+
+    /// The current emergency mode. Purely additive view (#20); treasury reads
+    /// this to fail fast with its own error instead of bubbling a nested
+    /// market-core code.
+    pub fn get_mode(env: Env) -> Result<OperatingMode, Error> {
+        Self::mode(&env)
     }
 
     /// Affects markets created after the call; existing markets keep their fee.
@@ -471,7 +562,7 @@ impl MarketCore {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::assert_mode_allows(&env, Action::Create)?;
         creator.require_auth();
 
         if close_time <= env.ledger().timestamp() {
@@ -626,7 +717,7 @@ impl MarketCore {
         min_shares_out: i128,
         limit_price_bps: Option<u32>,
     ) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::assert_mode_allows(&env, Action::Buy)?;
         if let Some(limit) = limit_price_bps {
             if limit as i128 > BPS {
                 return Err(Error::InvalidAmount);
@@ -765,7 +856,7 @@ impl MarketCore {
         max_shares_in: i128,
         limit_price_bps: Option<u32>,
     ) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::assert_mode_allows(&env, Action::Sell)?;
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
@@ -837,6 +928,7 @@ impl MarketCore {
 
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::assert_mode_allows(&env, Action::Resolve)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -857,6 +949,7 @@ impl MarketCore {
     /// Invalid or unresolvable market. Allowed any time before finality.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::assert_mode_allows(&env, Action::Void)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -876,6 +969,7 @@ impl MarketCore {
     /// Pays out `holder`'s position for a final market and clears it.
     /// Losing positions clear with a payout of 0.
     pub fn redeem(env: Env, holder: Address, market_id: u64) -> Result<i128, Error> {
+        Self::assert_mode_allows(&env, Action::Redeem)?;
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
@@ -901,6 +995,7 @@ impl MarketCore {
     /// Creator (the LP) withdraws whatever the pool still holds once final,
     /// plus any unclaimed LP fees. Returns the total paid out.
     pub fn claim_pool_remainder(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::assert_mode_allows(&env, Action::ClaimRemainder)?;
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let kind = Self::settlement(&m)?;
@@ -933,6 +1028,7 @@ impl MarketCore {
     /// time, including before finality. Returns the amount claimed (0 when
     /// nothing is pending, mirroring `sweep_fees`).
     pub fn claim_lp_fees(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::assert_mode_allows(&env, Action::ClaimLpFees)?;
         let m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let amount = Self::load_lp_fees(&env, market_id);
@@ -956,6 +1052,7 @@ impl MarketCore {
     /// created before `FeeTerms` existed have none and keep the legacy
     /// behaviour: the `DataKey::Treasury` of the moment of the sweep.
     pub fn sweep_fees(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::assert_mode_allows(&env, Action::SweepFees)?;
         let mut m = Self::load_market(&env, market_id)?;
         let amount = m.fees_accrued;
         if amount <= 0 {
@@ -1071,7 +1168,10 @@ impl MarketCore {
             resolver: Self::instance_get(&env, &DataKey::Resolver)?,
             default_fee_bps: Self::instance_get(&env, &DataKey::DefaultFeeBps)?,
             protocol_fee_share_bps: Self::instance_get(&env, &DataKey::ProtocolFeeShareBps)?,
-            paused: Self::instance_get(&env, &DataKey::Paused)?,
+            // Compatibility shim (#20): the `Config` shape is unchanged, so
+            // bindings and the vendored decoders keep working. Any non-Normal
+            // mode reads as "paused". Use `get_mode` for the real state.
+            paused: Self::mode(&env)? != OperatingMode::Normal,
         })
     }
 
@@ -1222,12 +1322,73 @@ impl MarketCore {
         Ok(())
     }
 
-    fn assert_not_paused(env: &Env) -> Result<(), Error> {
-        let paused: bool = Self::instance_get(env, &DataKey::Paused)?;
-        if paused {
+    /// The active emergency mode (#20). An instance deployed before `Mode`
+    /// existed has no such key, so it is derived from the legacy boolean;
+    /// every write path (`__constructor`, `set_mode`) keeps both in sync.
+    fn mode(env: &Env) -> Result<OperatingMode, Error> {
+        let s = env.storage().instance();
+        s.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        if let Some(mode) = s.get::<_, OperatingMode>(&DataKey::Mode) {
+            return Ok(mode);
+        }
+        let paused: bool = s.get(&DataKey::Paused).ok_or(Error::NotInitialized)?;
+        Ok(if paused {
+            OperatingMode::Halted
+        } else {
+            OperatingMode::Normal
+        })
+    }
+
+    /// The single gate every state-changing entrypoint goes through (#20).
+    ///
+    /// ```text
+    /// | Action                          | Normal | ReduceOnly | SettleOnly | Halted |
+    /// |---------------------------------|--------|------------|------------|--------|
+    /// | create_market, buy / buy_v2     |   yes  |     no     |     no     |   no   |
+    /// | sell / sell_v2                  |   yes  |    yes     |     no     |   no   |
+    /// | resolve, void_market            |   yes  |    yes     |     yes    |   no   |
+    /// | redeem, claim_pool_remainder,   |   yes  |    yes     |     yes    |   no   |
+    /// |   claim_lp_fees                 |        |            |            |        |
+    /// | sweep_fees                      |   yes  |     no     |     no     |   no   |
+    /// ```
+    ///
+    /// Rationale: `ReduceOnly` stops *new* risk while a pricing bug is fixed,
+    /// so holders can still exit; `SettleOnly` stops every trade so a
+    /// suspected accounting bug cannot be traded against, but keeps
+    /// resolution and payouts alive; `sweep_fees` is the first thing to stop
+    /// because it moves protocol revenue (not user funds) out of the single
+    /// shared balance, and `void_market` is blocked in `Halted` so the
+    /// operator always performs one explicit step before a terminal change.
+    /// `transfer_position` / `transfer_lp` are deliberately *not* gated: they
+    /// move no collateral, so they stay available in every mode exactly as
+    /// they stayed available while `paused`.
+    ///
+    /// Compatibility: `create_market`, `buy`/`buy_v2` and `sell`/`sell_v2`
+    /// still report `Error::Paused` (2) when the contract is `Halted`, so
+    /// clients that match on that legacy code keep working. Every other
+    /// rejection reports `Error::ModeRestricted` (23).
+    fn assert_mode_allows(env: &Env, action: Action) -> Result<(), Error> {
+        let mode = Self::mode(env)?;
+        let allowed = match (mode, action) {
+            (OperatingMode::Normal, _) => true,
+            (OperatingMode::ReduceOnly, Action::Create | Action::Buy | Action::SweepFees) => false,
+            (OperatingMode::ReduceOnly, _) => true,
+            (
+                OperatingMode::SettleOnly,
+                Action::Create | Action::Buy | Action::Sell | Action::SweepFees,
+            ) => false,
+            (OperatingMode::SettleOnly, _) => true,
+            (OperatingMode::Halted, _) => false,
+        };
+        if allowed {
+            return Ok(());
+        }
+        if mode == OperatingMode::Halted
+            && matches!(action, Action::Create | Action::Buy | Action::Sell)
+        {
             return Err(Error::Paused);
         }
-        Ok(())
+        Err(Error::ModeRestricted)
     }
 
     fn assert_tradable(env: &Env, m: &Market) -> Result<(), Error> {
@@ -2728,5 +2889,414 @@ mod test {
         client.void_market(&market_id);
         client.claim_pool_remainder(&market_id);
         client.transfer_lp(&market_id, &Address::generate(&env));
+    }
+
+    // ----- #20: graduated emergency modes ---------------------------------
+
+    const ALL_MODES: [OperatingMode; 4] = [
+        OperatingMode::Normal,
+        OperatingMode::ReduceOnly,
+        OperatingMode::SettleOnly,
+        OperatingMode::Halted,
+    ];
+    const ALL_ACTIONS: [Action; 9] = [
+        Action::Create,
+        Action::Buy,
+        Action::Sell,
+        Action::Resolve,
+        Action::Void,
+        Action::Redeem,
+        Action::ClaimRemainder,
+        Action::ClaimLpFees,
+        Action::SweepFees,
+    ];
+
+    /// The matrix of `docs/architecture.md`, written independently of
+    /// `assert_mode_allows` so the table test is a real check and not a mirror
+    /// of the implementation.
+    fn mode_allows(mode: OperatingMode, action: Action) -> bool {
+        match action {
+            Action::Create | Action::Buy | Action::SweepFees => mode == OperatingMode::Normal,
+            Action::Sell => matches!(mode, OperatingMode::Normal | OperatingMode::ReduceOnly),
+            Action::Resolve
+            | Action::Void
+            | Action::Redeem
+            | Action::ClaimRemainder
+            | Action::ClaimLpFees => mode != OperatingMode::Halted,
+        }
+    }
+
+    /// The error a rejected cell must report: the three trading entrypoints
+    /// keep the legacy `Paused` (2) code while `Halted`, everything new uses
+    /// `ModeRestricted` (23).
+    fn expected_rejection(mode: OperatingMode, action: Action) -> Error {
+        if mode == OperatingMode::Halted
+            && matches!(action, Action::Create | Action::Buy | Action::Sell)
+        {
+            Error::Paused
+        } else {
+            Error::ModeRestricted
+        }
+    }
+
+    /// A fresh fixture with the market in the lifecycle state `action` needs,
+    /// so the only thing that can reject the attempt is the mode. Prepared in
+    /// `Normal` (preparation is never what the test is about); the caller
+    /// switches the mode afterwards. `setup_market_full(5_000, ..)` splits fees
+    /// 50/50 so both `sweep_fees` and `claim_lp_fees` have real balances.
+    fn prepare_for_action(
+        action: Action,
+    ) -> (Env, MarketCoreClient<'static>, Address, Address, u64) {
+        let (env, client, creator, trader, _, _) = setup_market_full(5_000, None);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let close = client.get_market(&market_id).close_time;
+        match action {
+            Action::Create | Action::Buy | Action::Void => {}
+            Action::Sell | Action::SweepFees | Action::ClaimLpFees => {
+                client.buy(
+                    &trader,
+                    &market_id,
+                    &Outcome::Yes,
+                    &(10 * 10_000_000_i128),
+                    &0_i128,
+                );
+            }
+            Action::Resolve => {
+                env.ledger().set_timestamp(close + 1);
+            }
+            Action::Redeem => {
+                client.buy(
+                    &trader,
+                    &market_id,
+                    &Outcome::Yes,
+                    &(10 * 10_000_000_i128),
+                    &0_i128,
+                );
+                env.ledger().set_timestamp(close + 1);
+                client.resolve(&market_id, &Outcome::Yes);
+            }
+            Action::ClaimRemainder => {
+                env.ledger().set_timestamp(close + 1);
+                client.resolve(&market_id, &Outcome::Yes);
+            }
+        }
+        (env, client, creator, trader, market_id)
+    }
+
+    /// Invokes `action` on the contract and reports the outcome as the
+    /// contract sees it: `Ok(())` when the entrypoint ran, `Err(Error)` when
+    /// it rejected the call. Uses `Env::try_invoke_contract` rather than the
+    /// generated `try_` client methods so the contract error is decoded
+    /// uniformly for entrypoints with different return types.
+    fn attempt(
+        env: &Env,
+        contract: &Address,
+        creator: &Address,
+        trader: &Address,
+        market_id: u64,
+        action: Action,
+    ) -> Result<(), Error> {
+        let usdc = |n: i128| n * 10_000_000_i128;
+        let close_time = env.ledger().timestamp() + 60_000;
+        let args: soroban_sdk::Vec<soroban_sdk::Val> = match action {
+            Action::Create => (
+                creator,
+                BytesN::from_array(env, &[7u8; 32]),
+                BytesN::from_array(env, &[70u8; 32]),
+                String::from_str(env, "ipfs://matrix-cell"),
+                Category::Crypto,
+                close_time,
+                usdc(100),
+                5000u32,
+            )
+                .into_val(env),
+            Action::Buy => (trader, market_id, Outcome::Yes, usdc(10), 0_i128).into_val(env),
+            Action::Sell => (trader, market_id, Outcome::Yes, usdc(1), i128::MAX).into_val(env),
+            Action::Resolve => (market_id, Outcome::Yes).into_val(env),
+            Action::Void => (market_id,).into_val(env),
+            Action::Redeem => (trader, market_id).into_val(env),
+            Action::ClaimRemainder => (market_id,).into_val(env),
+            Action::ClaimLpFees => (market_id,).into_val(env),
+            Action::SweepFees => (market_id,).into_val(env),
+        };
+        let name = soroban_sdk::Symbol::new(
+            env,
+            match action {
+                Action::Create => "create_market",
+                Action::Buy => "buy",
+                Action::Sell => "sell",
+                Action::Resolve => "resolve",
+                Action::Void => "void_market",
+                Action::Redeem => "redeem",
+                Action::ClaimRemainder => "claim_pool_remainder",
+                Action::ClaimLpFees => "claim_lp_fees",
+                Action::SweepFees => "sweep_fees",
+            },
+        );
+        let call: Result<
+            Result<(), soroban_sdk::ConversionError>,
+            Result<Error, soroban_sdk::InvokeError>,
+        > = env.try_invoke_contract::<(), Error>(contract, &name, args);
+        match call {
+            Ok(_) => Ok(()),
+            Err(Ok(e)) => Err(e),
+            Err(Err(e)) => panic!("host-level error instead of a contract error: {e:?}"),
+        }
+    }
+
+    /// Every mode × action cell of the documented matrix, both directions.
+    #[test]
+    fn mode_matrix_is_enforced() {
+        let mut cells = 0u32;
+        for mode in ALL_MODES {
+            for action in ALL_ACTIONS {
+                cells += 1;
+                let (env, client, creator, trader, market_id) = prepare_for_action(action);
+                client.set_mode(&mode);
+                assert_eq!(client.get_mode(), mode);
+
+                let result = attempt(&env, &client.address, &creator, &trader, market_id, action);
+                if mode_allows(mode, action) {
+                    assert!(
+                        result.is_ok(),
+                        "{mode:?} must allow {action:?}, got {result:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(expected_rejection(mode, action)),
+                        "{mode:?} must reject {action:?} with the documented code"
+                    );
+                }
+            }
+        }
+        assert_eq!(cells, 4 * 9, "the matrix test must stay exhaustive");
+    }
+
+    #[test]
+    fn set_paused_shim_maps_to_halted_and_normal() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.set_paused(&true);
+        assert_eq!(client.get_mode(), OperatingMode::Halted);
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &1_000_000_i128, &0_i128),
+            Err(Ok(Error::Paused))
+        );
+        assert_eq!(
+            client.try_create_market(
+                &creator,
+                &BytesN::from_array(&env, &[20u8; 32]),
+                &BytesN::from_array(&env, &[120u8; 32]),
+                &String::from_str(&env, "ipfs://halted"),
+                &Category::Crypto,
+                &(env.ledger().timestamp() + 60_000),
+                &(100 * 10_000_000_i128),
+                &5000u32
+            ),
+            Err(Ok(Error::Paused))
+        );
+
+        client.set_paused(&false);
+        assert_eq!(client.get_mode(), OperatingMode::Normal);
+        assert!(client
+            .try_buy(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &(10 * 10_000_000_i128),
+                &0_i128
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn get_config_paused_reflects_mode() {
+        let (env, client, creator, _, _, _) = setup_market();
+        new_market(&env, &client, &creator, 5000);
+        assert!(!client.get_config().paused);
+
+        for mode in [
+            OperatingMode::ReduceOnly,
+            OperatingMode::SettleOnly,
+            OperatingMode::Halted,
+        ] {
+            client.set_mode(&mode);
+            assert!(client.get_config().paused, "{mode:?} must read as paused");
+        }
+        client.set_mode(&OperatingMode::Normal);
+        assert!(!client.get_config().paused);
+    }
+
+    #[test]
+    fn mode_changed_event_emitted() {
+        use soroban_sdk::{testutils::Events, Event};
+        let (env, client, _, _, _, _) = setup_market();
+        // `set_mode` publishes exactly one event per invocation (#20 added the
+        // event; the old `set_paused` published nothing).
+        client.set_mode(&OperatingMode::ReduceOnly);
+        let expected = ModeChanged {
+            old: OperatingMode::Normal,
+            new: OperatingMode::ReduceOnly,
+        }
+        .to_xdr(&env, &client.address);
+        assert_eq!(env.events().all().events(), &[expected][..]);
+
+        // The `set_paused` shim emits it too.
+        client.set_paused(&true);
+        let expected = ModeChanged {
+            old: OperatingMode::ReduceOnly,
+            new: OperatingMode::Halted,
+        }
+        .to_xdr(&env, &client.address);
+        assert_eq!(env.events().all().events(), &[expected][..]);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_set_mode() {
+        let (env, client, _, trader, _, _) = setup_market();
+        env.set_auths(&[]);
+        for mode in ALL_MODES {
+            assert!(client
+                .mock_auths(&[MockAuth {
+                    address: &trader,
+                    invoke: &MockAuthInvoke {
+                        contract: &client.address,
+                        fn_name: "set_mode",
+                        args: (mode,).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_set_mode(&mode)
+                .is_err());
+        }
+        assert_eq!(client.get_mode(), OperatingMode::Normal);
+    }
+
+    /// No mode sequence may strand a holder: `Halted` is reversible and
+    /// `SettleOnly` always pays out.
+    #[test]
+    fn halted_then_settle_only_allows_redeem() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let close = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+
+        client.set_mode(&OperatingMode::Halted);
+        assert_eq!(
+            client.try_redeem(&trader, &market_id),
+            Err(Ok(Error::ModeRestricted))
+        );
+
+        client.set_mode(&OperatingMode::SettleOnly);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+        let before = token.balance(&trader);
+        let payout = client.redeem(&trader, &market_id);
+        assert!(payout > 0);
+        assert_eq!(token.balance(&trader), before + payout);
+        // and the LP can still take the remainder in the same mode
+        assert!(client.try_claim_pool_remainder(&market_id).is_ok());
+    }
+
+    /// An instance deployed before `DataKey::Mode` existed only has the legacy
+    /// boolean; the mode is derived from it, so nothing has to be migrated.
+    #[test]
+    fn mode_derived_from_legacy_paused_boolean() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let contract = client.address.clone();
+        env.as_contract(&contract, || {
+            env.storage().instance().remove(&DataKey::Mode);
+            env.storage().instance().set(&DataKey::Paused, &true);
+        });
+
+        assert_eq!(client.get_mode(), OperatingMode::Halted);
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &1_000_000_i128, &0_i128),
+            Err(Ok(Error::Paused))
+        );
+
+        env.as_contract(&contract, || {
+            env.storage().instance().set(&DataKey::Paused, &false);
+        });
+        assert_eq!(client.get_mode(), OperatingMode::Normal);
+    }
+
+    /// ReduceOnly keeps collecting fees that cannot be swept yet: the accrual
+    /// stays intact and one later sweep in Normal moves the whole amount.
+    #[test]
+    fn reduce_only_accrues_fees_that_sweep_later_in_normal() {
+        let (env, client, creator, trader, _, _) = setup_market_full(10_000, None);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let first = client.get_market(&market_id).fees_accrued;
+        assert!(first > 0);
+
+        client.set_mode(&OperatingMode::ReduceOnly);
+        assert_eq!(
+            client.try_sweep_fees(&market_id),
+            Err(Ok(Error::ModeRestricted))
+        );
+        assert_eq!(client.get_market(&market_id).fees_accrued, first);
+
+        client.sell(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(5 * 10_000_000_i128),
+            &i128::MAX,
+        );
+        let accrued = client.get_market(&market_id).fees_accrued;
+        assert!(accrued > first);
+
+        client.set_mode(&OperatingMode::Normal);
+        assert_eq!(client.sweep_fees(&market_id), accrued);
+        assert_eq!(client.get_market(&market_id).fees_accrued, 0);
+    }
+
+    /// `transfer_position` / `transfer_lp` move no collateral, so they stay
+    /// available in every mode, `Halted` included (same as the old pause).
+    #[test]
+    fn transfers_stay_open_in_every_mode() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let receiver = Address::generate(&env);
+        for mode in ALL_MODES {
+            client.set_mode(&mode);
+            assert!(
+                client
+                    .try_transfer_position(&trader, &receiver, &market_id, &Outcome::Yes, &1_i128)
+                    .is_ok(),
+                "{mode:?} must still allow position transfers"
+            );
+            assert!(
+                client
+                    .try_transfer_lp(&market_id, &Address::generate(&env))
+                    .is_ok(),
+                "{mode:?} must still allow the LP role to move"
+            );
+        }
     }
 }

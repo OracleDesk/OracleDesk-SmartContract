@@ -132,6 +132,53 @@ There is deliberately no on-chain "breaker tripped" event (a reverted
 invocation's events are rolled back with it) — surface trips to users from
 the error codes above and the views here.
 
+## Operating modes (contract-wide emergency state)
+
+`market-core` has four graduated emergency states instead of a single
+pause switch: `Normal`, `ReduceOnly`, `SettleOnly`, `Halted`. Read the
+current one before rendering any trade UI — `get_config().paused` is kept
+only as a compatibility boolean (`mode != Normal`) and tells you nothing
+about *which* restriction is active:
+
+```ts
+const { result: mode } = await client.get_mode();
+// mode is a tagged union, e.g. {tag: "ReduceOnly", values: void}
+switch (mode.tag) {
+  case "Normal":     break;                       // everything enabled
+  case "ReduceOnly": disableCreateMarket(); disableBuy(); break;
+  case "SettleOnly": disableCreateMarket(); disableBuy(); disableSell(); break;
+  case "Halted":     disableAllTrading(); break;  // redemption still works
+}
+```
+
+What to show per mode:
+
+- `Normal` — everything enabled.
+- `ReduceOnly` — hide/disable *Create market* and *Buy*; keep *Sell* and
+  *Redeem* live and banner it ("no new positions, exits only"). A blocked
+  buy/sell attempt reverts with `ModeRestricted` (#23), or with the legacy
+  `Paused` (#2) when the contract is `Halted`, so keep handling both.
+- `SettleOnly` — no trading at all: disable *Create*, *Buy* and *Sell*, but
+  keep *Redeem*, *Claim pool remainder* and *Claim LP fees* available;
+  markets still get resolved. Banner should read "settlement only".
+- `Halted` — every user-facing action is blocked. Keep the redemption screen
+  reachable (an admin can always move to `SettleOnly`, and your users should
+  be told their funds are not lost, just temporarily frozen).
+
+Fee accrual keeps running in `ReduceOnly`/`SettleOnly` (`sell` still pays
+fees into `fees_accrued`) while `sweep_fees` is blocked, so a fee banner may
+show a pending sweep that will only settle once the contract is back in
+`Normal` — the amount is not lost.
+
+Only the contract admin changes modes: `set_mode({mode})` (and the legacy
+`set_paused({paused})`, where `true` → `Halted`, `false` → `Normal`). Both
+emit a `ModeChanged {old, new}` event — subscribe to it rather than polling,
+so the UI flips as soon as the ledger does.
+
+`treasury` pre-checks market-core's mode, so an agent call that market-core
+forbids fails with treasury's own `MarketCoreRestricted` (#44) instead of a
+nested market-core error.
+
 ## Selling an exact share count
 
 `sell` takes an exact `collateral_out`, not a share count — market-core has
