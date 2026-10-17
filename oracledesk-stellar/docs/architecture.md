@@ -75,9 +75,9 @@ share-count slippage parameters:
   ledgers by construction.
 
 **Transferability.** `transfer_position(from, to, market_id, outcome,
-amount)` moves shares between any two addresses (owner auth; allowed while
-`Paused` — a transfer moves no collateral — and after finality until
-`redeem`), rejecting self-transfers, transfers to the contract's own
+amount)` moves shares between any two addresses (owner auth; allowed in
+every `OperatingMode` — a transfer moves no collateral — and after finality
+until `redeem`), rejecting self-transfers, transfers to the contract's own
 address (they could never be redeemed) and over-transfers, and emitting
 `PositionTransferred` so indexers stay in sync. `transfer_lp(market_id,
 new_creator)` (current-creator auth, until `lp_claimed`) moves the single
@@ -85,6 +85,57 @@ LP role — the right to `claim_pool_remainder` and `claim_lp_fees` — and
 emits `LpTransferred`. Both preserve the solvency invariant by
 construction; the position mapping is unchanged down to the "remove
 zero entries" rule.
+
+**Operating modes (graduated emergency control).** The old one-switch
+`set_paused(bool)` trapped every trader in their positions during any
+incident, because it blocked creation, `buy` *and* `sell` together while
+`redeem`/`sweep_fees` kept flowing. It is now a four-state
+`OperatingMode` in instance storage (`DataKey::Mode`, appended last so
+existing XDR discriminants are untouched), set by the admin with
+`set_mode(mode)` (emits `ModeChanged { old, new }`, readable with
+`get_mode`). Every state-changing entrypoint goes through one
+`assert_mode_allows(env, action)` gate:
+
+| Action | Normal | ReduceOnly | SettleOnly | Halted |
+|---|---|---|---|---|
+| `create_market`, `buy` / `buy_v2` | yes | no | no | no |
+| `sell` / `sell_v2` | yes | yes | no | no |
+| `resolve`, `void_market` | yes | yes | yes | no |
+| `redeem`, `claim_pool_remainder`, `claim_lp_fees` | yes | yes | yes | no |
+| `sweep_fees` | yes | no | no | no |
+| `transfer_position`, `transfer_lp` | yes | yes | yes | yes |
+
+`ReduceOnly` is the response to a pricing bug: no *new* risk (creation and
+buys stop) but holders can still exit via `sell`. `SettleOnly` is the
+response to a suspected accounting or collateral bug: all trading stops, so
+the bug cannot be traded against, while resolution and payouts keep working.
+`sweep_fees` is the first thing to stop in both, because it moves protocol
+revenue — not user funds — out of the one shared collateral balance that
+backs every market. `void_market` is deliberately blocked in `Halted`: the
+operator must take one explicit step to `SettleOnly` before any terminal
+change. Nothing in the matrix can strand a holder — `Halted` is reversible
+and `SettleOnly` always pays out (`halted_then_settle_only_allows_redeem`
+locks that in, and `mode_matrix_is_enforced` locks the whole table). The
+admin configuration setters (`set_resolver`, `set_treasury`,
+`set_default_fee_bps`, `set_protocol_fee_share_bps`, `set_default_breaker`)
+are not in the matrix and stay callable in every mode: they move no funds,
+and during an incident the admin must be able to swap the resolver or the
+fee recipient.
+
+Compatibility: `set_paused(true`/`false)` still works and maps to
+`Halted`/`Normal`; `Config.paused` is still populated (`mode != Normal`) so
+the `Config` shape and the generated bindings are unchanged; and
+`create_market`/`buy`/`sell` in `Halted` still return `Error::Paused` (2)
+rather than the new `Error::ModeRestricted` (23), so clients matching on
+code 2 keep working. An instance that predates `DataKey::Mode` needs no
+migration — the mode is derived from the legacy boolean.
+
+`treasury` reads `get_mode` and pre-checks it before forwarding an agent
+action, so agents fail fast with treasury's own
+`Error::MarketCoreRestricted` (12) instead of a nested market-core code that
+would collide with treasury's numbering (market-core's `Paused` is 2, which
+is treasury's `Unauthorized`). Treasury's own `Paused` flag is independent
+and still checked first.
 
 **Resolution commitment**: `resolution_hash` is fixed at `create_market`
 time — see [ADR 0001](adr/0001-resolution-commitment.md) for why.

@@ -245,6 +245,16 @@ markers in the files themselves:
   lifetime cap on capital ever committed to one market), documented in
   `contracts/treasury/src/lib.rs`'s comments, but worth stating here since
   it's easy to misread as a bug.
+- **Emergency modes hinge on admin liveness.** `market-core` now has four
+  graduated states (`Normal` / `ReduceOnly` / `SettleOnly` / `Halted`, see
+  `docs/architecture.md`) instead of a binary pause, so an incident no
+  longer has to freeze exits to stop new risk. But only the single admin key
+  can move between them: while the contract sits in `Halted`, redemption is
+  blocked until that key acts (the matrix guarantees `Halted → SettleOnly →
+  redeem` always works, and `set_mode` itself is never gated). Adding a
+  timelock/multisig or an automatic de-escalation timer is
+  `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md` territory
+  (wave-issue #61/#62), not done here.
 
 ## Reproducing this
 
