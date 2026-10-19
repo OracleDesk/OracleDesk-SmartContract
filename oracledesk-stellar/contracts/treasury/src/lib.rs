@@ -8049,8 +8049,15 @@ mod test {
         ] {
             for (action, name) in cells {
                 checked += 1;
-                let allows = Treasury::market_core_allows(mode, action);
-                assert_eq!(allows, documented(mode, action), "{mode:?} / {name}");
+                // NB: `OperatingMode` here is the `contractimport!`-generated
+                // type, which derives Clone but NOT Copy — a bare `mode` would
+                // move it into `market_core_allows` mid-loop (E0382).
+                let allows = Treasury::market_core_allows(mode.clone(), action);
+                assert_eq!(
+                    allows,
+                    documented(mode.clone(), action),
+                    "{mode:?} / {name}"
+                );
             }
         }
         assert_eq!(checked, 4 * 7, "the mirror test must stay exhaustive");
