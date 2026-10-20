@@ -119,6 +119,9 @@ pub enum TraceVerdict {
     AgentRevokedAfter(u64),
 }
 
+/// How long a pending admin proposal stays acceptable.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
@@ -233,6 +236,11 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
+    /// #17: `action.len() > MAX_ACTION_LEN` on either publish path.
+    /// Appended last; existing discriminants are unchanged.
+    ActionTooLong = 13,
+    /// #17: `ipfs_cid.len() > MAX_CID_LEN` on either publish path.
+    CidTooLong = 14,
 }
 
 #[contractevent]
@@ -1602,6 +1610,9 @@ impl ReasoningRegistry {
         if ipfs_cid.is_empty() {
             return Err(Error::EmptyCid);
         }
+        if ipfs_cid.len() > MAX_CID_LEN {
+            return Err(Error::CidTooLong);
+        }
         Ok(())
     }
 
@@ -1699,7 +1710,7 @@ impl ReasoningRegistry {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+        testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke},
         IntoVal,
     };
 
@@ -2964,5 +2975,123 @@ mod test {
             }])
             .try_cancel_admin_transfer()
             .is_err());
+    }
+
+    // ----- #17: action / ipfs_cid length bounds -----------------------------
+    //
+    // Rebase note (develop@655974c4): upstream #52/#57 replaced the free-form
+    // `action: String` with the closed `TraceAction` enum (`Other(Symbol)` is
+    // protocol-capped at 32 bytes, under MAX_ACTION_LEN = 64), so the action
+    // length is now bounded by the type system and `validate_action` instead of
+    // a `len()` gate. The `ipfs_cid` cap below is still the live #17 bound; the
+    // `ActionTooLong` variant is retained because the shared publish paths
+    // still return it.
+
+    #[test]
+    fn publish_accepts_fields_at_cap() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let id = client.publish_trace(
+            &agent,
+            &1,
+            &TraceAction::Buy,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &String::from_bytes(&env, &[b'b'; MAX_CID_LEN as usize]),
+        );
+        let trace = client.get_trace(&id);
+        assert_eq!(trace.ipfs_cid.len(), MAX_CID_LEN);
+    }
+
+    #[test]
+    fn publish_rejects_cid_over_cap() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &1,
+                &TraceAction::Buy,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &String::from_bytes(&env, &[b'b'; (MAX_CID_LEN + 1) as usize]),
+            ),
+            Err(Ok(Error::CidTooLong))
+        );
+        assert_eq!(client.trace_count(), 0);
+    }
+
+    #[test]
+    fn chained_publish_shares_the_same_bounds() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(
+            client.try_publish_chained_trace(
+                &agent,
+                &1,
+                &TraceAction::Buy,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &String::from_bytes(&env, &[b'b'; (MAX_CID_LEN + 1) as usize]),
+                &1u64,
+                &zero,
+            ),
+            Err(Ok(Error::CidTooLong))
+        );
+        assert_eq!(client.trace_count(), 0);
+    }
+
+    // ----- #17: worst-case footprint proof -----------------------------------
+
+    extern crate std;
+    use soroban_sdk::xdr::{Limits, ToXdr, WriteXdr};
+
+    #[test]
+    fn trace_footprint_at_caps_within_budget() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let action_at_cap = String::from_bytes(&env, &[b'a'; MAX_ACTION_LEN as usize]);
+        let cid_at_cap = String::from_bytes(&env, &[b'b'; MAX_CID_LEN as usize]);
+        let entry_bytes;
+        let event_bytes;
+        {
+            let id = client.publish_trace(
+                &agent,
+                &1,
+                &action_at_cap,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &cid_at_cap,
+            );
+            // `env.events().all()` reports the last invocation's events only,
+            // so read them before any further call. The publish emitted
+            // exactly one `TracePublished`; measure it in its raw ledger XDR
+            // form — the event carries the same two strings as the entry.
+            let events = env.events().all();
+            let evs = events.events();
+            let last = &evs[evs.len() - 1];
+            event_bytes = last.to_xdr(Limits::none()).unwrap().len() as u32;
+            let trace = client.get_trace(&id);
+            entry_bytes = trace.to_xdr(&env).len();
+        }
+        // A second identical publish under the unlimited budget, for the
+        // host-cost reading (`reset_unlimited` drops recorded events, so it
+        // must come after the event measurement above).
+        env.cost_estimate().budget().reset_unlimited();
+        client.publish_trace(
+            &agent,
+            &1,
+            &action_at_cap,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &cid_at_cap,
+        );
+        let used = env.cost_estimate().resources();
+        std::println!(
+            "worst-case publish_trace: Trace entry = {} B, TracePublished event = {} B, {} instructions, {} mem_bytes",
+            entry_bytes, event_bytes, used.instructions, used.mem_bytes
+        );
+        // action 64B + cid 128B + fixed-size fields (id, agent, hash, time)
+        // cannot exceed 512 B once bounded; before #17 both strings were
+        // unbounded and this number had no ceiling.
+        assert!(entry_bytes <= 512);
+        assert!(event_bytes <= 768);
+        assert!(used.mem_bytes <= 5_000_000);
     }
 }

@@ -123,6 +123,50 @@ Key additions:
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
+## Contributor addendum: 2026-10-20
+
+Bounded unbounded inputs (#17) and the `Market` hot/cold storage split (#19)
+are implemented on `feat/bound-inputs-and-hot-cold-market-17-19` (PR against
+`develop`).
+- **Input bounds (#17)**: `market-core` `create_market` rejects
+  `meta_uri` longer than `MAX_META_URI_LEN` (256 B) with `MetaUriTooLong`
+  (appended as error 27); `reasoning-registry` publish paths reject
+  `ipfs_cid` over `MAX_CID_LEN` (128 B) with `CidTooLong` (error 14,
+  appended) on both `publish_trace` and `publish_chained_trace` via the
+  shared `check_publish`. `action` is additionally capped at
+  `MAX_ACTION_LEN` (64 B, `ActionTooLong` = 13, appended); after the rebase
+  onto `655974c4` upstream's `TraceAction` enum (#52/#57) already closes the
+  free-form action string at the type level, and `check_publish` keeps the
+  `ipfs_cid` cap. Footprint proofs at the caps (measured at the original
+  base `5cba67b2`): worst-case `Trace` entry 432 B / `TracePublished` event
+  484 B; worst-case per-market record total 816 B. The
+  `resolver::register_signer_spec` signer-list bound described in issue #17
+  is **not** part of this change (different crate, different lane).
+- **Hot/cold split (#19)**: `Market` storage is split into `MarketHot`
+  (status, close_time, fee terms, reserves, sets, accrued fees, LP flag — the
+  record every trade path reads and rewrites) and `MarketCold` (question /
+  resolution hashes, `meta_uri`, category — read only by `get_market`).
+  `DataKey::MarketHot`/`MarketCold` are appended after all existing variants
+  so no discriminant shifts; pre-split flat records stay readable and are
+  migrated by the next write. Measured at the #17 cap: the per-trade record
+  drops from 804 B to 352 B (serialized XDR). No entrypoint signature,
+  arity, or existing error discriminant changed, so the vendored cross-
+  contract `.wasm` copies compile unchanged.
+- Verification: scoped `cargo check/test/clippy --all-targets -D warnings` on
+  `market-core` (76 passed) and `reasoning-registry` (28 passed), plus
+  `cargo fmt --check` on both — all measured at the original base
+  `5cba67b2` (last green run; see PR #184 body). After the rebase onto
+  `655974c4` these gates are unattainable repo-wide: the pinned toolchain
+  `1.90.0` is below the `soroban-sdk 27.0.6` MSRV (1.91), and under a
+  disclosed `+1.91.0` override compilation stops in upstream code
+  (`contracts/oracledesk-types` missing its `contracttype` import, and
+  pre-existing merge damage in `reasoning-registry/src/lib.rs` from #174) —
+  identically at the pristine tip and at this branch head, so this diff
+  adds no new errors. Not run: workspace-wide gates (broken on `develop` by
+  duplicate `Error` discriminants in `contracts/treasury/src/lib.rs` E0081,
+  unrelated to this change) and any wasm rebuild (CLI 22.0.0 here vs the
+  repo's 27.1.0 artifacts; no `.wasm` byte changed in this branch).
+
 ## Phase 0: recon and safety
 
 **Toolchain** (as installed in the environment this was built in):
