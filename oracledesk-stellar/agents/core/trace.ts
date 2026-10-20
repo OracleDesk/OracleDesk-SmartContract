@@ -87,6 +87,7 @@ export function fromTraceAction(action: TraceActionType): TraceActionString {
   }
 }
 
+/** @deprecated Use ReasoningTraceV2 for new traces. V1 traces have no schemaVersion. */
 export interface ReasoningTrace {
   agent: AgentRole;
   marketId: number | null; // null for a not-yet-created market (agent proposals)
@@ -97,6 +98,100 @@ export interface ReasoningTrace {
   inputs: Record<string, unknown>;
   timestamp: number; // unix seconds
 }
+
+// ─── V2 trace types ───────────────────────────────────────────────────────────
+
+/**
+ * V2 traces carry schemaVersion: 2, use string-encoded u64 marketId to avoid
+ * JS number precision loss, and require action-specific inputs validated against
+ * trace.schema.json before the trace is hashed. canonicalize is unchanged, so
+ * existing v1 hashes remain valid.
+ */
+
+export type TraceActionV2 =
+  | "buy"
+  | "sell"
+  | "create_market"
+  | "inventory_rebalance"
+  | "risk_reject"
+  | "skip"
+  | "redeem"
+  | "claim_remainder"
+  | "resolve";
+
+export interface FairValueEstimate {
+  bps: number;
+  source: string;
+  observedAt: number;
+}
+
+export interface TradeContracts {
+  marketCore: string;
+  treasury: string;
+}
+
+export interface BuyInputs {
+  marketId: string;
+  ledgerSequence: number;
+  ledgerCloseTime: number;
+  reserveYes: string;
+  reserveNo: string;
+  feeBps: number;
+  /** floor(reserveNo * 10000 / (reserveYes + reserveNo)) — must match reserves */
+  priceYesBps: number;
+  fairValue: FairValueEstimate;
+  order: { outcome: "yes" | "no"; collateralIn: string; minSharesOut: string };
+  contracts: TradeContracts;
+  extensions?: Record<string, unknown>;
+}
+
+export interface SellInputs {
+  marketId: string;
+  ledgerSequence: number;
+  ledgerCloseTime: number;
+  reserveYes: string;
+  reserveNo: string;
+  feeBps: number;
+  priceYesBps: number;
+  fairValue: FairValueEstimate;
+  order: { outcome: "yes" | "no"; sharesIn: string; minCollateralOut: string };
+  contracts: TradeContracts;
+  extensions?: Record<string, unknown>;
+}
+
+export interface CreateMarketInputs {
+  questionHash: string;
+  resolutionCommitment: string;
+  initialYesBps: number;
+  seedAmount: string;
+  closeTime: number;
+  category: string;
+  extensions?: Record<string, unknown>;
+}
+
+export interface InventoryRebalanceInputs {
+  marketId: string;
+  ledgerSequence: number;
+  currentExposure: { yes: string; no: string };
+  targetExposure: { yes: string; no: string };
+  action: "buy_yes" | "buy_no" | "sell_yes" | "sell_no" | "none";
+  extensions?: Record<string, unknown>;
+}
+
+export interface RiskRejectInputs {
+  marketId: string;
+  reason: string;
+  checkedAt?: number;
+  extensions?: Record<string, unknown>;
+}
+
+export type ReasoningTraceV2 =
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: "buy"; reasoning: string; inputs: BuyInputs; timestamp: number }
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: "sell"; reasoning: string; inputs: SellInputs; timestamp: number }
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: "create_market"; reasoning: string; inputs: CreateMarketInputs; timestamp: number }
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: "inventory_rebalance"; reasoning: string; inputs: InventoryRebalanceInputs; timestamp: number }
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: "risk_reject"; reasoning: string; inputs: RiskRejectInputs; timestamp: number }
+  | { schemaVersion: 2; agent: AgentRole; marketId: string | null; action: Exclude<TraceActionV2, "buy" | "sell" | "create_market" | "inventory_rebalance" | "risk_reject">; reasoning: string; inputs: Record<string, unknown>; timestamp: number };
 
 /**
  * Deterministic JSON encoding: object keys sorted recursively, no
@@ -136,6 +231,57 @@ export interface BuiltTrace {
 
 export function buildTrace(input: Omit<ReasoningTrace, "timestamp"> & { timestamp?: number }): BuiltTrace {
   const trace: ReasoningTrace = { ...input, timestamp: input.timestamp ?? Math.floor(Date.now() / 1000) };
+  const json = canonicalize(trace);
+  return { trace, json, hash: createHash("sha256").update(json).digest("hex") };
+}
+
+export interface BuiltTraceV2 {
+  trace: ReasoningTraceV2;
+  json: string;
+  hash: string;
+}
+
+/**
+ * Build and hash a v2 trace. Injects schemaVersion: 2 and timestamp, then
+ * canonicalizes with the same unchanged canonicalize function so v2 hashes use
+ * the same algorithm as v1.
+ *
+ * Cross-field semantic checks are applied before hashing:
+ *   - buy/sell: priceYesBps must equal floor(reserveNo*10000/(reserveYes+reserveNo))
+ *   - buy/sell: marketId in inputs must match the trace-level marketId
+ *
+ * Throws if either check fails, so an invalid trace is never hashed.
+ */
+export function buildTraceV2(
+  input: Omit<ReasoningTraceV2, "timestamp" | "schemaVersion"> & { timestamp?: number }
+): BuiltTraceV2 {
+  const trace = {
+    ...input,
+    schemaVersion: 2 as const,
+    timestamp: input.timestamp ?? Math.floor(Date.now() / 1000),
+  } as ReasoningTraceV2;
+
+  // Cross-field checks for trade actions
+  if (trace.action === "buy" || trace.action === "sell") {
+    const inp = trace.inputs as BuyInputs | SellInputs;
+    const reserveYes = BigInt(inp.reserveYes);
+    const reserveNo = BigInt(inp.reserveNo);
+    const total = reserveYes + reserveNo;
+    if (total > 0n) {
+      const expectedPriceYesBps = Number((reserveNo * 10000n) / total);
+      if (inp.priceYesBps !== expectedPriceYesBps) {
+        throw new Error(
+          `priceYesBps mismatch: trace has ${inp.priceYesBps}, reserves imply ${expectedPriceYesBps}`
+        );
+      }
+    }
+    if (trace.marketId !== null && inp.marketId !== trace.marketId) {
+      throw new Error(
+        `marketId mismatch: trace-level ${trace.marketId}, inputs.marketId ${inp.marketId}`
+      );
+    }
+  }
+
   const json = canonicalize(trace);
   return { trace, json, hash: createHash("sha256").update(json).digest("hex") };
 }
