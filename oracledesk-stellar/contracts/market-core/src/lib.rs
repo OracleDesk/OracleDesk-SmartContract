@@ -29,6 +29,14 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
+/// #17: maximum byte length of `create_market`'s `meta_uri`. The `Market`
+/// record is read and rewritten on every `buy`/`sell`, so an unbounded URI
+/// makes every later trade on that market proportionally more expensive —
+/// the caller picks the price of all future trading, forever. 256 bytes
+/// covers an IPFS gateway URL (`ipfs://<cidv1>`, a ~70-char subdomain link,
+/// or a DNSLink URL) with generous headroom.
+const MAX_META_URI_LEN: u32 = 256;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -205,6 +213,9 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// #17: `create_market` called with `meta_uri.len() > MAX_META_URI_LEN`.
+    /// Appended last; existing discriminants are unchanged.
+    MetaUriTooLong = 27,
 }
 
 impl From<MathError> for Error {
@@ -586,6 +597,9 @@ impl MarketCore {
 
         if close_time <= env.ledger().timestamp() {
             return Err(Error::InvalidCloseTime);
+        }
+        if meta_uri.len() > MAX_META_URI_LEN {
+            return Err(Error::MetaUriTooLong);
         }
         if !(MIN_SEED..=MAX_SETS).contains(&seed_amount) {
             return Err(Error::InvalidAmount);
@@ -3065,6 +3079,54 @@ mod test {
             }])
             .try_propose_treasury(&peer)
             .is_err());
+    }
+
+    // ----- #17: meta_uri length bound ---------------------------------------
+
+    fn create_with_uri_len(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        len: u32,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[9u8; 32]),
+            &BytesN::from_array(env, &[199u8; 32]),
+            &String::from_bytes(env, &[b'u'; 512][..len as usize]),
+            &Category::Other,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn create_market_accepts_meta_uri_at_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        let m = client.get_market(&id);
+        assert_eq!(m.meta_uri.len(), MAX_META_URI_LEN);
+    }
+
+    #[test]
+    fn create_market_rejects_meta_uri_over_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        assert_eq!(
+            client.try_create_market(
+                &creator,
+                &BytesN::from_array(&env, &[9u8; 32]),
+                &BytesN::from_array(&env, &[199u8; 32]),
+                &String::from_bytes(&env, &[b'u'; (MAX_META_URI_LEN + 1) as usize]),
+                &Category::Other,
+                &(env.ledger().timestamp() + 60_000),
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            ),
+            Err(Ok(Error::MetaUriTooLong))
+        );
+        // No market id was consumed by the rejected call.
+        assert_eq!(client.market_count(), 0);
     }
 }
 
