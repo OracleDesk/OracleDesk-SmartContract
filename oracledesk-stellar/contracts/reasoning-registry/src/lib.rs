@@ -1710,7 +1710,7 @@ impl ReasoningRegistry {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+        testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke},
         IntoVal,
     };
 
@@ -3037,5 +3037,61 @@ mod test {
             Err(Ok(Error::CidTooLong))
         );
         assert_eq!(client.trace_count(), 0);
+    }
+
+    // ----- #17: worst-case footprint proof -----------------------------------
+
+    extern crate std;
+    use soroban_sdk::xdr::{Limits, ToXdr, WriteXdr};
+
+    #[test]
+    fn trace_footprint_at_caps_within_budget() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let action_at_cap = String::from_bytes(&env, &[b'a'; MAX_ACTION_LEN as usize]);
+        let cid_at_cap = String::from_bytes(&env, &[b'b'; MAX_CID_LEN as usize]);
+        let entry_bytes;
+        let event_bytes;
+        {
+            let id = client.publish_trace(
+                &agent,
+                &1,
+                &action_at_cap,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &cid_at_cap,
+            );
+            // `env.events().all()` reports the last invocation's events only,
+            // so read them before any further call. The publish emitted
+            // exactly one `TracePublished`; measure it in its raw ledger XDR
+            // form — the event carries the same two strings as the entry.
+            let events = env.events().all();
+            let evs = events.events();
+            let last = &evs[evs.len() - 1];
+            event_bytes = last.to_xdr(Limits::none()).unwrap().len() as u32;
+            let trace = client.get_trace(&id);
+            entry_bytes = trace.to_xdr(&env).len();
+        }
+        // A second identical publish under the unlimited budget, for the
+        // host-cost reading (`reset_unlimited` drops recorded events, so it
+        // must come after the event measurement above).
+        env.cost_estimate().budget().reset_unlimited();
+        client.publish_trace(
+            &agent,
+            &1,
+            &action_at_cap,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &cid_at_cap,
+        );
+        let used = env.cost_estimate().resources();
+        std::println!(
+            "worst-case publish_trace: Trace entry = {} B, TracePublished event = {} B, {} instructions, {} mem_bytes",
+            entry_bytes, event_bytes, used.instructions, used.mem_bytes
+        );
+        // action 64B + cid 128B + fixed-size fields (id, agent, hash, time)
+        // cannot exceed 512 B once bounded; before #17 both strings were
+        // unbounded and this number had no ceiling.
+        assert!(entry_bytes <= 512);
+        assert!(event_bytes <= 768);
+        assert!(used.mem_bytes <= 5_000_000);
     }
 }

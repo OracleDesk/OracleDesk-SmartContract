@@ -3383,6 +3383,97 @@ mod test {
         assert!(after.reserve_yes < flat.reserve_yes);
         assert_eq!(after.meta_uri, flat.meta_uri);
     }
+
+    // ----- #17/#19: worst-case footprint proofs -------------------------------
+
+    extern crate std;
+    use soroban_sdk::xdr::ToXdr;
+
+    #[test]
+    fn hot_entry_strictly_smaller_than_flat_record_at_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        // `Market` is exactly the record every trade read AND rewrote before
+        // the split; `MarketHot` is what a trade reads and rewrites now.
+        let flat = client.get_market(&id);
+        let hot = MarketHot::from(&flat);
+        let flat_bytes = flat.clone().to_xdr(&env).len();
+        let hot_bytes = hot.clone().to_xdr(&env).len();
+        let cold_bytes = MarketCold::from(&flat).to_xdr(&env).len();
+        std::println!(
+            "per-trade record at max meta_uri ({}B): flat Market = {} B, MarketHot = {} B; cold = {} B, worst-case total = {} B",
+            MAX_META_URI_LEN, flat_bytes, hot_bytes, cold_bytes,
+            hot_bytes + cold_bytes,
+        );
+        assert!(hot_bytes < flat_bytes);
+        // Worst-case per-market storage: both entries are bounded because
+        // `meta_uri` is capped (#17) and every other field is fixed-size.
+        assert!(hot_bytes + cold_bytes <= 1_024);
+    }
+
+    #[test]
+    fn trade_footprint_at_cap_within_budget() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        env.cost_estimate().budget().reset_unlimited();
+        client.buy(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let used = env.cost_estimate().resources();
+        std::println!(
+            "buy on a worst-case market (meta_uri at the {}B cap): {} instructions, {} mem_bytes, {} disk reads",
+            MAX_META_URI_LEN, used.instructions, used.mem_bytes,
+            used.disk_read_entries
+        );
+        // Network budget is 400M instructions / 40 MiB per transaction;
+        // a single trade must stay orders of magnitude under it even with a
+        // market created at the largest legal metadata size.
+        assert!(used.instructions <= 100_000_000);
+        assert!(used.mem_bytes <= 5_000_000);
+    }
+
+    #[test]
+    fn trade_path_never_touches_the_cold_record() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        // Delete the metadata entry entirely. If any trade, resolution or
+        // settlement path still needed the flat record, it would fail here.
+        remove_side_entry(&env, &client, DataKey::MarketCold(id));
+        client.buy(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        client.sell(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(5 * 10_000_000_i128),
+            &10_000_000_000_i128,
+        );
+        client.sweep_fees(&id);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&id, &Outcome::Yes);
+        client.redeem(&trader, &id);
+        // `get_market` — the one view that assembles metadata — fails loudly
+        // rather than serving a record that silently lost the cold fields.
+        assert_eq!(client.try_get_market(&id), Err(Ok(Error::MarketNotFound)));
+        // ...and the surviving hot entry still holds the post-trade state.
+        let hot = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, MarketHot>(&DataKey::MarketHot(id))
+                .unwrap()
+        });
+        assert_eq!(hot.status, MarketStatus::Resolved(Outcome::Yes));
+    }
 }
 
 // ---------------------------------------------------------------------------
