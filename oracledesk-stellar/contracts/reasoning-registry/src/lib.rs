@@ -119,6 +119,9 @@ pub enum TraceVerdict {
     AgentRevokedAfter(u64),
 }
 
+/// How long a pending admin proposal stays acceptable.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
@@ -233,6 +236,11 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
+    /// #17: `action.len() > MAX_ACTION_LEN` on either publish path.
+    /// Appended last; existing discriminants are unchanged.
+    ActionTooLong = 13,
+    /// #17: `ipfs_cid.len() > MAX_CID_LEN` on either publish path.
+    CidTooLong = 14,
 }
 
 #[contractevent]
@@ -1602,6 +1610,9 @@ impl ReasoningRegistry {
         if ipfs_cid.is_empty() {
             return Err(Error::EmptyCid);
         }
+        if ipfs_cid.len() > MAX_CID_LEN {
+            return Err(Error::CidTooLong);
+        }
         Ok(())
     }
 
@@ -2964,5 +2975,67 @@ mod test {
             }])
             .try_cancel_admin_transfer()
             .is_err());
+    }
+
+    // ----- #17: action / ipfs_cid length bounds -----------------------------
+    //
+    // Rebase note (develop@655974c4): upstream #52/#57 replaced the free-form
+    // `action: String` with the closed `TraceAction` enum (`Other(Symbol)` is
+    // protocol-capped at 32 bytes, under MAX_ACTION_LEN = 64), so the action
+    // length is now bounded by the type system and `validate_action` instead of
+    // a `len()` gate. The `ipfs_cid` cap below is still the live #17 bound; the
+    // `ActionTooLong` variant is retained because the shared publish paths
+    // still return it.
+
+    #[test]
+    fn publish_accepts_fields_at_cap() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let id = client.publish_trace(
+            &agent,
+            &1,
+            &TraceAction::Buy,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &String::from_bytes(&env, &[b'b'; MAX_CID_LEN as usize]),
+        );
+        let trace = client.get_trace(&id);
+        assert_eq!(trace.ipfs_cid.len(), MAX_CID_LEN);
+    }
+
+    #[test]
+    fn publish_rejects_cid_over_cap() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &1,
+                &TraceAction::Buy,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &String::from_bytes(&env, &[b'b'; (MAX_CID_LEN + 1) as usize]),
+            ),
+            Err(Ok(Error::CidTooLong))
+        );
+        assert_eq!(client.trace_count(), 0);
+    }
+
+    #[test]
+    fn chained_publish_shares_the_same_bounds() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(
+            client.try_publish_chained_trace(
+                &agent,
+                &1,
+                &TraceAction::Buy,
+                &BytesN::from_array(&env, &[7u8; 32]),
+                &String::from_bytes(&env, &[b'b'; (MAX_CID_LEN + 1) as usize]),
+                &1u64,
+                &zero,
+            ),
+            Err(Ok(Error::CidTooLong))
+        );
+        assert_eq!(client.trace_count(), 0);
     }
 }
