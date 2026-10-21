@@ -464,6 +464,26 @@ pub struct BondSettled {
     pub forfeited: bool,
 }
 
+/// A `*_via` trade credited an integrator (#24). Emitted next to (never
+/// instead of) `Trade`; the `Trade.fee` field stays the protocol portion so
+/// existing consumers keep their meaning.
+#[contractevent]
+pub struct IntegratorFeeAccrued {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub integrator: Address,
+    pub amount: i128,
+}
+
+/// An integrator withdrew its accrued balance across all markets (#24).
+#[contractevent]
+pub struct IntegratorFeesClaimed {
+    #[topic]
+    pub integrator: Address,
+    pub amount: i128,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -689,6 +709,37 @@ impl MarketCore {
             .unwrap_or(0)
     }
 
+    /// Sets the global cap new markets snapshot for `integrator_fee_bps` on
+    /// `buy_via`/`sell_via` (#24). The cap is validated against the current
+    /// default protocol fee so a market created at the cap can still charge
+    /// the default fee plus the maximum integrator cut without exceeding
+    /// `MAX_FEE_BPS` in aggregate. Existing markets keep their snapshot,
+    /// exactly like the fee/breaker defaults. Absent = 0 (integrator routing
+    /// disabled until an admin opts in).
+    pub fn set_max_integrator_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let default_fee: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultFeeBps)
+            .unwrap_or(0);
+        if default_fee.checked_add(bps).ok_or(Error::Overflow)? > MAX_FEE_BPS {
+            return Err(Error::InvalidFee);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxIntegratorFeeBps, &bps);
+        Ok(())
+    }
+
+    /// The global integrator-fee cap new markets snapshot at creation (#24).
+    pub fn get_max_integrator_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxIntegratorFeeBps)
+            .unwrap_or(0)
+    }
+
     // ----- market lifecycle -----------------------------------------------
 
     /// Creates a market and seeds the pool. `creator` becomes the sole LP.
@@ -737,6 +788,7 @@ impl MarketCore {
         let treasury: Address = s.get(&DataKey::Treasury).ok_or(Error::NotInitialized)?;
         let breaker: Option<BreakerConfig> = s.get(&DataKey::DefaultBreaker);
         let creation_bond: i128 = s.get(&DataKey::CreationBond).unwrap_or(0);
+        let max_integrator_fee_bps: u32 = s.get(&DataKey::MaxIntegratorFeeBps).unwrap_or(0);
 
         let market = Market {
             creator: creator.clone(),
@@ -764,6 +816,12 @@ impl MarketCore {
         );
         if let Some(b) = breaker {
             Self::save_breaker(&env, id, &b);
+        }
+        // Integrator-fee cap sidecar (#24): snapshotted so a later admin
+        // change cannot widen (or narrow) what this market honours. Absent
+        // entry means 0, so nothing is written for the default.
+        if max_integrator_fee_bps > 0 {
+            Self::save_market_max_integrator_fee(&env, id, max_integrator_fee_bps);
         }
         if seed.creator_yes > 0 || seed.creator_no > 0 {
             Self::save_position(
@@ -838,6 +896,7 @@ impl MarketCore {
             collateral_in,
             min_shares_out,
             None,
+            None,
         )
     }
 
@@ -876,11 +935,42 @@ impl MarketCore {
             } else {
                 Some(limit_price_bps)
             },
+            None,
         )
     }
 
-    /// Shared implementation of `buy` / `buy_v2` (single copy of the
-    /// breaker, effect and interaction logic).
+    /// `buy` with an integrator (#24): `integrator_fee_bps` of the input is
+    /// charged on top of the protocol fee and credited to `integrator`'s
+    /// unclaimed balance, retrievable via `claim_integrator_fees`. The fee
+    /// must fit the market's creation-time cap
+    /// (`get_market_max_integrator_fee_bps`) and the sum with the market's
+    /// protocol fee must stay within `MAX_FEE_BPS`; otherwise the trade
+    /// reverts, so an agent front-end can never silently overcharge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buy_via(
+        env: Env,
+        trader: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        integrator: Address,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        Self::do_buy(
+            env,
+            trader,
+            market_id,
+            outcome,
+            collateral_in,
+            min_shares_out,
+            None,
+            Some((integrator, integrator_fee_bps)),
+        )
+    }
+
+    /// Shared implementation of `buy` / `buy_v2` / `buy_via` (single copy of
+    /// the breaker, effect and interaction logic).
     #[allow(clippy::too_many_arguments)]
     fn do_buy(
         env: Env,
@@ -890,6 +980,7 @@ impl MarketCore {
         collateral_in: i128,
         min_shares_out: i128,
         limit_price_bps: Option<u32>,
+        integrator_opt: Option<(Address, u32)>,
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         if let Some(limit) = limit_price_bps {
@@ -901,8 +992,11 @@ impl MarketCore {
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, integrator_opt.map(|(_, bps)| bps))?;
+
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
-        let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
+        let q = math::calc_buy_with(r_bought, r_other, collateral_in, m.fee_bps, int_fee_bps)?;
         if q.shares_out < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
@@ -932,6 +1026,17 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
+        if q.integrator_fee > 0 {
+            if let Some((ref integrator, _)) = integrator_opt {
+                Self::accrue_integrator_fee(&env, integrator, q.integrator_fee)?;
+                IntegratorFeeAccrued {
+                    market_id,
+                    integrator: integrator.clone(),
+                    amount: q.integrator_fee,
+                }
+                .publish(&env);
+            }
+        }
         let mut pos = Self::load_position(&env, market_id, &trader);
         match outcome {
             Outcome::Yes => pos.yes += q.shares_out,
@@ -980,6 +1085,7 @@ impl MarketCore {
             collateral_out,
             max_shares_in,
             None,
+            None,
         )
     }
 
@@ -1016,10 +1122,39 @@ impl MarketCore {
             } else {
                 Some(limit_price_bps)
             },
+            None,
         )
     }
 
-    /// Shared implementation of `sell` / `sell_v2`.
+    /// `sell` with an integrator (#24): the gross spread is widened to cover
+    /// `integrator_fee_bps` and the integrator's floor-rounded share of it is
+    /// credited to `integrator`'s unclaimed balance. The protocol never
+    /// receives less than plain `sell` would have taken. Same cap validation
+    /// as `buy_via`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sell_via(
+        env: Env,
+        trader: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        integrator: Address,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        Self::do_sell(
+            env,
+            trader,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            None,
+            Some((integrator, integrator_fee_bps)),
+        )
+    }
+
+    /// Shared implementation of `sell` / `sell_v2` / `sell_via`.
     #[allow(clippy::too_many_arguments)]
     fn do_sell(
         env: Env,
@@ -1029,14 +1164,18 @@ impl MarketCore {
         collateral_out: i128,
         max_shares_in: i128,
         limit_price_bps: Option<u32>,
+        integrator_opt: Option<(Address, u32)>,
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, integrator_opt.map(|(_, bps)| bps))?;
+
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
-        let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
+        let q = math::calc_sell_with(r_sold, r_other, collateral_out, m.fee_bps, int_fee_bps)?;
         if q.shares_in > max_shares_in {
             return Err(Error::SlippageExceeded);
         }
@@ -1076,6 +1215,17 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
+        if q.integrator_fee > 0 {
+            if let Some((ref integrator, _)) = integrator_opt {
+                Self::accrue_integrator_fee(&env, integrator, q.integrator_fee)?;
+                IntegratorFeeAccrued {
+                    market_id,
+                    integrator: integrator.clone(),
+                    amount: q.integrator_fee,
+                }
+                .publish(&env);
+            }
+        }
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -1094,6 +1244,27 @@ impl MarketCore {
         }
         .publish(&env);
         Ok(q.shares_in)
+    }
+
+    /// Pay out `integrator`'s accrued #24 fees across all markets and zero
+    /// the balance. Permissionless besides the integrator's own auth: anyone
+    /// can submit the call, only the integrator can authorise it, and the
+    /// integrator itself cannot invoke trading — it just claims. Returns 0
+    /// (no event, no transfer) when there is nothing to claim.
+    pub fn claim_integrator_fees(env: Env, integrator: Address) -> Result<i128, Error> {
+        integrator.require_auth();
+        let key = DataKey::IntegratorFees(integrator.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return Ok(0);
+        }
+        // effects before interaction (CEI): the balance is gone before the
+        // token transfer, so a re-entrant or failing transfer cannot
+        // double-pay.
+        env.storage().persistent().remove(&key);
+        Self::token(&env)?.transfer(&env.current_contract_address(), &integrator, &amount);
+        IntegratorFeesClaimed { integrator, amount }.publish(&env);
+        Ok(amount)
     }
 
     // ----- resolution -----------------------------------------------------
@@ -1484,6 +1655,60 @@ impl MarketCore {
         Ok(math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?.shares_in)
     }
 
+    /// Shares a `buy_via` of `collateral_in` would return right now, running
+    /// the same cap validation as the trade itself (#24).
+    pub fn quote_buy_via(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, Some(integrator_fee_bps))?;
+        let (r_bought, r_other) = Self::reserves_for(&m, outcome);
+        Ok(
+            math::calc_buy_with(r_bought, r_other, collateral_in, m.fee_bps, int_fee_bps)?
+                .shares_out,
+        )
+    }
+
+    /// Shares a `sell_via` for exactly `collateral_out` would consume right
+    /// now, running the same cap validation as the trade itself (#24).
+    pub fn quote_sell_via(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, Some(integrator_fee_bps))?;
+        let (r_sold, r_other) = Self::reserves_for(&m, outcome);
+        Ok(
+            math::calc_sell_with(r_sold, r_other, collateral_out, m.fee_bps, int_fee_bps)?
+                .shares_in,
+        )
+    }
+
+    /// `integrator`'s unclaimed #24 balance across all markets.
+    pub fn get_integrator_fees(env: Env, integrator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IntegratorFees(integrator))
+            .unwrap_or(0)
+    }
+
+    /// The integrator-fee cap this market snapshotted at creation (#24).
+    /// Zero for markets created before the feature or while the global cap
+    /// was zero — integrator routing on such markets always reverts.
+    pub fn get_market_max_integrator_fee_bps(env: Env, market_id: u64) -> Result<u32, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_market_max_integrator_fee(&env, market_id))
+    }
+
     /// The market's snapshotted breakers (`None` for legacy markets created
     /// before breakers existed — those are never checked).
     pub fn breaker_config(env: Env, market_id: u64) -> Result<Option<BreakerConfig>, Error> {
@@ -1746,6 +1971,66 @@ impl MarketCore {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    fn load_market_max_integrator_fee(env: &Env, id: u64) -> u32 {
+        let key = DataKey::MarketMaxIntegratorFee(id);
+        let cap: Option<u32> = env.storage().persistent().get(&key);
+        if cap.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        cap.unwrap_or(0)
+    }
+
+    fn save_market_max_integrator_fee(env: &Env, id: u64, cap: u32) {
+        let key = DataKey::MarketMaxIntegratorFee(id);
+        env.storage().persistent().set(&key, &cap);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// Common cap check for `*_via` trades and quotes (#24): the requested
+    /// integrator bps must fit the market's creation-time snapshot and the
+    /// combined protocol + integrator take must stay within `MAX_FEE_BPS`.
+    /// Returns the bps to feed into the math (0 when there is no integrator).
+    fn validate_integrator_fee(
+        env: &Env,
+        market_id: u64,
+        m: &Market,
+        integrator_bps: Option<u32>,
+    ) -> Result<u32, Error> {
+        match integrator_bps {
+            Some(bps) => {
+                if bps > Self::load_market_max_integrator_fee(env, market_id) {
+                    return Err(Error::IntegratorFeeTooHigh);
+                }
+                if bps.checked_add(m.fee_bps).ok_or(Error::Overflow)? > MAX_FEE_BPS {
+                    return Err(Error::InvalidFee);
+                }
+                Ok(bps)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Credit `amount` to `integrator`'s unclaimed balance (#24). Balances
+    /// are per integrator across all markets, mirroring `LpFees` being
+    /// per market: an integrator serves many markets with one claim call.
+    fn accrue_integrator_fee(env: &Env, integrator: &Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let key = DataKey::IntegratorFees(integrator.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = current.checked_add(amount).ok_or(Error::Overflow)?;
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(())
     }
 
     /// Splits a trade `fee` per the market's snapshotted `FeeTerms` (legacy
@@ -3648,6 +3933,363 @@ mod test {
         assert_eq!(client.try_set_creation_bond(&0_i128), Ok(Ok(())));
         assert_eq!(client.get_creation_bond(), 0);
         let _ = env;
+    }
+
+    // ----- Issue #24: integrator fees -------------------------------------
+
+    #[test]
+    fn buy_via_accrues_integrator_fee() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let trader_before = collateral_client.balance(&trader);
+        let contract_before = collateral_client.balance(&client.address);
+
+        let collateral_in = 10_000_000_i128;
+        let int_fee_bps = 50u32;
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &int_fee_bps,
+        );
+        assert!(shares > 0);
+
+        // charged on top of the protocol fee, always rounded up
+        let expected_ifee = math::mul_div_ceil(collateral_in, int_fee_bps as i128, BPS).unwrap();
+        assert_eq!(client.get_integrator_fees(&integrator), expected_ifee);
+        assert_eq!(
+            collateral_client.balance(&trader),
+            trader_before - collateral_in
+        );
+        assert_eq!(
+            collateral_client.balance(&client.address),
+            contract_before + collateral_in
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    fn sell_via_accrues_integrator_fee() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(20_000_000_i128),
+            &0_i128,
+        );
+
+        let collateral_out = 5_000_000_i128;
+        let shares_sold = client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_out,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert!(shares_sold > 0);
+        assert!(client.get_integrator_fees(&integrator) > 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn buy_via_rejects_fee_above_market_cap() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &100u32,
+        );
+    }
+
+    #[test]
+    fn integrator_plus_market_fee_above_max_is_invalid_fee() {
+        // The global cap is validated against the default fee at set time;
+        // if an admin raises the default fee afterwards, markets created at
+        // the higher fee must still refuse trades whose combined take would
+        // exceed MAX_FEE_BPS.
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&900);
+        client.set_default_fee_bps(&200);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        // 850 <= cap(900) but 850 + market fee 200 > MAX_FEE_BPS
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &850u32,
+            ),
+            Err(Ok(Error::InvalidFee))
+        );
+        // exactly at the ceiling passes the fee check
+        assert!(client
+            .try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &800u32,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn markets_without_a_cap_snapshot_reject_integrator_routing() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        // default global cap is absent = 0
+        assert_eq!(client.get_max_integrator_fee_bps(), 0);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 0);
+        let integrator = Address::generate(&env);
+
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &1u32,
+            ),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+        // zero bps is still "no integrator cut", even on a capped market
+        assert_eq!(
+            client.quote_buy_via(&market_id, &Outcome::Yes, &10_000_000_i128, &0u32),
+            client.quote_buy(&market_id, &Outcome::Yes, &10_000_000_i128)
+        );
+    }
+
+    #[test]
+    fn claim_integrator_fees_pays_and_zeroes() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+
+        let fee = client.get_integrator_fees(&integrator);
+        assert!(fee > 0);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&integrator);
+        let claimed = client.claim_integrator_fees(&integrator);
+        assert_eq!(claimed, fee);
+        assert_eq!(collateral_client.balance(&integrator), before + fee);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+
+        // claiming again is a no-op returning 0, and never moves tokens
+        assert_eq!(client.claim_integrator_fees(&integrator), 0);
+        assert_eq!(collateral_client.balance(&integrator), before + fee);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_claim_integrator_fees() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "claim_integrator_fees",
+                    args: (integrator.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_claim_integrator_fees(&integrator)
+            .is_err());
+        // the accrual is untouched
+        assert!(client.get_integrator_fees(&integrator) > 0);
+    }
+
+    #[test]
+    fn solvency_includes_integrator_balances() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &2_000_000_i128,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator.clone()]);
+
+        // and keeps holding after the claim moves the balance out
+        client.claim_integrator_fees(&integrator);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    fn max_integrator_fee_snapshot_not_affected_by_admin_change() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.set_max_integrator_fee_bps(&200);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 50);
+
+        // the market still enforces its snapshot of 50
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &100u32,
+            ),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+        // 50 (its cap) is exactly allowed; market fee 100 keeps the sum
+        // within MAX_FEE_BPS
+        assert!(client
+            .try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &50u32,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn quote_via_matches_execution() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        let collateral_in = 10_000_000_i128;
+        let quoted = client.quote_buy_via(&market_id, &Outcome::Yes, &collateral_in, &50u32);
+        let got = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_eq!(quoted, got);
+
+        let collateral_out = 2_000_000_i128;
+        let quoted = client.quote_sell_via(&market_id, &Outcome::Yes, &collateral_out, &50u32);
+        let got = client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_out,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_eq!(quoted, got);
+
+        // quotes enforce the same caps as the trades
+        assert_eq!(
+            client.try_quote_buy_via(&market_id, &Outcome::Yes, &collateral_in, &101u32),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+    }
+
+    #[test]
+    fn set_max_integrator_fee_bps_bounds_and_auth() {
+        let (env, client, _, trader, _, _) = setup_market();
+        // default protocol fee is 100; cap must keep fee + cap <= 1_000
+        assert_eq!(
+            client.try_set_max_integrator_fee_bps(&901u32),
+            Err(Ok(Error::InvalidFee))
+        );
+        assert_eq!(client.try_set_max_integrator_fee_bps(&900u32), Ok(Ok(())));
+        assert_eq!(client.get_max_integrator_fee_bps(), 900);
+
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "set_max_integrator_fee_bps",
+                    args: (50u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_max_integrator_fee_bps(&50u32)
+            .is_err());
     }
 }
 

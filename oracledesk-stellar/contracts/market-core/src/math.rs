@@ -38,7 +38,11 @@ pub enum Settlement {
 pub struct BuyQuote {
     pub shares_out: i128,
     pub fee: i128,
-    /// Collateral that actually mints complete sets (`collateral_in - fee`).
+    /// Integrator portion charged on top of the protocol fee (#24). Zero for
+    /// every quote produced through `calc_buy`.
+    pub integrator_fee: i128,
+    /// Collateral that actually mints complete sets
+    /// (`collateral_in - fee - integrator_fee`).
     pub net: i128,
     pub new_reserve_bought: i128,
     pub new_reserve_other: i128,
@@ -48,7 +52,13 @@ pub struct BuyQuote {
 pub struct SellQuote {
     pub shares_in: i128,
     pub fee: i128,
-    /// Complete sets burned from the pool (`collateral_out + fee`).
+    /// Integrator portion carved out of the gross spread (#24). The protocol
+    /// `fee` above is the remainder, so `fee + integrator_fee` is exactly
+    /// what plain `calc_sell` would have reported as `fee`. Zero for every
+    /// quote produced through `calc_sell`.
+    pub integrator_fee: i128,
+    /// Complete sets burned from the pool
+    /// (`collateral_out + fee + integrator_fee`).
     pub gross: i128,
     pub new_reserve_sold: i128,
     pub new_reserve_other: i128,
@@ -136,23 +146,37 @@ pub fn seed_reserves(seed: i128, yes_bps: u32) -> Result<SeedReserves, MathError
     })
 }
 
-/// Buy `collateral_in` worth of the outcome whose pool reserve is `r_bought`.
+/// Buy `collateral_in` worth of the outcome whose pool reserve is `r_bought`,
+/// paying an integrator cut on top of the protocol fee (#24).
 ///
-/// 1. fee = ceil(in * fee_bps / BPS); net = in - fee
+/// 1. fee = ceil(in * fee_bps / BPS); ifee = ceil(in * integrator_fee_bps / BPS);
+///    net = in - fee - ifee
 /// 2. mint `net` complete sets into the pool: r_other += net
 /// 3. pool keeps r_bought' = ceil(r_bought * r_other / r_other')  (k preserved)
 /// 4. buyer receives r_bought + net - r_bought'
-pub fn calc_buy(
+///
+/// The integrator fee is charged **in addition to** the protocol fee, so the
+/// pool's spread for a given `collateral_in` only grows and rounding keeps
+/// favouring the pool. `calc_buy` is this with `integrator_fee_bps = 0` and
+/// produces byte-identical quotes.
+#[allow(clippy::too_many_arguments)]
+pub fn calc_buy_with(
     r_bought: i128,
     r_other: i128,
     collateral_in: i128,
     fee_bps: u32,
+    integrator_fee_bps: u32,
 ) -> Result<BuyQuote, MathError> {
     if collateral_in <= 0 || r_bought <= 0 || r_other <= 0 {
         return Err(MathError::InvalidInput);
     }
     let fee = mul_div_ceil(collateral_in, fee_bps as i128, BPS)?;
-    let net = collateral_in - fee;
+    let ifee = mul_div_ceil(collateral_in, integrator_fee_bps as i128, BPS)?;
+    let net = collateral_in
+        .checked_sub(fee)
+        .ok_or(MathError::Overflow)?
+        .checked_sub(ifee)
+        .ok_or(MathError::Overflow)?;
     if net <= 0 {
         return Err(MathError::InvalidInput);
     }
@@ -165,34 +189,61 @@ pub fn calc_buy(
     Ok(BuyQuote {
         shares_out,
         fee,
+        integrator_fee: ifee,
         net,
         new_reserve_bought: new_bought,
         new_reserve_other: new_other,
     })
 }
 
+pub fn calc_buy(
+    r_bought: i128,
+    r_other: i128,
+    collateral_in: i128,
+    fee_bps: u32,
+) -> Result<BuyQuote, MathError> {
+    calc_buy_with(r_bought, r_other, collateral_in, fee_bps, 0)
+}
+
 /// Sell shares of the outcome with pool reserve `r_sold` for an exact
-/// `collateral_out` (Gnosis-style, so no square root on-chain).
+/// `collateral_out` (Gnosis-style, so no square root on-chain), splitting the
+/// gross spread between the protocol and an integrator (#24).
 ///
-/// 1. gross = ceil(out * BPS / (BPS - fee_bps)); fee = gross - out
+/// 1. total = fee_bps + integrator_fee_bps;
+///    gross = ceil(out * BPS / (BPS - total)); total_fee = gross - out;
+///    ifee = floor(total_fee * integrator_fee_bps / total); fee = total_fee - ifee
 /// 2. burn `gross` complete sets from the pool: r_other -= gross
 /// 3. pool must end at r_sold' = ceil(r_sold * r_other / r_other')
 /// 4. seller gives r_sold' + gross - r_sold shares
 ///
+/// The integrator portion rounds **down**, so the protocol always receives at
+/// least what plain `calc_sell` would have taken and the split is exact:
+/// `fee + integrator_fee == gross - collateral_out`.
+///
 /// To sell an exact share count, the frontend inverts this off-chain
 /// (quadratic, see `model/fpmm_model.py::gross_for_shares`) and passes the
 /// result as `collateral_out` with a `max_shares_in` slippage bound.
-pub fn calc_sell(
+pub fn calc_sell_with(
     r_sold: i128,
     r_other: i128,
     collateral_out: i128,
     fee_bps: u32,
+    integrator_fee_bps: u32,
 ) -> Result<SellQuote, MathError> {
-    if collateral_out <= 0 || r_sold <= 0 || r_other <= 0 || (fee_bps as i128) >= BPS {
+    let sum_fees = (fee_bps as i128)
+        .checked_add(integrator_fee_bps as i128)
+        .ok_or(MathError::Overflow)?;
+    if collateral_out <= 0 || r_sold <= 0 || r_other <= 0 || sum_fees >= BPS {
         return Err(MathError::InvalidInput);
     }
-    let gross = mul_div_ceil(collateral_out, BPS, BPS - fee_bps as i128)?;
-    let fee = gross - collateral_out;
+    let gross = mul_div_ceil(collateral_out, BPS, BPS - sum_fees)?;
+    let total_fee = gross - collateral_out;
+    let (fee, ifee) = if sum_fees == 0 {
+        (0, 0)
+    } else {
+        let ifee = mul_div_floor(total_fee, integrator_fee_bps as i128, sum_fees)?;
+        (total_fee - ifee, ifee)
+    };
     if gross >= r_other {
         return Err(MathError::InsufficientLiquidity);
     }
@@ -205,10 +256,20 @@ pub fn calc_sell(
     Ok(SellQuote {
         shares_in,
         fee,
+        integrator_fee: ifee,
         gross,
         new_reserve_sold: new_sold,
         new_reserve_other: new_other,
     })
+}
+
+pub fn calc_sell(
+    r_sold: i128,
+    r_other: i128,
+    collateral_out: i128,
+    fee_bps: u32,
+) -> Result<SellQuote, MathError> {
+    calc_sell_with(r_sold, r_other, collateral_out, fee_bps, 0)
 }
 
 /// Integer square root (Newton's method), mirroring `agents/core/fpmm.ts::isqrt`.
@@ -346,12 +407,41 @@ mod tests {
     }
 
     #[test]
+    fn buy_with_integrator_known_values() {
+        // 1000/1000 pool, buy 100 with fee 100 bps + integrator 50 bps:
+        // fee = ceil(100*100/10000) = 1, ifee = ceil(100*50/10000) = 1,
+        // net = 98, new_other = 1098, new_bought = ceil(1e6/1098) = 911.
+        let q = calc_buy_with(1000, 1000, 100, 100, 50).unwrap();
+        assert_eq!(q.fee, 1);
+        assert_eq!(q.integrator_fee, 1);
+        assert_eq!(q.net, 98);
+        assert_eq!(q.shares_out, 187);
+        assert_eq!(q.new_reserve_bought, 911);
+        assert_eq!(q.new_reserve_other, 1098);
+    }
+
+    #[test]
     fn sell_example_matches_model() {
         let q = calc_sell(1000, 1000, 100, 0).unwrap();
         assert_eq!(q.shares_in, 212);
         assert_eq!(q.gross, 100);
         assert_eq!(q.new_reserve_sold, 1112);
         assert_eq!(q.new_reserve_other, 900);
+    }
+
+    #[test]
+    fn sell_with_integrator_known_values() {
+        // 10000/20000 pool, sell for 1000 with fee 100 + integrator 50 bps:
+        // gross = ceil(1000*10000/9850) = 1016, total spread 16,
+        // ifee = floor(16*50/150) = 5, protocol fee = 11.
+        let q = calc_sell_with(10_000, 20_000, 1000, 100, 50).unwrap();
+        assert_eq!(q.gross, 1016);
+        assert_eq!(q.integrator_fee, 5);
+        assert_eq!(q.fee, 11);
+        assert_eq!(q.fee + q.integrator_fee, q.gross - 1000);
+        assert_eq!(q.new_reserve_other, 18_984);
+        assert_eq!(q.new_reserve_sold, 10_536);
+        assert_eq!(q.shares_in, 1552);
     }
 
     #[test]
@@ -559,5 +649,99 @@ mod tests {
             price_after(false, 910, 1_100).unwrap(),
             price_yes_bps(1_100, 910).unwrap()
         );
+    }
+
+    #[test]
+    fn calc_buy_with_zero_integrator_matches_calc_buy() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let ry = 1_000_000 + next() % 1_000_000_000;
+            let rn = 1_000_000 + next() % 1_000_000_000;
+            let amt = 1 + next() % (ry.min(rn) / 2);
+            let fee = (next() % 300) as u32;
+            let q1 = calc_buy(ry, rn, amt, fee).unwrap();
+            let q2 = calc_buy_with(ry, rn, amt, fee, 0).unwrap();
+            assert_eq!(q1, q2);
+            assert_eq!(q2.integrator_fee, 0);
+        }
+    }
+
+    #[test]
+    fn calc_sell_with_zero_integrator_matches_calc_sell() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let ry = 1_000_000 + next() % 1_000_000_000;
+            let rn = 1_000_000 + next() % 1_000_000_000;
+            let amt = 1 + next() % (rn / 2);
+            let fee = (next() % 300) as u32;
+            let q1 = calc_sell(ry, rn, amt, fee).unwrap();
+            let q2 = calc_sell_with(ry, rn, amt, fee, 0).unwrap();
+            assert_eq!(q1, q2);
+            assert_eq!(q2.integrator_fee, 0);
+        }
+    }
+
+    #[test]
+    fn calc_sell_with_split_never_shortchanges_protocol() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let ry = 1_000_000 + next() % 1_000_000_000;
+            let rn = 1_000_000 + next() % 1_000_000_000;
+            let amt = 1 + next() % (rn / 4);
+            let fee = (next() % 200) as u32;
+            let ifee = (next() % 200) as u32;
+            if let (Ok(q_with), Ok(q_solo)) = (
+                calc_sell_with(ry, rn, amt, fee, ifee),
+                calc_sell(ry, rn, amt, fee),
+            ) {
+                assert!(q_with.fee >= q_solo.fee, "protocol shortchanged");
+                assert_eq!(q_with.fee + q_with.integrator_fee, q_with.gross - amt);
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_with_integrator_never_profits() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let ry = 1_000_000 + next() % 1_000_000_000;
+            let rn = 1_000_000 + next() % 1_000_000_000;
+            let amt = 1 + next() % (ry.min(rn) / 2);
+            let fee = (next() % 200) as u32;
+            let ifee = (next() % 100) as u32;
+            let k0 = ry * rn;
+            let q = calc_buy_with(ry, rn, amt, fee, ifee).unwrap();
+            assert!(q.new_reserve_bought * q.new_reserve_other >= k0);
+            // getting `amt` back out costs at least the shares the buy paid
+            // out, integrator spread included
+            if let Ok(s) = calc_sell_with(q.new_reserve_bought, q.new_reserve_other, amt, fee, ifee)
+            {
+                assert!(s.shares_in >= q.shares_out, "free money with integrator");
+            }
+        }
     }
 }
