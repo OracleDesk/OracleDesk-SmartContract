@@ -176,3 +176,94 @@ To eliminate unbounded administrative discretion and guarantee credible decentra
   - `guardian_void_market` can only be invoked after grace periods have expired: `close_time + REVEAL_GRACE_SECS` (3 days) for unrevealed specs, `close_time + ORACLE_GRACE_SECS` (1 day) for failing price feeds, and `close_time + SIGNER_GRACE_SECS` (7 days) for unresponsive signer sets.
 - Cancellation rate limiting: `cancel_proposal` is strictly capped at `MAX_CANCELS_PER_MARKET = 2` cancellations per market to prevent indefinite griefing.
 - Audit trail: both `cancel_proposal` and `guardian_void_market` require a typed `GuardianReason` enum (`StaleOracleFeed = 1`, `CompromisedSigner = 2`, `AmbiguousSpec = 3`, `LivenessFailure = 4`, `Other = 5`), emitting structured `GuardianAction` events with execution metadata.
+
+## Early close: the commitment, the threat model, the late-trade policy (#22)
+
+Context. A commitment must cover *who may end trading early and on what
+evidence*, or a halt can be sprung on traders after they have priced the market.
+`halt_trading` alone (market-core) is resolver-only and backdated at most
+`MAX_BACKDATE_SECS`, but the authority to call it is delegated by a signer set,
+so the delegation needs a commitment of its own.
+
+Decision. The early-close config is **committed, resolver-local, and hashed in
+its own domain tag**:
+
+```
+signer_with_early_close_hash = sha256(
+    "oracledesk:early-close-spec" || XDR(SignerConfig) || XDR(EarlyCloseSignerSpec)
+)
+```
+
+`EarlyCloseSignerSpec { early_close_threshold, early_close_window,
+late_trade_policy }` lives in `contracts/resolver/src/lib.rs`, not in
+`oracledesk-types`, for the same reason PR #171 kept its own config local: that
+crate is the XDR-consensus surface shared by every consumer (and is the crate
+that fails `cargo +stable check` with 21 pre-existing errors at this tip). The
+preimage is a *third* hash space, disjoint from ADR 0001's legacy
+`sha256(XDR(ResolutionSpec))` and ADR 0004's V2 `sha256(SPEC_DOMAIN || XDR(...))`:
+every legacy preimage is the XDR of an `ScVal` and therefore starts with the
+bytes `00 00 00 10`, while both tags start with ASCII `o`, and the two tags
+differ within their first 13 bytes, so no preimage can be valid under both.
+`register_signer_spec` and `legacy_spec_hash` are untouched, which is why every
+existing spec hash and every existing golden vector holds **by construction**
+rather than by re-baselining. `scripts/spec-hash` still only ever computes
+legacy hashes; delegating the new tag into it is deliberately not done here.
+
+A market reveals through `register_signer_early_close_spec` or
+`register_signer_spec`, never both: each entrypoint checks its own commitment,
+so the two authorities are not interchangeable after the fact
+(`SpecHashMismatch` either way).
+
+Vote agreement. `propose_early_close(market_id, signer, event_time)` requires
+signer auth, membership in the market's existing signer group, the market still
+`Open`, `now` before the effective close, one vote per signer per round, and
+**exact agreement** on `event_time` with the vote already under consideration.
+#22 allowed "match or take the maximum"; matching is what is auditable. A
+maximum would let whichever signer votes latest silently move the refund
+boundary for everyone, and a signer who genuinely believes a different instant is
+the true one should be attesting `Invalid` on the outcome, not dragging a halt
+forward. `event_time` must lie in `[now − MAX_BACKDATE_SECS, now]`: the upper
+bound is what makes a halt a record of a fact rather than a schedule, the lower
+bound is the same seven days the guardian's `SIGNER_GRACE_SECS` grace already
+tolerates.
+
+Threat model. The worst a captured or mistaken signer majority can do is
+**freeze a market early**; it cannot choose the outcome, cannot move collateral,
+and cannot resolve anything, because `finalize_signers`, `resolve` and
+`void_market` are untouched. Three bounds make that the whole damage:
+`early_close_threshold >= SignerConfig.threshold` (freezing is never easier than
+resolving, validated at registration, and `<= signers.len()` so a quorum can
+exist), `early_close_window > 0` with the halt gated behind it
+(`EarlyCloseProposed` is visible before it lands and `cancel_early_close` is the
+guardian's veto while it is open), and one halt per market, final and
+non-extending (`effective_close` is a clamped `min`, so a corrupt value can never
+lengthen a market's life). `cancel_early_close` clears the votes as well as the
+proposal, unlike `cancel_proposal`, which leaves outcome counters in place: votes
+for a rejected event time must not count towards the next round. It
+deliberately does **not** consume `MAX_CANCELS_PER_MARKET`, because that budget
+bounds churn of an *outcome*, and a guardian refusing a halt strands nothing —
+trading simply continues to `close_time`.
+
+Late trades. The policy is **accept and disclose**, committed in
+`late_trade_policy` and enforced by `TradingHalted`, which publishes
+`effective_at`, `halted_at`, `close_time` and `last_trade_at` so the window
+`[effective_at, halted_at)` can be flagged and repriced off-chain. Trades in it
+are not reverted: they settled against a pool that was still open, and
+clawing them back would move collateral belonging to parties who relied on the
+market being tradable — the explicit non-goal of #22. *Void-if-late* was
+rejected because it converts one signer group's latency into a total loss for
+every holder (a void pays half per share, which under `CostBasis` (#21) is a
+second-order refund surprise on top of a halt), and because `last_trade_at`
+measures the last accepted trade, not every trade in the window, so it cannot
+decide a void honestly. `LateTradePolicy::VoidIfLate` remains registerable so a
+creator can be honest about intending it, and nothing acts on it yet.
+
+Follow-up for maintainers, named rather than assumed: the canonical home of
+`EarlyCloseSignerSpec` is a `ResolutionSpec::SignersWithEarlyClose` variant in
+`oracledesk-types::ResolutionSpec` / `SignerConfig`, which would let
+`scripts/spec-hash` and `packages/bindings` see it. That append changes the XDR
+every consumer decodes and therefore requires re-rendering the sha256-pinned
+`market_core.wasm`/`treasury` blobs and the generated bindings together with it;
+neither is possible from this checkout, so it is left as the maintainer step it
+has always been.
+\n
