@@ -6,9 +6,9 @@
 //! `spec_v2_hash`, so the tool cannot drift from the contract.
 
 use resolver::{
-    legacy_spec_hash, spec_v2_hash, CommitteeRef, DisputableSignerConfig, Escalation, HybridConfig,
-    OracleAsset, PriceConfig, PriceDirection, ResolutionSpec, ResolutionSpecV2, SignerConfig,
-    WeightedKey, WeightedKeyConfig,
+    legacy_spec_hash, spec_v2_hash, CommitteeRef, DisputableSignerConfig, Escalation, FeedRef,
+    HybridConfig, OracleAsset, PriceConfig, PriceDirection, QuorumPriceConfig, ResolutionSpec,
+    ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec as SorobanVec};
 
@@ -24,7 +24,10 @@ usage:
     <escalation> is `guardian` or `committee:<k>:<G_address>,<G_address>...`
   spec-hash [V2 FLAGS] committee <committee_id> <min_epoch> <max_rotation_delta> <dispute_window_secs>
   spec-hash [V2 FLAGS] hybrid <fallback_after_secs> <reflector> <asset> <threshold> <direction> <max_staleness> -- <threshold> <dispute_window_secs> <signer>...
-  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable|committee|hybrid> <args>...
+  spec-hash [V2 FLAGS] price-quorum <min_responses> <threshold> <threshold_decimals> <direction>
+      <max_staleness_secs> <max_deviation_bps> <reflector>:<asset>:<decimals>,<reflector>:<asset>:<decimals>,...
+    one entry per committed feed; <asset> uses the same `stellar:`/`other:` form as `price`
+  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable|committee|hybrid|price-quorum> <args>...
   spec-hash gen-salt
 
 V2 FLAGS (all four are required together; without them the legacy hash is printed):
@@ -112,30 +115,36 @@ pub fn parse_signers(env: &Env, args: &[String]) -> Result<ResolutionSpec, Strin
     }))
 }
 
+pub fn parse_asset(env: &Env, value: &str) -> Result<OracleAsset, String> {
+    if let Some(address) = value.strip_prefix("stellar:") {
+        Ok(OracleAsset::Stellar(parse_address(env, address)?))
+    } else if let Some(symbol) = value.strip_prefix("other:") {
+        Ok(OracleAsset::Other(Symbol::new(env, symbol)))
+    } else {
+        Err("asset must be `stellar:<address>` or `other:<symbol>`".into())
+    }
+}
+
+pub fn parse_direction(value: &str) -> Result<PriceDirection, String> {
+    match value {
+        "above" => Ok(PriceDirection::Above),
+        "at-or-above" => Ok(PriceDirection::AtOrAbove),
+        "below" => Ok(PriceDirection::Below),
+        "at-or-below" => Ok(PriceDirection::AtOrBelow),
+        other => Err(format!(
+            "unknown direction '{other}': expected above|at-or-above|below|at-or-below"
+        )),
+    }
+}
+
 pub fn parse_price(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
     let [reflector, asset, threshold, direction, max_staleness] = args else {
         return Err(
             "price needs <reflector> <asset> <threshold> <direction> <max_staleness>".into(),
         );
     };
-    let asset = if let Some(address) = asset.strip_prefix("stellar:") {
-        OracleAsset::Stellar(parse_address(env, address)?)
-    } else if let Some(symbol) = asset.strip_prefix("other:") {
-        OracleAsset::Other(Symbol::new(env, symbol))
-    } else {
-        return Err("asset must be `stellar:<address>` or `other:<symbol>`".into());
-    };
-    let direction = match direction.as_str() {
-        "above" => PriceDirection::Above,
-        "at-or-above" => PriceDirection::AtOrAbove,
-        "below" => PriceDirection::Below,
-        "at-or-below" => PriceDirection::AtOrBelow,
-        other => {
-            return Err(format!(
-                "unknown direction '{other}': expected above|at-or-above|below|at-or-below"
-            ))
-        }
-    };
+    let asset = parse_asset(env, asset)?;
+    let direction = parse_direction(direction)?;
     Ok(ResolutionSpec::Price(PriceConfig {
         reflector: parse_address(env, reflector)?,
         asset,
@@ -146,6 +155,59 @@ pub fn parse_price(env: &Env, args: &[String]) -> Result<ResolutionSpec, String>
         max_staleness: max_staleness
             .parse()
             .map_err(|_| "max_staleness must be a u64".to_string())?,
+    }))
+}
+
+/// `<reflector>:<asset>:<decimals>` per feed, comma-separated. Split on the
+/// FIRST and LAST colon so the asset's own `stellar:`/`other:` colon survives
+/// in the middle without escaping.
+pub fn parse_price_quorum(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
+    let [min_responses, threshold, threshold_decimals, direction, max_staleness, max_deviation_bps, feeds @ ..] =
+        args
+    else {
+        return Err("price-quorum needs <min_responses> <threshold> <threshold_decimals> <direction> <max_staleness> <max_deviation_bps> <reflector>:<asset>:<decimals>,...".into());
+    };
+    if feeds.len() != 1 || feeds[0].is_empty() {
+        return Err("price-quorum needs exactly one comma-separated feed list".into());
+    }
+    let mut list = SorobanVec::new(env);
+    for entry in feeds[0].split(',') {
+        let Some((reflector, rest)) = entry.split_once(':') else {
+            return Err(format!(
+                "feed '{entry}' is not <reflector>:<asset>:<decimals>"
+            ));
+        };
+        let Some((asset, decimals)) = rest.rsplit_once(':') else {
+            return Err(format!(
+                "feed '{entry}' is not <reflector>:<asset>:<decimals>"
+            ));
+        };
+        list.push_back(FeedRef {
+            reflector: parse_address(env, reflector)?,
+            asset: parse_asset(env, asset)?,
+            decimals: decimals
+                .parse()
+                .map_err(|_| format!("decimals in '{entry}' must be a u32"))?,
+        });
+    }
+    Ok(ResolutionSpec::PriceQuorum(QuorumPriceConfig {
+        feeds: list,
+        min_responses: min_responses
+            .parse()
+            .map_err(|_| "min_responses must be a u32".to_string())?,
+        threshold: threshold
+            .parse()
+            .map_err(|_| "threshold must be an i128".to_string())?,
+        threshold_decimals: threshold_decimals
+            .parse()
+            .map_err(|_| "threshold_decimals must be a u32".to_string())?,
+        direction: parse_direction(direction)?,
+        max_staleness: max_staleness
+            .parse()
+            .map_err(|_| "max_staleness must be a u64".to_string())?,
+        max_deviation_bps: max_deviation_bps
+            .parse()
+            .map_err(|_| "max_deviation_bps must be a u32".to_string())?,
     }))
 }
 
@@ -285,7 +347,8 @@ fn parse_rule(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
         [kind, rest @ ..] if kind == "signers-disputable" => parse_signers_disputable(env, rest),
         [kind, rest @ ..] if kind == "committee" => parse_committee(rest),
         [kind, rest @ ..] if kind == "hybrid" => parse_hybrid(env, rest),
-        _ => Err("expected `signers`, `price`, `weighted-keys`, `signers-disputable`, `committee` or `hybrid`".into()),
+        [kind, rest @ ..] if kind == "price-quorum" => parse_price_quorum(env, rest),
+        _ => Err("expected `signers`, `price`, `weighted-keys`, `signers-disputable`, `committee`, `hybrid` or `price-quorum`".into()),
     }
 }
 
@@ -605,6 +668,103 @@ mod tests {
             args(&["verify", "abcd", "signers", "1", "5", G1]),
             args(&[]),
         ] {
+            assert!(matches!(run(&bad), Err(CliError::Usage(_))), "{bad:?}");
+        }
+    }
+
+    fn quorum_parts() -> [&'static str; 7] {
+        [
+            "price-quorum",
+            "2",
+            "2000000000000",
+            "8",
+            "above",
+            "600",
+            "1000",
+        ]
+    }
+
+    fn quorum_feeds() -> String {
+        format!("{C1}:other:XLM:8,{C2}:stellar:{C3}:4")
+    }
+
+    fn price_quorum_args() -> Vec<String> {
+        quorum_parts()
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once(quorum_feeds()))
+            .collect()
+    }
+
+    #[test]
+    fn price_quorum_roundtrips_through_verify() {
+        let rule = price_quorum_args();
+        let hash = hash_of(&rule.iter().map(String::as_str).collect::<Vec<&str>>());
+        let mut verify: Vec<String> = vec!["verify".into(), hash.clone()];
+        verify.extend(rule);
+        let verify_refs: Vec<&str> = verify.iter().map(String::as_str).collect();
+        assert_eq!(hash_of(&verify_refs), "match");
+    }
+
+    #[test]
+    fn price_quorum_hash_binds_every_field() {
+        let base_hash = hash_of(
+            &price_quorum_args()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+        );
+        // Each variant stays *parseable*; only the committed value changes,
+        // so a difference here proves the field is inside the hash.
+        let variants: [(&str, &str); 6] = [
+            ("2", "1"),                // min_responses
+            ("2000000000000", "2000"), // threshold
+            ("8", "7"),                // threshold_decimals
+            ("above", "below"),        // direction
+            ("600", "601"),            // max_staleness
+            ("1000", "999"),           // max_deviation_bps
+        ];
+        for (from, to) in variants {
+            let mut parts = price_quorum_args();
+            let slot = parts
+                .iter_mut()
+                .find(|arg| arg.as_str() == from)
+                .unwrap_or_else(|| panic!("field '{from}' missing from base args"));
+            *slot = to.to_string();
+            assert_ne!(
+                hash_of(&parts.iter().map(String::as_str).collect::<Vec<&str>>()),
+                base_hash,
+                "field '{from}' is not covered by the commitment"
+            );
+        }
+        // The feed list itself: same fields, different decimals.
+        let mut other_feeds = price_quorum_args();
+        other_feeds[7] = format!("{C1}:other:XLM:12,{C2}:stellar:{C3}:4");
+        assert_ne!(
+            hash_of(
+                &other_feeds
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<&str>>()
+            ),
+            base_hash
+        );
+    }
+
+    #[test]
+    fn price_quorum_rejects_malformed_input() {
+        let good = price_quorum_args();
+        let mut too_few = good.clone();
+        too_few.remove(too_few.len() - 1); // feed list missing
+        let mut bad_decimals = good.clone();
+        bad_decimals[7] = bad_decimals[7].replace(":8,", ":x,");
+        let mut no_decimals = good.clone();
+        no_decimals[7] = no_decimals[7].replace(":8,", ",");
+        let mut bad_asset = good.clone();
+        bad_asset[7] = bad_asset[7].replace("other:XLM", "bogus");
+        let mut empty_feeds = good.clone();
+        empty_feeds[7] = String::new();
+        for bad in [too_few, bad_decimals, no_decimals, bad_asset, empty_feeds] {
             assert!(matches!(run(&bad), Err(CliError::Usage(_))), "{bad:?}");
         }
     }
