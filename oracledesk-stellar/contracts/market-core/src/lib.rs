@@ -114,6 +114,54 @@ pub struct BandState {
     pub ref_price_bps: u32,
 }
 
+/// Why a market was voided (#23). Both variants are unit variants with no
+/// explicit discriminants, so the XDR encoding is `ScVal::Symbol("NoFault")`
+/// / `ScVal::Symbol("GuardianFault")`. That is what lets the resolver call
+/// `void_market_with_reason` through name dispatch without a regenerated
+/// vendored client — the encoding is decided by variant *names*, not by
+/// spec, so the stale `market_core.wasm` clients simply cannot see the new
+/// entrypoint (see `docs/adr/0002-cross-contract-calls.md`).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoidReason {
+    NoFault,
+    GuardianFault,
+}
+
+/// Lifecycle of a market's creation bond (#23).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BondState {
+    None,
+    Held,
+    Refunded,
+    Forfeited,
+}
+
+/// Sidecar entry `DataKey::Bond(id)` holding a market's creation bond (#23),
+/// snapshotted at creation as a side entry exactly like `FeeTerms` so
+/// `Market`'s XDR shape never changes.
+///
+/// Markets created while `get_creation_bond()` was 0 have no `Bond` entry
+/// and no bond accounting (`claim_bond` fails with `NoBond`), which makes
+/// the upgrade migration-free.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketBond {
+    /// Amount pulled from the creator on top of `seed_amount` at creation.
+    pub amount: i128,
+    pub state: BondState,
+    /// Recorded by the void path that finalized the market. `None` while the
+    /// market has not been voided; `Some(NoFault)` also on plain
+    /// `void_market`, which keeps its pre-#23 NoFault semantics.
+    pub void_reason: Option<VoidReason>,
+    /// Fee recipient snapshotted when a `GuardianFault` void is recorded, so
+    /// a later `propose_treasury`/`accept_treasury` cannot redirect the
+    /// forfeit between the void and `claim_bond`. Falls back to the current
+    /// `DataKey::Treasury` when absent (mirrors the `sweep_fees` legacy path).
+    pub forfeit_to: Option<Address>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -161,6 +209,21 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // ----- appended tails (#23/#24) ---------------------------------------
+    // Strictly append-only: the discriminants of every pre-existing variant
+    // are unchanged.
+    // Instance storage: creation-bond default for new markets, absent = 0.
+    CreationBond,
+    // Instance storage: integrator-fee cap default for new markets, absent = 0.
+    MaxIntegratorFeeBps,
+    // Persistent sidecars; absent = legacy default, same pattern as FeeTerms.
+    Bond(u64),
+    /// Per-market snapshot of `MaxIntegratorFeeBps` taken at creation,
+    /// absent (or legacy market) means 0.
+    MarketMaxIntegratorFee(u64),
+    /// Unclaimed integrator fee balances, one entry per integrator address
+    /// across all markets.
+    IntegratorFees(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +268,14 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// `buy_via`/`sell_via`/`quote_buy_via`/`quote_sell_via` called with an
+    /// `integrator_fee_bps` above the market's creation-time snapshot cap.
+    /// NOTE: PRs #239/#240/#242 each claim 27 on their own branches; the
+    /// last PR to merge re-appends (append-only tails, collision disclosed).
+    IntegratorFeeTooHigh = 27,
+    /// `claim_bond` called on a market with no `Bond(id)` sidecar entry,
+    /// i.e. created before the creation bond existed (#23).
+    NoBond = 28,
 }
 
 impl From<MathError> for Error {
@@ -364,6 +435,33 @@ pub struct LpTransferred {
     pub market_id: u64,
     pub from: Address,
     pub to: Address,
+}
+
+/// The global creation-bond default changed. Applies to markets created
+/// after the call, never to existing snapshots (#23).
+#[contractevent]
+pub struct CreationBondChanged {
+    pub old: i128,
+    pub new: i128,
+}
+
+/// A creator posted the bond on top of the seed at creation (#23).
+#[contractevent]
+pub struct BondPosted {
+    #[topic]
+    pub market_id: u64,
+    pub amount: i128,
+}
+
+/// A held bond was settled: refunded to the creator or forfeited to the
+/// fee-recipient snapshot taken at void time (#23).
+#[contractevent]
+pub struct BondSettled {
+    #[topic]
+    pub market_id: u64,
+    pub to: Address,
+    pub amount: i128,
+    pub forfeited: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -564,11 +662,43 @@ impl MarketCore {
         Ok(())
     }
 
+    /// Sets the creation bond pulled from every new market's creator on top
+    /// of the seed (#23). Affects markets created after the call; existing
+    /// markets keep their snapshot, exactly like `set_default_fee_bps`.
+    /// 0 disables the bond and is the default (absent entry).
+    pub fn set_creation_bond(env: Env, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !(0..=MAX_SETS).contains(&amount) {
+            return Err(Error::InvalidAmount);
+        }
+        let old = Self::get_creation_bond(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::CreationBond, &amount);
+        CreationBondChanged { old, new: amount }.publish(&env);
+        Ok(())
+    }
+
+    /// The creation-bond default new markets snapshot at creation (#23).
+    /// Absent = 0 (pre-feature deployments and fresh instances). Treasury
+    /// reads this by name across the vendored-client boundary.
+    pub fn get_creation_bond(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CreationBond)
+            .unwrap_or(0)
+    }
+
     // ----- market lifecycle -----------------------------------------------
 
     /// Creates a market and seeds the pool. `creator` becomes the sole LP.
     /// `initial_yes_bps` in [100, 9900] sets the opening YES probability;
     /// the creator receives the leftover shares of the likelier outcome.
+    ///
+    /// When `get_creation_bond()` is non-zero the creator additionally posts
+    /// that refundable bond (#23): `seed_amount + bond` leaves the creator
+    /// in one transfer, and the bond is recorded in the `Bond(id)` sidecar
+    /// (`DataKey::Bond`), never in `Market` itself.
     #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         env: Env,
@@ -606,6 +736,7 @@ impl MarketCore {
             .ok_or(Error::NotInitialized)?;
         let treasury: Address = s.get(&DataKey::Treasury).ok_or(Error::NotInitialized)?;
         let breaker: Option<BreakerConfig> = s.get(&DataKey::DefaultBreaker);
+        let creation_bond: i128 = s.get(&DataKey::CreationBond).unwrap_or(0);
 
         let market = Market {
             creator: creator.clone(),
@@ -646,7 +777,31 @@ impl MarketCore {
             );
         }
 
-        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
+        // Creation bond sidecar (#23): recorded before the pull, and the
+        // whole `seed + bond` leaves the creator in ONE transfer so the
+        // treasury's nested-call pre-authorisation (which matches on the
+        // exact `(from, to, amount)` triple) stays a single entry.
+        if creation_bond > 0 {
+            Self::save_bond(
+                &env,
+                id,
+                &MarketBond {
+                    amount: creation_bond,
+                    state: BondState::Held,
+                    void_reason: None,
+                    forfeit_to: None,
+                },
+            );
+            BondPosted {
+                market_id: id,
+                amount: creation_bond,
+            }
+            .publish(&env);
+        }
+        let total_pull = seed_amount
+            .checked_add(creation_bond)
+            .ok_or(Error::Overflow)?;
+        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &total_pull);
 
         MarketCreated {
             market_id: id,
@@ -965,7 +1120,33 @@ impl MarketCore {
     }
 
     /// Invalid or unresolvable market. Allowed any time before finality.
+    ///
+    /// Keeps its pre-#23 semantics: this is the `NoFault` path. A market's
+    /// creation bond is refunded, never forfeited, when it voids through
+    /// here (which includes every `Verdict::Invalid` and expiry route).
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
+        Self::void_inner(env, market_id, VoidReason::NoFault)
+    }
+
+    /// `void_market` plus the reason (#23). Resolver-only, like `void_market`.
+    /// `GuardianFault` marks a guardian-initiated void for cause and forfeits
+    /// the market's creation bond at `claim_bond`, snapshotting the forfeit
+    /// recipient at void time.
+    ///
+    /// Callers outside this crate may not have a generated client that can
+    /// see this entrypoint (the vendored `market_core.wasm` predates it);
+    /// the resolver reaches it via `env.try_invoke_contract` name dispatch.
+    /// `VoidReason` is an all-unit-variant `#[contracttype]` enum and
+    /// therefore encodes as a plain `ScVal::Symbol` variant name.
+    pub fn void_market_with_reason(
+        env: Env,
+        market_id: u64,
+        reason: VoidReason,
+    ) -> Result<(), Error> {
+        Self::void_inner(env, market_id, reason)
+    }
+
+    fn void_inner(env: Env, market_id: u64, reason: VoidReason) -> Result<(), Error> {
         Self::require_resolver(&env)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
@@ -973,12 +1154,74 @@ impl MarketCore {
         }
         m.status = MarketStatus::Void;
         Self::save_market(&env, market_id, &m);
+
+        // Record the reason on the bond sidecar; markets without a bond
+        // entry (created pre-#23 or with a zero default) are untouched.
+        if let Some(mut bond) = Self::load_bond(&env, market_id) {
+            bond.void_reason = Some(reason);
+            if reason == VoidReason::GuardianFault && bond.state == BondState::Held {
+                // Snapshot the same destination `sweep_fees` would use, at
+                // void time, so a later treasury swap cannot redirect it.
+                let recipient = match Self::load_fee_terms(&env, market_id) {
+                    Some(t) => t.recipient,
+                    None => Self::instance_get(&env, &DataKey::Treasury)?,
+                };
+                bond.forfeit_to = Some(recipient);
+            }
+            Self::save_bond(&env, market_id, &bond);
+        }
+
         MarketResolved {
             market_id,
             outcome: None,
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Settles a market's creation bond once the market is final (#23).
+    /// Permissionless so a keeper can drive it; the state flip is written
+    /// before the transfer (effects before interactions), so a second call
+    /// can never pay again and fails with `AlreadyClaimed`.
+    ///
+    /// Pays the creator on `Resolved` and on a `NoFault` void; pays the
+    /// `GuardianFault` void amount to the fee recipient snapshotted at void
+    /// time. Returns the settled amount.
+    pub fn claim_bond(env: Env, market_id: u64) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        Self::settlement(&m)?;
+        let mut bond = Self::load_bond(&env, market_id).ok_or(Error::NoBond)?;
+        if bond.state != BondState::Held {
+            return Err(Error::AlreadyClaimed);
+        }
+        let forfeited = matches!(m.status, MarketStatus::Void)
+            && bond.void_reason == Some(VoidReason::GuardianFault);
+        let to = if forfeited {
+            match bond.forfeit_to.clone() {
+                Some(a) => a,
+                None => Self::instance_get(&env, &DataKey::Treasury)?,
+            }
+        } else {
+            m.creator.clone()
+        };
+        bond.state = if forfeited {
+            BondState::Forfeited
+        } else {
+            BondState::Refunded
+        };
+        Self::save_bond(&env, market_id, &bond);
+        let amount = bond.amount;
+        if amount > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &to, &amount);
+        }
+        BondSettled {
+            market_id,
+            to,
+            amount,
+            forfeited,
+        }
+        .publish(&env);
+        Ok(amount)
     }
 
     // ----- settlement -----------------------------------------------------
@@ -1248,6 +1491,13 @@ impl MarketCore {
         Ok(Self::load_breaker(&env, market_id))
     }
 
+    /// The market's creation-bond sidecar (#23). `None` for markets created
+    /// without a bond (legacy markets or a zero default at creation).
+    pub fn get_bond(env: Env, market_id: u64) -> Result<Option<MarketBond>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_bond(&env, market_id))
+    }
+
     /// The current ledger's band reference, if a band check has run this
     /// ledger. `None` means the next trade sets the reference (to its own
     /// pre-trade price, which equals the ledger-open price).
@@ -1477,6 +1727,25 @@ impl MarketCore {
                 .persistent()
                 .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         }
+    }
+
+    fn load_bond(env: &Env, id: u64) -> Option<MarketBond> {
+        let key = DataKey::Bond(id);
+        let bond = env.storage().persistent().get(&key);
+        if bond.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        bond
+    }
+
+    fn save_bond(env: &Env, id: u64, bond: &MarketBond) {
+        let key = DataKey::Bond(id);
+        env.storage().persistent().set(&key, bond);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
     }
 
     /// Splits a trade `fee` per the market's snapshotted `FeeTerms` (legacy
@@ -3065,6 +3334,320 @@ mod test {
             }])
             .try_propose_treasury(&peer)
             .is_err());
+    }
+
+    // ----- Issue #23: creation bond --------------------------------------
+
+    const BOND: i128 = 10_000_000; // 1 USDC on top of the 100 USDC seed
+
+    /// Held-bond term of the global solvency invariant: the contract's
+    /// collateral balance must equal
+    /// `Σ (sets_minted + fees_accrued + lp_fees) + Σ held bonds
+    ///  + Σ unclaimed integrator balances`
+    /// (#23/#24 extend the pre-#23 invariant `sets_minted + fees_accrued`
+    /// documented in `docs/architecture.md`; integrator balances are added
+    /// by the #24 tests via the `integrator` argument).
+    fn assert_global_solvency(
+        env: &Env,
+        client: &MarketCoreClient,
+        collateral: &Address,
+        integrators: &[Address],
+    ) {
+        let token = StellarAssetClient::new(env, collateral);
+        let core = client.address.clone();
+        let mut expected = 0i128;
+        for id in 0..client.market_count() {
+            let m = client.get_market(&id);
+            expected += m.sets_minted + m.fees_accrued;
+            let lp: i128 = env.as_contract(&core, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::LpFees(id))
+                    .unwrap_or(0)
+            });
+            expected += lp;
+            if let Some(b) = client.get_bond(&id) {
+                if b.state == BondState::Held {
+                    expected += b.amount;
+                }
+            }
+        }
+        for integrator in integrators {
+            expected += env.as_contract(&core, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::IntegratorFees(integrator.clone()))
+                    .unwrap_or(0)
+            });
+        }
+        assert_eq!(token.balance(&core), expected);
+    }
+
+    #[test]
+    fn create_market_pulls_seed_plus_bond() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        assert_eq!(client.get_creation_bond(), BOND);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let creator_before = collateral_client.balance(&creator);
+
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        // One atomic pull of seed + bond, per the treasury pre-authorisation
+        // contract (`authorize_token_pull` matches a single exact amount).
+        assert_eq!(
+            collateral_client.balance(&creator),
+            creator_before - (100 * 10_000_000_i128) - BOND
+        );
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.amount, BOND);
+        assert_eq!(bond.state, BondState::Held);
+        assert_eq!(bond.void_reason, None);
+        assert_eq!(bond.forfeit_to, None);
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_refunded_on_resolution() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        let refunded = client.claim_bond(&market_id);
+        assert_eq!(refunded, BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+
+        assert_eq!(
+            client.get_bond(&market_id).unwrap().state,
+            BondState::Refunded
+        );
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_refunded_on_plain_void_keeps_no_fault_semantics() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        // `void_market` itself — the compatibility path — must refund.
+        client.void_market(&market_id);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Refunded);
+        assert_eq!(bond.void_reason, Some(VoidReason::NoFault));
+    }
+
+    #[test]
+    fn bond_refunded_on_explicit_no_fault_void() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::NoFault);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+        assert_eq!(
+            client.get_bond(&market_id).unwrap().state,
+            BondState::Refunded
+        );
+    }
+
+    #[test]
+    fn bond_forfeited_on_guardian_fault_void() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        let treasury = client.get_config().treasury;
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::GuardianFault);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let treasury_before = collateral_client.balance(&treasury);
+        let creator_before = collateral_client.balance(&creator);
+
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&treasury), treasury_before + BOND);
+        assert_eq!(collateral_client.balance(&creator), creator_before);
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Forfeited);
+        assert_eq!(bond.void_reason, Some(VoidReason::GuardianFault));
+        // Recipient snapshotted at void time, not read at claim time.
+        assert_eq!(bond.forfeit_to, Some(treasury.clone()));
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_forfeit_survives_later_treasury_change() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        let treasury = client.get_config().treasury;
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::GuardianFault);
+
+        // Two-step treasury handover to a wired peer after the void; the
+        // forfeit must still pay the snapshot, not the new treasury.
+        let new_treasury = register_wiring_peer(&env, &client);
+        client.propose_treasury(&new_treasury);
+        client.accept_treasury();
+        assert_eq!(client.get_config().treasury, new_treasury);
+
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        assert_eq!(collateral_client.balance(&new_treasury), 0);
+        assert!(collateral_client.balance(&treasury) >= BOND);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #17)")]
+    fn claim_bond_twice_fails() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+        client.claim_bond(&market_id);
+        client.claim_bond(&market_id);
+    }
+
+    #[test]
+    fn claim_bond_before_finality_fails() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        assert_eq!(client.try_claim_bond(&market_id), Err(Ok(Error::NotFinal)));
+    }
+
+    #[test]
+    fn claim_pool_remainder_does_not_touch_bond() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+        client.claim_pool_remainder(&market_id);
+
+        // The LP payout is computed from reserves only; the bond sidecar is
+        // untouched and still claimable.
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Held);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+    }
+
+    #[test]
+    fn legacy_market_has_no_bond() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(client.get_bond(&market_id), Ok(None));
+
+        // Remove the sidecar to simulate a market created before this
+        // feature: `claim_bond` reports `NoBond`, not a zero refund.
+        remove_side_entry(&env, &client, DataKey::Bond(market_id));
+        assert_eq!(client.get_bond(&market_id), Ok(None));
+        client.void_market(&market_id);
+        assert_eq!(client.try_claim_bond(&market_id), Err(Ok(Error::NoBond)));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_set_creation_bond() {
+        let (env, client, _, trader, _, _) = setup_market();
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "set_creation_bond",
+                    args: (BOND,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_creation_bond(&BOND)
+            .is_err());
+    }
+
+    #[test]
+    fn wrong_caller_cannot_void_with_reason() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "void_market_with_reason",
+                    args: (market_id, VoidReason::GuardianFault).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_void_market_with_reason(&market_id, &VoidReason::GuardianFault)
+            .is_err());
+    }
+
+    #[test]
+    fn global_solvency_includes_bonds_multi_market() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 6000);
+
+        client.buy(&trader, &m0, &Outcome::Yes, &(10 * 10_000_000_i128), &0);
+        // Give the trader NO shares in m1 first, then sell some back.
+        client.buy(&trader, &m1, &Outcome::No, &(5 * 10_000_000_i128), &0);
+        client.sell(
+            &trader,
+            &m1,
+            &Outcome::No,
+            &(1 * 10_000_000_i128),
+            &(100 * 10_000_000_i128),
+        );
+        assert_global_solvency(&env, &client, &collateral, &[]);
+
+        // One market resolves and its bond leaves the held set; the
+        // invariant tracks it through the payout.
+        let close_time = client.get_market(&m0).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&m0, &Outcome::Yes);
+        client.claim_bond(&m0);
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn set_creation_bond_bounds() {
+        let (env, client, _, _, _, _) = setup_market();
+        assert_eq!(
+            client.try_set_creation_bond(&-1_i128),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            client.try_set_creation_bond(&(MAX_SETS + 1)),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(client.try_set_creation_bond(&0_i128), Ok(Ok(())));
+        assert_eq!(client.get_creation_bond(), 0);
+        let _ = env;
     }
 }
 
