@@ -169,6 +169,49 @@ pub struct HybridConfig {
     pub fallback_after: u64,
 }
 
+/// One oracle feed inside a [`QuorumPriceConfig`].
+///
+/// `decimals` is creator-declared at registration, not read from the feed:
+/// the Reflector-style price interface (`price(asset, timestamp)`) exposes no
+/// `decimals()` method, and probing for one would fail against every deployed
+/// Reflector. Carrying it in the commitment keeps the normalisation scale
+/// covered by the `resolution_hash` instead of trusting a live oracle call.
+/// Validated `<= 18` (`MAX_DECIMALS`) before the spec is ever stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedRef {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    /// Decimal places by which this feed's `PriceData::price` is scaled.
+    pub decimals: u32,
+}
+
+/// Multi-oracle quorum rule: read every committed feed, reject the ones that
+/// fail per-feed checks, take the median of the survivors, and compare it to
+/// `threshold` like [`PriceConfig`] does. Registration validates
+/// `1 <= min_responses <= feeds.len() <= MAX_FEEDS`, a strict majority
+/// (`min_responses * 2 > feeds.len()`), distinct `(reflector, asset)` pairs,
+/// `max_deviation_bps <= 10_000`, and per-feed decimals `<= 18`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumPriceConfig {
+    pub feeds: Vec<FeedRef>,
+    /// Minimum feeds that must produce a usable price. Fewer resolves nothing
+    /// (retryable), it never voids.
+    pub min_responses: u32,
+    /// Strike compared against the median, at `threshold_decimals` scale.
+    pub threshold: i128,
+    /// Decimal places of [`Self::threshold`]. The resolution normalises every
+    /// price and the threshold to `max(threshold_decimals, max feed decimals)`
+    /// (capped at 18).
+    pub threshold_decimals: u32,
+    pub direction: PriceDirection,
+    pub max_staleness: u64,
+    /// Maximum tolerated `(max - min) / median` spread across accepted feeds,
+    /// in basis points. A wider spread is `FeedsDisagree`, not a median.
+    pub max_deviation_bps: u32,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
@@ -182,6 +225,11 @@ pub enum ResolutionSpec {
     SignersDisputable(DisputableSignerConfig),
     Committee(CommitteeRef),
     Hybrid(HybridConfig),
+    /// Append-only tail: `#[contracttype]` enums encode the *case name* as an
+    /// `ScVal` union, and every existing hash is over `sha256(XDR(spec))`, so
+    /// appending a variant cannot shift or re-encode `Price`/`Signers`/... —
+    /// the `golden` tests in `contracts/resolver` pin those exact hashes.
+    PriceQuorum(QuorumPriceConfig),
 }
 
 /// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
@@ -259,9 +307,25 @@ mod test {
             ResolutionSpec::Price(price.clone()),
             ResolutionSpec::Signers(signer.clone()),
             ResolutionSpec::Hybrid(HybridConfig {
-                price,
-                fallback: signer,
+                price: price.clone(),
+                fallback: signer.clone(),
                 fallback_after: 3_600,
+            }),
+            ResolutionSpec::PriceQuorum(QuorumPriceConfig {
+                feeds: Vec::from_array(
+                    &env,
+                    [FeedRef {
+                        reflector: price.reflector.clone(),
+                        asset: price.asset.clone(),
+                        decimals: 8,
+                    }],
+                ),
+                min_responses: 1,
+                threshold: price.threshold,
+                threshold_decimals: 8,
+                direction: price.direction,
+                max_staleness: price.max_staleness,
+                max_deviation_bps: 100,
             }),
         ];
         for (i, a) in specs.iter().enumerate() {
