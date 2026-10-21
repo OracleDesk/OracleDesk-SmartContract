@@ -19,14 +19,22 @@
 //!   `ORACLEDESK_MARKET_CORE_V2_WASM`.
 //!
 //! Disclosure: none of these tests has been executed on the machine that
-//! produced this PR. The workspace does not compile at this base for two
-//! pre-existing reasons unrelated to this file — an illegal `//!` header in the
-//! file `include!`d by `contracts/resolver/build.rs` and `contracts/treasury/build.rs`
-//! (14 x E0753 before anything else is even type-checked), and a
-//! `rust-toolchain.toml` pin of 1.90.0, below soroban-sdk 27's MSRV. Run them
-//! with `cargo test -p market-core` (mechanism) and
-//! `cargo test -p market-core --features test-v2` (migration) once that is
-//! fixed. Do not merge on the assumption that they pass.
+//! produced this PR, and no compiler has read this file. What was measured at
+//! this base, in order: `rust-toolchain.toml` pins 1.90.0 while `Cargo.lock`
+//! holds soroban-sdk 27.0.6, which requires rustc 1.91.0, so
+//! `cargo check -p market-core --tests` exits at dependency resolution
+//! (EXIT 101) before compiling anything. With a 1.91 toolchain the build reaches
+//! `contracts/oracledesk-types` and dies there with 21 errors (16 of them
+//! "cannot find attribute `contracttype`": that crate uses the macro from its
+//! `:33` onward without importing it at `:27`), so `market-core` itself is never
+//! analysed — and the error set is byte-identical at the base commit, i.e. this
+//! file adds none of it. `resolver` and `treasury` would additionally fail on an
+//! illegal `//!` header inside the file their `build.rs` `include!`s
+//! (`scripts/verify-wasm-hash.rs` — read from source, never reached by a
+//! compiler here). All of it predates this PR. Run with
+//! `cargo test -p market-core` (mechanism) and `cargo test -p market-core
+//! --features test-v2` (migration) once the workspace builds again. Do not merge
+//! on the assumption that they pass.
 
 use super::*;
 use soroban_sdk::{

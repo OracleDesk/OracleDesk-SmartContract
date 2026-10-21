@@ -8,12 +8,19 @@
 //! `market_core.wasm` (docs/adr/0002-cross-contract-calls.md).
 //!
 //! Disclosure: none of these tests has been executed on the machine that
-//! produced this PR — the workspace does not compile at this base (an illegal
-//! `//!` header in the file `include!`d by `contracts/resolver/build.rs` gives
-//! 14 x E0753 before anything is type-checked, and `rust-toolchain.toml` pins
-//! 1.90.0, below soroban-sdk 27's MSRV). Run with `cargo test -p resolver`, or
-//! `cargo test -p resolver --features test-v2` for the migration group. Do not
-//! merge on the assumption that they pass.
+//! produced this PR, and no compiler has read this file. Measured at this base:
+//! `rust-toolchain.toml` pins 1.90.0 while `Cargo.lock` holds soroban-sdk
+//! 27.0.6, which requires rustc 1.91.0, so a check exits at dependency
+//! resolution (EXIT 101) before compiling anything; with a 1.91 toolchain the
+//! build dies inside `contracts/oracledesk-types` — 21 errors, 16 of them
+//! "cannot find attribute `contracttype`", which that crate uses without
+//! importing — so nothing downstream of it is analysed. resolver would
+//! additionally fail on an illegal `//!` header in the file
+//! `contracts/resolver/build.rs` `include!`s
+//! (`scripts/verify-wasm-hash.rs` — read from source, never reached by a
+//! compiler here). Run with `cargo test -p resolver`, or `cargo test -p resolver
+//! --features test-v2` for the migration group, once the workspace builds again.
+//! Do not merge on the assumption that they pass.
 
 use super::*;
 use soroban_sdk::{
