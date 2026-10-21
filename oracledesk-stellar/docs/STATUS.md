@@ -383,6 +383,25 @@ markers in the files themselves:
   lets resolution outlive the oracle's bounded history, but only if someone
   calls it while the `close_time` record is still retained; there is no
   keeper doing so automatically yet.
+- **Emergency modes hinge on admin liveness.** `market-core` now has four
+  graduated states (`Normal` / `ReduceOnly` / `SettleOnly` / `Halted`, #20,
+  see `docs/architecture.md`) instead of a binary pause, so an incident no
+  longer has to freeze exits to stop new risk. But only the single admin key
+  can move between them: while the contract sits in `Halted`, redemption is
+  blocked until that key acts (the matrix guarantees `Halted → SettleOnly →
+  redeem` always works, and `set_mode` itself is never gated). Adding a
+  timelock/multisig or an automatic de-escalation timer is
+  `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md` territory
+  (wave-issue #61/#62), not done here.
+- **Two separate emergency mechanisms now exist.** The `OperatingMode`
+  ladder above lives in `market-core` and is admin-driven; the treasury-side
+  drawdown breaker from #46 (`DrawdownTripped`, `acknowledge_drawdown`,
+  `NotAcknowledged`, see the contributor addendum) is automatic and
+  PnL-triggered, and gates buys at the treasury layer. They overlap in
+  intent ("stop new risk, keep exits") but not in code: a buy can be refused
+  by either, and resuming one does not resume the other. The treasury
+  pre-check (#20) only reads market-core's mode to fail fast with its own
+  `MarketCoreRestricted`; market-core remains the enforcement authority.
 
 ## Reproducing this
 

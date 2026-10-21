@@ -4,8 +4,8 @@ use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
     vec,
-    xdr::ToXdr,
-    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    xdr::{ScErrorCode, ScErrorType, ToXdr},
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 // See the comment on the equivalent `mod market_core` in
@@ -116,7 +116,10 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
 fn core_call<T>(
-    result: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    result: Result<
+        Result<T, market_core::Error>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    >,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
@@ -180,6 +183,34 @@ pub struct GlobalConfig {
     /// Cap on capital deployed in open positions across all markets at once
     /// (see `net_exposure`).
     pub max_net_exposure: i128,
+}
+
+/// market-core's `OperatingMode` (#20) as treasury sees it: a *name-decoded*
+/// mirror. Treasury never imports market-core's type and never touches its
+/// `contractimport!`-generated module, so this feature needed no refresh of
+/// the vendored `market_core.wasm` blob: `get_mode` returns an enum whose
+/// variants are all unit and declared without discriminants, which
+/// `soroban-sdk` encodes as `ScVal::Symbol("<VariantName>")`. The read
+/// decodes that symbol by name (version-robust: adding a mode to
+/// market-core later cannot silently shift an index under this decoder).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreMode {
+    Normal,
+    ReduceOnly,
+    SettleOnly,
+    Halted,
+}
+
+/// Which market-core entrypoint a treasury agent call would reach, used
+/// only to pre-check market-core's `OperatingMode` (#20). Internal: never
+/// part of a public signature, so it stays out of the spec and bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarketCoreAction {
+    Create,
+    Buy,
+    Sell,
+    Redeem,
+    ClaimRemainder,
 }
 
 /// One registered agent. `max_trade` / `max_daily` sit under the global
@@ -559,6 +590,13 @@ pub enum Error {
     /// `agent_create_market_and_reveal` was given a malformed resolution
     /// envelope or a rule outside the two primary modes (#64).
     InvalidResolution = 48,
+    /// market-core's `OperatingMode` (#20) forbids the action the agent
+    /// asked for. Reported here rather than bubbling market-core's code,
+    /// which would collide with treasury's own numbering (market-core's
+    /// `Paused` is 2, the same number as treasury's `Unauthorized`).
+    /// Appended after the real tail at this tip (48); the `44` in the issue
+    /// text is stale.
+    MarketCoreRestricted = 49,
 }
 
 #[contractevent]
@@ -1740,6 +1778,7 @@ impl Treasury {
         Self::assert_not_paused(&env)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_CREATE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Create)?;
         if seed_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1769,16 +1808,18 @@ impl Treasury {
 
         let treasury_addr = env.current_contract_address();
         Self::authorize_token_pull(&env, &global, &treasury_addr, seed_amount);
-        let market_id = core_call(MarketCoreClient::new(&env, &global.market_core).try_create_market(
-            &treasury_addr,
-            &question_hash,
-            &resolution_hash,
-            &meta_uri,
-            &category,
-            &close_time,
-            &seed_amount,
-            &initial_yes_bps,
-        ))?;
+        let market_id = core_call(
+            MarketCoreClient::new(&env, &global.market_core).try_create_market(
+                &treasury_addr,
+                &question_hash,
+                &resolution_hash,
+                &meta_uri,
+                &category,
+                &close_time,
+                &seed_amount,
+                &initial_yes_bps,
+            ),
+        )?;
         Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
         Self::record_cost(&env, market_id, seed_amount)?;
@@ -1947,6 +1988,7 @@ impl Treasury {
     pub fn redeem(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Redeem)?;
         Self::settle_redeem(&env, &global.market_core, market_id)
     }
 
@@ -1955,6 +1997,11 @@ impl Treasury {
     pub fn claim_pool_remainder(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
+        Self::assert_market_core_allows(
+            &env,
+            &global.market_core,
+            MarketCoreAction::ClaimRemainder,
+        )?;
         Self::settle_claim(&env, &global.market_core, market_id)
     }
 
@@ -2501,6 +2548,106 @@ impl Treasury {
         Ok(())
     }
 
+    /// The market-core actions the treasury forwards, mirroring market-core's
+    /// own matrix (`assert_mode_allows` in `contracts/market-core/src/lib.rs`,
+    /// table in `docs/architecture.md`). Market-core stays the enforcement
+    /// authority — this table only decides what the treasury is willing to
+    /// *forward*, so a drift here costs a nested market-core revert, not
+    /// safety.
+    fn market_core_allows(mode: CoreMode, action: MarketCoreAction) -> bool {
+        match (mode, action) {
+            (CoreMode::Normal, _) => true,
+            (CoreMode::ReduceOnly, MarketCoreAction::Create | MarketCoreAction::Buy) => false,
+            (CoreMode::ReduceOnly, _) => true,
+            (
+                CoreMode::SettleOnly,
+                MarketCoreAction::Create | MarketCoreAction::Buy | MarketCoreAction::Sell,
+            ) => false,
+            (CoreMode::SettleOnly, _) => true,
+            (CoreMode::Halted, _) => false,
+        }
+    }
+
+    /// Reads market-core's `OperatingMode` (#20) *by name*, exactly like
+    /// [`Treasury::core_trade`] dispatches the trade calls: same
+    /// `try_invoke_contract` helper family, same discipline that a failure
+    /// maps into treasury's own error range and never leaks a market-core
+    /// code. Deliberately *not* a `MarketCoreClient::get_mode` — that method
+    /// does not exist in the vendored blob, and exporting it would force a
+    /// wasm rebuild this contract's `contractimport!` cannot skip.
+    ///
+    /// `market_core::OperatingMode` is declared without discriminants, so
+    /// the soroban derive encodes each variant as `ScVal::Symbol(name)`
+    /// (`soroban-sdk-macros::derive_enum`, unit-variant path); decoding the
+    /// variant *name* is version-robust.
+    ///
+    /// A market-core deployed before #20 has no `get_mode` export at all:
+    /// the host rejects the call with `WasmVm/MissingValue` ("trying to
+    /// invoke non-existent contract function"). That specific outcome is
+    /// treated as `Normal` — such an instance only has the legacy binary
+    /// pause, which this contract's *own* `Paused` check (always run first,
+    /// unchanged) guards. Anything else (a remote contract error, metering,
+    /// a garbled reply, an unrecognized future variant name) maps into
+    /// treasury's own errors, never market-core's.
+    fn read_market_core_mode(env: &Env, core: &Address) -> Result<CoreMode, Error> {
+        let val = match env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            core,
+            &Symbol::new(env, "get_mode"),
+            vec![env],
+        ) {
+            Ok(Ok(v)) => v,
+            // `Val` conversion is infallible, so `Ok(Err)` is unreachable;
+            // keep the arm honest rather than panic.
+            Ok(Err(_)) => return Err(Error::MarketCoreCallFailed),
+            Err(Ok(e)) => {
+                let missing_fn = soroban_sdk::Error::from_type_and_code(
+                    ScErrorType::WasmVm,
+                    ScErrorCode::MissingValue,
+                );
+                if e == missing_fn {
+                    return Ok(CoreMode::Normal);
+                }
+                return Err(Error::MarketCoreCallFailed);
+            }
+            Err(Err(_)) => return Err(Error::MarketCoreCallFailed),
+        };
+        let name = Symbol::try_from_val(env, &val).map_err(|_| Error::MarketCoreCallFailed)?;
+        if name == Symbol::new(env, "Normal") {
+            Ok(CoreMode::Normal)
+        } else if name == Symbol::new(env, "ReduceOnly") {
+            Ok(CoreMode::ReduceOnly)
+        } else if name == Symbol::new(env, "SettleOnly") {
+            Ok(CoreMode::SettleOnly)
+        } else if name == Symbol::new(env, "Halted") {
+            Ok(CoreMode::Halted)
+        } else {
+            // A mode this treasury was not taught about: refuse to forward,
+            // conservatively. `MarketCoreRestricted` is treasury's own code.
+            Err(Error::MarketCoreRestricted)
+        }
+    }
+
+    /// Pre-checks market-core's emergency mode (#20) before forwarding an
+    /// agent action, so the agent sees treasury's own
+    /// `Error::MarketCoreRestricted` (49) instead of a nested market-core
+    /// code that would collide with treasury's numbering. Exactly one
+    /// cross-contract read per call (never also `get_config`). Treasury's
+    /// own `Paused` check runs first and is unchanged. Deliberately *not*
+    /// wired into the `legacy_*` settle paths: a detached legacy core is
+    /// outside the current config's blast radius, and those paths exist
+    /// precisely so positions there are never stranded.
+    fn assert_market_core_allows(
+        env: &Env,
+        core: &Address,
+        action: MarketCoreAction,
+    ) -> Result<(), Error> {
+        let mode = Self::read_market_core_mode(env, core)?;
+        if Self::market_core_allows(mode, action) {
+            return Ok(());
+        }
+        Err(Error::MarketCoreRestricted)
+    }
+
     fn put_persistent<V: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
         env.storage().persistent().set(key, value);
         env.storage()
@@ -2768,6 +2915,7 @@ impl Treasury {
         Self::assert_not_paused(&env)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Buy)?;
         Self::check_trade_size(&global, &policy, collateral_in)?;
         Self::ensure_unreserved(&env, &global, collateral_in)?;
 
@@ -2841,6 +2989,7 @@ impl Treasury {
         }
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        Self::assert_market_core_allows(&env, &global.market_core, MarketCoreAction::Sell)?;
         let prices = Self::load_price_policy(&env);
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(&env, &global.market_core);
@@ -8030,5 +8179,241 @@ mod test {
 
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
+    }
+
+    // ----- #20: market-core's emergency mode is pre-checked ----------------
+
+    /// Stand-in market-core exposing only `get_mode`, answering with the
+    /// variant-name *symbol* market-core's real `OperatingMode` encodes
+    /// (unit variants, no discriminants → `ScVal::Symbol(name)`). Exactly
+    /// what [`Treasury::read_market_core_mode`] is built to decode — and
+    /// what the vendored pre-#20 blob cannot answer at all (no export,
+    /// `WasmVm/MissingValue`), which is the legacy path.
+    #[contract]
+    struct ModeStubCore;
+
+    #[contractimpl]
+    impl ModeStubCore {
+        pub fn set_mode(env: Env, mode: Symbol) {
+            env.storage().instance().set(&0u32, &mode);
+        }
+
+        pub fn get_mode(env: Env) -> Symbol {
+            env.storage()
+                .instance()
+                .get(&0u32)
+                .unwrap_or_else(|| Symbol::new(&env, "Normal"))
+        }
+    }
+
+    /// A treasury (second instance, sharing the fixture's token/admin/agent)
+    /// whose `market_core` is a `ModeStubCore` stuck in `mode`. Same
+    /// scaffolding as `agent_buy_hot_path_makes_no_extra_cross_contract_reads`.
+    fn stub_core_fixture(
+        mode: &str,
+    ) -> (
+        Fixture,
+        TreasuryClient<'static>,
+        ModeStubCoreClient<'static>,
+    ) {
+        let f = fixture();
+        let config = f.treasury.get_config();
+        let proxy_id = f.env.register(ModeStubCore, ());
+        let proxy = ModeStubCoreClient::new(&f.env, &proxy_id);
+        proxy.set_mode(&Symbol::new(&f.env, mode));
+        let default_policy = CreationPolicy {
+            max_seed: config.max_market,
+            max_markets_per_window: 100,
+            creation_window_secs: 86_400,
+            min_close_horizon: 60,
+            max_close_horizon: 365 * DAY_SECONDS,
+            allowed_categories: 0x3F,
+        };
+        let max_drawdown = config.max_daily * 10;
+        let window_days = 7u32;
+        let treasury_id = f.env.register(
+            Treasury,
+            TreasuryArgs::__constructor(
+                &f.admin,
+                &config.agent,
+                &f.token,
+                &proxy_id,
+                &config.max_trade,
+                &config.max_market,
+                &config.max_daily,
+                &config.max_daily,
+                &DELAY,
+                &max_drawdown,
+                &window_days,
+                &default_policy,
+            ),
+        );
+        StellarAssetClient::new(&f.env, &f.token).mint(&treasury_id, &(100 * USDC));
+        let treasury = TreasuryClient::new(&f.env, &treasury_id);
+        (f, treasury, proxy)
+    }
+
+    /// All 4 modes × 5 forwarded actions of the treasury-side mirror,
+    /// checked against the table written out independently here (and in
+    /// `docs/architecture.md`) rather than against `market_core_allows`
+    /// itself.
+    #[test]
+    fn market_core_matrix_mirror_is_the_documented_one() {
+        let documented = |mode: CoreMode, action: MarketCoreAction| match action {
+            MarketCoreAction::Create | MarketCoreAction::Buy => mode == CoreMode::Normal,
+            MarketCoreAction::Sell => matches!(mode, CoreMode::Normal | CoreMode::ReduceOnly),
+            MarketCoreAction::Redeem | MarketCoreAction::ClaimRemainder => mode != CoreMode::Halted,
+        };
+        let cells = [
+            (MarketCoreAction::Create, "agent_create_market"),
+            (MarketCoreAction::Buy, "agent_buy"),
+            (MarketCoreAction::Sell, "agent_sell"),
+            (MarketCoreAction::Redeem, "redeem"),
+            (MarketCoreAction::ClaimRemainder, "claim_pool_remainder"),
+        ];
+        let mut checked = 0u32;
+        for mode in [
+            CoreMode::Normal,
+            CoreMode::ReduceOnly,
+            CoreMode::SettleOnly,
+            CoreMode::Halted,
+        ] {
+            for (action, name) in cells {
+                checked += 1;
+                let allows = Treasury::market_core_allows(mode, action);
+                assert_eq!(allows, documented(mode, action), "{mode:?} / {name}");
+            }
+        }
+        assert_eq!(checked, 4 * 5, "the mirror test must stay exhaustive");
+    }
+
+    /// An agent asking for something market-core's mode forbids gets
+    /// treasury's own `MarketCoreRestricted` (49), not market-core's code 2
+    /// (which is treasury's `Unauthorized`) or code 27.
+    #[test]
+    fn agent_create_and_buy_rejected_when_core_reports_reduce_only() {
+        let (f, treasury, _proxy) = stub_core_fixture("ReduceOnly");
+        assert_eq!(
+            treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            treasury.try_agent_create_market(
+                &f.agent,
+                &BytesN::from_array(&f.env, &[13u8; 32]),
+                &BytesN::from_array(&f.env, &[113u8; 32]),
+                &String::from_str(&f.env, "ipfs://agent-created"),
+                &Category::Macro,
+                &MARKET_CLOSE,
+                &(100 * USDC),
+                &5000u32
+            ),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        // No cap was consumed by the rejected calls.
+        assert_eq!(treasury.daily_usage().amount, 0);
+    }
+
+    /// `Halted` blocks everything, including the payout paths — and the
+    /// pre-check fires before market-core is called, so an unfinalized
+    /// market is not even looked at.
+    #[test]
+    fn halted_core_rejects_every_forwarded_action() {
+        let (f, treasury, _proxy) = stub_core_fixture("Halted");
+        assert_eq!(
+            treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            treasury.try_agent_sell(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &i128::MAX),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            treasury.try_redeem(&f.agent, &f.market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+        assert_eq!(
+            treasury.try_claim_pool_remainder(&f.agent, &f.market_id),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+    }
+
+    /// What the mode allows, the pre-check forwards: the call proceeds to
+    /// the deeper market-core interaction and only then dies on the stub's
+    /// missing trade functions. `MarketCoreCallFailed` (not
+    /// `MarketCoreRestricted`) *is* the proof that the gate passed. The
+    /// `Normal` case doubles as the positive symbol-decode test: the stub
+    /// answers `get_mode` with the real wire form (`ScVal::Symbol`).
+    #[test]
+    fn precheck_forwards_the_actions_the_mode_allows() {
+        // ReduceOnly keeps the exit path open.
+        let (f1, treasury1, _proxy1) = stub_core_fixture("ReduceOnly");
+        assert_eq!(
+            treasury1.try_agent_sell(&f1.agent, &f1.market_id, &Outcome::Yes, &USDC, &i128::MAX),
+            Err(Ok(Error::MarketCoreCallFailed))
+        );
+        // SettleOnly keeps resolution payouts.
+        let (f2, treasury2, _proxy2) = stub_core_fixture("SettleOnly");
+        assert_eq!(
+            treasury2.try_redeem(&f2.agent, &f2.market_id),
+            Err(Ok(Error::MarketCoreError))
+        );
+        // Normal forwards everything.
+        let (f3, treasury3, _proxy3) = stub_core_fixture("Normal");
+        assert_eq!(
+            treasury3.try_agent_buy(&f3.agent, &f3.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreCallFailed))
+        );
+    }
+
+    /// A mode name this treasury was not taught about refuses forwarding —
+    /// conservatively, with treasury's own `MarketCoreRestricted`, never a
+    /// leaked market-core code and never a silent pass.
+    #[test]
+    fn unknown_core_mode_name_is_conservatively_restricted() {
+        let (f, treasury, _proxy) = stub_core_fixture("MeltedDown");
+        assert_eq!(
+            treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreRestricted))
+        );
+    }
+
+    /// The vendored blob in `fixture()` is a pre-#20 market-core: it has no
+    /// `get_mode` export at all. The name-based read maps the host's
+    /// `WasmVm/MissingValue` to `Normal`, so nothing about the treasury's
+    /// behaviour against such a core changes (its own `Paused` flag still
+    /// guards the legacy binary pause).
+    #[test]
+    fn legacy_core_without_get_mode_passes_the_precheck_as_normal() {
+        let f = fixture();
+        assert!(f
+            .treasury
+            .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0)
+            .is_ok());
+        // And a full price-checked sell round-trip still works against it.
+        assert!(f
+            .treasury
+            .try_agent_sell(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &i128::MAX)
+            .is_ok());
+    }
+
+    /// Treasury's own `Paused` check runs first and is unchanged: a paused
+    /// treasury reports `Paused` (10) whatever market-core says.
+    #[test]
+    fn treasury_pause_wins_over_the_core_mode_precheck() {
+        let (f, treasury, proxy) = stub_core_fixture("ReduceOnly");
+        treasury.set_paused(&true);
+        assert_eq!(
+            treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::Paused))
+        );
+        // With the treasury unpaused again, the core's mode takes over —
+        // proving the two checks are independent layers, not one table.
+        treasury.set_paused(&false);
+        proxy.set_mode(&Symbol::new(&f.env, "Normal"));
+        assert_eq!(
+            treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(10 * USDC), &0),
+            Err(Ok(Error::MarketCoreCallFailed))
+        );
     }
 }
