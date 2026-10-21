@@ -29,6 +29,17 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
+/// How far a `halt_trading` effective time may be backdated (issue #22).
+///
+/// Seven days, deliberately the *same* window the resolver already grants its
+/// signers (`resolver::SIGNER_GRACE_SECS`: attestations are accepted until
+/// `close_time + 7 days`). A halt may therefore reach back no further than the
+/// period in which post-close trading is already tolerated today, which keeps
+/// the earliest possible `effective_at` inside the window whose trades the
+/// agreed late-trade policy discloses. Anything longer would rewrite history
+/// beyond the evidence a signer set can credibly attest to.
+const MAX_BACKDATE_SECS: u64 = 7 * 86_400;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -212,6 +223,18 @@ pub enum DataKey {
     BasisTotal(u64),
     /// [`VoidSnapshot`] written by `void_market` for `CostBasis` markets.
     VoidSnapshot(u64),
+    // ----- #22 event-driven early close --------------------------------------
+    /// `halt_trading` recorded: trading ends at this timestamp instead of at
+    /// `Market::close_time`. Absent = no halt, so `effective_close == close_time`
+    /// and every pre-upgrade market behaves exactly as before. One entry per
+    /// market, written at most once (there is no unfinalised state to clear:
+    /// disputes are settled on the resolver side *before* `halt_trading` runs).
+    EarlyClose(u64),
+    /// Timestamp of the last accepted `buy`/`sell`, written on every trade and
+    /// read back by `TradingHalted` so the disclosed late-trade window
+    /// `[effective_at, halted_at)` can be anchored to a real on-chain trade
+    /// (issue #22). One entry per market; it never grows.
+    LastTrade(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +279,11 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// `halt_trading` called for a market that is already halted (issue #22).
+    /// A halt is a single, permanent fact: there is no re-halt and no lift.
+    AlreadyHalted = 27,
+    /// `halt_trading` backdated further than `MAX_BACKDATE_SECS` (issue #22).
+    HaltTooOld = 28,
 }
 
 impl From<MathError> for Error {
@@ -438,6 +466,25 @@ pub struct CostBasisVoidSnapshotted {
     pub market_id: u64,
     pub pot: i128,
     pub basis_total: i128,
+}
+
+/// Emitted by `halt_trading` (issue #22). `effective_at` is when trading *ended*
+/// and `halted_at` when the chain learned about it, so the pair is exactly the
+/// window the agreed late-trade policy has to cover: trades in
+/// `[effective_at, halted_at)` happened at a price the event says is stale and
+/// are **not** reverted (see `docs/architecture.md`, "Early close and the
+/// late-trade window", and ADR 0001). `last_trade_at` anchors the window to the
+/// market's real final trade, which is the number an off-chain auditor needs to
+/// quantify the damage; `close_time` is carried so a consumer does not have to
+/// re-read a market whose state has since moved on.
+#[contractevent]
+pub struct TradingHalted {
+    #[topic]
+    pub market_id: u64,
+    pub effective_at: u64,
+    pub halted_at: u64,
+    pub close_time: u64,
+    pub last_trade_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +929,7 @@ impl MarketCore {
         }
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
-        Self::assert_tradable(&env, &m)?;
+        Self::assert_tradable(&env, market_id, &m)?;
 
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
@@ -925,6 +972,9 @@ impl MarketCore {
         // left the trader's pocket into `sets_minted` (the fee went to the
         // protocol and is never refunded, so it is excluded by design).
         Self::add_basis(&env, market_id, &trader, q.net, false)?;
+        // #22: one extra persistent write per accepted trade, always to the same
+        // key, so the cost is a fixed 8-byte entry per market and never growth.
+        Self::save_last_trade(&env, market_id);
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -1020,7 +1070,7 @@ impl MarketCore {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
-        Self::assert_tradable(&env, &m)?;
+        Self::assert_tradable(&env, market_id, &m)?;
 
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
@@ -1065,6 +1115,8 @@ impl MarketCore {
         // position once it empties, and its unrecovered positive part, if any,
         // becomes the LP's residual.
         Self::add_basis(&env, market_id, &trader, -q.gross, emptied)?;
+        // #22: see the note in `do_buy`.
+        Self::save_last_trade(&env, market_id);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
         m.sets_minted -= q.gross;
         let protocol_fee = Self::accrue_fees(&env, market_id, q.fee)?;
@@ -1096,13 +1148,73 @@ impl MarketCore {
     // Only the configured resolver contract may call these. When the resolver
     // contract is the direct caller, `require_auth` on its address passes.
 
+    /// Brings the end of trading forward to `effective_at` (issue #22).
+    ///
+    /// A "Will X happen by D?" question can be settled by the world long before
+    /// `D`; until now the pool stayed open and anyone faster than the repricing
+    /// crowd bought the already-known outcome at a stale price, with the loss
+    /// landing on the LP. `halt_trading` closes that window: from the moment it
+    /// is called, `assert_tradable`, `resolve` and the resolver's attestation
+    /// gate all read `effective_close = min(close_time, effective_at)`.
+    ///
+    /// Rules, in order:
+    /// - resolver-only, exactly like `resolve` / `void_market`;
+    /// - the market must still be `Open` (a resolved or void market has nothing
+    ///   to halt, and `finalize_early_close` reaching a market that was voided
+    ///   mid-dispute fails here rather than half-applying a halt);
+    /// - one halt per market — a halt is permanent, there is no lift entrypoint,
+    ///   which is what makes "the halt is final" trivially true on-chain;
+    /// - `effective_at <= close_time` (a halt may only move the close earlier)
+    ///   and `effective_at <= now` (a halt records a fact, it cannot schedule
+    ///   one), plus `effective_at >= now - MAX_BACKDATE_SECS`.
+    ///
+    /// Because the halt only *records* a past instant, trades that landed
+    /// between `effective_at` and this transaction still happened. The chosen
+    /// policy is **accept and disclose**: they are not reverted, and the event
+    /// publishes the window so the backend can flag them. Rationale and the
+    /// rejected alternative are in `docs/adr/0001-resolution-commitment.md`.
+    pub fn halt_trading(env: Env, market_id: u64, effective_at: u64) -> Result<(), Error> {
+        Self::require_resolver(&env)?;
+        let m = Self::load_market(&env, market_id)?;
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if Self::load_early_close(&env, market_id).is_some() {
+            return Err(Error::AlreadyHalted);
+        }
+        if effective_at > m.close_time {
+            return Err(Error::InvalidCloseTime);
+        }
+        let now = env.ledger().timestamp();
+        if effective_at > now {
+            return Err(Error::InvalidCloseTime);
+        }
+        if effective_at < now.saturating_sub(MAX_BACKDATE_SECS) {
+            return Err(Error::HaltTooOld);
+        }
+        Self::save_early_close(&env, market_id, effective_at);
+        TradingHalted {
+            market_id,
+            effective_at,
+            halted_at: now,
+            close_time: m.close_time,
+            last_trade_at: Self::load_last_trade(&env, market_id),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_resolver(&env)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
-        if env.ledger().timestamp() < m.close_time {
+        // Issue #22: an early halt is final the instant it is written (it can
+        // only come from the resolver, and there is no way to lift it), so the
+        // effective close is the only gate. With no halt recorded this is the
+        // original `m.close_time` comparison, byte for byte.
+        if env.ledger().timestamp() < Self::effective_close(&env, market_id, &m) {
             return Err(Error::NotClosedYet);
         }
         m.status = MarketStatus::Resolved(outcome);
@@ -1466,6 +1578,29 @@ impl MarketCore {
         Ok(Self::load_void_snapshot_opt(&env, market_id))
     }
 
+    /// The instant recorded by `halt_trading` (issue #22), `None` while the
+    /// market has never been halted. Read-only and permissionless, so the
+    /// resolver can gate attestation on it without a second source of truth.
+    pub fn get_early_close(env: Env, market_id: u64) -> Result<Option<u64>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_early_close(&env, market_id))
+    }
+
+    /// `min(close_time, early_close)` — when trading really ends (issue #22).
+    /// Equals `get_market(..).close_time` for every market that was never
+    /// halted, which is the whole compatibility argument for the sidecar.
+    pub fn get_effective_close(env: Env, market_id: u64) -> Result<u64, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        Ok(Self::effective_close(&env, market_id, &m))
+    }
+
+    /// Timestamp of the last accepted `buy`/`sell`, 0 if the market never
+    /// traded (issue #22: the anchor for the disclosed late-trade window).
+    pub fn get_last_trade_at(env: Env, market_id: u64) -> Result<u64, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_last_trade(&env, market_id))
+    }
+
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
     pub fn get_price(env: Env, market_id: u64, outcome: Outcome) -> Result<u32, Error> {
         let m = Self::load_market(&env, market_id)?;
@@ -1613,11 +1748,17 @@ impl MarketCore {
         Ok(())
     }
 
-    fn assert_tradable(env: &Env, m: &Market) -> Result<(), Error> {
+    /// Trading gates: open, and strictly before the **effective** close.
+    ///
+    /// Issue #22 adds the early-close term. A market with no `EarlyClose` entry
+    /// — every market created before this change, and every one never halted —
+    /// compares against `m.close_time` exactly as before, at the cost of one
+    /// storage read that misses.
+    fn assert_tradable(env: &Env, market_id: u64, m: &Market) -> Result<(), Error> {
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
-        if env.ledger().timestamp() >= m.close_time {
+        if env.ledger().timestamp() >= Self::effective_close(env, market_id, m) {
             return Err(Error::MarketClosed);
         }
         Ok(())
@@ -1850,6 +1991,67 @@ impl MarketCore {
             return Ok(0);
         }
         Ok(math::mul_div_floor(basis, amount, held_before)?)
+    }
+
+    // ----- #22 event-driven early close -------------------------------------
+    //
+    // A halt is sidecar state, not a `Market` field: `Market`'s XDR is decoded by
+    // resolver, treasury and router out of vendored copies of this contract's
+    // wasm that the repo pins by sha256, so adding a field would need a blob
+    // rebuild that cannot be performed here (the same reason as #21). The one
+    // behavioural consequence is that `close_time` stays the *nominal* close and
+    // every consumer that cares about the real one has to go through
+    // `effective_close` / the new views.
+
+    /// The recorded halt instant, `None` when the market was never halted.
+    fn load_early_close(env: &Env, id: u64) -> Option<u64> {
+        let key = DataKey::EarlyClose(id);
+        let at: Option<u64> = env.storage().persistent().get(&key);
+        if at.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        at
+    }
+
+    fn save_early_close(env: &Env, id: u64, effective_at: u64) {
+        let key = DataKey::EarlyClose(id);
+        env.storage().persistent().set(&key, &effective_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// When trading really ends: an early halt can only move the close
+    /// *earlier*, so the effective close is the minimum. Clamped defensively —
+    /// `halt_trading` already refuses `effective_at > close_time`, and a halt
+    /// must never extend a market's life.
+    fn effective_close(env: &Env, id: u64, m: &Market) -> u64 {
+        match Self::load_early_close(env, id) {
+            Some(at) if at < m.close_time => at,
+            _ => m.close_time,
+        }
+    }
+
+    /// Timestamp of the last accepted trade, 0 when the market has never
+    /// traded. Read by `halt_trading` to anchor the disclosed late-trade window
+    /// and exposed as `get_last_trade_at` for the backend.
+    fn load_last_trade(env: &Env, id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LastTrade(id))
+            .unwrap_or(0)
+    }
+
+    fn save_last_trade(env: &Env, id: u64) {
+        let key = DataKey::LastTrade(id);
+        env.storage()
+            .persistent()
+            .set(&key, &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
     }
 
     fn load_fee_terms(env: &Env, id: u64) -> Option<FeeTerms> {
@@ -3872,6 +4074,267 @@ mod test {
         // residual never exceed the collateral the market actually holds.
         assert!(paid <= pot, "void paid {paid} out of a pot of {pot}");
         assert!(creator_payout <= TEST_SEED);
+    }
+
+    // ----- #22: event-driven early close ------------------------------------
+
+    /// 10 USDC, the size every #22 test trades.
+    const BUY_10: i128 = 10 * 10_000_000;
+
+    /// A market whose nominal close is `close_in` seconds away. `new_market`
+    /// fixes it at 60_000s, which is shorter than `MAX_BACKDATE_SECS`; the
+    /// backdating tests need a market that is still open days later.
+    fn new_market_long_close(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        close_in: u64,
+        salt: u8,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[salt; 32]),
+            &BytesN::from_array(env, &[salt.wrapping_add(100); 32]),
+            &String::from_str(env, "ipfs://early-close"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + close_in),
+            &TEST_SEED,
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn halt_trading_blocks_buys_after_effective_time() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+
+        // The event happens 500s in; the resolver finalises its early-close
+        // flow 500s after that, so the halt is recorded at now = start + 1_000
+        // with effective_at = start + 500.
+        env.ledger().set_timestamp(start + 1_000);
+        client.halt_trading(&market_id, &(start + 500));
+
+        assert_eq!(client.get_early_close(&market_id), Some(start + 500));
+        assert_eq!(client.get_effective_close(&market_id), start + 500);
+        // `close_time` is untouched: `Market`'s XDR is frozen, so the halt only
+        // lives in the sidecar and the nominal close stays reportable.
+        assert_eq!(client.get_market(&market_id).close_time, start + 60_000);
+        // A halt closes trading, it does not resolve anything.
+        assert_eq!(client.get_market(&market_id).status, MarketStatus::Open);
+
+        // Every later trade is refused even though `close_time` is 59_000s away.
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        assert_eq!(
+            client.try_sell(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        // `buy_v2` / `sell_v2` share `do_buy` / `do_sell`, so they inherit it.
+        assert_eq!(
+            client.try_buy_v2(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &BUY_10,
+                &0_i128,
+                &0u32,
+                &(start + 5_000u64)
+            ),
+            Err(Ok(Error::MarketClosed))
+        );
+    }
+
+    #[test]
+    fn halt_trading_rejects_future_or_after_close() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        // 40 days out, so a 7-day backdate is still comfortably before the close.
+        let close_in = 40 * 86_400;
+        let market_id = new_market_long_close(&env, &client, &creator, close_in, 31);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+        let now = start + 1_000;
+
+        // Never future-dated: a halt records a fact, it cannot schedule one.
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(now + 1)),
+            Err(Ok(Error::InvalidCloseTime))
+        );
+        // Cannot move the close later than itself: recorded after the nominal
+        // close has passed, `effective_at` still has to be at or before it.
+        let close_time = start + close_in;
+        env.ledger().set_timestamp(close_time + 10);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(close_time + 5)),
+            Err(Ok(Error::InvalidCloseTime))
+        );
+        // Backdating is bounded by MAX_BACKDATE_SECS.
+        env.ledger().set_timestamp(start + 10 * 86_400);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(start + 1)),
+            Err(Ok(Error::HaltTooOld))
+        );
+        // Exactly at the boundary is fine, and `effective_at == now` is too.
+        let at = env.ledger().timestamp() - MAX_BACKDATE_SECS;
+        client.halt_trading(&market_id, &at);
+        assert_eq!(client.get_effective_close(&market_id), at);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &at),
+            Err(Ok(Error::AlreadyHalted))
+        );
+        // A halt is permanent: the effective close stays at the first one and
+        // `close_time` still dominates the nominal view.
+        assert_eq!(client.get_early_close(&market_id), Some(at));
+        assert_eq!(client.get_market(&market_id).close_time, close_time);
+    }
+
+    #[test]
+    fn resolve_allowed_after_early_close() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+
+        // Before the halt the original rule still bites.
+        assert_eq!(
+            client.try_resolve(&market_id, &Outcome::Yes),
+            Err(Ok(Error::NotClosedYet))
+        );
+
+        client.halt_trading(&market_id, &(start + 500));
+        // The halt is final the moment it is written (resolver-only, no lift),
+        // so resolution unlocks immediately.
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_eq!(
+            client.get_market(&market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+        // A resolved market has nothing left to halt. `finalize_early_close`
+        // racing a guardian void lands here too, which is why the resolver can
+        // treat a failed halt as harmless.
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(start + 500)),
+            Err(Ok(Error::MarketNotOpen))
+        );
+    }
+
+    #[test]
+    fn void_market_still_works_after_a_halt() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+        client.halt_trading(&market_id, &(start + 500));
+
+        // Halting is not resolving: the market stays Open, so the resolver can
+        // still call it invalid afterwards.
+        client.void_market(&market_id);
+        assert_eq!(client.get_market(&market_id).status, MarketStatus::Void);
+        let pos = client.get_position(&market_id, &trader);
+        assert_eq!(client.redeem(&trader, &market_id), (pos.yes + pos.no) / 2);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_halt_trading() {
+        let (env, client, creator, trader, resolver, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let at = env.ledger().timestamp();
+        let attacker = Address::generate(&env);
+
+        // `halt_trading` authorises the *resolver address*, exactly like
+        // `resolve`, so no other key can produce the auth it needs — not the
+        // admin, not the creator, not a trader.
+        env.set_auths(&[]);
+        for signer in [
+            attacker.clone(),
+            trader.clone(),
+            creator.clone(),
+            resolver.clone(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (index, address) = signer;
+            let result = client
+                .mock_auths(&[MockAuth {
+                    address,
+                    invoke: &MockAuthInvoke {
+                        contract: &client.address,
+                        fn_name: "halt_trading",
+                        args: (market_id, at).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_halt_trading(&market_id, &at);
+            if index == 3 {
+                // The resolver key is the one path that must succeed.
+                assert_eq!(result, Ok(Ok(())));
+            } else {
+                assert!(result.is_err(), "non-resolver {index} could halt trading");
+                assert_eq!(client.get_early_close(&market_id), None);
+            }
+        }
+    }
+
+    #[test]
+    fn last_trade_at_updated() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        // Seeding the pool is not a trade.
+        assert_eq!(client.get_last_trade_at(&market_id), 0);
+
+        env.ledger().set_timestamp(start + 10);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 10);
+
+        env.ledger().set_timestamp(start + 20);
+        let held = client.get_position(&market_id, &trader).yes;
+        let (r_sold, r_other, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let out = math::collateral_out_for_shares(r_sold, r_other, held / 2, fee_bps).unwrap();
+        let qs = math::calc_sell(r_sold, r_other, out, fee_bps).unwrap();
+        client.sell(&trader, &market_id, &Outcome::Yes, &out, &qs.shares_in);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+
+        // A rejected trade must not move it: the market is closed by then, and
+        // the write happens after every check that can fail.
+        env.ledger().set_timestamp(start + 30);
+        client.halt_trading(&market_id, &(start + 25));
+        // `env.events().all()` only reports the *last* invocation, so this is
+        // the halt's own event count: `TradingHalted` publishes the whole
+        // disclosure window — effective_at, halted_at, close_time, last_trade_at
+        // — in that single event, so an indexer never has to re-read the market.
+        assert_eq!(env.events().all().events().len(), 1);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+    }
+
+    #[test]
+    fn unhalted_markets_never_touch_the_early_close_keys() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert!(!has_entry(&env, &client, DataKey::EarlyClose(market_id)));
+        assert_eq!(client.get_early_close(&market_id), None);
+        // The compatibility claim in one line: an un-halted market's effective
+        // close *is* its close_time, so `assert_tradable` and `resolve` compare
+        // against the same number they did before this change.
+        assert_eq!(
+            client.get_effective_close(&market_id),
+            client.get_market(&market_id).close_time
+        );
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        assert!(has_entry(&env, &client, DataKey::LastTrade(market_id)));
+        assert!(!has_entry(&env, &client, DataKey::EarlyClose(market_id)));
     }
 }
 
