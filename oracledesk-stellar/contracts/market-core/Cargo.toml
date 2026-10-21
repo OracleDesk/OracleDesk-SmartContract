@@ -16,6 +16,13 @@ soroban-sdk = "27.0.6"
 ed25519-dalek = "2"
 soroban-sdk = { version = "27.0.6", features = ["testutils"] }
 
+[features]
+# Source-only v2 schema variant for the #18 migration tests (see
+# `SCHEMA_VERSION` in `src/lib.rs` and docs/adr/0010-upgrades.md). Never
+# enable in a deployed build; it adds no dependencies, so `Cargo.lock` and
+# the pinned wasm hashes are untouched by it.
+test-v2 = []
+
 # `cfg(kani)` is only set by `cargo kani`; declaring it here keeps
 # `cargo clippy -D warnings` quiet about the proof module.
 [lints.rust]

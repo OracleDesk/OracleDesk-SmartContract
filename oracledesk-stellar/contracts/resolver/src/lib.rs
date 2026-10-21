@@ -382,6 +382,67 @@ pub enum DataKey {
     CountV2(u64, AttestedOutcome),
     ProposalV2(u64),
     Snapshot(u64),
+    // --- upgrades & schema versioning (#18) -------------------------------
+    // Appended at the tail; both are instance keys, one shared entry budget.
+    SchemaVersion,
+    MigrationCursor,
+}
+
+// ---------------------------------------------------------------------------
+// Upgrades & schema versioning (#18) — see docs/adr/0010-upgrades.md
+// ---------------------------------------------------------------------------
+
+/// Storage schema version compiled into this build. A real v2 bumps this
+/// constant and adds its conversion step; the identical seam is documented
+/// for market-core, which is the contract this one calls through a
+/// vendored interface (ADR-0002, ADR-0010).
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The version assumed for deployments that predate #18 and therefore have
+/// no `SchemaVersion` instance key.
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// Resume state for `migrate` (#18). Exactly one instance-storage entry.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema the stored entries were written with.
+    pub from_version: u32,
+    /// Reserved; stays 0 until this contract gains an enumerable
+    /// conversion loop (see `migrate`).
+    pub next_id: u64,
+    /// True once the pass represented by `from_version` is complete.
+    pub done: bool,
+}
+
+/// What one `migrate` call did (#18).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Entries converted by this call.
+    pub processed: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`; the record of the executable swap itself, since
+/// `update_current_contract_wasm` never runs a constructor (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted once per `migrate` call with that call's outcome (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u64,
+    pub done: bool,
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -642,6 +703,10 @@ impl Resolver {
         env.storage()
             .instance()
             .set(&DataKey::MarketCore, &market_core);
+        // #18: instances created from this build know their schema version.
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
     }
 
     pub fn market_core(env: Env) -> Address {
@@ -1690,6 +1755,89 @@ impl Resolver {
 
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
+    }
+
+    // ----- upgrades & migrations (#18) -------------------------------------
+
+    /// The schema version this contract's storage conforms to. Deployments
+    /// that predate #18 have no key and report 1.
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION)
+    }
+
+    /// In-place upgrade of this contract's executable. Same address, same
+    /// storage, new code from the next invocation; admin-gated like every
+    /// other entrypoint here (ADR-0010 states the trust trade-off).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version: u32 = Self::schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, idempotent, cursor-tracked migration toward
+    /// `SCHEMA_VERSION` (#18). This contract's persistent entries are keyed
+    /// by market id, which lives in market-core, so there is no enumerable
+    /// id space to loop over here: a resolver schema change must either
+    /// convert lazily on entry load or be driven off-chain by a key list —
+    /// the two patterns market-core ships as `ensure_migrated` and
+    /// `migrate_positions` (ADR-0010). Until one exists this call is the
+    /// v1 -> v1 record: it opens and closes the cursor and emits
+    /// `Migrated`, so the state machine callers and tests exercise is the
+    /// state machine a real v2 runs through.
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        // Consumed the day this contract gains an enumerable conversion
+        // loop; kept in the signature because that is the #18 API.
+        let _ = batch;
+        let s = env.storage().instance();
+        let stored: u32 = s
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        let to = SCHEMA_VERSION;
+        let prior: Option<MigrationCursor> = s.get(&DataKey::MigrationCursor);
+        if let Some(c) = &prior {
+            if c.done && c.from_version == stored && stored == to {
+                return Ok(MigrationProgress {
+                    from_version: c.from_version,
+                    to_version: to,
+                    processed: 0,
+                    done: true,
+                });
+            }
+        }
+        let done_now = stored == to;
+        let cursor = MigrationCursor {
+            from_version: stored,
+            next_id: 0,
+            done: done_now,
+        };
+        s.set(&DataKey::MigrationCursor, &cursor);
+        if done_now {
+            s.set(&DataKey::SchemaVersion, &to);
+        }
+        Migrated {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
+        })
     }
 }
 
@@ -5086,5 +5234,107 @@ mod golden {
         let a = DeclaredAlphabetically { alpha: 1, beta: 2 }.to_xdr(&env);
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade & migration tests (#18). Same execution caveat as market-core's
+// `upgrade_test` module (this base compiles nothing), and the same
+// `require_admin`-first argument for why `upgrade_requires_admin` can use a
+// placeholder hash. The mid-dispute-window item from #18's plan is realized
+// here as the storage-preservation test below: it pins that `migrate`
+// leaves every existing entry — instance config and per-market data —
+// byte-identical, which is the property a real in-flight-proposal upgrade
+// depends on. Assertions on `Proposal`/`Count`/`Attestation` decoding
+// against the heavy `fixture()` harness stay open for the v2 PR.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod upgrade_test {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        IntoVal,
+    };
+
+    fn setup() -> (Env, Address, ResolverClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        // `upgrade`/`migrate`/`schema_version` never call market-core, so a
+        // generated address stands in for the constructor link.
+        let market_core = Address::generate(&env);
+        let id = env.register(Resolver, ResolverArgs::__constructor(&admin, &market_core));
+        let client = ResolverClient::new(&env, &id);
+        (env, admin, client, id)
+    }
+
+    #[test]
+    fn schema_version_written_by_constructor_and_defaults_to_1_when_absent() {
+        let (env, _admin, client, id) = setup();
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
+        env.as_contract(&id, || {
+            env.storage().instance().remove(&DataKey::SchemaVersion);
+        });
+        assert_eq!(client.schema_version(), LEGACY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrade_requires_admin() {
+        let (env, _admin, client, _id) = setup();
+        let stranger = Address::generate(&env);
+        let fake_hash = BytesN::from_array(&env, &[9u8; 32]);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "upgrade",
+                    args: (fake_hash.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_upgrade(&fake_hash)
+            .is_err());
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_preserves_entry_state() {
+        let (env, _admin, client, id) = setup();
+        let market_id = 7u64;
+        // A populated instance: admin + market-core wiring (from the
+        // constructor), plus one per-market persistent entry — a price
+        // released for market 7, the shape dispute windows key on.
+        let price = PriceData {
+            price: 123_456,
+            timestamp: 999,
+        };
+        env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Price(market_id), &price);
+        });
+        let admin_before = client.admin();
+        let core_before = client.market_core();
+
+        let p = client.migrate(&50u32);
+        assert_eq!(p.processed, 0);
+        assert!(p.done);
+        // Re-calling is a recorded no-op (#18: v1 -> v1 never rewrites).
+        let p = client.migrate(&50u32);
+        assert!(p.done);
+        assert_eq!(p.processed, 0);
+
+        // Nothing moved: config intact, entry decodes identically.
+        assert_eq!(client.admin(), admin_before);
+        assert_eq!(client.market_core(), core_before);
+        let read: PriceData = env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Price(market_id))
+                .unwrap()
+        });
+        assert_eq!(read, price);
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
     }
 }

@@ -52,6 +52,11 @@ protect against: the admin can still pause the treasury instantly, and can
 a compromised admin key remains a custody risk for open positions. A
 governance timelock over all admin roles is separate work.
 
+Every contract's admin key is also an *upgrade* key: `upgrade(new_wasm_hash)`
+(#18, `docs/adr/0010-upgrades.md`) swaps the whole executable in place and can
+therefore drain collateral or the vault outright; #61/#62 track timelock/multisig
+over that authority.
+
 In scope for reports: anything that lets a depositor withdraw more than
 their pro-rata share of NAV (share inflation, rounding, NAV manipulation
 through trades against a pool), lets an agent spend capital reserved for

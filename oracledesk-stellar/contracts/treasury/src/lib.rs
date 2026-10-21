@@ -487,6 +487,65 @@ pub enum DataKey {
     CreationBuckets,
     YieldVenue,
     YieldPrincipal,
+    // --- upgrades & schema versioning (#18) -------------------------------
+    // Appended at the tail; both are instance keys, one shared entry budget.
+    SchemaVersion,
+    MigrationCursor,
+}
+
+// ---------------------------------------------------------------------------
+// Upgrades & schema versioning (#18) — see docs/adr/0010-upgrades.md
+// ---------------------------------------------------------------------------
+
+/// Storage schema version compiled into this build; bumping procedure and
+/// vendored-interface compatibility rule documented in ADR-0010, next to
+/// the identical constant in market-core.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The version assumed for deployments that predate #18 (no key).
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// Resume state for `migrate` (#18). Exactly one instance-storage entry.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema the stored entries were written with.
+    pub from_version: u32,
+    /// Reserved; stays 0 until this contract gains an enumerable
+    /// conversion loop (see `migrate`).
+    pub next_id: u64,
+    /// True once the pass represented by `from_version` is complete.
+    pub done: bool,
+}
+
+/// What one `migrate` call did (#18).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Entries converted by this call.
+    pub processed: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`; the record of the executable swap itself, since
+/// `update_current_contract_wasm` never runs a constructor (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted once per `migrate` call with that call's outcome (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u64,
+    pub done: bool,
 }
 
 /// Note that market-core errors reach callers of treasury entrypoints with
@@ -979,6 +1038,8 @@ impl Treasury {
         let buckets: Vec<CreationBucket> = Vec::new(&env);
         storage.set(&DataKey::CreationBuckets, &buckets);
         storage.set(&DataKey::YieldPrincipal, &0i128);
+        // #18: instances created from this build know their schema version.
+        storage.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
 
         let full = AgentPolicy {
             roles: ROLE_ALL,
@@ -2469,6 +2530,91 @@ impl Treasury {
         }
         .publish(&env);
         Ok(())
+    }
+
+    // ----- upgrades & migrations (#18) -------------------------------------
+
+    /// The schema version this contract's storage conforms to. Deployments
+    /// that predate #18 have no key and report 1.
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION)
+    }
+
+    /// In-place upgrade of this contract's executable. Same address, same
+    /// storage, new code from the next invocation; admin-gated like every
+    /// other entrypoint here (ADR-0010 states the trust trade-off — with
+    /// an agent holding collateral, say it loudly: the admin key can
+    /// replace all logic and drain the vault).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version: u32 = Self::schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, idempotent, cursor-tracked migration toward
+    /// `SCHEMA_VERSION` (#18). This contract's persistent entries
+    /// (`Market(u64)` exposure, realized PnL, yield ledger) are keyed by
+    /// market id, which lives in market-core, so there is no enumerable id
+    /// space here: a treasury schema change must convert lazily on entry
+    /// load or be driven off-chain by a key list — the two patterns
+    /// market-core ships as `ensure_migrated` and `migrate_positions`
+    /// (ADR-0010). Until one exists this call is the v1 -> v1 record: it
+    /// opens and closes the cursor and emits `Migrated`, so callers and
+    /// tests exercise the same state machine a real v2 will run through.
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        // Consumed the day this contract gains an enumerable conversion
+        // loop; kept in the signature because that is the #18 API.
+        let _ = batch;
+        let s = env.storage().instance();
+        let stored: u32 = s
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        let to = SCHEMA_VERSION;
+        let prior: Option<MigrationCursor> = s.get(&DataKey::MigrationCursor);
+        if let Some(c) = &prior {
+            if c.done && c.from_version == stored && stored == to {
+                return Ok(MigrationProgress {
+                    from_version: c.from_version,
+                    to_version: to,
+                    processed: 0,
+                    done: true,
+                });
+            }
+        }
+        let done_now = stored == to;
+        let cursor = MigrationCursor {
+            from_version: stored,
+            next_id: 0,
+            done: done_now,
+        };
+        s.set(&DataKey::MigrationCursor, &cursor);
+        if done_now {
+            s.set(&DataKey::SchemaVersion, &to);
+        }
+        Migrated {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
+        })
     }
 }
 

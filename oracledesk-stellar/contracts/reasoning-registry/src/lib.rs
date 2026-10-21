@@ -185,6 +185,65 @@ pub enum DataKey {
     /// `market, action, index -> trace_id`, so "every Buy decision on market
     /// 7" is one page instead of scanning the market's whole index (#57).
     MarketActionTraceAt(u64, String, u64),
+    // --- upgrades & schema versioning (#18) -------------------------------
+    // Appended at the tail; both are instance keys, one shared entry budget.
+    SchemaVersion,
+    MigrationCursor,
+}
+
+// ---------------------------------------------------------------------------
+// Upgrades & schema versioning (#18) — see docs/adr/0010-upgrades.md
+// ---------------------------------------------------------------------------
+
+/// Storage schema version compiled into this build; bumping procedure and
+/// vendored-interface compatibility rule documented in ADR-0010, next to
+/// the identical constant in market-core.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The version assumed for deployments that predate #18 (no key).
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// Resume state for `migrate` (#18). Exactly one instance-storage entry.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema the stored entries were written with.
+    pub from_version: u32,
+    /// Reserved; a trace-keyed conversion loop (traces ARE enumerable via
+    /// `NextId`) would use it — see `migrate` and ADR-0010.
+    pub next_id: u64,
+    /// True once the pass represented by `from_version` is complete.
+    pub done: bool,
+}
+
+/// What one `migrate` call did (#18).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Entries converted by this call.
+    pub processed: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`; the record of the executable swap itself, since
+/// `update_current_contract_wasm` never runs a constructor (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted once per `migrate` call with that call's outcome (#18).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u64,
+    pub done: bool,
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -331,6 +390,10 @@ impl ReasoningRegistry {
         env.storage().instance().set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::NextBatchId, &0u64);
+        // #18: instances created from this build know their schema version.
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
     }
 
     // ----- admin ----------------------------------------------------------
@@ -862,6 +925,87 @@ impl ReasoningRegistry {
                     index,
                 ))
                 .ok_or(Error::TraceNotFound)
+        })
+    }
+
+    // ----- upgrades & migrations (#18) -------------------------------------
+
+    /// The schema version this contract's storage conforms to. Deployments
+    /// that predate #18 have no key and report 1.
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION)
+    }
+
+    /// In-place upgrade of this contract's executable. Same address, same
+    /// trace history, new code from the next invocation; admin-gated like
+    /// every other entrypoint here (ADR-0010 states the trust trade-off).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version: u32 = Self::schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, idempotent, cursor-tracked migration toward
+    /// `SCHEMA_VERSION` (#18). Trace ids *are* enumerable (`NextId` bounds
+    /// them), so a real registry v2 has the choice market-core shows: a
+    /// batched `next_id..min(next_id+batch, NextId)` conversion loop here,
+    /// or lazy per-entry conversion — ADR-0010. Until one exists this call
+    /// is the v1 -> v1 record: it opens and closes the cursor and emits
+    /// `Migrated`, so callers and tests exercise the state machine a real
+    /// v2 runs through.
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        // Consumed the day this contract gains the conversion loop sketched
+        // above; kept in the signature because that is the #18 API.
+        let _ = batch;
+        let s = env.storage().instance();
+        let stored: u32 = s
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        let to = SCHEMA_VERSION;
+        let prior: Option<MigrationCursor> = s.get(&DataKey::MigrationCursor);
+        if let Some(c) = &prior {
+            if c.done && c.from_version == stored && stored == to {
+                return Ok(MigrationProgress {
+                    from_version: c.from_version,
+                    to_version: to,
+                    processed: 0,
+                    done: true,
+                });
+            }
+        }
+        let done_now = stored == to;
+        let cursor = MigrationCursor {
+            from_version: stored,
+            next_id: 0,
+            done: done_now,
+        };
+        s.set(&DataKey::MigrationCursor, &cursor);
+        if done_now {
+            s.set(&DataKey::SchemaVersion, &to);
+        }
+        Migrated {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version: stored,
+            to_version: to,
+            processed: 0,
+            done: done_now,
         })
     }
 }

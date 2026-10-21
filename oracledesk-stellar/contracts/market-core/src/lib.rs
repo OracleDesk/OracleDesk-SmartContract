@@ -7,7 +7,7 @@ mod math_proofs;
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +161,17 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // --- upgrades & schema versioning (#18) -------------------------------
+    // Appended at the tail so every existing key keeps its discriminant.
+    // Instance storage: the schema this instance's storage conforms to, and
+    // the resume cursor of the `migrate` batch loop.
+    SchemaVersion,
+    MigrationCursor,
+    /// Persistent per-market version stamp (#18): written by `create_market`
+    /// and by the migration driver, so an entry's shape is known without
+    /// decoding it (`get::<_, Market>` panics on a mismatched shape).
+    /// Absent means "written before #18", i.e. version 1.
+    MarketVersion(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +224,142 @@ impl From<MathError> for Error {
             MathError::Overflow => Error::Overflow,
             MathError::InvalidInput => Error::InvalidAmount,
             MathError::InsufficientLiquidity => Error::InsufficientLiquidity,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrades & schema versioning (#18) — see docs/adr/0010-upgrades.md
+// ---------------------------------------------------------------------------
+
+/// Storage schema version compiled into this build. A real v2 bumps this
+/// constant, freezes the current `Market` shape into `legacy`, and adds a
+/// `from_version == 1` arm to `migrate_market_entry`. Nothing else changes.
+#[cfg(not(feature = "test-v2"))]
+pub const SCHEMA_VERSION: u32 = 1;
+/// Source-only v2 variant for the migration tests (#18). The entry shapes
+/// are unchanged — only the version moves — so the cursor, the bounded
+/// batch loop, the lazy `ensure_migrated` hook and the `MarketVersion`
+/// stamp are all exercised without committing a second wasm blob (this
+/// repo's vendored wasm cannot be rebuilt here; ADR-0010 records that the
+/// "populated v1 deployment to a real v2 build" host test is deferred for
+/// exactly that reason). Never enable this feature in a deployed build.
+#[cfg(feature = "test-v2")]
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version assumed for instances and entries written before #18, i.e.
+/// deployments that have no `SchemaVersion` / `MarketVersion` key at all.
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// Resume state for `migrate` (#18). Exactly one instance-storage entry.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema the entries being converted were written with.
+    pub from_version: u32,
+    /// First market id not yet processed in this pass.
+    pub next_id: u64,
+    /// True once every market below `NextId` has been processed.
+    pub done: bool,
+}
+
+/// What one `migrate` call did (#18).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Entries converted by this call (at most `batch`).
+    pub processed: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`. `update_current_contract_wasm` does not run a
+/// constructor, so this event is the only record of the swap itself; the
+/// version bookkeeping happens in `migrate`.
+#[contractevent]
+pub struct Upgraded {
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted once per `migrate` call with that call's outcome (#18).
+#[contractevent]
+pub struct Migrated {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u64,
+    pub done: bool,
+}
+
+/// The frozen pre-migration shapes of the persistent entries (#18). Today
+/// `Market` *is* v1, so this module only exists under `cfg(test)` (to unit-
+/// test the conversion seam) and under the `test-v2` feature (where the
+/// migration driver reads old entries through it). A real v2 keeps these
+/// types and adds the next one, `MarketV2`.
+#[cfg(any(test, feature = "test-v2"))]
+mod legacy {
+    use super::*;
+
+    /// v1 shape of `Market` — field-for-field identical to the current
+    /// struct at the tip, and deliberately so: it pins the exact shape a
+    /// future conversion must decode.
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct MarketV1 {
+        pub creator: Address,
+        pub question_hash: BytesN<32>,
+        pub resolution_hash: BytesN<32>,
+        pub meta_uri: String,
+        pub category: Category,
+        pub close_time: u64,
+        pub fee_bps: u32,
+        pub status: MarketStatus,
+        pub reserve_yes: i128,
+        pub reserve_no: i128,
+        pub sets_minted: i128,
+        pub fees_accrued: i128,
+        pub lp_claimed: bool,
+    }
+
+    /// v1 -> current. The identity today because no real v2 exists yet;
+    /// this function is the seam a field-appending v2 edits, and the only
+    /// thing `migrate_market_entry` calls per old entry.
+    pub fn market_v1_to_current(m: MarketV1) -> Market {
+        Market {
+            creator: m.creator,
+            question_hash: m.question_hash,
+            resolution_hash: m.resolution_hash,
+            meta_uri: m.meta_uri,
+            category: m.category,
+            close_time: m.close_time,
+            fee_bps: m.fee_bps,
+            status: m.status,
+            reserve_yes: m.reserve_yes,
+            reserve_no: m.reserve_no,
+            sets_minted: m.sets_minted,
+            fees_accrued: m.fees_accrued,
+            lp_claimed: m.lp_claimed,
+        }
+    }
+
+    /// current -> v1, the other direction, so a round-trip test can pin
+    /// the conversion byte-for-byte.
+    pub fn current_to_market_v1(m: &Market) -> MarketV1 {
+        MarketV1 {
+            creator: m.creator.clone(),
+            question_hash: m.question_hash.clone(),
+            resolution_hash: m.resolution_hash.clone(),
+            meta_uri: m.meta_uri.clone(),
+            category: m.category.clone(),
+            close_time: m.close_time,
+            fee_bps: m.fee_bps,
+            status: m.status.clone(),
+            reserve_yes: m.reserve_yes,
+            reserve_no: m.reserve_no,
+            sets_minted: m.sets_minted,
+            fees_accrued: m.fees_accrued,
+            lp_claimed: m.lp_claimed,
         }
     }
 }
@@ -403,6 +550,9 @@ impl MarketCore {
         s.set(&DataKey::ProtocolFeeShareBps, &protocol_fee_share_bps);
         s.set(&DataKey::Paused, &false);
         s.set(&DataKey::NextId, &0u64);
+        // #18: instances created from this build know their schema version.
+        // Pre-#18 deployments have no key and read as `unwrap_or(1)`.
+        s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
     }
 
     // ----- admin ----------------------------------------------------------
@@ -623,6 +773,12 @@ impl MarketCore {
             lp_claimed: false,
         };
         Self::save_market(&env, id, &market);
+        // #18: a brand-new entry is by construction at the current schema
+        // version; stamp it so neither `ensure_migrated` nor the batch loop
+        // ever has to decode it speculatively.
+        env.storage()
+            .persistent()
+            .set(&DataKey::MarketVersion(id), &SCHEMA_VERSION);
         Self::save_fee_terms(
             &env,
             id,
@@ -743,6 +899,10 @@ impl MarketCore {
             }
         }
         trader.require_auth();
+        // #18: lazily bring this market's entry to the current schema
+        // before touching it, so a stalled `migrate` batch never blocks
+        // trading.
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
@@ -877,6 +1037,8 @@ impl MarketCore {
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
+        // #18: lazy per-entry migration, see `do_buy`.
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
@@ -947,6 +1109,7 @@ impl MarketCore {
 
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -967,6 +1130,7 @@ impl MarketCore {
     /// Invalid or unresolvable market. Allowed any time before finality.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -987,6 +1151,7 @@ impl MarketCore {
     /// Losing positions clear with a payout of 0.
     pub fn redeem(env: Env, holder: Address, market_id: u64) -> Result<i128, Error> {
         holder.require_auth();
+        Self::ensure_migrated(&env, market_id)?;
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
         let pos = Self::load_position(&env, market_id, &holder);
@@ -1011,6 +1176,7 @@ impl MarketCore {
     /// Creator (the LP) withdraws whatever the pool still holds once final,
     /// plus any unclaimed LP fees. Returns the total paid out.
     pub fn claim_pool_remainder(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let kind = Self::settlement(&m)?;
@@ -1066,6 +1232,7 @@ impl MarketCore {
     /// created before `FeeTerms` existed have none and keep the legacy
     /// behaviour: the `DataKey::Treasury` of the moment of the sweep.
     pub fn sweep_fees(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::ensure_migrated(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         let amount = m.fees_accrued;
         if amount <= 0 {
@@ -1580,6 +1747,198 @@ impl MarketCore {
         );
         env.storage().temporary().extend_ttl(&key, 1, 16);
         reference
+    }
+
+    // ----- upgrades & migrations (#18) -------------------------------------
+
+    /// The schema version this contract's storage currently conforms to.
+    /// Deployments that predate #18 have no key and report 1.
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION)
+    }
+
+    /// In-place upgrade of this contract's executable: same address, same
+    /// storage, new code from the *next* invocation onwards. Admin-gated
+    /// like every other config entrypoint, and deliberately thin:
+    /// `update_current_contract_wasm` does not run a constructor, so all
+    /// version bookkeeping belongs to `migrate` (ADR-0010 states the trust
+    /// trade-off — the admin key can replace all logic, #61/#62 harden it).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version: u32 = Self::schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, resumable, idempotent migration of every `Market` entry
+    /// toward `SCHEMA_VERSION`, tracked by the single `MigrationCursor`
+    /// instance key (#18). `batch` is caller-provided so a too-large batch
+    /// can always be split; each call converts at most `batch` entries and
+    /// returns how many it did.
+    ///
+    /// While a batch pass is incomplete nothing is locked: the state-
+    /// changing entrypoints convert their own market lazily through
+    /// `ensure_migrated`, which is why there is no `MigrationInProgress`
+    /// error. With no v2 shipped (`from_version == SCHEMA_VERSION == 1`)
+    /// the loop is an identity pass that records and stamps every entry,
+    /// so the machinery below is exactly what a real v2 runs through.
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        let s = env.storage().instance();
+        let stored: u32 = s
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        let to = SCHEMA_VERSION;
+        let stored_cursor: Option<MigrationCursor> = s.get(&DataKey::MigrationCursor);
+        let mut cursor: MigrationCursor = match stored_cursor {
+            // In-progress pass for the version we are migrating from:
+            // resume exactly where the last batch stopped.
+            Some(c) if !c.done && c.from_version == stored => c,
+            // A completed pass of the current version: nothing pending.
+            Some(c) if c.done && c.from_version == stored && stored == to => {
+                return Ok(MigrationProgress {
+                    from_version: c.from_version,
+                    to_version: to,
+                    processed: 0,
+                    done: true,
+                })
+            }
+            // First call after this change, or a stale cursor from before
+            // an upgrade: start a fresh pass.
+            _ => MigrationCursor {
+                from_version: stored,
+                next_id: 0,
+                done: false,
+            },
+        };
+        let next_id: u64 = s.get(&DataKey::NextId).unwrap_or(0);
+        let end = cursor.next_id.saturating_add(batch as u64).min(next_id);
+        let mut processed: u64 = 0;
+        for id in cursor.next_id..end {
+            Self::migrate_market_entry(&env, id, cursor.from_version, to);
+            processed += 1;
+        }
+        cursor.next_id = end;
+        cursor.done = end >= next_id;
+        if cursor.done {
+            // Only a finished pass may advance the instance's declared
+            // schema; until then old and new entries genuinely coexist.
+            s.set(&DataKey::SchemaVersion, &to);
+        }
+        s.set(&DataKey::MigrationCursor, &cursor);
+        Migrated {
+            from_version: cursor.from_version,
+            to_version: to,
+            processed,
+            done: cursor.done,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version: cursor.from_version,
+            to_version: to,
+            processed,
+            done: cursor.done,
+        })
+    }
+
+    /// Off-chain-driven alternative for `Position` entries, which cannot be
+    /// enumerated on-chain (#18): an indexer replays the `(market_id,
+    /// holder)` keys it saw in `Trade`/`Redeemed`/`PositionTransferred`
+    /// events and passes them here in bounded lists. Today this rewrites
+    /// each listed position through the current shape (an identity, and
+    /// idempotent); a `Position` schema change moves the old-shape read
+    /// into `ensure_position_migrated`, exactly as `MarketVersion` does for
+    /// markets.
+    pub fn migrate_positions(env: Env, keys: Vec<(u64, Address)>) -> Result<u64, Error> {
+        Self::require_admin(&env)?;
+        let mut processed: u64 = 0;
+        for (market_id, holder) in keys.iter() {
+            Self::ensure_position_migrated(&env, market_id, &holder);
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    /// Convert market `id`'s entry to `to_version` (idempotent, #18).
+    /// The `MarketVersion` stamp makes the entry's shape known without
+    /// decoding it: `get::<_, Market>` panics on a shape mismatch, which is
+    /// why an in-flight v1 -> v2 pass must never re-read an already-
+    /// converted entry. Unknown steps convert nothing and stamp nothing —
+    /// they leave the entry to the strict decode, the honest failure mode
+    /// until a real v2 adds its arm here.
+    fn migrate_market_entry(env: &Env, id: u64, from_version: u32, to_version: u32) {
+        let vkey = DataKey::MarketVersion(id);
+        let stamped: Option<u32> = env.storage().persistent().get(&vkey);
+        if stamped == Some(to_version) {
+            return;
+        }
+        if from_version == to_version {
+            // v1 -> v1: identity, but the stamp records that this entry was
+            // *seen* by the migration driver at `to_version`.
+            let exists: Option<Market> = env.storage().persistent().get(&DataKey::Market(id));
+            if exists.is_some() {
+                env.storage().persistent().set(&vkey, &to_version);
+            }
+            return;
+        }
+        #[cfg(feature = "test-v2")]
+        if from_version == 1 && to_version == 2 {
+            // The seam a real v2 uses: decode through `legacy`, convert,
+            // store the current shape, stamp. `save_market` keeps the TTL
+            // extension every other write performs.
+            let old: Option<legacy::MarketV1> =
+                env.storage().persistent().get(&DataKey::Market(id));
+            if let Some(old) = old {
+                let converted = legacy::market_v1_to_current(old);
+                Self::save_market(env, id, &converted);
+                env.storage().persistent().set(&vkey, &to_version);
+            }
+            return;
+        }
+        let _ = (from_version, to_version);
+    }
+
+    /// Lazy per-entry migration hook used by every state-changing
+    /// entrypoint before it touches a `Market` (#18). Chosen over a
+    /// `MigrationInProgress` refusal so a stalled batch can never lock
+    /// funds or freeze trading; the fast path (no upgrade pending) is a
+    /// single instance read that is already warm.
+    fn ensure_migrated(env: &Env, id: u64) -> Result<(), Error> {
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        if stored == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let entry_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketVersion(id))
+            .unwrap_or(LEGACY_SCHEMA_VERSION);
+        if entry_version != SCHEMA_VERSION {
+            Self::migrate_market_entry(env, id, entry_version, SCHEMA_VERSION);
+        }
+        Ok(())
+    }
+
+    /// One listed position, converted in place and TTL-extended — the
+    /// single-entry kernel shared by `migrate_positions` above and the
+    /// lazy path a `Position` shape change would take through
+    /// `load_position`.
+    fn ensure_position_migrated(env: &Env, id: u64, holder: &Address) {
+        let p = Self::load_position(env, id, holder);
+        Self::save_position(env, id, holder, &p);
     }
 }
 
@@ -3330,5 +3689,193 @@ mod multisig_account {
         }
         env.set_auths(&[entry]);
         assert!(client.try_set_paused(&true).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade & migration tests (#18).
+//
+// Authored conservatively against the patterns already exercised in `mod
+// test` above. ONE deferral is deliberate, per ADR-0010: `upgrade`'s happy
+// path cannot run in a host test on this base because testhost validates
+// `update_current_contract_wasm`'s hash against a wasm blob in the ledger,
+// and we can neither build nor commit a second blob (CLI 22 vs pinned 27.1).
+// `upgrade_requires_admin` covers the gate — the wasm swap is reached only
+// after it passes. Everything versioned, batched and stamped below runs
+// against real storage with no second executable, which is exactly the
+// surface a v1 -> v1 pass exposes.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod upgrade_test {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        token::StellarAssetClient,
+        IntoVal,
+    };
+
+    /// Deploys like the main module's `setup_market_full` (duplicated, not
+    /// shared, so this module stays independent of the trading fixtures).
+    fn setup() -> (Env, MarketCoreClient<'static>, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        StellarAssetClient::new(&env, &collateral.address()).mint(&creator, &10_000_000_000_i128);
+        let contract_id = env.register(
+            MarketCore,
+            MarketCoreArgs::__constructor(
+                &admin,
+                &collateral.address(),
+                &treasury,
+                &resolver,
+                &100u32,
+                &10_000u32,
+            ),
+        );
+        let client = MarketCoreClient::new(&env, &contract_id);
+        (env, client, admin, creator, collateral.address())
+    }
+
+    fn new_market(env: &Env, client: &MarketCoreClient, creator: &Address) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[42u8; 32]),
+            &BytesN::from_array(env, &[142u8; 32]),
+            &String::from_str(env, "ipfs://upgrade-test"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5000,
+        )
+    }
+
+    #[test]
+    fn schema_version_written_by_constructor_and_defaults_to_1_when_absent() {
+        let (env, client, _, _, _) = setup();
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
+        let contract = client.address.clone();
+        // Simulate a pre-#18 deployment: drop the key entirely.
+        env.as_contract(&contract, || {
+            env.storage().instance().remove(&DataKey::SchemaVersion);
+        });
+        assert_eq!(client.schema_version(), LEGACY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrade_requires_admin() {
+        let (env, client, _admin, creator, _) = setup();
+        let fake_hash = BytesN::from_array(&env, &[9u8; 32]);
+        env.set_auths(&[]);
+        // Authenticated as `creator`, never the admin: `require_admin` is
+        // the first statement, so the deployer is not reached and the bad
+        // hash above never matters for this outcome.
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "upgrade",
+                    args: (fake_hash.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_upgrade(&fake_hash)
+            .is_err());
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_bounded() {
+        let (env, client, _, creator, _) = setup();
+        for _ in 0..3 {
+            new_market(&env, &client, &creator);
+        }
+        // batch=1: exactly one entry per call, three calls to finish.
+        let p = client.migrate(&1u32);
+        assert_eq!(p.processed, 1);
+        assert_eq!(p.from_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(p.to_version, SCHEMA_VERSION);
+        assert!(!p.done);
+        assert!(!client.migrate(&1u32).done);
+        let p = client.migrate(&1u32);
+        assert_eq!(p.processed, 1);
+        assert!(p.done);
+        // Extra calls after completion are true no-ops: zero processed,
+        // cursor untouched, version unchanged.
+        let p = client.migrate(&50u32);
+        assert_eq!(p.processed, 0);
+        assert!(p.done);
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_preserves_markets_and_positions() {
+        // The "upgrade preserves state" acceptance item, minus the
+        // executable swap it cannot host-validate here (module doc).
+        let (env, client, _, creator, collateral) = setup();
+        let id = new_market(&env, &client, &creator);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&trader, &10_000_000_000_i128);
+        client.buy(&trader, &id, &Outcome::Yes, &(10 * 10_000_000), &0);
+
+        let market_before = client.get_market(&id);
+        let position_before = client.get_position(&id, &trader);
+        let progress = client.migrate(&50u32);
+        assert!(progress.done);
+        assert_eq!(client.get_market(&id), market_before);
+        assert_eq!(client.get_position(&id, &trader), position_before);
+
+        // Trading keeps working across and after the migration (#18's
+        // "a stalled batch must never lock funds": nothing here gated).
+        client.buy(&trader, &id, &Outcome::No, &(10 * 10_000_000), &0);
+        assert_ne!(client.get_position(&id, &trader), position_before);
+    }
+
+    #[test]
+    fn migrate_positions_is_idempotent_for_listed_keys() {
+        let (env, client, _, creator, collateral) = setup();
+        let id = new_market(&env, &client, &creator);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&trader, &10_000_000_000_i128);
+        client.buy(&trader, &id, &Outcome::Yes, &(10 * 10_000_000), &0);
+        let before = client.get_position(&id, &trader);
+
+        let keys = Vec::from_array(&env, [(id, trader.clone())]);
+        assert_eq!(client.migrate_positions(&keys), 1);
+        assert_eq!(client.get_position(&id, &trader), before);
+        // Re-listing the same key is harmless.
+        assert_eq!(client.migrate_positions(&keys), 1);
+        assert_eq!(client.get_position(&id, &trader), before);
+    }
+
+    #[test]
+    fn legacy_conversion_round_trip_is_the_identity_v2_starts_from() {
+        // Pure (no-host) unit test of the `legacy` seam itself: today v1
+        // *is* the current shape, and this test fails the day a real v2
+        // edits `market_v1_to_current` without extending `MarketV1` —
+        // which is exactly the coupling ADR-0010 wants pinned.
+        let env = Env::default();
+        let m = Market {
+            creator: Address::generate(&env),
+            question_hash: BytesN::from_array(&env, &[1u8; 32]),
+            resolution_hash: BytesN::from_array(&env, &[2u8; 32]),
+            meta_uri: String::from_str(&env, "ipfs://round-trip"),
+            category: Category::Crypto,
+            close_time: 1_700_000_000,
+            fee_bps: 100,
+            status: MarketStatus::Open,
+            reserve_yes: 1000,
+            reserve_no: 2000,
+            sets_minted: 3000,
+            fees_accrued: 4000,
+            lp_claimed: false,
+        };
+        assert_eq!(
+            legacy::market_v1_to_current(legacy::current_to_market_v1(&m)),
+            m
+        );
     }
 }
