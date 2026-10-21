@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted. Implements issue #18 on `market-core` and `resolver`.
+Accepted. Implements issue #18 on `market-core` and `resolver`, completed on
+this branch for `treasury` and `reasoning-registry` — all four contracts now
+carry the mechanism (the original "Deferrals" note claimed otherwise; it was
+rewritten where it belongs, see below and the PR #237 body).
 
 **Numbering deviation:** #18 asked for this document as
 `docs/adr/0003-upgrades.md`. That number (and filename) is already taken by
@@ -37,9 +40,12 @@ Three properties of `update_current_contract_wasm` shape the whole design:
    user's `redeem`.
 
 Layered on top of that is this repository's own coupling: per ADR 0002,
-`resolver` and `treasury` do not depend on the `market-core` crate; they vendor
+`resolver`, `treasury` and `reasoning-registry` do not depend on the
+`market-core` crate; they vendor
 a compiled `market_core.wasm` and generate their client from it with
-`contractimport!`. Their `build.rs` pins that blob by sha256 (ADR 0002, #58), so
+`contractimport!`. `resolver`'s and `treasury`'s `build.rs` pin that blob by
+sha256 (ADR 0002, #58 — `reasoning-registry` vendors the same way but has no
+pin yet), so
 it is refreshed only by `make build` / `scripts/sync-vendored-wasm.sh`, which
 needs a Stellar CLI version this dev box does not have. **Changing a struct that
 another contract decodes is therefore a build break for that other contract, not
@@ -114,18 +120,24 @@ Because the compatibility view keeps the old key readable, the safe order is:
 1. **`market-core` first.** It writes only new keys and keeps every old one
    decodable, so a not-yet-upgraded `resolver`/`treasury` (whose vendored blob
    describes the *old* interface) keeps working across the swap.
-2. **Then `resolver` and `treasury`.** They may now adopt the new interface,
-   after `make build` refreshes their vendored blobs together with their sha256
-   pins.
+2. **Then `resolver`, `treasury` and `reasoning-registry`.** They may now adopt
+   the new interface, after `make build` refreshes their vendored blobs
+   together with their sha256 pins.
 
 The reverse order breaks: an upgraded `resolver` compiled against a v2
 `market-core` interface would be calling a contract that still has v2 entrypoints
 that do not exist, and its `build.rs` pin would not match the deployed wasm.
 
-`scripts/upgrade.sh` takes exactly one contract per invocation and refuses
-`treasury` / `reasoning_registry` (see Deferrals) rather than half-upgrading
-them, so the order is enforced by the operator driving it contract-by-contract;
-it does not attempt to sequence a multi-contract fleet on its own.
+`scripts/upgrade.sh` takes exactly one contract per invocation and drives all
+four (`market_core`, `resolver`, `treasury`, `reasoning_registry` — aliases
+`market-core`/`core` and `registry`/`reasoning-registry` normalise to the
+deployment-record key); `router` and `timelock` still refuse, because their
+crates carry no `upgrade`/`migrate`/`schema_version` entrypoints at all on this
+base. So the order is enforced by the operator driving it contract-by-contract;
+the script does not attempt to sequence a multi-contract fleet on its own. It
+does add an ADR 0010 §3 *reminder*: when a non-market-core contract is
+upgraded while the record shows no prior market-core upgrade, the script logs a
+loud warning rather than silently allowing out-of-order releases.
 
 ### 4. Version stamping and reading it
 
@@ -143,7 +155,9 @@ check, which is precisely the call that has to work on the instance about to be
 upgraded.
 
 `schema_version(env) -> u32` is a public read for that purpose (market-core
-`contracts/market-core/src/lib.rs:640`, resolver `contracts/resolver/src/lib.rs:845`).
+`contracts/market-core/src/lib.rs:640`, resolver `contracts/resolver/src/lib.rs:845`,
+treasury `contracts/treasury/src/lib.rs:2671`, reasoning-registry
+`contracts/reasoning-registry/src/lib.rs:1900`).
 
 ### 5. Bounded, resumable, idempotent `migrate`
 
@@ -154,13 +168,16 @@ it walks every entry:
   `Err(Error::MigrationBatchTooLarge)` — an error, not a trap. A too-large batch
   would exceed the instruction/ledger limits mid-loop, which is unrecoverable
   from the caller's side and leaves the transaction rolled back with no signal.
-  market-core `:273`, resolver `:380`.
+  market-core `:273`, resolver `:380`, treasury `migrate` at `:2733`,
+  reasoning-registry `migrate` at `:1963`.
 - **Resumable**: `DataKey::MigrationCursor { from_version, next_id, done }` is
   the resume point. A cursor whose `from_version` no longer matches the stored
   version is discarded and the sweep restarts from 0 — correct because every
   step is idempotent, and cost is reads, not double-writes.
 - **Idempotent**: the *target* entry doubles as the "already done" marker
-  (`storage.has(&DataKey::MarketV2(id))`, `!storage.has(&DataKey::ProposalV2(id))`),
+  (`storage.has(&DataKey::MarketV2(id))`, `!storage.has(&DataKey::ProposalV2(id))`,
+  and in the completion `storage.has(&DataKey::ExposureV2(id))` /
+  `storage.has(&DataKey::TraceV2(id))`),
   and a legacy key is removed only in the same call that folds its value into
   the new one. That is ADR 0003's existing "nothing is ever counted twice"
   invariant, reused rather than restated.
@@ -184,6 +201,8 @@ market_id)` before it reads that market:
 | --- | --- |
 | market-core | `do_buy` `:1037`, `do_sell` `:1172`, `resolve` `:1243`, `void_market` `:1264`, `redeem` `:1285` |
 | resolver | `submit_signatures` `:1692`, `finalize_signers` `:1761`, `record_attestation` `:2736` (covers `attest` / `attest_with_evidence`) |
+| treasury | `reserve_capacity` `:3623` (reached by every authorised buy), `close_market_exposure` `:4155` (sells/redemptions, and `realize` through it), `settle_market` `:2203` |
+| reasoning-registry | `consume_trace` `:788` (the gate every consumer passes before acting), `flag_trace` `:831` (the admin integrity path) |
 
 It reads `SchemaVersion` once, returns immediately when the instance is current
 (always, in the shipped v1 build — the cost is one instance read that these
@@ -242,6 +261,14 @@ new keys become the first keys this contract ever let expire unnoticed.
   introduced): every resolver path that writes an instance key now calls
   `bump_instance_ttl` (`:1976`) — including `__constructor` (`:758`), which is
   why the constructor comment says so out loud, and the lazy path at `:2028`.
+- treasury and reasoning-registry have the same gap in a sharper form: no
+  instance read in either contract ever bumped (treasury's `require_admin`
+  reads the admin key and extends nothing), and an expired `SchemaVersion`
+  silently decodes back to v1, which would make a pending migration look
+  already-done. Both therefore write instance keys only through paths that
+  call `bump_instance_ttl` (treasury `:2815`, registry `:2045`) — the
+  constructor stamp, `schema_version`, every `migrate` batch, and the lazy
+  step after it migrates an entry.
 
 `BUMP_THRESHOLD`/`BUMP_TO` are the existing 30-day/60-day constants per contract
 (market-core `:24-25`, resolver `:50-51`); nothing here changes the TTL policy.
@@ -249,7 +276,7 @@ new keys become the first keys this contract ever let expire unnoticed.
 ### 9. Test surface without a second deployed blob
 
 To make migration steps *reachable* from tests without shipping a second wasm,
-each crate opts into a `test-v2` feature (`[features] test-v2 = []` in both
+each crate opts into a `test-v2` feature (`[features] test-v2 = []` in all four
 Cargo.tomls). With it, the same crate compiles "as the next version":
 `SCHEMA_VERSION = 2`, the v2 key/type exists (`DataKey::MarketV2`, `MarketV2`;
 resolver's `ProposalV2`/`CountV2` paths), and `migrate_from` gains its 1→2 step.
@@ -259,7 +286,13 @@ so the default build's storage layout stays **byte-for-byte** what the vendored
 `market_core.wasm` describes (§2) and gains no cross-contract dependency:
 resolver's `migration_bound` (`:1998`) reads market-core's `market_count` only
 under `test-v2`, with an `Ok(0)` stub in the default build (`:2010`) that keeps
-the sweep code identical in both.
+the sweep code identical in both. treasury copies that split exactly
+(`:2837` / `:2853`), because its sweep bounds itself by the same
+cross-contract `market_count`. reasoning-registry is the divergence worth
+naming: it *owns* its sweep range — trace ids come from its own instance
+`DataKey::NextId` — so its `migration_bound` (`:2068`) is a plain local read
+in both builds and needs no stub at all. The bound should be whatever the
+contract can enumerate without borrowing another contract's word.
 
 `migration_bound`'s stub is a load-bearing pattern worth repeating to future
 contributors: returning `Ok(0)` there is safe *only* because `migrate` exits
@@ -276,6 +309,25 @@ contract cannot enumerate, so an eager sweep cannot reach it. It stays on ADR
 legacy key exists anywhere". Any future audit of migration completeness must
 check the lazy path, not only the cursor.
 
+The completion extended the same caveat to the other two contracts rather than
+pretending coverage it does not have:
+
+- **treasury** sweeps `[0, market-core.market_count)` of the *original core's*
+  per-market exposure keys (`Market(id)`/`Net(id)`). Exposure under the
+  namespaced `MarketV2(Address-ish, u64)`/`NetV2` keys belongs to cores switched
+  to after those keys existed and has no legacy shape to move; agent-, ticket-
+  and share-keyed state lives in address spaces the contract cannot enumerate
+  and is covered by the lazy path on the three trade entrypoints only.
+- **reasoning-registry** sweeps `[0, NextId)` of its own trace ids — one
+  enumerable range it owns end to end. Address-keyed state (`Agent`,
+  `AgentHead`, `AgentTrace*`, `Consumer`, the signing-key indexes) and the
+  market/action index keys (`MarketTrace*`, `MarketActionTrace*`) are not
+  enumerable from inside the contract; under the append-only projection they
+  have no v1→v2 shape change today, and any future step that gives them one
+  must use the lazy-convert / indexer-key-list approach this section already
+  records for resolver's dedupe flags — a bounded id sweep demonstrably does
+  **not** cover them.
+
 ## Consequences
 
 - Upgrades become possible without a new contract id, which also means the
@@ -285,7 +337,17 @@ check the lazy path, not only the cursor.
   market-core appends `SchemaVersion`, `MigrationCursor`, `MarketV2(u64)`
   (`:209`, `:212`, `:219`) after `Band(u64)`, and `MigrationBatchTooLarge = 30`
   (`:273`); resolver appends `SchemaVersion`, `MigrationCursor` (`:434`, `:437`)
-  and `MigrationBatchTooLarge = 50` (`:380`).
+  and `MigrationBatchTooLarge = 50` (`:380`). treasury appends `SchemaVersion`,
+  `MigrationCursor`, `ExposureV2(u64)` (`:540`, `:543`, `:554`) after
+  `YieldPrincipal`, and `MigrationBatchTooLarge = 60` (`:637`) after
+  `InvalidResolution = 48` — leaving `49..=59` for the concurrent #20 lane and
+  touching its existing `CategoryCapExceeded = 2029` not at all.
+  reasoning-registry appends `SchemaVersion`, `MigrationCursor`, `TraceV2(u64)`
+  (`:244`, `:247`, `:253`) after `MarketActionTraceAt`, and
+  `MigrationBatchTooLarge = 3010` (`:313`) — starting past `3009` because the
+  registry's own `Error` series is 3001-based and `13..=3000` is left
+  unassigned for the undeclared variants this tip references (PR body, registry
+  report).
   **The gap is deliberate:** PR #184 owns `DataKey::MarketHot`/`MarketCold` and
   `Error::MetaUriTooLong = 27`, and other open lanes want 28/29 in market-core
   and 44–49 in resolver. Numbers 27..=29 (market-core) and 44..=49 (resolver)
@@ -294,8 +356,9 @@ check the lazy path, not only the cursor.
   conflict mechanically with #184** — one hunk in `DataKey`, one in `Error`; the
   resolution is "keep both, ours first, theirs appended", which is mechanical
   and preserves every existing discriminant. This branch is not based on #184.
-- Tests are split by build: `contracts/market-core/src/tests_upgrade.rs` and
-  `contracts/resolver/src/tests_upgrade.rs` are `#[cfg(any(test,
+- Tests are split by build: `contracts/market-core/src/tests_upgrade.rs`,
+  `contracts/resolver/src/tests_upgrade.rs`, `contracts/treasury/src/tests_upgrade.rs`
+  and `contracts/reasoning-registry/src/tests_upgrade.rs` are `#[cfg(any(test,
   feature = "test-v2"))]` modules; cross-version cases are additionally
   `#[cfg(all(test, feature = "test-v2"))]`, so the default `cargo test`
   selection is not widened by a feature that changes storage layout.
@@ -303,12 +366,20 @@ check the lazy path, not only the cursor.
   `ORACLEDESK_MARKET_CORE_V2_WASM` (a `make build`-produced path), **not**
   committed and **not** `include_bytes!`'d — zero `.wasm` in this diff (see
   Verification).
-- **Deferrals (named follow-up, not implemented here):** `treasury` and
-  `reasoning-registry`. `treasury` does not compile at this base (five duplicate
-  `Error` discriminants, E0081), so an upgrade path added to it could not be
-  compiled even in principle; `reasoning-registry` is in scope for the same
-  mechanism but has no versioned storage to move. Both are excluded from
-  `scripts/upgrade.sh`, which exits non-zero when asked for them.
+- **Deferrals — corrected on this branch.** The original text deferred
+  `treasury` and `reasoning-registry` claiming `treasury` "does not compile at
+  this base (five duplicate `Error` discriminants, E0081)". That was measured
+  false: `treasury`'s `Error` enum at the base has 48 variants with **zero**
+  duplicate discriminants. Both contracts are now implemented here (commits
+  `72bb6fd`, `4c62eeb`, `097afdf`). What is *actually* true — and was always
+  the honest blocker — is shared by all four contracts and recorded in the PR
+  body's Verification section: nothing in this workspace can be compiled at
+  all, because the pinned toolchain (rustc 1.90.0) is below `soroban-sdk`
+  27.0.6's MSRV (1.91), and the `+stable` fallback dies on 21 pre-existing
+  `oracledesk-types` errors before reaching any contract. `reasoning-registry`
+  additionally does not *parse* at this base for reasons unrelated to #18 (the
+  PR body's registry report); its new tests are authored against the repaired
+  file and disclosed as never executed.
 - Verification status: **nothing in this PR has been compiled or executed.** The
   repository does not build at its base commit for reasons unrelated to this
   work (see the PR body's Verification section); the executable evidence is
@@ -316,8 +387,12 @@ check the lazy path, not only the cursor.
 
 ## Follow-ups
 
-1. `treasury` + `reasoning-registry`: same mechanism, after treasury's E0081
-   error-discriminant collision is fixed on its own lane.
+1. ~~`treasury` + `reasoning-registry`: same mechanism~~ — **done on this
+   branch** (issue #18 completion). The remaining piece for both is the
+   workspace build itself: run `cargo test -p treasury --features test-v2` and
+   `cargo test -p reasoning-registry --features test-v2` the moment the
+   toolchain and `oracledesk-types` walls come down, plus repair the registry's
+   pre-existing parse damage first (PR body's registry report).
 2. Add `--timelock-propose-then-exec` sequencing to `scripts/upgrade.sh` so a
    production upgrade is two recorded transactions rather than one `admin_call`.
 3. Decide whether `get_market` should *read* `MarketV2` once the sweep is done
