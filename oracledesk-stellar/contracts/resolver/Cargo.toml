@@ -8,6 +8,16 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 doctest = false
 
+# Issue #18: one opt-in feature, nothing else in this file. `test-v2` compiles
+# this crate as the build whose schema is already 2 (`SCHEMA_VERSION`, the
+# 1 -> 2 step in `migrate_from`, the cross-contract `market_count()` bound) and
+# turns on the cross-version tests. The default build must not enable it: its
+# storage layout and its entrypoint set are what the vendored
+# `market_core.wasm` / `reasoning_registry.wasm` copies are compiled against
+# (docs/adr/0002-cross-contract-calls.md).
+[features]
+test-v2 = []
+
 [dependencies]
 # Shared #[contracttype] definitions (Outcome/Category and the resolution
 # spec surface). Types-only crate: no #[contract]/#[contractimpl], so it
