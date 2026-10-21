@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 mod math;
 #[cfg(kani)]
 mod math_proofs;
@@ -7,7 +10,7 @@ mod math_proofs;
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -23,6 +26,13 @@ const BUMP_TO: u32 = 60 * DAY_IN_LEDGERS;
 const MAX_FEE_BPS: u32 = 1_000;
 /// Minimum seed liquidity: 100 USDC (7 decimals). Stops spam markets.
 const MIN_SEED: i128 = 100 * 10_000_000;
+/// Hard cap on one page of a directory view (`open_markets`,
+/// `markets_by_category`, `markets_of`), so a read cannot be forced to
+/// return an unbounded vector. Clients page with `start += MAX_PAGE`.
+const MAX_PAGE: u32 = 50;
+/// Markets a single `rebuild_open_index` call may scan (admin backfill of
+/// pre-upgrade markets, run in bounded batches).
+const MAX_BACKFILL_BATCH: u64 = 200;
 
 /// A proposed admin handover must be accepted (or cancelled) within this many
 /// seconds, so a proposal forgotten by the outgoing admin cannot be used to
@@ -161,6 +171,32 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // persistent storage — on-chain market directories (#25). Counter-indexed
+    // like reasoning-registry's `MarketTraceCount`/`MarketTrace`: no
+    // directory is ever an unbounded `Vec` in a single entry. Append-only
+    // listing of ids; `*At` keys map index -> id, `*Index` keys are the
+    // reverse maps that make removal O(1) swap-removes. Swap-remove means
+    // pages are an order-unstable snapshot: paginating while markets are
+    // resolved/positions emptied can skip or repeat ids, so clients must
+    // de-duplicate (see docs/architecture.md).
+    //
+    /// Number of currently-Open markets (`OpenAt(0..OpenCount)`). Persistent,
+    /// not instance: it is written on every lifecycle transition and a hot
+    /// counter in instance storage would make every call's instance entry
+    /// write heavier.
+    OpenCount,
+    OpenAt(u32),
+    OpenIndex(u64),
+    /// Append-only per-category list of every market ever created in the
+    /// category; status filtering is the client's job (or an intersection
+    /// with the open directory).
+    CategoryCount(Category),
+    CategoryAt(Category, u32),
+    /// Markets `holder` has a non-empty position in, maintained inside
+    /// `save_position` on empty/non-empty transitions only.
+    HolderCount(Address),
+    HolderAt(Address, u32),
+    HolderIndex(Address, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +241,11 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// A swap-remove through a market directory hit an archived `*At` slot
+    /// while its reverse index still exists: the entry must be restored
+    /// before the lifecycle transition can run (see the directory notes in
+    /// docs/architecture.md). Never fires on live storage.
+    DirectoryEntryArchived = 27,
 }
 
 impl From<MathError> for Error {
@@ -623,6 +664,12 @@ impl MarketCore {
             lp_claimed: false,
         };
         Self::save_market(&env, id, &market);
+        // Directory writes live in the effects section (after auth and all
+        // validation): open + category append, then the creator's seed
+        // position into the holder directory. The id is brand new, so the
+        // creator's previous position is definitionally empty.
+        Self::open_add(&env, id);
+        Self::category_add(&env, category, id);
         Self::save_fee_terms(
             &env,
             id,
@@ -643,6 +690,7 @@ impl MarketCore {
                     yes: seed.creator_yes,
                     no: seed.creator_no,
                 },
+                true,
             );
         }
 
@@ -778,11 +826,12 @@ impl MarketCore {
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
         let mut pos = Self::load_position(&env, market_id, &trader);
+        let was_empty = pos.yes == 0 && pos.no == 0;
         match outcome {
             Outcome::Yes => pos.yes += q.shares_out,
             Outcome::No => pos.no += q.shares_out,
         }
-        Self::save_position(&env, market_id, &trader, &pos);
+        Self::save_position(&env, market_id, &trader, &pos, was_empty);
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -900,6 +949,7 @@ impl MarketCore {
         )?;
 
         let mut pos = Self::load_position(&env, market_id, &trader);
+        let was_empty = pos.yes == 0 && pos.no == 0;
         let held = match outcome {
             Outcome::Yes => pos.yes,
             Outcome::No => pos.no,
@@ -913,7 +963,7 @@ impl MarketCore {
             Outcome::Yes => pos.yes -= q.shares_in,
             Outcome::No => pos.no -= q.shares_in,
         }
-        Self::save_position(&env, market_id, &trader, &pos);
+        Self::save_position(&env, market_id, &trader, &pos, was_empty);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
         m.sets_minted -= q.gross;
         let protocol_fee = Self::accrue_fees(&env, market_id, q.fee)?;
@@ -956,6 +1006,7 @@ impl MarketCore {
         }
         m.status = MarketStatus::Resolved(outcome);
         Self::save_market(&env, market_id, &m);
+        Self::open_remove(&env, market_id);
         MarketResolved {
             market_id,
             outcome: Some(outcome),
@@ -973,6 +1024,7 @@ impl MarketCore {
         }
         m.status = MarketStatus::Void;
         Self::save_market(&env, market_id, &m);
+        Self::open_remove(&env, market_id);
         MarketResolved {
             market_id,
             outcome: None,
@@ -995,7 +1047,9 @@ impl MarketCore {
         }
         let payout = math::settle_value(kind, pos.yes, pos.no);
 
-        Self::save_position(&env, market_id, &holder, &Position { yes: 0, no: 0 });
+        // A non-empty position is emptied here, so `redeem` always removes
+        // the market from the holder's directory (was_empty = false).
+        Self::save_position(&env, market_id, &holder, &Position { yes: 0, no: 0 }, false);
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
         }
@@ -1118,6 +1172,10 @@ impl MarketCore {
         Self::load_market(&env, market_id)?;
         let mut a = Self::load_position(&env, market_id, &from);
         let mut b = Self::load_position(&env, market_id, &to);
+        // `amount > 0` and the balance checks below imply `from` was
+        // non-empty; `to`'s previous emptiness decides whether the market is
+        // newly added to its directory.
+        let to_was_empty = b.yes == 0 && b.no == 0;
         match outcome {
             Outcome::Yes => {
                 if a.yes < amount {
@@ -1134,8 +1192,8 @@ impl MarketCore {
                 b.no = b.no.checked_add(amount).ok_or(Error::Overflow)?;
             }
         }
-        Self::save_position(&env, market_id, &from, &a);
-        Self::save_position(&env, market_id, &to, &b);
+        Self::save_position(&env, market_id, &from, &a, false);
+        Self::save_position(&env, market_id, &to, &b, to_was_empty);
         PositionTransferred {
             market_id,
             from,
@@ -1204,6 +1262,107 @@ impl MarketCore {
 
     pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
         Self::load_position(&env, market_id, &holder)
+    }
+
+    // ----- market directory views (#25) --------------------------------------
+    // `open_markets` / `markets_by_category` / `markets_of` page through the
+    // counter-indexed directories. `limit` is capped at `MAX_PAGE` (50) and
+    // a page shorter than requested means the end of the directory; an empty
+    // page means `start >= count`. Because removals are O(1) swap-removes,
+    // the order is NOT stable across concurrent lifecycle transitions: pages
+    // are a best-effort snapshot, clients must de-duplicate ids across pages
+    // and re-page until no new ids appear (docs/architecture.md).
+
+    /// Number of markets currently in `Open` status (indexed by `create_market`
+    /// or `rebuild_open_index`).
+    pub fn open_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OpenCount)
+            .unwrap_or(0)
+    }
+
+    pub fn open_markets(env: Env, start: u32, limit: u32) -> Vec<u64> {
+        let count: u32 = Self::open_count(env.clone());
+        Self::dir_page(&env, count, DataKey::OpenAt, start, limit)
+    }
+
+    /// Total number of markets ever created in `category` (append-only;
+    /// includes resolved and voided markets).
+    pub fn category_count(env: Env, category: Category) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CategoryCount(category))
+            .unwrap_or(0)
+    }
+
+    pub fn markets_by_category(env: Env, category: Category, start: u32, limit: u32) -> Vec<u64> {
+        let count: u32 = Self::category_count(env.clone(), category.clone());
+        Self::dir_page(
+            &env,
+            count,
+            |i| DataKey::CategoryAt(category.clone(), i),
+            start,
+            limit,
+        )
+    }
+
+    /// Number of markets `holder` currently has a non-empty position in.
+    pub fn holder_count(env: Env, holder: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HolderCount(holder))
+            .unwrap_or(0)
+    }
+
+    pub fn markets_of(env: Env, holder: Address, start: u32, limit: u32) -> Vec<u64> {
+        let count: u32 = Self::holder_count(env.clone(), holder.clone());
+        Self::dir_page(
+            &env,
+            count,
+            |i| DataKey::HolderAt(holder.clone(), i),
+            start,
+            limit,
+        )
+    }
+
+    // ----- directory maintenance (#25) ---------------------------------------
+
+    /// Admin backfill for deployments upgraded while markets existed: scans
+    /// `Market(start_id..end_id)` (at most `MAX_BACKFILL_BATCH` ids per call,
+    /// run in batches) and appends every market still in `Open` status that is
+    /// not indexed yet, so the open directory becomes complete for old
+    /// markets. Already-indexed ids are skipped, making overlapping batches
+    /// safe. Idempotent per batch; returns the number of markets added.
+    ///
+    /// Category directories and holder directories cannot be backfilled
+    /// on-chain in bounded storage (the category of a legacy market is only
+    /// known after loading it, and legacy holder positions were dust-pruned
+    /// per-holder): positions opened before the upgrade appear in
+    /// `markets_of` only after their next change (buy/sell/transfer/redeem).
+    /// This limitation is documented in docs/architecture.md.
+    pub fn rebuild_open_index(env: Env, start_id: u64, end_id: u64) -> Result<u32, Error> {
+        Self::require_admin(&env)?;
+        if end_id < start_id || end_id - start_id > MAX_BACKFILL_BATCH {
+            return Err(Error::InvalidAmount);
+        }
+        let mut added = 0u32;
+        let storage = env.storage().persistent();
+        for id in start_id..end_id {
+            let key = DataKey::Market(id);
+            let Some(m) = storage.get::<_, Market>(&key) else {
+                continue;
+            };
+            if m.status != MarketStatus::Open {
+                continue;
+            }
+            if storage.has(&DataKey::OpenIndex(id)) {
+                continue;
+            }
+            Self::open_add(&env, id);
+            added += 1;
+        }
+        Ok(added)
     }
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
@@ -1428,16 +1587,166 @@ impl MarketCore {
     }
 
     /// Empty positions are removed so storage does not grow with dust entries.
-    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position) {
+    ///
+    /// The holder directory (#25) is updated here on empty/non-empty
+    /// transitions only: `was_empty` is the emptiness of the position *before*
+    /// the write, which every caller already knows because it loaded the
+    /// position (so this never costs a second storage read). Adding to a market
+    /// already held, or trading down within it, writes no directory entry.
+    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position, was_empty: bool) {
         let key = DataKey::Position(id, holder.clone());
-        if p.yes == 0 && p.no == 0 {
+        let is_empty = p.yes == 0 && p.no == 0;
+        if is_empty {
             env.storage().persistent().remove(&key);
+            if !was_empty {
+                Self::holder_remove(env, holder, id);
+            }
         } else {
             env.storage().persistent().set(&key, p);
             env.storage()
                 .persistent()
                 .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+            if was_empty {
+                Self::holder_add(env, holder, id);
+            }
         }
+    }
+
+    // ----- market directories (#25) -----------------------------------------
+    // Counter-indexed persistent entries (see `DataKey`). Every write
+    // TTL-extends the entries it touches with BUMP_THRESHOLD/BUMP_TO. An
+    // archived directory entry MUST be restored (soroban-cli ledger entry
+    // restore) before any transaction that swap-removes through it, or the
+    // removal would read a missing slot mid-transition — the `docs/
+    // architecture.md` directory section documents this restore requirement,
+    // and the wave-issue 14 keeper covers live entries.
+
+    fn dir_write(env: &Env, key: &DataKey, value: &u64) {
+        env.storage().persistent().set(key, value);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    fn dir_write_u32(env: &Env, key: &DataKey, value: u32) {
+        env.storage().persistent().set(key, &value);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// Generic O(1) swap-remove over a `count / at(i) / reverse(id)` key
+    /// family: move the last entry into the removed slot, shrink the count,
+    /// delete the vacated slot. `i == last` skips the moved-entry writes.
+    /// A no-op when the item has no reverse key (never indexed, e.g. a legacy
+    /// market created before the upgrade — `rebuild_open_index` is the admin
+    /// path that adds those back). A reverse key without its `at(last)` slot
+    /// means that slot was archived: it must be restored before the
+    /// transition runs (see the directory notes in docs/architecture.md),
+    /// and this traps with `DirectoryEntryArchived` rather than corrupting
+    /// the directory.
+    fn dir_remove<F, G>(env: &Env, count_key: DataKey, at: F, rev: G, idx_key: DataKey)
+    where
+        F: Fn(u32) -> DataKey,
+        G: Fn(u64) -> DataKey,
+    {
+        let i: u32 = match env.storage().persistent().get(&idx_key) {
+            Some(i) => i,
+            None => return,
+        };
+        let n: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let last = n - 1;
+        if i != last {
+            let moved: u64 = env
+                .storage()
+                .persistent()
+                .get(&at(last))
+                .unwrap_or_else(|| panic_with_error!(env, Error::DirectoryEntryArchived));
+            Self::dir_write(env, &at(i), &moved);
+            Self::dir_write_u32(env, &rev(moved), i);
+        }
+        env.storage().persistent().remove(&at(last));
+        env.storage().persistent().remove(&idx_key);
+        Self::dir_write_u32(env, &count_key, last);
+    }
+
+    fn open_add(env: &Env, id: u64) {
+        let n: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OpenCount)
+            .unwrap_or(0u32);
+        Self::dir_write(env, &DataKey::OpenAt(n), &id);
+        Self::dir_write_u32(env, &DataKey::OpenIndex(id), n);
+        Self::dir_write_u32(env, &DataKey::OpenCount, n + 1);
+    }
+
+    fn open_remove(env: &Env, id: u64) {
+        Self::dir_remove(
+            env,
+            DataKey::OpenCount,
+            DataKey::OpenAt,
+            DataKey::OpenIndex,
+            DataKey::OpenIndex(id),
+        );
+    }
+
+    fn category_add(env: &Env, category: Category, id: u64) {
+        let n: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryCount(category))
+            .unwrap_or(0u32);
+        Self::dir_write(env, &DataKey::CategoryAt(category, n), &id);
+        Self::dir_write_u32(env, &DataKey::CategoryCount(category), n + 1);
+    }
+
+    fn holder_add(env: &Env, holder: &Address, id: u64) {
+        let n: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderCount(holder.clone()))
+            .unwrap_or(0u32);
+        Self::dir_write(env, &DataKey::HolderAt(holder.clone(), n), &id);
+        Self::dir_write_u32(env, &DataKey::HolderIndex(holder.clone(), id), n);
+        Self::dir_write_u32(env, &DataKey::HolderCount(holder.clone()), n + 1);
+    }
+
+    fn holder_remove(env: &Env, holder: &Address, id: u64) {
+        Self::dir_remove(
+            env,
+            DataKey::HolderCount(holder.clone()),
+            |i| DataKey::HolderAt(holder.clone(), i),
+            |item| DataKey::HolderIndex(holder.clone(), item),
+            DataKey::HolderIndex(holder.clone(), id),
+        );
+    }
+
+    /// `start..start+len` of a `count / at(i)` directory, `len =
+    /// min(limit, MAX_PAGE)` clamped to the remaining entries. Reads only
+    /// TTL-extend the entries they touch.
+    fn dir_page<F>(env: &Env, count: u32, at: F, start: u32, limit: u32) -> Vec<u64>
+    where
+        F: Fn(u32) -> DataKey,
+    {
+        let mut out = Vec::new(env);
+        if start >= count {
+            return out;
+        }
+        let want = limit.min(MAX_PAGE);
+        let end = (start + want).min(count);
+        let mut i = start;
+        while i < end {
+            let key = at(i);
+            if let Some(id) = env.storage().persistent().get::<_, u64>(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+                out.push_back(id);
+            }
+            i += 1;
+        }
+        out
     }
 
     fn load_fee_terms(env: &Env, id: u64) -> Option<FeeTerms> {
@@ -3065,6 +3374,926 @@ mod test {
             }])
             .try_propose_treasury(&peer)
             .is_err());
+    }
+
+    // ----- #25: on-chain market directories ---------------------------------
+    // Open / category / holder directories must stay consistent with the
+    // ground-truth `Market` / `Position` entries on every mutation path
+    // (create, buy, sell, resolve, void, redeem, transfer, rebuild).
+
+    const UNIT: i128 = 10_000_000;
+
+    fn pget_u64(env: &Env, client: &MarketCoreClient, key: &DataKey) -> Option<u64> {
+        let contract = client.address.clone();
+        env.as_contract(&contract, || {
+            env.storage().persistent().get::<DataKey, u64>(key)
+        })
+    }
+
+    fn pget_u32(env: &Env, client: &MarketCoreClient, key: &DataKey) -> Option<u32> {
+        let contract = client.address.clone();
+        env.as_contract(&contract, || {
+            env.storage().persistent().get::<DataKey, u32>(key)
+        })
+    }
+
+    /// `Vec<u64>` (contract side) to a sorted std Vec for set comparisons.
+    fn ids_of(v: &Vec<u64>) -> std::vec::Vec<u64> {
+        let mut out = std::vec::Vec::new();
+        let mut i = 0u32;
+        while i < v.len() {
+            out.push(v.get(i).unwrap());
+            i += 1;
+        }
+        out
+    }
+
+    /// Directory slots in storage order (NOT sorted): this is what clients
+    /// page through, and the swap-remove tests pin its exact shape.
+    fn raw_dir<F>(env: &Env, client: &MarketCoreClient, count: u32, at: F) -> std::vec::Vec<u64>
+    where
+        F: Fn(u32) -> DataKey,
+    {
+        let mut out = std::vec::Vec::new();
+        let mut i = 0u32;
+        while i < count {
+            out.push(
+                pget_u64(env, client, &at(i))
+                    .expect("directory slot missing while count covers it"),
+            );
+            i += 1;
+        }
+        out
+    }
+
+    /// Ground truth by raw scan: ids with `Market(id)` in `Open` status.
+    fn open_by_status_scan(env: &Env, client: &MarketCoreClient) -> std::vec::Vec<u64> {
+        let contract = client.address.clone();
+        let mut expected = std::vec::Vec::new();
+        let n = client.market_count();
+        let mut id = 0u64;
+        while id < n {
+            let m = env.as_contract(&contract, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, Market>(&DataKey::Market(id))
+            });
+            if let Some(m) = m {
+                if m.status == MarketStatus::Open {
+                    expected.push(id);
+                }
+            }
+            id += 1;
+        }
+        expected.sort();
+        expected
+    }
+
+    /// Cross-check the open directory against the ground truth: same set of
+    /// ids, exact count, dense `OpenAt` slots, and matching `OpenIndex`
+    /// back-pointers for every entry.
+    fn assert_open_consistent(env: &Env, client: &MarketCoreClient) {
+        let raw = raw_dir(env, client, client.open_count(), DataKey::OpenAt);
+        let mut got = raw.clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(
+            got,
+            open_by_status_scan(env, client),
+            "open directory mismatch"
+        );
+        let mut i = 0usize;
+        while i < raw.len() {
+            assert_eq!(
+                pget_u32(env, client, &DataKey::OpenIndex(raw[i])),
+                Some(i as u32),
+                "stale OpenIndex back-pointer for market {}",
+                raw[i]
+            );
+            i += 1;
+        }
+    }
+
+    /// Same cross-check for one holder's directory against its positions.
+    fn assert_holder_consistent(env: &Env, client: &MarketCoreClient, holder: &Address) {
+        let contract = client.address.clone();
+        let n = client.market_count();
+        let mut expected = std::vec::Vec::new();
+        let mut id = 0u64;
+        while id < n {
+            let p = env.as_contract(&contract, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, Position>(&DataKey::Position(id, holder.clone()))
+            });
+            if let Some(p) = p {
+                if p.yes > 0 || p.no > 0 {
+                    expected.push(id);
+                }
+            }
+            id += 1;
+        }
+        expected.sort();
+        let raw = raw_dir(env, client, client.holder_count(&holder), |i| {
+            DataKey::HolderAt(holder.clone(), i)
+        });
+        let mut got = raw.clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(got, expected, "holder directory mismatch");
+        let mut i = 0usize;
+        while i < raw.len() {
+            assert_eq!(
+                pget_u32(env, client, &DataKey::HolderIndex(holder.clone(), raw[i])),
+                Some(i as u32),
+                "stale HolderIndex back-pointer for market {}",
+                raw[i]
+            );
+            i += 1;
+        }
+    }
+
+    /// Largest `collateral_out` whose `quote_sell` still consumes at most
+    /// `have` shares. A quote that fails as `InvalidAmount` means the floor
+    /// rounds the consumed share count to zero — i.e. the amount is too
+    /// *small*, so it counts as feasible; that makes feasibility a clean
+    /// true..true,false..false predicate over the search range.
+    fn max_fitable_sell(
+        client: &MarketCoreClient,
+        market_id: u64,
+        outcome: &Outcome,
+        have: i128,
+    ) -> i128 {
+        let feasible = |co: i128| -> bool {
+            match client.try_quote_sell(&market_id, outcome, &co) {
+                Ok(Ok(shares)) => shares <= have,
+                Err(Ok(Error::InvalidAmount)) => true,
+                _ => false,
+            }
+        };
+        let mut lo: i128 = 1;
+        let mut hi: i128 = 100_000 * UNIT; // far above any pool used in tests
+        assert!(feasible(lo), "1-lamport sell must always fit");
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if feasible(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    /// Smallest `collateral_out` whose `quote_sell` consumes at least
+    /// `want` shares, and the consumed count at that collateral. `None`
+    /// when the search bound is too small to consume `want` at all.
+    fn min_covering_sell(
+        client: &MarketCoreClient,
+        market_id: u64,
+        outcome: &Outcome,
+        want: i128,
+    ) -> Option<(i128, i128)> {
+        let covers = |co: i128| -> bool {
+            matches!(client.try_quote_sell(&market_id, outcome, &co), Ok(Ok(s)) if s >= want)
+        };
+        let mut hi: i128 = 100_000 * UNIT; // far above any pool used in tests
+        if !covers(hi) {
+            return None;
+        }
+        let mut lo: i128 = 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if covers(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some((lo, client.quote_sell(&market_id, outcome, &lo)))
+    }
+
+    /// Smallest `collateral_in` whose `quote_buy` mints at least `want`
+    /// shares (the buy staircase is dense at the bottom, so the first
+    /// collateral that covers 1 share mints exactly 1).
+    fn min_covering_buy(
+        client: &MarketCoreClient,
+        market_id: u64,
+        outcome: &Outcome,
+        want: i128,
+    ) -> i128 {
+        let covers = |co: i128| -> bool {
+            matches!(client.try_quote_buy(&market_id, outcome, &co), Ok(Ok(s)) if s >= want)
+        };
+        let mut lo: i128 = 1;
+        let mut hi: i128 = 10 * UNIT;
+        assert!(covers(hi), "10 UNIT must mint a share");
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if covers(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    /// Sell the trader's whole `outcome` position through the AMM. The AMM
+    /// is collateral-driven (`sell` computes the consumed shares from
+    /// `collateral_out` with ceil rounding), and near the top of a
+    /// convex sell curve one lamport can jump past the exact share count,
+    /// so a naive maximal sell can strand a 1-share tail that no
+    /// collateral amount can consume on its own (the minimum sell consumes
+    /// two shares). Selling *exact* chunks — the smallest collateral whose
+    /// quote covers the target, halving the target whenever the staircase
+    /// skips it — always lands on zero. Bounded number of rounds.
+    fn sell_position_entirely(
+        _env: &Env,
+        client: &MarketCoreClient,
+        trader: &Address,
+        market_id: u64,
+        outcome: Outcome,
+    ) {
+        let mut left = match outcome {
+            Outcome::Yes => client.get_position(&market_id, trader).yes,
+            Outcome::No => client.get_position(&market_id, trader).no,
+        };
+        assert!(left > 0, "nothing to sell");
+        let mut rounds = 0;
+        while left > 0 {
+            rounds += 1;
+            assert!(rounds < 64, "sell-to-empty did not converge");
+            // Try to sell the whole remainder in one exact step; if the
+            // staircase skips `left`, aim at progressively smaller exact
+            // chunks until one lands.
+            let mut target = left;
+            let mut sold_now = 0i128;
+            while target >= 2 {
+                if let Some((co, got)) = min_covering_sell(client, market_id, &outcome, target) {
+                    if got == target {
+                        client.sell(trader, &market_id, &outcome, &co, &target);
+                        sold_now = got;
+                        break;
+                    }
+                }
+                target /= 2;
+            }
+            if sold_now == 0 && left > 16 {
+                // No exact chunk within the search bound (position larger
+                // than one maximal sell): shrink with the biggest sell that
+                // fits, then re-aim at an exact finish next round.
+                let co = max_fitable_sell(client, market_id, &outcome, left);
+                client.sell(trader, &market_id, &outcome, &co, &left);
+            } else if sold_now == 0 {
+                // Tiny tail. The minimum sell consumes 2 shares (ceil on
+                // gross + liquidity-curve bump) and the share staircase at
+                // this scale skips some counts, so a leftover of e.g. 1
+                // share has no collateral that clears it. Try small exact
+                // collateral sells; if none hits, top the position up by
+                // the minimum 1-share buy and retry.
+                let mut attempts = 0;
+                while sold_now == 0 {
+                    attempts += 1;
+                    assert!(attempts <= 8, "small-tail sell did not converge");
+                    assert!(left >= 1, "position already empty");
+                    let mut co = 1i128;
+                    while co <= 64 && sold_now == 0 {
+                        if let Ok(Ok(s)) = client.try_quote_sell(&market_id, &outcome, &co) {
+                            if s == left {
+                                client.sell(trader, &market_id, &outcome, &co, &s);
+                                sold_now = s;
+                            }
+                        }
+                        co += 1;
+                    }
+                    if sold_now == 0 {
+                        let co_b = min_covering_buy(client, market_id, &outcome, 1);
+                        client.buy(trader, &market_id, &outcome, &co_b, &0_i128);
+                        left = match outcome {
+                            Outcome::Yes => client.get_position(&market_id, trader).yes,
+                            Outcome::No => client.get_position(&market_id, trader).no,
+                        };
+                    }
+                }
+            }
+            left = match outcome {
+                Outcome::Yes => client.get_position(&market_id, trader).yes,
+                Outcome::No => client.get_position(&market_id, trader).no,
+            };
+        }
+        assert_eq!(left, 0, "full sell must empty the position");
+    }
+
+    #[test]
+    fn open_directory_tracks_create_resolve_void() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 5000);
+        let m2 = new_market(&env, &client, &creator, 5000);
+
+        assert_eq!(client.open_count(), 3);
+        assert_eq!(ids_of(&client.open_markets(&0, &10)), std::vec![m0, m1, m2]);
+
+        // resolve removes from the open directory only after close_time
+        let close = client.get_market(&m1).close_time;
+        assert_eq!(
+            client.try_resolve(&m1, &Outcome::Yes),
+            Err(Ok(Error::NotClosedYet))
+        );
+        env.ledger().set_timestamp(close + 1);
+        client.resolve(&m1, &Outcome::Yes);
+        assert_eq!(client.open_count(), 2);
+        assert_eq!(ids_of(&client.open_markets(&0, &10)), std::vec![m0, m2]);
+        assert_open_consistent(&env, &client);
+
+        // void removes too, and removal is idempotent-safe (double final fails)
+        client.void_market(&m2);
+        assert_eq!(ids_of(&client.open_markets(&0, &10)), std::vec![m0]);
+        assert!(client.try_void_market(&m2).is_err());
+        assert_open_consistent(&env, &client);
+
+        client.void_market(&m0);
+        assert_eq!(client.open_count(), 0);
+        assert_eq!(client.open_markets(&0, &10).len(), 0);
+        assert_open_consistent(&env, &client);
+    }
+
+    #[test]
+    fn swap_remove_first_middle_last() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let ids: std::vec::Vec<u64> = (0..5)
+            .map(|_| new_market(&env, &client, &creator, 5000))
+            .collect();
+        assert_eq!(
+            raw_dir(&env, &client, client.open_count(), DataKey::OpenAt),
+            ids
+        );
+
+        // remove FIRST (index 0 of 5): the last entry moves into slot 0
+        client.void_market(&ids[0]);
+        assert_eq!(
+            raw_dir(&env, &client, client.open_count(), DataKey::OpenAt),
+            std::vec![4, 1, 2, 3]
+        );
+        assert_eq!(pget_u32(&env, &client, &DataKey::OpenIndex(4)), Some(0));
+        assert_eq!(pget_u32(&env, &client, &DataKey::OpenIndex(0)), None);
+        assert_open_consistent(&env, &client);
+
+        // remove MIDDLE (market 2 sits at index 2 of 4): last entry (3) moves in
+        client.void_market(&ids[2]);
+        assert_eq!(
+            raw_dir(&env, &client, client.open_count(), DataKey::OpenAt),
+            std::vec![4, 1, 3]
+        );
+        assert_eq!(pget_u32(&env, &client, &DataKey::OpenIndex(3)), Some(2));
+        assert_open_consistent(&env, &client);
+
+        // remove LAST (market 3 is at the final index): no moved entry at all
+        client.void_market(&ids[3]);
+        assert_eq!(
+            raw_dir(&env, &client, client.open_count(), DataKey::OpenAt),
+            std::vec![4, 1]
+        );
+        assert_eq!(pget_u64(&env, &client, &DataKey::OpenAt(2)), None);
+        assert_eq!(pget_u32(&env, &client, &DataKey::OpenCount), Some(2));
+
+        // drain the rest, both directions of the index shrink covered
+        client.void_market(&ids[4]);
+        client.void_market(&ids[1]);
+        assert_eq!(client.open_count(), 0);
+        assert_eq!(pget_u64(&env, &client, &DataKey::OpenAt(0)), None);
+        assert_eq!(pget_u32(&env, &client, &DataKey::OpenCount), Some(0));
+        for id in &ids {
+            assert_eq!(pget_u32(&env, &client, &DataKey::OpenIndex(*id)), None);
+        }
+    }
+
+    #[test]
+    fn category_directory_append_only() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let mk = |category: Category, bps: u32, env: &Env, client: &MarketCoreClient| {
+            client.create_market(
+                &creator,
+                &BytesN::from_array(env, &[7u8; 32]),
+                &BytesN::from_array(env, &[17u8; 32]),
+                &String::from_str(env, "ipfs://categories"),
+                &category,
+                &(env.ledger().timestamp() + 60_000),
+                &(100 * UNIT),
+                &bps,
+            )
+        };
+        let c0 = mk(Category::Crypto, 5000, &env, &client);
+        let m0 = mk(Category::Macro, 5000, &env, &client);
+        let c1 = mk(Category::Crypto, 5000, &env, &client);
+        let c2 = mk(Category::Crypto, 5000, &env, &client);
+
+        assert_eq!(client.category_count(&Category::Crypto), 3);
+        assert_eq!(client.category_count(&Category::Macro), 1);
+        assert_eq!(client.category_count(&Category::Sports), 0);
+        assert_eq!(
+            ids_of(&client.markets_by_category(&Category::Crypto, &0, &50)),
+            std::vec![c0, c1, c2]
+        );
+        assert_eq!(
+            ids_of(&client.markets_by_category(&Category::Macro, &0, &50)),
+            std::vec![m0]
+        );
+        assert_eq!(
+            client.markets_by_category(&Category::Sports, &0, &50).len(),
+            0
+        );
+
+        // finality does NOT touch category directories: append-only, keeps
+        // resolved/voided markets (they remain browsable history).
+        let close = client.get_market(&c1).close_time;
+        env.ledger().set_timestamp(close + 1);
+        client.resolve(&c1, &Outcome::No);
+        client.void_market(&c2);
+        assert_eq!(client.category_count(&Category::Crypto), 3);
+        assert_eq!(
+            ids_of(&client.markets_by_category(&Category::Crypto, &0, &50)),
+            std::vec![c0, c1, c2]
+        );
+        assert_eq!(client.open_count(), 2);
+        assert_open_consistent(&env, &client);
+    }
+
+    #[test]
+    fn holder_directory_add_on_first_buy_remove_on_full_sell() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let m = new_market(&env, &client, &creator, 5000);
+        let m2 = new_market(&env, &client, &creator, 5000);
+
+        assert_eq!(client.holder_count(&trader), 0);
+        assert_holder_consistent(&env, &client, &trader);
+
+        // first buy in `m` adds the market to the holder directory
+        client.buy(&trader, &m, &Outcome::Yes, &(10 * UNIT), &0_i128);
+        assert_eq!(client.holder_count(&trader), 1);
+        assert_eq!(ids_of(&client.markets_of(&trader, &0, &50)), std::vec![m]);
+        assert_holder_consistent(&env, &client, &trader);
+
+        // first buy in a second market appends
+        client.buy(&trader, &m2, &Outcome::Yes, &(2 * UNIT), &0_i128);
+        assert_eq!(client.holder_count(&trader), 2);
+        assert_eq!(
+            ids_of(&client.markets_of(&trader, &0, &50)),
+            std::vec![m, m2]
+        );
+
+        // full sell in `m` removes it (swap-remove: `m2` moves into slot 0)
+        sell_position_entirely(&env, &client, &trader, m, Outcome::Yes);
+        assert_eq!(client.holder_count(&trader), 1);
+        assert_eq!(ids_of(&client.markets_of(&trader, &0, &50)), std::vec![m2]);
+        assert_eq!(
+            pget_u32(&env, &client, &DataKey::HolderIndex(trader.clone(), m)),
+            None
+        );
+        assert_holder_consistent(&env, &client, &trader);
+
+        // and fully selling the last market empties the directory
+        sell_position_entirely(&env, &client, &trader, m2, Outcome::Yes);
+        assert_eq!(client.holder_count(&trader), 0);
+        assert_eq!(client.markets_of(&trader, &0, &50).len(), 0);
+        assert_holder_consistent(&env, &client, &trader);
+    }
+
+    #[test]
+    fn holder_directory_unchanged_on_additional_buy() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let m = new_market(&env, &client, &creator, 5000);
+
+        // first buy: the holder directory grows by three written entries
+        // (HolderAt, HolderIndex, HolderCount) on top of the position work.
+        client.buy(&trader, &m, &Outcome::Yes, &(10 * UNIT), &0_i128);
+        let first_buy_writes = env.cost_estimate().resources().write_entries;
+
+        let snapshot = raw_dir(&env, &client, client.holder_count(&trader), |i| {
+            DataKey::HolderAt(trader.clone(), i)
+        });
+
+        // additional buy into the same market (other outcome): position work
+        // only, ZERO directory writes and a byte-identical directory.
+        client.buy(&trader, &m, &Outcome::No, &(5 * UNIT), &0_i128);
+        let more_buy_writes = env.cost_estimate().resources().write_entries;
+
+        assert_eq!(
+            raw_dir(&env, &client, client.holder_count(&trader), |i| {
+                DataKey::HolderAt(trader.clone(), i)
+            }),
+            snapshot
+        );
+        assert_eq!(client.holder_count(&trader), 1);
+        assert_eq!(
+            first_buy_writes - more_buy_writes,
+            3,
+            "an additional buy must not write any directory entry"
+        );
+
+        // selling down within the position (still non-empty) also leaves the
+        // directory untouched.
+        client.sell(&trader, &m, &Outcome::Yes, &(1 * UNIT), &i128::MAX);
+        assert_eq!(
+            raw_dir(&env, &client, client.holder_count(&trader), |i| {
+                DataKey::HolderAt(trader.clone(), i)
+            }),
+            snapshot
+        );
+        assert_holder_consistent(&env, &client, &trader);
+    }
+
+    #[test]
+    fn redeem_removes_from_holder_directory() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let loser = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &collateral).mint(&loser, &(1000 * UNIT));
+
+        let m = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &m, &Outcome::Yes, &(10 * UNIT), &0_i128);
+        client.buy(&loser, &m, &Outcome::No, &(5 * UNIT), &0_i128);
+        assert_eq!(client.holder_count(&trader), 1);
+        assert_eq!(client.holder_count(&loser), 1);
+
+        let close = client.get_market(&m).close_time;
+        env.ledger().set_timestamp(close + 1);
+        client.resolve(&m, &Outcome::Yes);
+
+        // winning holder redeems and leaves the directory
+        assert!(client.redeem(&trader, &m) > 0);
+        assert_eq!(client.holder_count(&trader), 0);
+        assert_eq!(
+            pget_u32(&env, &client, &DataKey::HolderIndex(trader.clone(), m)),
+            None
+        );
+
+        // losing holder redeems a zero payout and also leaves
+        assert_eq!(client.redeem(&loser, &m), 0);
+        assert_eq!(client.holder_count(&loser), 0);
+        assert_holder_consistent(&env, &client, &trader);
+        assert_holder_consistent(&env, &client, &loser);
+    }
+
+    #[test]
+    fn creator_seed_position_listed() {
+        let (env, client, creator, _, _, _) = setup_market();
+        // asymmetric seed: the creator keeps the leftover YES shares
+        let m = new_market(&env, &client, &creator, 6800);
+        assert_eq!(client.holder_count(&creator), 1);
+        assert_eq!(ids_of(&client.markets_of(&creator, &0, &50)), std::vec![m]);
+        assert!(client.get_position(&m, &creator).yes > 0);
+        assert_holder_consistent(&env, &client, &creator);
+
+        // a 50/50 seed leaves the creator no position, so nothing is listed
+        let m2 = new_market(&env, &client, &creator, 5000);
+        assert_eq!(client.holder_count(&creator), 1);
+        assert_eq!(ids_of(&client.markets_of(&creator, &0, &50)), std::vec![m]);
+        assert_eq!(client.get_position(&m2, &creator).yes, 0);
+        assert_eq!(client.get_position(&m2, &creator).no, 0);
+        assert_holder_consistent(&env, &client, &creator);
+    }
+
+    #[test]
+    fn pagination_limits_and_out_of_range() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        soroban_sdk::token::StellarAssetClient::new(&env, &collateral)
+            .mint(&creator, &(20_000 * UNIT));
+
+        // 52 open markets: more than one MAX_PAGE (50)
+        let mut ids = std::vec::Vec::new();
+        for _ in 0..52 {
+            ids.push(new_market(&env, &client, &creator, 5000));
+        }
+        assert_eq!(client.open_count(), 52);
+
+        // `limit` is capped at MAX_PAGE no matter how large the request is
+        let page = client.open_markets(&0, &100);
+        assert_eq!(page.len(), MAX_PAGE);
+        assert_eq!(ids_of(&page), ids[..50].to_vec());
+        let rest = client.open_markets(&MAX_PAGE, &100);
+        assert_eq!(ids_of(&rest), ids[50..].to_vec());
+        // paging with limit 0 returns nothing
+        assert_eq!(client.open_markets(&0, &0).len(), 0);
+        // start beyond the end is an empty page, never a trap
+        assert_eq!(client.open_markets(&52, &10).len(), 0);
+        assert_eq!(client.open_markets(&1_000_000, &10).len(), 0);
+
+        // same behaviour for the other two directories
+        assert_eq!(
+            client
+                .markets_by_category(&Category::Crypto, &0, &100)
+                .len(),
+            MAX_PAGE
+        );
+        assert_eq!(
+            client
+                .markets_by_category(&Category::Crypto, &50, &100)
+                .len(),
+            2
+        );
+        assert_eq!(
+            client
+                .markets_by_category(&Category::Crypto, &52, &10)
+                .len(),
+            0
+        );
+        assert_eq!(
+            client.markets_by_category(&Category::Sports, &0, &10).len(),
+            0
+        );
+
+        for m in ids.iter().take(51) {
+            client.buy(&trader, m, &Outcome::Yes, &(10 * UNIT), &0_i128);
+        }
+        assert_eq!(client.holder_count(&trader), 51);
+        assert_eq!(client.markets_of(&trader, &0, &100).len(), MAX_PAGE);
+        assert_eq!(client.markets_of(&trader, &MAX_PAGE, &100).len(), 1);
+        assert_eq!(client.markets_of(&trader, &51, &10).len(), 0);
+        assert_open_consistent(&env, &client);
+        assert_holder_consistent(&env, &client, &trader);
+    }
+
+    /// Deterministic LCG (no rand dependency in a `no_std` test module).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u64
+        }
+    }
+
+    #[test]
+    fn directory_consistency_random_sequences() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &collateral);
+        let mut holders = std::vec::Vec::new();
+        holders.push(trader);
+        for _ in 1..4 {
+            let h = Address::generate(&env);
+            token_admin.mint(&h, &(100_000 * UNIT));
+            holders.push(h);
+        }
+        token_admin.mint(&creator, &(100_000 * UNIT));
+
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        let mut created: std::vec::Vec<u64> = std::vec::Vec::new();
+        let cats = [
+            Category::Crypto,
+            Category::Macro,
+            Category::Geopolitics,
+            Category::Sports,
+            Category::Culture,
+            Category::Other,
+        ];
+
+        for step in 0..90u64 {
+            let r = rng.next();
+            match r % 7 {
+                0 | 1 => {
+                    let id = client.create_market(
+                        &creator,
+                        &BytesN::from_array(&env, &[step as u8; 32]),
+                        &BytesN::from_array(&env, &[step as u8; 32]),
+                        &String::from_str(&env, "ipfs://lcg"),
+                        &cats[(r >> 7) as usize % cats.len()],
+                        &(env.ledger().timestamp() + 60_000),
+                        &(100 * UNIT),
+                        &(5000u32 + ((r >> 13) as u32 % 4000)),
+                    );
+                    created.push(id);
+                }
+                2 | 3 => {
+                    // trade one of two outcomes in a random market; failed
+                    // trades (closed/not open/liquidity) are skipped, matching
+                    // what a live deployment would see
+                    if created.is_empty() {
+                        continue;
+                    }
+                    let m = created[(r >> 19) as usize % created.len()];
+                    let h = &holders[(r >> 25) as usize % holders.len()];
+                    let o = if r & (1 << 30) != 0 {
+                        Outcome::Yes
+                    } else {
+                        Outcome::No
+                    };
+                    let amount = (1 + ((r >> 37) % 4)) as i128 * UNIT;
+                    if !client.try_buy(h, &m, &o, &amount, &0_i128).is_ok() {
+                        let _ = client.try_sell(h, &m, &o, &amount, &i128::MAX);
+                    }
+                }
+                4 => {
+                    if !created.is_empty() {
+                        let m = created[(r >> 19) as usize % created.len()];
+                        let _ = client.try_void_market(&m);
+                    }
+                }
+                5 => {
+                    // move time past every market's close so resolves/redeems
+                    // below become legal (later creates get fresh close times)
+                    env.ledger()
+                        .set_timestamp(env.ledger().timestamp() + 60_001);
+                }
+                _ => {
+                    if !created.is_empty() {
+                        let m = created[(r >> 19) as usize % created.len()];
+                        let h = &holders[(r >> 25) as usize % holders.len()];
+                        let _ = client.try_redeem(h, &m);
+                    }
+                }
+            }
+        }
+
+        // after the whole sequence, all three directories must agree with the
+        // ground truth
+        assert_open_consistent(&env, &client);
+        for h in &holders {
+            assert_holder_consistent(&env, &client, h);
+        }
+        assert_holder_consistent(&env, &client, &creator);
+
+        // category directories: dense slots, exact counts, correct membership
+        let contract = client.address.clone();
+        let mut per_cat = std::vec::Vec::new();
+        for cat in cats {
+            let count = client.category_count(&cat);
+            let raw = raw_dir(&env, &client, count, |i| DataKey::CategoryAt(cat, i));
+            let mut expected = std::vec::Vec::new();
+            let mut id = 0u64;
+            while id < client.market_count() {
+                if let Some(m) = env.as_contract(&contract, || {
+                    env.storage()
+                        .persistent()
+                        .get::<DataKey, Market>(&DataKey::Market(id))
+                }) {
+                    if m.category == cat {
+                        expected.push(id);
+                    }
+                }
+                id += 1;
+            }
+            assert_eq!(raw, expected, "category directory {cat:?} drifted");
+            assert_eq!(
+                pget_u64(&env, &client, &DataKey::CategoryAt(cat, count)),
+                None,
+                "category directory {cat:?} has a hole past its count"
+            );
+            per_cat.push(raw.len() as u32);
+        }
+        assert_eq!(
+            per_cat.iter().sum::<u32>(),
+            client.market_count() as u32,
+            "every created market is in exactly one category directory"
+        );
+    }
+
+    #[test]
+    fn rebuild_open_index_admin_only() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+
+        // Simulate a legacy market: written straight into storage (as an
+        // upgraded deployment's pre-existing markets would look) with no
+        // open-directory entry at all.
+        let legacy = Market {
+            creator: creator.clone(),
+            question_hash: BytesN::from_array(&env, &[9u8; 32]),
+            resolution_hash: BytesN::from_array(&env, &[19u8; 32]),
+            meta_uri: String::from_str(&env, "ipfs://legacy"),
+            category: Category::Crypto,
+            close_time: env.ledger().timestamp() + 60_000,
+            fee_bps: 100,
+            status: MarketStatus::Open,
+            reserve_yes: 50 * UNIT,
+            reserve_no: 50 * UNIT,
+            sets_minted: 100 * UNIT,
+            fees_accrued: 0,
+            lp_claimed: false,
+        };
+        let contract = client.address.clone();
+        env.as_contract(&contract, || {
+            env.storage().persistent().set(&DataKey::Market(7), &legacy);
+            // Move NextId past the legacy id so `market_count()` covers it
+            // (an upgraded deployment would already be counting past its
+            // pre-existing markets).
+            env.storage().instance().set(&DataKey::NextId, &8u64);
+        });
+        assert_eq!(client.open_count(), 1);
+
+        // Only the admin may rebuild.
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "rebuild_open_index",
+                    args: (0u64, 10u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_rebuild_open_index(&0, &10)
+            .is_err());
+
+        // admin backfill: adds market 7, skips already-indexed m0, ignores
+        // absent ids and non-open markets.
+        env.mock_all_auths();
+        let added = client.rebuild_open_index(&0, &10);
+        assert_eq!(added, 1);
+        assert_eq!(client.open_count(), 2);
+        let mut expect = std::vec![m0, 7u64];
+        expect.sort();
+        assert_eq!(ids_of(&client.open_markets(&0, &10)), expect);
+        assert_open_consistent(&env, &client);
+
+        // idempotent: re-running the same batch adds nothing
+        assert_eq!(client.rebuild_open_index(&0, &10), 0);
+        assert_eq!(client.open_count(), 2);
+
+        // voiding the backfilled market removes it normally (the rebuild gave
+        // it the reverse index the swap-remove needs)
+        client.void_market(&7);
+        assert_eq!(client.open_count(), 1);
+        assert_open_consistent(&env, &client);
+
+        // batch bounds: end < start, or more than MAX_BACKFILL_BATCH ids
+        assert_eq!(
+            client.try_rebuild_open_index(&10, &5),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            client.try_rebuild_open_index(&0, &(MAX_BACKFILL_BATCH + 2)),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn directory_remove_traps_on_archived_slot() {
+        // A swap-remove whose reverse index exists but whose last `OpenAt`
+        // slot was archived by rent must trap (Error #27) instead of silently
+        // corrupting the directory; the entry has to be restored first (see
+        // the directory notes in docs/architecture.md) before the transition.
+        let (env, client, creator, _, _, _) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let _m1 = new_market(&env, &client, &creator, 5000);
+        assert_eq!(
+            raw_dir(&env, &client, client.open_count(), DataKey::OpenAt),
+            std::vec![m0, 1]
+        );
+        // simulate the rent-loss of the LAST directory slot only
+        remove_side_entry(&env, &client, DataKey::OpenAt(1));
+        client.void_market(&m0); // swap-remove would move slot 1 into slot 0
+    }
+
+    #[test]
+    fn directory_write_costs() {
+        // Measurements for docs/architecture.md: ledger-entry writes per
+        // mutation path with and without the directories (#25). Run with
+        // `cargo test -p market-core directory_write_costs -- --nocapture`.
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        soroban_sdk::token::StellarAssetClient::new(&env, &collateral)
+            .mint(&trader, &(100_000 * UNIT));
+        let mut rows: std::vec::Vec<(std::string::String, u32, u32)> = std::vec::Vec::new();
+        let record =
+            |name: &str, env: &Env, rows: &mut std::vec::Vec<(std::string::String, u32, u32)>| {
+                let r = env.cost_estimate().resources();
+                rows.push((
+                    std::string::String::from(name),
+                    r.write_entries,
+                    r.write_bytes,
+                ));
+            };
+
+        let m = new_market(&env, &client, &creator, 5000);
+        record("create_market", &env, &mut rows);
+        let m2 = new_market(&env, &client, &creator, 5000);
+        let _ = m2;
+
+        client.buy(&trader, &m, &Outcome::Yes, &(10 * UNIT), &0_i128);
+        record("buy (first position: +3 dir entries)", &env, &mut rows);
+        client.buy(&trader, &m, &Outcome::Yes, &(5 * UNIT), &0_i128);
+        record("buy (additional, no dir write)", &env, &mut rows);
+        sell_position_entirely(&env, &client, &trader, m, Outcome::Yes);
+        record("sell to empty (-dir removal)", &env, &mut rows);
+
+        client.buy(&trader, &m, &Outcome::No, &(5 * UNIT), &0_i128);
+        let close = client.get_market(&m).close_time;
+        env.ledger().set_timestamp(close + 1);
+        client.resolve(&m, &Outcome::No);
+        record("resolve (open-dir swap-remove)", &env, &mut rows);
+        client.redeem(&trader, &m);
+        record("redeem (holder-dir removal)", &env, &mut rows);
+
+        let mut out = std::string::String::from("\n#25 directory write footprint:\n");
+        for (name, entries, bytes) in rows {
+            out += &std::format!("  {name:<40} write_entries={entries:<4} write_bytes={bytes}\n");
+        }
+        std::println!("{out}");
     }
 }
 
