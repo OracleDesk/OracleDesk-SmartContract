@@ -579,6 +579,82 @@ no admin.
   `scripts/wire-timelock.sh`) removes any single key's ability to change a
   live market instantly.
 
+## On-chain market directories (wave-issue 25)
+
+`market-core` maintains three counter-indexed directories in **persistent**
+storage, following `reasoning-registry`'s `MarketTraceCount`/`MarketTrace`
+pattern — no directory is ever an unbounded `Vec` in a single entry:
+
+| Directory | Keys | Mutation points |
+| --- | --- | --- |
+| Open markets | `OpenCount`, `OpenAt(u32) -> u64`, `OpenIndex(u64) -> u32` | `create_market` appends; `resolve` / `void_market` swap-remove; `rebuild_open_index` backfills |
+| Markets by category | `CategoryCount(Category)`, `CategoryAt(Category, u32) -> u64` | `create_market` appends (append-only; finality never removes) |
+| Markets of a holder | `HolderCount(Address)`, `HolderAt(Address, u32) -> u64`, `HolderIndex(Address, u64) -> u32` | `save_position` on empty/non-empty transitions only |
+
+`OpenCount` lives in persistent (not instance) storage on purpose: it is
+written on every lifecycle transition, and a hot counter in the instance
+entry would make *every* call's instance write heavier.
+
+**Swap-remove.** The removable directories (open, holder) are dense
+arrays plus a reverse index (`id -> slot`), so removal is O(1): the last
+entry moves into the vacated slot, the count shrinks, and the vacated slot
+plus the reverse key are removed. When the removed entry *is* the last one,
+no moved-entry write happens. If the reverse key is absent the item was
+never indexed (a legacy market) and removal is a no-op; if the reverse key
+exists but the last `*At` slot does not, the slot was **archived by rent**
+and the swap-remove traps with `DirectoryEntryArchived` (error #27) rather
+than silently corrupting the directory.
+
+**Restore requirement.** Every directory write TTL-extends the entries it
+touches (`BUMP_THRESHOLD`/`BUMP_TO`), and directory *reads* extend the TTLs
+of the slots they touch — but a read done via simulation (or a plain RPC
+`getTransaction`) does not persist those TTL bumps. A long-dormant holder's
+`HolderAt` slots can therefore archive, and the next transaction that
+swap-removes through them will fail until the entries are restored
+(`soroban-cli ledger-entry restore`). The wave-issue 14 keeper is what keeps
+live directories from getting into that state; `DirectoryEntryArchived`
+never fires on kept storage.
+
+**Pagination is snapshot-free.** Because swap-remove reorders entries,
+pages taken across concurrent lifecycle transitions can skip or repeat ids.
+Clients must de-duplicate across pages and re-page until no new ids appear.
+Views cap `limit` at `MAX_PAGE = 50`; a page shorter than requested is the
+end of the directory, `start >= count` returns an empty page (never a
+trap). Reads return `Vec<u64>` of market ids; clients hydrate with
+`get_market` / `get_position` and sort/filter locally.
+
+**Costs (authored-test derivations, not run results).** The extra
+ledger-entry writes are bounded and land only on transitions:
+
+| Operation | Directory entry writes | Directory removals |
+| --- | --- | --- |
+| `create_market` | +5 (`OpenAt`, `OpenIndex`, `OpenCount`, `CategoryAt`, `CategoryCount`) | — |
+| `resolve` / `void_market` | ≤3 (`OpenAt(i)`, `OpenIndex(moved)`, `OpenCount`) | 2 (`OpenAt(last)`, `OpenIndex(id)`) |
+| `buy` opening a new market (empty → non-empty) | +3 (`HolderAt`, `HolderIndex`, `HolderCount`) | — |
+| `buy` more in a market already held | **0** | 0 |
+| `sell` / `redeem` emptying a position | ≤3 (holder swap-remove) | 2 |
+| `sell` partial (still non-empty) | **0** | 0 |
+| `transfer_position` not crossing a boundary | **0** | 0 |
+
+These counts are derived from the directory helpers and asserted in the
+`#25` tests in `contracts/market-core/src/lib.rs`
+(`holder_directory_unchanged_on_additional_buy` pins the zero-directory-write
+common case at 3-entry delta versus a first buy; `directory_write_costs`
+records the per-path `env.cost_estimate()` table when run with
+`cargo test -p market-core directory_write_costs -- --nocapture`). The exact
+`write_bytes` numbers must be re-recorded on a compiling toolchain before
+being published as measurements.
+
+**Backfill.** Markets created before the upgrade are not in the open
+directory; an admin runs `rebuild_open_index(start_id, end_id)` in batches
+of at most `MAX_BACKFILL_BATCH = 200` ids per call. It is idempotent
+(already-indexed ids are skipped, so overlapping batches are safe) and only
+appends markets still in `Open` status. Category directories for legacy
+markets and **holder directories cannot be backfilled on-chain** (a legacy
+holder's positions are unbounded in number and not enumerable from storage):
+positions opened before the upgrade appear in `markets_of` only after their
+next change (buy/sell/transfer/redeem).
+
 ## Off-chain pieces
 
 - **x402/**: an Express service selling reasoning traces for ~$0.01 via
