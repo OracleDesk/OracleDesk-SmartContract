@@ -6,6 +6,14 @@
 #[cfg(test)]
 extern crate std;
 
+// Issue #18 (completion): upgrade + schema-migration tests for the registry.
+// `cfg(test)` keeps them out of the wasm build entirely, and the cross-version
+// cases are additionally behind the opt-in `test-v2` feature so the default
+// build is not widened — same pattern as market-core/resolver/treasury
+// (ADR 0010 §9).
+#[cfg(any(test, feature = "test-v2"))]
+mod tests_upgrade;
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
     Env, String, Vec,
@@ -51,6 +59,40 @@ pub struct TraceBatch {
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+
+// ---------------------------------------------------------------------------
+// Upgrade / schema-version constants (issue #18, completion lane)
+// ---------------------------------------------------------------------------
+
+/// The storage-schema version this build writes. Bump this *only* together
+/// with a real step in [`ReasoningRegistry::migrate_from`], and never lower
+/// it.
+///
+/// `DataKey::SchemaVersion` is stamped by `__constructor` from now on, but
+/// instances deployed before this feature have no such key, so readers treat
+/// an absent key as [`PRE_VERSIONING_SCHEMA_VERSION`] and those deployments
+/// are considered already-migrated at v1 (no migration, no re-write). Same
+/// contract as market-core/resolver/treasury establish in ADR 0010 §4.
+#[cfg(not(feature = "test-v2"))]
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The same constant as it looks in the *next* build: `--features test-v2`
+/// compiles this crate as if it were already the post-1->2 version, which is
+/// what makes the migration step in `migrate_from` reachable from a test
+/// without needing a second deployed wasm. The shipped build is the
+/// `cfg(not(…))` one above; enabling the feature must never be part of a
+/// release build (see `[features]` in this crate's `Cargo.toml`).
+#[cfg(feature = "test-v2")]
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version implicit in every instance that predates `SchemaVersion`.
+const PRE_VERSIONING_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on one `migrate` batch. Identical to the other three contracts'
+/// value on purpose: `scripts/upgrade.sh` passes one `BATCH` to every contract
+/// it drives, and the bound keeps a single call inside the instruction budget
+/// no matter how many traces the deployment holds.
+const MAX_MIGRATION_BATCH: u32 = 50;
 
 /// Longest accepted `action` string, in bytes (#57). Bounding every trace's
 /// variable-length fields is what makes the paginated batch reads below
@@ -185,6 +227,30 @@ pub enum DataKey {
     /// `market, action, index -> trace_id`, so "every Buy decision on market
     /// 7" is one page instead of scanning the market's whole index (#57).
     MarketActionTraceAt(u64, String, u64),
+    // ---- appended by issue #18 (completion); never renumber anything above
+    // this line (positional XDR, ADR 0010 §2). RE-LAYOUT NOTE for whoever
+    // restores the variants this file's own code still references but this
+    // enum no longer declares (`MarketCore`, `NextBatchId`, `Batch`, `Flag`,
+    // `AgentSigningKeys`, `KeyToAgent`, `SigningKeyHistory*`, `TraceSignature`,
+    // …; the PR body counts them): those restorations must be *re-inserted
+    // above these two new keys in their original positions*, which is safe
+    // only because `SchemaVersion`/`MigrationCursor`/`TraceV2` are brand-new
+    // keys no pre-existing instance ever
+    // wrote — renumbering them before the first deployment of this build
+    // changes nothing on any ledger. Renumbering anything above the marker
+    // still would.
+    /// Instance storage: the storage-schema version this instance is on
+    /// (issue #18). Absent means [`PRE_VERSIONING_SCHEMA_VERSION`].
+    SchemaVersion,
+    /// Instance storage: resume point of the bounded `migrate` loop
+    /// (issue #18). Removed once the migration reaches `done`.
+    MigrationCursor,
+    /// Only in the `test-v2` build: the projection of a trace under its own
+    /// key, written by the 1 -> 2 step. A *separate* key, so `Trace(id)`
+    /// stays readable and byte-identical (ADR-0002). Not present in the
+    /// default build at all, so its declaration index is unused there.
+    #[cfg(feature = "test-v2")]
+    TraceV2(u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -233,6 +299,18 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
+    // ---- appended by issue #18 (completion). Error codes are append-only for
+    // the same reason `DataKey` variants are (they are the on-wire value).
+    // 13..=3000 are deliberately left unassigned: this file's code references
+    // eighteen `Error::…` variants the enum at this tip no longer declares
+    // (`FlagHistoryFull`, `InvalidProof`, `TooManyKeys`, …; the PR body lists
+    // them), and only the features that shipped them know their original
+    // discriminants. The registry's own numeric series continues from its
+    // highest *declared* code instead of colliding with that unknown space.
+    /// `migrate` called with a `batch` of 0 or larger than
+    /// `MAX_MIGRATION_BATCH`, i.e. a batch that would not fit the instruction
+    /// budget. Bounded by construction, so the call fails instead of trapping.
+    MigrationBatchTooLarge = 3010,
 }
 
 #[contractevent]
@@ -321,6 +399,90 @@ pub struct BatchPublished {
     pub published_at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Upgrade / schema-migration types and events (issue #18, completion lane)
+// ---------------------------------------------------------------------------
+
+/// Resume point of the bounded `migrate` sweep; stored under
+/// `DataKey::MigrationCursor`. `next_id` is the first *trace* id not yet
+/// processed — the registry's own id space (`DataKey::NextId`) is the one
+/// enumerable sweep, exactly like market-core sweeps `[0, NextId)` of its
+/// markets; see `migrate` for what the sweep deliberately does *not* cover.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema version the sweep is migrating *from*, as read when it started.
+    /// A cursor left behind by a different `from_version` is discarded rather
+    /// than trusted.
+    pub from_version: u32,
+    /// First trace id not yet processed.
+    pub next_id: u64,
+    /// True once `next_id` has passed `DataKey::NextId`.
+    pub done: bool,
+}
+
+/// What one `migrate` call reports. Returned rather than only emitted so
+/// `scripts/upgrade.sh` can loop on `done` without parsing event XDR.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    /// The version the storage is on after this call: `to_version` once the
+    /// sweep finished, otherwise still `from_version`.
+    pub to_version: u32,
+    /// Entries rewritten by *this* call (never more than `batch`).
+    pub processed: u32,
+    /// First trace id not yet processed — the caller's resume point.
+    pub next_id: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`. `update_current_contract_wasm` swaps the executing
+/// code but does *not* run the new version's `__constructor`, so this event is
+/// the off-chain record that the following `migrate` is mandatory, not
+/// optional.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    /// Schema version in force at the moment of the swap.
+    #[topic]
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted by `migrate` on every batch, so an indexer can follow a long
+/// migration instead of only seeing its end.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    #[topic]
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u32,
+    pub done: bool,
+}
+
+/// The v2 storage shape: a *projection* of `Trace` under its own key
+/// (`DataKey::TraceV2(id)`), carrying the version it was derived at. It exists
+/// **only** under the opt-in `test-v2` feature.
+///
+/// Deliberately not a rewrite of `Trace` in place: `Trace` is what the other
+/// vendored interfaces decode (ADR-0002), so a schema bump gets a *new* key
+/// and leaves the old entry readable — the compatibility view ADR 0010 §2/§3
+/// require. Its presence is also the migration's idempotence marker (ADR 0010
+/// §7: no separate per-entry version key). A real schema bump replaces the
+/// step in `migrate_from` and this type together; `Trace` itself never changes
+/// shape.
+#[cfg(feature = "test-v2")]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceV2 {
+    /// The v1 entry this projection was derived from, unchanged.
+    pub v1: Trace,
+    /// Schema the projection was written at.
+    pub schema: u32,
+}
+
 #[contract]
 pub struct ReasoningRegistry;
 
@@ -331,6 +493,17 @@ impl ReasoningRegistry {
         env.storage().instance().set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::NextBatchId, &0u64);
+        // Issue #18: stamp the schema this build writes. Instances deployed
+        // before this line existed simply have no key, which readers treat as
+        // `PRE_VERSIONING_SCHEMA_VERSION` (== this value), so a pre-existing
+        // instance needs no migration to be version 1. The extend below is
+        // ADR 0010 §8 applied to the registry: no instance read in this
+        // contract ever bumps, so the key that decides whether a sweep is
+        // pending must not be the first one this contract lets expire
+        // unnoticed.
+        let s = env.storage().instance();
+        s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        s.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
     }
 
     // ----- admin ----------------------------------------------------------
@@ -609,6 +782,10 @@ impl ReasoningRegistry {
         {
             return Err(Error::Unauthorized);
         }
+        // Issue #18: lazy per-trace migration before the first read of the
+        // trace this consumer is about to act on (ADR 0010 §6 — a stalled
+        // admin batch must never freeze the action the trace unlocks).
+        Self::ensure_entry_migrated(&env, trace_id);
         let trace = Self::get_trace(env.clone(), trace_id)?;
         let key = DataKey::Consumed(trace_id);
         if env.storage().persistent().has(&key) {
@@ -649,6 +826,9 @@ impl ReasoningRegistry {
 
     pub fn flag_trace(env: Env, trace_id: u64, reason: Symbol) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        // Issue #18: same lazy step as `consume_trace`, on the admin's
+        // integrity path this time (ADR 0010 §6).
+        Self::ensure_entry_migrated(&env, trace_id);
         Self::get_trace(env.clone(), trace_id)?;
         let count_key = DataKey::FlagHistoryCount(trace_id);
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -1692,6 +1872,280 @@ impl ReasoningRegistry {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+}
+
+// Issue #18: a second `#[contractimpl]` block so the three new entrypoints are
+// exported without touching any existing line of the main block (soroban-sdk
+// merges them; market-core and resolver put theirs inline in the main block —
+// the registry's 1100-line block and its pre-existing duplicate-definition
+// breakage make the separate additive block the safer hunk). It intentionally
+// does *not* define another `require_admin`: this type already declares that
+// helper twice at this tip (main block and the plain block above), and a third
+// copy would add to the breakage rather than to the feature.
+#[contractimpl]
+impl ReasoningRegistry {
+    // ----- upgrades (issue #18, completion lane) ----------------------------
+
+    /// The storage-schema version this instance is on.
+    ///
+    /// Read-only and infallible by design: an instance deployed before this
+    /// feature existed simply has no `DataKey::SchemaVersion`, and reports
+    /// [`PRE_VERSIONING_SCHEMA_VERSION`] rather than `Error::NotInitialized`,
+    /// so `scripts/upgrade.sh` can call it against any live deployment —
+    /// including the one about to be upgraded. Extends the instance TTL
+    /// because the version lives in instance storage and the registry's plain
+    /// instance reads never bump it (ADR 0010 §8 — `trace_count` is the
+    /// proof: it reads `NextId` and extends nothing).
+    pub fn schema_version(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
+        Self::load_schema_version(&env)
+    }
+
+    /// Admin-gated in-place upgrade to an already-uploaded wasm.
+    ///
+    /// `new_wasm_hash` is the sha256 of a wasm the caller must have installed
+    /// on this network first (`stellar contract install`); it is not a file
+    /// path, and `scripts/upgrade.sh` does the install before calling this.
+    ///
+    /// Two properties of `update_current_contract_wasm` shape the rest of
+    /// this feature and are the reason `migrate` exists (issue #18's own
+    /// pitfall):
+    ///
+    /// 1. The new version's `__constructor` does **not** run. Anything a new
+    ///    build must initialise has to happen in `migrate`/`migrate_from`, not
+    ///    in the constructor.
+    /// 2. Storage, keys, TTLs and the admin role survive the swap untouched,
+    ///    so the version read here is the version the *new* code will migrate
+    ///    from. `Upgraded` records it before the swap.
+    ///
+    /// The registry holds no capital, but it holds the audit trail consumers
+    /// like the treasury rely on (`consume_trace`, `verify_trace`), so the
+    /// migration is about not breaking *evidence*, and the same ADR 0010 §1
+    /// rule applies: on any network with real value the admin must be the
+    /// timelock. `scripts/upgrade.sh` refuses to auto-call when the recorded
+    /// admin is the timelock.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version = Self::load_schema_version(&env);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, resumable, idempotent migration sweep over this instance's
+    /// per-trace state. Call it repeatedly with a `batch` you can afford
+    /// until the returned `done` is `true` (`scripts/upgrade.sh` does exactly
+    /// that).
+    ///
+    /// Admin-gated because it walks *every* entry; it is not required for
+    /// correctness. The same step runs for a single trace lazily on the paths
+    /// that touch it (`ensure_entry_migrated`), which is the deliberate choice
+    /// over returning `Error::MigrationInProgress`: a stalled or never-run
+    /// batch must never freeze a consumer's action (ADR 0010 §6).
+    ///
+    /// The sweep covers the trace id space `[0, DataKey::NextId)` — the one
+    /// range this contract can enumerate on its own, exactly like market-core
+    /// sweeps `[0, NextId)` of its markets. It deliberately does **not**
+    /// cover the address-keyed state (`Agent`, `AgentHead`, `AgentTrace`,
+    /// `Consumer`, key-binding indexes) or the market/action index keys
+    /// (`MarketTrace*`, `MarketActionTrace*`): those key spaces are not
+    /// enumerable from inside the contract, and under this build's
+    /// append-only projection they have no legacy shape to move anyway.
+    /// `done` therefore means "everything enumerable is converted", the same
+    /// explicit carve-out ADR 0010 §10 records for the other three
+    /// contracts — not "no v1-shaped bytes remain on this instance".
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        if batch == 0 || batch > MAX_MIGRATION_BATCH {
+            return Err(Error::MigrationBatchTooLarge);
+        }
+
+        let from_version = Self::load_schema_version(&env);
+        if from_version >= SCHEMA_VERSION {
+            // Nothing pending, and `migrate` never rewinds: calling it on an
+            // already-current instance is cheap and safe, so the deploy driver
+            // may run it unconditionally right after `upgrade`.
+            return Ok(MigrationProgress {
+                from_version,
+                to_version: from_version,
+                processed: 0,
+                next_id: 0,
+                done: true,
+            });
+        }
+
+        let total = Self::migration_bound(&env);
+        let mut cursor = match Self::load_migration_cursor(&env) {
+            Some(c) if c.from_version == from_version => c,
+            _ => MigrationCursor {
+                from_version,
+                next_id: 0,
+                done: false,
+            },
+        };
+
+        let mut processed = 0u32;
+        while processed < batch && cursor.next_id < total {
+            let id = cursor.next_id;
+            Self::migrate_trace_entry(&env, id, from_version);
+            cursor.next_id = id + 1;
+            processed += 1;
+        }
+        cursor.done = cursor.next_id >= total;
+        let to_version = if cursor.done {
+            SCHEMA_VERSION
+        } else {
+            from_version
+        };
+
+        // Instance writes only protect their own TTL window, so extend in the
+        // same path that writes them (ADR 0010 §8).
+        Self::bump_instance_ttl(&env);
+        let s = env.storage().instance();
+        if cursor.done {
+            s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+            s.remove(&DataKey::MigrationCursor);
+        } else {
+            s.set(&DataKey::MigrationCursor, &cursor);
+        }
+
+        Migrated {
+            from_version,
+            to_version,
+            processed,
+            done: cursor.done,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version,
+            to_version,
+            processed,
+            next_id: cursor.next_id,
+            done: cursor.done,
+        })
+    }
+}
+
+impl ReasoningRegistry {
+    // ----- upgrade helpers (issue #18, completion lane) ---------------------
+
+    /// The registry's instance reads never bump the instance TTL (`trace_count`
+    /// and `require_admin` both read instance keys and extend nothing), so
+    /// every path here that *writes* an instance key extends it in the same
+    /// call — otherwise `SchemaVersion`/`MigrationCursor` would be the first
+    /// keys this contract ever let expire unnoticed. Same finding resolver
+    /// recorded in ADR 0010 §8; expired `SchemaVersion` silently reads back
+    /// as v1.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// `DataKey::SchemaVersion` with the pre-#18 default applied (issue #18).
+    fn load_schema_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(PRE_VERSIONING_SCHEMA_VERSION)
+    }
+
+    fn load_migration_cursor(env: &Env) -> Option<MigrationCursor> {
+        env.storage().instance().get(&DataKey::MigrationCursor)
+    }
+
+    /// The sweep's upper bound: this contract's own trace id counter, the
+    /// exact value `trace_count` publishes. Unlike treasury/resolver the
+    /// bound is a *local* instance read, so there is no cross-contract
+    /// dependency on the vendored `market_core.wasm` interface to hide behind
+    /// a `cfg` split (ADR-0002), and the default build is one function
+    /// shorter, not one behaviour different: `migrate` returns before ever
+    /// reaching this read whenever the stored version is already current.
+    fn migration_bound(env: &Env) -> u64 {
+        env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
+    }
+
+    /// Lazy, per-entry migration on the paths that mutate a trace's
+    /// bookkeeping: `consume_trace` (the one every consumer takes before
+    /// acting on evidence) and `flag_trace` (the admin's integrity signal).
+    ///
+    /// Costs one instance read and returns immediately whenever the instance
+    /// is current — *always*, in the shipped build (`SCHEMA_VERSION == 1`), so
+    /// the default path pays a read and nothing else. Never blocks: if the
+    /// admin batch has stalled, the consumer's own transaction migrates just
+    /// the trace it is about to use and proceeds (ADR 0010 §6).
+    fn ensure_entry_migrated(env: &Env, trace_id: u64) {
+        let from_version = Self::load_schema_version(env);
+        if from_version >= SCHEMA_VERSION {
+            return;
+        }
+        Self::migrate_trace_entry(env, trace_id, from_version);
+        // A migrated entry is a persistent write; the cursor/version are not
+        // touched, so a half-done migration stays half-done and resumable.
+        Self::bump_instance_ttl(env);
+    }
+
+    /// One entry's migration step, shared by the lazy path and the batch
+    /// sweep so the two can never disagree about what "migrated" means.
+    fn migrate_trace_entry(env: &Env, trace_id: u64, from_version: u32) {
+        Self::migrate_from(env, trace_id, from_version);
+    }
+
+    /// The version-specific rewrite. Idempotent by construction: the target
+    /// entry doubles as the "already done" marker, so re-running a step (the
+    /// lazy path and the admin batch can both hit the same trace, and a batch
+    /// can be interrupted and replayed) writes nothing the second time.
+    ///
+    /// The default build has no pending step — v1 is current, and both callers
+    /// guard before reaching here — which keeps the storage layout
+    /// byte-for-byte what the vendored blobs and ADR-0002 describe. A real
+    /// schema bump adds its branch here and bumps `SCHEMA_VERSION`; it must
+    /// not change `Trace`'s shape in place, and it must not remove the legacy
+    /// keys: every existing read path (`get_trace`, `verify_trace`,
+    /// `get_trace_link`, the market indexes) still treats `Trace(id)` as
+    /// authoritative, so the projection is additive state — the same rule
+    /// market-core, resolver and treasury record, and reading it back here
+    /// costs nothing because `Trace` is exactly the shape the consumer
+    /// interfaces decode.
+    ///
+    /// Detection reads the source entry as an opaque `Val` and *attempts* the
+    /// v1 decode, so an entry of an unrecognisable shape is left alone for a
+    /// human instead of trapping the whole sweep (ADR 0010 §7).
+    fn migrate_from(env: &Env, trace_id: u64, from_version: u32) {
+        #[cfg(feature = "test-v2")]
+        {
+            if from_version < 2 {
+                let storage = env.storage().persistent();
+                let target = DataKey::TraceV2(trace_id);
+                if storage.has(&target) {
+                    // Already migrated: this entry's existence is the marker.
+                    return;
+                }
+                let source = DataKey::Trace(trace_id);
+                let Some(raw) = storage.get::<_, soroban_sdk::Val>(&source) else {
+                    return;
+                };
+                let Ok(v1) =
+                    <Trace as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(
+                        env, &raw,
+                    )
+                else {
+                    // Not a shape we understand: leave it for a human.
+                    return;
+                };
+                let v2 = TraceV2 { v1, schema: 2 };
+                storage.set(&target, &v2);
+                storage.extend_ttl(&target, BUMP_THRESHOLD, BUMP_TO);
+            }
+        }
+        #[cfg(not(feature = "test-v2"))]
+        {
+            let _ = (env, trace_id, from_version);
+        }
     }
 }
 
