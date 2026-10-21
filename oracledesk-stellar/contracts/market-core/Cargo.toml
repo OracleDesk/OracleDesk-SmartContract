@@ -8,6 +8,14 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 doctest = false
 
+# Issue #18: one opt-in feature, nothing else in this file. `test-v2` selects
+# the v2 storage shape (`MarketV2`) and the cross-version migration tests. The
+# default build must not enable it: it would change what `DataKey::Market(id)`
+# decodes to, and resolver/treasury compile against a *vendored copy* of this
+# contract's wasm (docs/adr/0002-cross-contract-calls.md).
+[features]
+test-v2 = []
+
 [dependencies]
 oracledesk-types = { path = "../oracledesk-types" }
 soroban-sdk = "27.0.6"

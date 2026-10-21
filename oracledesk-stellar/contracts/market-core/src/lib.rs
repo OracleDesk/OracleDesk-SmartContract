@@ -3,6 +3,11 @@
 mod math;
 #[cfg(kani)]
 mod math_proofs;
+// Issue #18: upgrade + schema-migration tests. `cfg(test)` keeps them out of
+// the wasm build entirely, and the cross-version cases are additionally
+// behind the opt-in `test-v2` feature so the default build is not widened.
+#[cfg(any(test, feature = "test-v2"))]
+mod tests_upgrade;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
@@ -28,6 +33,38 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// seconds, so a proposal forgotten by the outgoing admin cannot be used to
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
+// ---------------------------------------------------------------------------
+// Upgrade / schema-version constants (issue #18)
+// ---------------------------------------------------------------------------
+
+/// The storage-schema version this build writes. Bump this *only* together
+/// with a real step in [`MarketCore::migrate_from`], and never lower it.
+///
+/// `DataKey::SchemaVersion` is written by `__constructor` from now on, but
+/// instances deployed before this feature have no such key, so readers treat
+/// an absent key as [`PRE_VERSIONING_SCHEMA_VERSION`] and those deployments
+/// are considered already-migrated at v1 (no migration, no re-write).
+#[cfg(not(feature = "test-v2"))]
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The same constant as it looks in the *next* build: `--features test-v2`
+/// compiles this crate as if it were already the post-1->2 version, which is
+/// what makes the migration steps in `migrate_from` reachable from a test
+/// without needing a second deployed wasm. The shipped build is the `cfg(not(…))`
+/// one above; enabling the feature must never be part of a release build
+/// (see `[features]` in this crate's `Cargo.toml`).
+#[cfg(feature = "test-v2")]
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version implicit in every instance that predates `SchemaVersion`.
+const PRE_VERSIONING_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on one `migrate` batch. A migration step costs at most a
+/// handful of ledger-entry reads/writes per market, so this bound keeps a
+/// single call inside the instruction budget no matter how many markets the
+/// deployment has; `scripts/upgrade.sh` loops it to completion.
+const MAX_MIGRATION_BATCH: u32 = 50;
 
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
@@ -161,6 +198,25 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // ---- appended by issue #18; never renumber anything above this line ----
+    // Existing variants keep their declaration index: `#[contracttype]` enums
+    // serialise by *position*, so inserting or reordering one would change the
+    // XDR of every stored key and silently break ADR-0001's hash commitments
+    // (and the vendored `market_core.wasm` that resolver/treasury compile
+    // against). New keys therefore go at the tail.
+    /// Instance storage: the storage-schema version this instance is on
+    /// (issue #18). Absent means [`PRE_VERSIONING_SCHEMA_VERSION`].
+    SchemaVersion,
+    /// Instance storage: resume point of the bounded `migrate` loop
+    /// (issue #18). Removed once the migration reaches `done`.
+    MigrationCursor,
+    /// Only in the `test-v2` build: the v2 projection of a market, written by
+    /// the 1 -> 2 step. It is a *separate* key, so the migration never rewrites
+    /// `DataKey::Market(id)` and `Market`'s shape stays byte-identical to the
+    /// `market_core.wasm` vendored by resolver/treasury (ADR-0002). Not present
+    /// in the default build at all, so its declaration index is unused there.
+    #[cfg(feature = "test-v2")]
+    MarketV2(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +261,16 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    // ---- appended by issue #18. Error codes are append-only for the same
+    // reason `DataKey` variants are (they are the on-wire value). 27..=29 are
+    // deliberately skipped: our own PR #184 claims 27 (`MetaUriTooLong`) on
+    // this very enum and #167/#161 are expected to take 28..=29. Claiming a
+    // number two features ahead is exactly how `treasury` grew five duplicate
+    // discriminants and broke with E0081 — see ADR 0010.
+    /// `migrate` called with a `batch` of 0 or larger than
+    /// `MAX_MIGRATION_BATCH`, i.e. a batch that would not fit the instruction
+    /// budget. Bounded by construction, so the call fails instead of trapping.
+    MigrationBatchTooLarge = 30,
 }
 
 impl From<MathError> for Error {
@@ -367,6 +433,95 @@ pub struct LpTransferred {
 }
 
 // ---------------------------------------------------------------------------
+// Upgrade / schema-migration types (issue #18)
+// ---------------------------------------------------------------------------
+
+/// Resume point of the bounded `migrate` sweep, in instance storage under
+/// `DataKey::MigrationCursor`.
+///
+/// `next_id` is the first market id not yet processed, so an interrupted run
+/// continues exactly where it stopped and a re-run over already-migrated
+/// entries is a no-op (`migrate_market_entry` is idempotent by decode).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    /// Schema version the sweep is migrating *from*, as read when it started.
+    /// A cursor left behind by a different `from_version` is discarded rather
+    /// than trusted.
+    pub from_version: u32,
+    /// First market id not yet processed.
+    pub next_id: u64,
+    /// True once `next_id` has passed the last market id.
+    pub done: bool,
+}
+
+/// What one `migrate` call reports. Returned rather than only emitted so
+/// `scripts/upgrade.sh` can loop on `done` without parsing event XDR.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    /// The version the storage is on after this call: `to_version` once the
+    /// sweep finished, otherwise still `from_version`.
+    pub to_version: u32,
+    /// Entries rewritten by *this* call (never more than `batch`).
+    pub processed: u32,
+    /// First market id not yet processed — the caller's resume point.
+    pub next_id: u64,
+    pub done: bool,
+}
+
+/// Emitted by `upgrade`. `update_current_contract_wasm` swaps the executing
+/// code but does *not* run the new version's `__constructor`, so this event is
+/// the off-chain record that the following `migrate` is mandatory, not
+/// optional.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    /// Schema version in force at the moment of the swap.
+    #[topic]
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted by `migrate` on every batch, so an indexer can follow a long
+/// migration instead of only seeing its end.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    #[topic]
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u32,
+    pub done: bool,
+}
+
+/// The v2 storage shape: a *projection* of `Market` under its own key
+/// (`DataKey::MarketV2(id)`), carrying the version it was derived at. It exists
+/// **only** under the opt-in `test-v2` feature.
+///
+/// Deliberately not a rewrite of `Market` in place. `Market`'s field list is
+/// what resolver's and treasury's vendored `market_core.wasm` decodes
+/// (`contractimport!`, ADR-0002), and those blobs cannot be rebuilt on a normal
+/// dev box, so a schema bump gets a *new* key and keeps the old entry readable
+/// — the "market-core first with a compatibility view" order in ADR 0010. Its
+/// presence is also the migration's idempotence marker, which is why there is
+/// no separate per-market version key (see `migrate_from` and ADR 0010's
+/// storage-cost comparison).
+///
+/// A real schema bump replaces the step in `migrate_from` and this type
+/// together; `Market` itself never changes shape.
+#[cfg(feature = "test-v2")]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketV2 {
+    /// The v1 entry this projection was derived from, unchanged.
+    pub v1: Market,
+    /// Schema the projection was written at.
+    pub schema: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -403,6 +558,11 @@ impl MarketCore {
         s.set(&DataKey::ProtocolFeeShareBps, &protocol_fee_share_bps);
         s.set(&DataKey::Paused, &false);
         s.set(&DataKey::NextId, &0u64);
+        // Issue #18: stamp the schema this build writes. Instances deployed
+        // before this line existed simply have no key, which readers treat as
+        // `PRE_VERSIONING_SCHEMA_VERSION` (== this value), so a pre-existing
+        // instance needs no migration to be version 1.
+        s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
     }
 
     // ----- admin ----------------------------------------------------------
@@ -467,6 +627,137 @@ impl MarketCore {
             .instance()
             .set(&DataKey::DefaultFeeBps, &fee_bps);
         Ok(())
+    }
+
+    // ----- upgrades (issue #18) -------------------------------------------
+
+    /// The storage-schema version this instance is on.
+    ///
+    /// Read-only and infallible by design: an instance deployed before this
+    /// feature existed simply has no `DataKey::SchemaVersion`, and reports
+    /// [`PRE_VERSIONING_SCHEMA_VERSION`] rather than `Error::NotInitialized`,
+    /// so the accessor is safe to call on any live deployment.
+    pub fn schema_version(env: Env) -> u32 {
+        Self::load_schema_version(&env)
+    }
+
+    /// Admin-gated in-place upgrade to an already-uploaded wasm.
+    ///
+    /// `new_wasm_hash` is the sha256 of a wasm the caller must have installed
+    /// on this network first (`stellar contract install`); it is not a file
+    /// path, and `scripts/upgrade.sh` does the install before calling this.
+    ///
+    /// Two properties of `update_current_contract_wasm` shape the rest of this
+    /// feature and are the reason `migrate` exists (issue #18's own pitfall):
+    ///
+    /// 1. The new version's `__constructor` does **not** run. Anything a new
+    ///    build must initialise has to happen in `migrate`/`migrate_from`, not
+    ///    in the constructor — which is why the constructor here only *stamps*
+    ///    the version and every later change is a migration step.
+    /// 2. Storage, keys, TTLs and the admin role survive the swap untouched,
+    ///    so the version read here is the version the *new* code will migrate
+    ///    from. `Upgraded` records it before the swap.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version = Self::load_schema_version(&env);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Bounded, resumable, idempotent migration sweep over this instance's
+    /// markets. Call it repeatedly with a `batch` you can afford until the
+    /// returned `done` is `true` (`scripts/upgrade.sh` does exactly that).
+    ///
+    /// Admin-gated because it walks *every* entry; it is not required for
+    /// correctness. The same step runs for a single entry lazily on the paths
+    /// that touch it (`ensure_entry_migrated`), which is the deliberate choice
+    /// over the issue's alternative of returning `Error::MigrationInProgress`:
+    /// a stalled or never-run batch must never freeze user funds — see ADR
+    /// 0010 ("gating").
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        if batch == 0 || batch > MAX_MIGRATION_BATCH {
+            return Err(Error::MigrationBatchTooLarge);
+        }
+
+        let from_version = Self::load_schema_version(&env);
+        let total = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0u64);
+
+        if from_version >= SCHEMA_VERSION {
+            // Nothing pending, and `migrate` never rewinds: calling it on an
+            // already-current instance is cheap and safe, so the deploy driver
+            // may run it unconditionally right after `upgrade`.
+            return Ok(MigrationProgress {
+                from_version,
+                to_version: from_version,
+                processed: 0,
+                next_id: total,
+                done: true,
+            });
+        }
+
+        // Resume only a cursor that belongs to this migration. A stale cursor
+        // (written before a later upgrade moved `from_version`) is discarded
+        // and the sweep restarts from 0 — entries already converted are
+        // detected as such, so restarting costs reads, not correctness.
+        let mut cursor = match Self::load_migration_cursor(&env) {
+            Some(c) if c.from_version == from_version => c,
+            _ => MigrationCursor {
+                from_version,
+                next_id: 0,
+                done: false,
+            },
+        };
+
+        let mut processed = 0u32;
+        while processed < batch && cursor.next_id < total {
+            let id = cursor.next_id;
+            Self::migrate_market_entry(&env, id, from_version);
+            cursor.next_id = id + 1;
+            processed += 1;
+        }
+        cursor.done = cursor.next_id >= total;
+        let to_version = if cursor.done {
+            SCHEMA_VERSION
+        } else {
+            from_version
+        };
+
+        // Instance writes only protect their own TTL window, so extend in the
+        // same path that writes them (ADR 0010, "instance TTL").
+        let s = env.storage().instance();
+        s.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        if cursor.done {
+            s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+            s.remove(&DataKey::MigrationCursor);
+        } else {
+            s.set(&DataKey::MigrationCursor, &cursor);
+        }
+
+        Migrated {
+            from_version,
+            to_version,
+            processed,
+            done: cursor.done,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version,
+            to_version,
+            processed,
+            next_id: cursor.next_id,
+            done: cursor.done,
+        })
     }
 
     pub fn propose_resolver(env: Env, resolver: Address) -> Result<(), Error> {
@@ -743,6 +1034,7 @@ impl MarketCore {
             }
         }
         trader.require_auth();
+        Self::ensure_entry_migrated(&env, market_id);
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
@@ -877,6 +1169,7 @@ impl MarketCore {
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
+        Self::ensure_entry_migrated(&env, market_id);
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
@@ -947,6 +1240,7 @@ impl MarketCore {
 
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::ensure_entry_migrated(&env, market_id);
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -967,6 +1261,7 @@ impl MarketCore {
     /// Invalid or unresolvable market. Allowed any time before finality.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_resolver(&env)?;
+        Self::ensure_entry_migrated(&env, market_id);
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -987,6 +1282,7 @@ impl MarketCore {
     /// Losing positions clear with a payout of 0.
     pub fn redeem(env: Env, holder: Address, market_id: u64) -> Result<i128, Error> {
         holder.require_auth();
+        Self::ensure_entry_migrated(&env, market_id);
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
         let pos = Self::load_position(&env, market_id, &holder);
@@ -1337,6 +1633,95 @@ impl MarketCore {
 
     fn load_pending(env: &Env) -> Option<PendingAdmin> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// `DataKey::SchemaVersion` with the pre-#18 default applied (issue #18).
+    fn load_schema_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(PRE_VERSIONING_SCHEMA_VERSION)
+    }
+
+    fn load_migration_cursor(env: &Env) -> Option<MigrationCursor> {
+        env.storage().instance().get(&DataKey::MigrationCursor)
+    }
+
+    /// Lazy, per-entry migration on the paths that touch a market: `buy`,
+    /// `sell`, `resolve`, `void_market`, `redeem`.
+    ///
+    /// Costs one instance read that those callers mostly perform anyway, and
+    /// returns without touching storage whenever the instance is current — in
+    /// the shipped build (`SCHEMA_VERSION == 1`) that is *always*, so the
+    /// default path pays a read and nothing else. Never blocks: if the admin
+    /// batch has stalled, the user's own transaction migrates just the entry
+    /// it is about to use and proceeds.
+    fn ensure_entry_migrated(env: &Env, market_id: u64) {
+        let from_version = Self::load_schema_version(env);
+        if from_version >= SCHEMA_VERSION {
+            return;
+        }
+        Self::migrate_market_entry(env, market_id, from_version);
+        // A migrated entry is a persistent write; the cursor/version are not
+        // touched, so a half-done migration stays half-done and resumable.
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// One entry's migration step, shared by the lazy path and the batch
+    /// sweep so the two can never disagree about what "migrated" means.
+    fn migrate_market_entry(env: &Env, market_id: u64, from_version: u32) {
+        Self::migrate_from(env, market_id, from_version);
+    }
+
+    /// The version-specific rewrite. Idempotent by construction: the target
+    /// entry doubles as the "already done" marker, so re-running a step (the
+    /// lazy path and the admin batch can both hit the same market, and a batch
+    /// can be interrupted and replayed) writes nothing the second time.
+    ///
+    /// The default build has no pending step — v1 is current, and both callers
+    /// guard before reaching here — which keeps the storage layout byte-for-byte
+    /// what the vendored `market_core.wasm` describes (ADR-0002). A real schema
+    /// bump adds its branch here and bumps `SCHEMA_VERSION`; it must not change
+    /// `Market`'s shape in place.
+    fn migrate_from(env: &Env, market_id: u64, from_version: u32) {
+        #[cfg(feature = "test-v2")]
+        {
+            if from_version < 2 {
+                let storage = env.storage().persistent();
+                let target = DataKey::MarketV2(market_id);
+                if storage.has(&target) {
+                    // Already migrated: this entry's existence is the marker.
+                    return;
+                }
+                // Read the source as an opaque `Val` and *attempt* the v1
+                // decode, rather than `get::<_, Market>()`: a stored entry of a
+                // shape this build does not recognise then falls through to the
+                // `Err` branch below instead of aborting the caller's
+                // transaction. Same reason resolver reads a legacy `Val` before
+                // converting it (ADR-0003).
+                let source = DataKey::Market(market_id);
+                let Some(raw) = storage.get::<_, soroban_sdk::Val>(&source) else {
+                    return;
+                };
+                let Ok(v1) =
+                    <Market as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(
+                        env, &raw,
+                    )
+                else {
+                    // Not a shape we understand: leave it for a human.
+                    // Rewriting bytes we cannot parse is how a migration turns
+                    // one corrupt entry into a lost one.
+                    return;
+                };
+                let v2 = MarketV2 { v1, schema: 2 };
+                storage.set(&target, &v2);
+                storage.extend_ttl(&target, BUMP_THRESHOLD, BUMP_TO);
+            }
+        }
+        #[cfg(not(feature = "test-v2"))]
+        {
+            let _ = (env, market_id, from_version);
+        }
     }
 
     fn require_resolver(env: &Env) -> Result<(), Error> {
