@@ -8,6 +8,16 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 doctest = false
 
+# Issue #18 (completion): one opt-in feature, nothing else in this file.
+# `test-v2` compiles this crate as the build whose schema is already 2
+# (`SCHEMA_VERSION`, the 1 -> 2 step in `migrate_from`, the cross-contract
+# `market_count()` bound) and turns on the cross-version tests. The default
+# build must not enable it: its storage layout and its entrypoint set are what
+# the vendored `market_core.wasm` / `resolver.wasm` copies are compiled against
+# (docs/adr/0002-cross-contract-calls.md), and treasury's `build.rs` pins them.
+[features]
+test-v2 = []
+
 [dependencies]
 # See contracts/resolver/Cargo.toml for why this feature is needed.
 soroban-sdk = { version = "27.0.6", features = ["experimental_spec_shaking_v2"] }
