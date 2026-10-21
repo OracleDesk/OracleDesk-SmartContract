@@ -72,3 +72,26 @@ arbitrary cancellations:
   (`MAX_CANCELS_PER_MARKET`) to prevent indefinite griefing.
 - **Mandatory reason codes and public audit trail**: Every guardian action emits
   a `GuardianAction` event recording a typed `GuardianReason` and timestamp.
+
+## Contract upgrades (in-place wasm swap)
+
+`market-core` and `resolver` expose an admin-gated `upgrade`
+(`docs/adr/0010-upgrades-and-schema-migration.md`). Stated plainly: **the admin
+role can replace a contract's code with arbitrary code, and code that can do
+anything the contract can do — including draining the collateral of every open
+market.** The swap does not run the new version's `__constructor`, so an upgrade
+must be followed by the bounded `migrate` sweep the same ADR describes; the
+deployment scripts in `scripts/upgrade.sh` do that, and record the installed
+wasm hash in `deployments/<network>.json`.
+
+This is the same custody trust already documented for the treasury admin above:
+it is mitigated procedurally, by the governance timelock owning the admin role
+(ADR 0008) and by the installed hash coming from a reproducible build of a
+reviewed commit (ADR 0002, `scripts/check-wasm-determinism.sh`) — not by the
+contract refusing the capability.
+
+In scope for reports: anything that lets a party other than the admin (or the
+timelock acting for it) install or trigger a wasm swap; an `upgrade`/`migrate`
+authorization bypass; a migration path that silently loses or double-counts
+storage, including the `DataKey`/`Error` append-only rule in ADR 0010 §2 that
+existing deployments depend on.
