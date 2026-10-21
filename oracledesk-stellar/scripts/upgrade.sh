@@ -4,10 +4,11 @@
 #
 #   scripts/upgrade.sh <contract> [--migrate]
 #
-# <contract> is `market_core` or `resolver` — the two contracts this script
-# knows how to move. `treasury` and `reasoning_registry` are deliberately NOT
-# wired up here: they are the named follow-up (docs/adr/0010). Asking for one
-# fails loudly instead of half-upgrading it.
+# <contract> is `market_core`, `resolver`, `treasury` or `reasoning_registry`
+# — the four contracts that carry the upgrade/migrate entrypoints (issue #18
+# and its completion on this branch). `router` and `timelock` are NOT wired
+# up here (docs/adr/0010): asking for one fails loudly instead of
+# half-upgrading it.
 #
 # Reads the deployment record exactly the way scripts/deploy-testnet.sh does
 # (deployments/<network>.json, `.contracts.<name>` for the id), then:
@@ -38,8 +39,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 usage() {
-  echo "usage: $(basename "${BASH_SOURCE[0]}") <market_core|resolver> [--migrate]" >&2
-  echo "  (treasury / reasoning_registry are the deferred follow-up — see docs/adr/0010)" >&2
+  echo "usage: $(basename "${BASH_SOURCE[0]}") <market_core|resolver|treasury|reasoning_registry> [--migrate]" >&2
+  echo "  (router / timelock carry no upgrade entrypoints — see docs/adr/0010)" >&2
 }
 
 # --- arguments ---------------------------------------------------------------
@@ -73,8 +74,9 @@ if [ -z "$NAME" ]; then
   exit 1
 fi
 
-# The two contracts in scope, and only these. `wasm` is the file `make build`
-# produces; `fn_names` are the entrypoints compiled into that wasm.
+# The four contracts that carry the upgrade/migrate entrypoints, and only
+# these. `wasm` is the file `make build` produces; `fn_names` are the
+# entrypoints compiled into that wasm.
 case "$NAME" in
   market_core | market-core | core)
     NAME=market_core
@@ -83,10 +85,21 @@ case "$NAME" in
   resolver)
     WASF=resolver.wasm
     ;;
-  treasury | reasoning_registry | registry | router | timelock)
-    echo "error: $NAME is not wired for in-place upgrade by this script." >&2
-    echo "       issue #18 shipped the mechanism on market-core + resolver only;" >&2
-    echo "       treasury/reasoning-registry are a named follow-up (docs/adr/0010)." >&2
+  treasury)
+    WASF=treasury.wasm
+    ;;
+  reasoning_registry | reasoning-registry | registry)
+    # The deployment record spells it `reasoning_registry` (see the
+    # `.contracts` / `.salts` writes in scripts/deploy-testnet.sh), so every
+    # alias normalises to that key before it is used below.
+    NAME=reasoning_registry
+    WASF=reasoning_registry.wasm
+    ;;
+  router | timelock)
+    echo "error: $NAME carries no upgrade/migrate entrypoints on this base." >&2
+    echo "       issue #18 ships the mechanism on market-core, resolver," >&2
+    echo "       treasury and reasoning-registry; router/timelock remain" >&2
+    echo "       out of scope (docs/adr/0010, issue #18 completion)." >&2
     exit 1
     ;;
   *)
@@ -221,6 +234,19 @@ result_u32() {
 
 # -----------------------------------------------------------------------------
 log "upgrading $NAME at $CONTRACT_ID on $NETWORK"
+# ADR 0010 §3 release order: when a release changes the cross-contract
+# interface, market-core moves and migrates FIRST, then resolver, treasury and
+# reasoning-registry (the three contracts that vendor its blob / call it).
+# A release that only *uses* existing entrypoints may move contracts in any
+# order, so this is a loud reminder, not a hard block: the one record-wide
+# fact this script can check is whether market-core has ever been moved
+# through it on this deployment.
+if [ "$NAME" != "market_core" ] && [ -z "$(json_get .wasm_hashes.market_core)" ]; then
+  log "WARNING (ADR 0010 §3): no market-core upgrade is recorded in $OUT."
+  log "  If this release changed the market-core interface, run"
+  log "  'scripts/upgrade.sh market_core --migrate' BEFORE $NAME; proceeding"
+  log "  anyway is only safe when the vendored interfaces are unchanged."
+fi
 log "wasm: $WASM ($(wc -c <"$WASM") bytes, sha256 $(sha256_of "$WASM"))"
 
 OLD_VERSION=$(result_u32 "$(invoke_view schema_version)")
@@ -264,6 +290,16 @@ fi
 # 4. the bounded sweep. Termination is `schema_version` changing: the contract
 #    flips the version only when the cursor reaches the end, so a partial sweep
 #    keeps the old number and the loop keeps going.
+if [ "$DRY_RUN" = "1" ]; then
+  # A simulated `invoke_view schema_version` always answers 0, so the real
+  # loop below could never see the flip and would end at the stall guard —
+  # noisy and exit-non-zero for a run that is defined to change nothing.
+  # Print the plan instead and stop; the record is untouched either way.
+  log "DRY_RUN: would loop 'migrate --batch $BATCH' (max $MAX_ROUNDS rounds) until schema_version != $OLD_VERSION."
+  log "DRY_RUN: would then re-read schema_version and write .schema_versions.$NAME to $OUT."
+  log "DRY_RUN: nothing invoked, nothing written. exit 0."
+  exit 0
+fi
 log "migrating in batches of $BATCH (max $MAX_ROUNDS rounds)"
 round=0
 new_version="$OLD_VERSION"
@@ -287,4 +323,7 @@ fi
 json_set --arg n "$NAME" --arg v "$new_version" '.schema_versions[$n] = $v'
 log "done. $NAME on schema_version $new_version (was $OLD_VERSION), record updated: $OUT"
 log "reminder: a market-core upgrade may only ADD entrypoints and append error"
-log "codes — see the vendored-interface rule in docs/adr/0010."
+log "codes — see the vendored-interface rule in docs/adr/0010. resolver,"
+log "treasury and reasoning-registry each vend a market_core.wasm copy"
+log "(scripts/sync-vendored-wasm.sh): move market-core first, then refresh"
+log "those blobs in the same release before relying on new interfaces."
