@@ -2927,7 +2927,22 @@ mod test {
                 .set(&0u32, &PriceData { price, timestamp });
         }
 
+        /// Quorum tests (#28): toggles `price` to trap, standing in for a
+        /// malicious or broken oracle. `try_price` must classify it `Failed`
+        /// and the resolution must carry on.
+        pub fn set_panic(env: Env, should_panic: bool) {
+            env.storage().instance().set(&1u32, &should_panic);
+        }
+
         pub fn price(env: Env, _asset: OracleAsset, _timestamp: u64) -> Option<PriceData> {
+            let should_panic = env
+                .storage()
+                .instance()
+                .get::<_, bool>(&1u32)
+                .unwrap_or(false);
+            if should_panic {
+                panic!("mock reflector trap");
+            }
             env.storage().instance().get(&0u32)
         }
     }
@@ -5224,6 +5239,446 @@ mod test {
             .try_cancel_admin_transfer()
             .is_err());
     }
+
+    // ----- quorum resolution (#28) ---------------------------------------
+
+    /// How a mock feed should behave in a quorum test.
+    enum QuorumFeedSetting {
+        /// Serves `price` at `timestamp`.
+        Live(i128, u64),
+        /// Never given a price: `price()` returns `None` -> `Unavailable`.
+        Empty,
+        /// Traps on every call -> `Failed`, isolated by `try_price`.
+        Panic,
+    }
+
+    fn quorum_config(
+        env: &Env,
+        feeds: Vec<FeedRef>,
+        min_responses: u32,
+        threshold: i128,
+        threshold_decimals: u32,
+    ) -> QuorumPriceConfig {
+        QuorumPriceConfig {
+            feeds,
+            min_responses,
+            threshold,
+            threshold_decimals,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+            max_deviation_bps: 1_000,
+        }
+    }
+
+    fn quorum_feed(env: &Env, id: &Address, decimals: u32) -> FeedRef {
+        FeedRef {
+            reflector: id.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            decimals,
+        }
+    }
+
+    /// Fixture whose market commits to a quorum rule over freshly registered
+    /// mock feeds, revealed at setup. Returns the fixture and the feed
+    /// contract addresses in committed order.
+    fn quorum_setup(
+        feeds: &[(QuorumFeedSetting, u32)],
+        min_responses: u32,
+        threshold: i128,
+        threshold_decimals: u32,
+    ) -> (Fixture, std::vec::Vec<Address>) {
+        let mut ids = std::vec::Vec::new();
+        let f = fixture(|env, _r, _a, _b| {
+            let mut refs = Vec::new(env);
+            for (setting, decimals) in feeds {
+                let id = env.register(MockReflector, ());
+                let client = MockReflectorClient::new(env, &id);
+                match setting {
+                    QuorumFeedSetting::Live(price, timestamp) => client.set_price(price, timestamp),
+                    QuorumFeedSetting::Panic => client.set_panic(&true),
+                    QuorumFeedSetting::Empty => {}
+                }
+                refs.push_back(quorum_feed(env, &id, *decimals));
+                ids.push(id);
+            }
+            ResolutionSpec::PriceQuorum(quorum_config(
+                env,
+                refs,
+                min_responses,
+                threshold,
+                threshold_decimals,
+            ))
+        });
+        let ResolutionSpec::PriceQuorum(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_quorum_spec(&f.market_id, &spec);
+        (f, ids)
+    }
+
+    /// Reveal `f`'s committed quorum spec, expecting `validate_rule` to
+    /// reject it (the commitment cannot rescue a config quorum forbids).
+    fn assert_quorum_rejected(f: &Fixture) {
+        let ResolutionSpec::PriceQuorum(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_quorum_spec(&f.market_id, &spec),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
+    #[test]
+    fn quorum_median_of_three_resolves_market() {
+        let (f, _ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Live(2_500, 1_999), 8),
+                (QuorumFeedSetting::Live(2_600, 1_999), 8),
+                (QuorumFeedSetting::Live(2_700, 1_999), 8),
+            ],
+            2,
+            2_000,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
+
+    #[test]
+    fn quorum_even_count_uses_floored_median_average() {
+        let (f, _ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Live(2_599, 1_999), 8),
+                (QuorumFeedSetting::Live(2_600, 1_999), 8),
+                (QuorumFeedSetting::Live(2_601, 1_999), 8),
+                (QuorumFeedSetting::Live(2_602, 1_999), 8),
+            ],
+            3,
+            2_601,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        // floor((2_600 + 2_601) / 2) = 2_600, which is *not* above 2_601.
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [
+                soroban_sdk::Event::to_xdr(
+                    &QuorumResolution {
+                        market_id: f.market_id,
+                        median: 2_600,
+                        decimals: 8,
+                        accepted: 4,
+                        rejected: 0,
+                        outcome: Outcome::No,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &PriceResolution {
+                        market_id: f.market_id,
+                        price: 2_600,
+                        price_timestamp: 2_000,
+                        outcome: Outcome::No,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &PriceResolutionV2 {
+                        market_id: f.market_id,
+                        price: 2_600,
+                        price_timestamp: 2_000,
+                        outcome: Outcome::No,
+                        from_snapshot: false,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn quorum_ignores_panicking_feed_and_still_reaches_median() {
+        // The isolation the issue asks for is already `read_feed`'s `try_price`
+        // discipline; the quorum path classifies the trap as `Failed` instead
+        // of propagating it, so a hostile feed cannot abort the transaction.
+        let (f, _ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Panic, 8),
+                (QuorumFeedSetting::Live(2_500, 1_999), 8),
+                (QuorumFeedSetting::Live(2_700, 1_999), 8),
+            ],
+            2,
+            2_000,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+    }
+
+    #[test]
+    fn quorum_emits_feed_rejected_per_bad_feed_then_resolution() {
+        let (f, ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Live(2_500, 1_989), 8),
+                (QuorumFeedSetting::Empty, 8),
+                (QuorumFeedSetting::Live(2_600, 1_999), 8),
+                (QuorumFeedSetting::Live(2_625, 1_999), 8),
+                (QuorumFeedSetting::Live(2_650, 1_999), 8),
+            ],
+            3,
+            2_550,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+        let asset = OracleAsset::Other(Symbol::new(&f.env, "XLM"));
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [
+                soroban_sdk::Event::to_xdr(
+                    &FeedRejected {
+                        market_id: f.market_id,
+                        reflector: ids[0].clone(),
+                        asset: asset.clone(),
+                        reason: FeedRejectionReason::Stale,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &FeedRejected {
+                        market_id: f.market_id,
+                        reflector: ids[1].clone(),
+                        asset: asset.clone(),
+                        reason: FeedRejectionReason::Unavailable,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &QuorumResolution {
+                        market_id: f.market_id,
+                        median: 2_625,
+                        decimals: 8,
+                        accepted: 3,
+                        rejected: 2,
+                        outcome: Outcome::Yes,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &PriceResolution {
+                        market_id: f.market_id,
+                        price: 2_625,
+                        price_timestamp: 2_000,
+                        outcome: Outcome::Yes,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &PriceResolutionV2 {
+                        market_id: f.market_id,
+                        price: 2_625,
+                        price_timestamp: 2_000,
+                        outcome: Outcome::Yes,
+                        from_snapshot: false,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn quorum_not_reached_returns_retryable_error_and_writes_nothing() {
+        let (f, ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Empty, 8),
+                (QuorumFeedSetting::Empty, 8),
+                (QuorumFeedSetting::Live(2_600, 1_999), 8),
+            ],
+            2,
+            2_000,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::QuorumNotReached))
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Open
+        );
+        // Two feeds recover; the *same* market resolves on retry. Nothing was
+        // persisted per feed, so late data is re-read fresh.
+        MockReflectorClient::new(&f.env, &ids[0]).set_price(&2_500, &1_999);
+        MockReflectorClient::new(&f.env, &ids[1]).set_price(&2_700, &1_999);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+    }
+
+    #[test]
+    fn quorum_feeds_disagree_beyond_deviation_budget() {
+        let (f, _ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Live(2_000, 1_999), 8),
+                (QuorumFeedSetting::Live(2_600, 1_999), 8),
+                (QuorumFeedSetting::Live(3_200, 1_999), 8),
+            ],
+            2,
+            2_000,
+            8,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        // (3_200 - 2_000) * 10_000 / 2_600 = 4_615 bps > 1_000 budget.
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::FeedsDisagree))
+        );
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::Unconfigured
+        );
+    }
+
+    #[test]
+    fn quorum_normalizes_mixed_feed_decimals() {
+        // 26 @ 1dp, 2_600 @ 3dp and 26_000 @ 4dp are the same 2.6 value;
+        // target scale is max(threshold_decimals 2, feeds 1/3/4) = 4.
+        let (f, _ids) = quorum_setup(
+            &[
+                (QuorumFeedSetting::Live(26, 1_999), 1),
+                (QuorumFeedSetting::Live(2_600, 1_999), 3),
+                (QuorumFeedSetting::Live(26_000, 1_999), 4),
+            ],
+            2,
+            255,
+            2,
+        );
+        f.env.ledger().set_timestamp(2_000);
+        // Median 26_000 (2.6 at 4dp) against threshold 255 scaled to 25_500
+        // (2.55 at 4dp).
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+    }
+
+    #[test]
+    fn quorum_outlier_does_not_move_median_but_spread_guard_rejects_it() {
+        let env = Env::default();
+        let mut sorted = Vec::new(&env);
+        for value in [2_600i128, 2_550, 100_000, 2_650, 7] {
+            Resolver::insert_sorted(&mut sorted, value);
+        }
+        assert_eq!(sorted.get(0), Some(7));
+        assert_eq!(Resolver::median(&sorted), Some(2_600));
+        // The median shrugged the outlier off; the spread guard (measured
+        // max-min across accepted feeds, not distance-from-median) still
+        // refuses to settle on it.
+        assert_eq!(
+            Resolver::assert_spread(&sorted, 2_600, 1_000),
+            Err(Error::FeedsDisagree)
+        );
+    }
+
+    #[test]
+    fn quorum_registration_rejects_duplicate_feeds() {
+        let f = fixture(|env, _r, _a, _b| {
+            let first = env.register(MockReflector, ());
+            let refs = Vec::from_array(
+                env,
+                [quorum_feed(env, &first, 8), quorum_feed(env, &first, 8)],
+            );
+            ResolutionSpec::PriceQuorum(quorum_config(env, refs, 2, 2_000, 8))
+        });
+        assert_quorum_rejected(&f);
+    }
+
+    #[test]
+    fn quorum_registration_rejects_non_majority_quorum() {
+        // 4 feeds with min_responses 2: two disjoint halves could both claim
+        // quorum with conflicting answers, so the spec is refused.
+        let f = fixture(|env, _r, _a, _b| {
+            let mut refs = Vec::new(env);
+            for _ in 0..4 {
+                let feed = env.register(MockReflector, ());
+                refs.push_back(quorum_feed(env, &feed, 8));
+            }
+            ResolutionSpec::PriceQuorum(quorum_config(env, refs, 2, 2_000, 8))
+        });
+        assert_quorum_rejected(&f);
+    }
+
+    #[test]
+    fn quorum_registration_rejects_too_many_feeds() {
+        let f = fixture(|env, _r, _a, _b| {
+            let mut refs = Vec::new(env);
+            for _ in 0..MAX_FEEDS + 1 {
+                let feed = env.register(MockReflector, ());
+                refs.push_back(quorum_feed(env, &feed, 8));
+            }
+            ResolutionSpec::PriceQuorum(quorum_config(env, refs, 3, 2_000, 8))
+        });
+        assert_quorum_rejected(&f);
+    }
+
+    #[test]
+    fn quorum_registration_rejects_absurd_decimals() {
+        let f = fixture(|env, _r, _a, _b| {
+            let feed = env.register(MockReflector, ());
+            let refs = Vec::from_array(env, [quorum_feed(env, &feed, MAX_DECIMALS + 1)]);
+            ResolutionSpec::PriceQuorum(quorum_config(env, refs, 1, 2_000, 8))
+        });
+        assert_quorum_rejected(&f);
+    }
+
+    #[test]
+    fn quorum_registration_rejects_deviation_above_bps_cap() {
+        let f = fixture(|env, _r, _a, _b| {
+            let first = env.register(MockReflector, ());
+            let second = env.register(MockReflector, ());
+            let refs = Vec::from_array(
+                env,
+                [quorum_feed(env, &first, 8), quorum_feed(env, &second, 8)],
+            );
+            let mut config = quorum_config(env, refs, 2, 2_000, 8);
+            config.max_deviation_bps = MAX_DEVIATION_BPS + 1;
+            ResolutionSpec::PriceQuorum(config)
+        });
+        assert_quorum_rejected(&f);
+    }
+
+    #[test]
+    fn quorum_market_rejects_snapshot_pre_close_resolve_and_double_reveal() {
+        let (f, _ids) = quorum_setup(&[(QuorumFeedSetting::Live(2_600, 1_999), 8)], 1, 2_000, 8);
+        let caller = Address::generate(&f.env);
+        // `snapshot_price` is the single-feed recovery tool: no one feed of a
+        // quorum may be pinned.
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::WrongMode))
+        );
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::MarketNotClosed))
+        );
+        let ResolutionSpec::PriceQuorum(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_quorum_spec(&f.market_id, &spec),
+            Err(Ok(Error::MarketAlreadyConfigured))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5378,6 +5833,62 @@ mod golden {
         for (spec, expected) in vectors {
             assert_eq!(hex_of(&env, &spec), expected);
         }
+    }
+
+    /// Issue #28 appends `ResolutionSpec::PriceQuorum` at the tail of the
+    /// union. A `#[contracttype]` enum XDR-encodes per-variant by case name,
+    /// so an append cannot reindex or re-encode `Price`/`Signers`/...: these
+    /// are the pre-append golden vectors re-checked *after* the append, plus a
+    /// proof the new variant lives in its own hash space (no collision with
+    /// any legacy spec). Stranding a legacy `resolution_hash` would change one
+    /// of the constants above, which must never be "fixed" by editing them.
+    #[test]
+    fn legacy_specs_hash_unchanged_by_price_quorum_append() {
+        let env = Env::default();
+        let xlm = OracleAsset::Other(Symbol::new(&env, "XLM"));
+        assert_eq!(
+            hex_of(
+                &env,
+                &price(&env, xlm.clone(), 2_000, PriceDirection::Above, 10)
+            ),
+            "b6f2458326d5f76bd9b53a93a103ea6c0fed7129c5496e91e3faef9a9a23d469"
+        );
+        assert_eq!(
+            hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600)),
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
+        let quorum = ResolutionSpec::PriceQuorum(QuorumPriceConfig {
+            feeds: Vec::from_array(
+                &env,
+                [
+                    FeedRef {
+                        reflector: Address::from_str(&env, C1),
+                        asset: xlm.clone(),
+                        decimals: 8,
+                    },
+                    FeedRef {
+                        reflector: Address::from_str(&env, C2),
+                        asset: xlm.clone(),
+                        decimals: 8,
+                    },
+                ],
+            ),
+            min_responses: 2,
+            threshold: 2_000,
+            threshold_decimals: 8,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+            max_deviation_bps: 1_000,
+        });
+        let quorum_hash = hex_of(&env, &quorum);
+        assert_ne!(
+            quorum_hash,
+            "b6f2458326d5f76bd9b53a93a103ea6c0fed7129c5496e91e3faef9a9a23d469"
+        );
+        assert_ne!(
+            quorum_hash,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
     }
 
     /// V2 golden vector, re-derived independently from raw XDR (no Soroban) in
