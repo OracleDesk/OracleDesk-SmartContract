@@ -29,6 +29,17 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
+/// How far a `halt_trading` effective time may be backdated (issue #22).
+///
+/// Seven days, deliberately the *same* window the resolver already grants its
+/// signers (`resolver::SIGNER_GRACE_SECS`: attestations are accepted until
+/// `close_time + 7 days`). A halt may therefore reach back no further than the
+/// period in which post-close trading is already tolerated today, which keeps
+/// the earliest possible `effective_at` inside the window whose trades the
+/// agreed late-trade policy discloses. Anything longer would rewrite history
+/// beyond the evidence a signer set can credibly attest to.
+const MAX_BACKDATE_SECS: u64 = 7 * 86_400;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -134,6 +145,41 @@ pub struct PendingAdmin {
     pub expires_at: u64,
 }
 
+/// How a **voided** market pays its holders back (issue #21), chosen and
+/// frozen by the creator at market creation.
+///
+/// `HalfPerShare` is today's rule (`math::settle_value`) and remains the
+/// default for every market that has no `DataKey::VoidPolicy` entry, so
+/// markets created before this change read exactly as before.
+/// `CostBasis` refunds each holder the collateral it actually put in, capped
+/// pro-rata when the positive bases exceed the refund pot.
+///
+/// Stored as a sidecar entry rather than as a `Market` field: `Market`'s XDR
+/// is decoded by resolver, treasury and router through `contractimport!`
+/// copies of this contract's wasm that the repo pins by sha256, so adding a
+/// field would force a blob rebuild that cannot be performed here. See
+/// `docs/architecture.md`, "Void refund policies".
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoidPolicy {
+    HalfPerShare,
+    CostBasis,
+}
+
+/// The two numbers a `CostBasis` void pays out of, frozen by `void_market`
+/// (issue #21). Holders and the LP are settled against this snapshot and
+/// never against live storage, which is what makes the payouts independent of
+/// the order in which `redeem` is called.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoidSnapshot {
+    /// Complete sets in existence at void time — the collateral the pot can
+    /// ever pay. `pot == m.sets_minted`.
+    pub pot: i128,
+    /// Sum of the *positive* holder bases at void time.
+    pub basis_total: i128,
+}
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -161,6 +207,34 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // ----- #21 cost-basis void refunds --------------------------------------
+    // Append-only: `DataKey`'s discriminants are positional in XDR, so every
+    // entry above keeps its index. All four are absent for markets created
+    // before this change, and "absent" is defined as the legacy behaviour.
+    /// The market's [`VoidPolicy`]. Absent = [`VoidPolicy::HalfPerShare`].
+    VoidPolicy(u64),
+    /// Net collateral a holder paid in minus took out, for `CostBasis`
+    /// markets only. Signed: a holder who sold at a profit has a negative
+    /// basis and is refunded nothing. Removed with its position.
+    CostBasis(u64, Address),
+    /// Sum of the *positive* `CostBasis` entries of a market, maintained in
+    /// O(1) on every basis write so the void pro-rata needs no holder
+    /// enumeration.
+    BasisTotal(u64),
+    /// [`VoidSnapshot`] written by `void_market` for `CostBasis` markets.
+    VoidSnapshot(u64),
+    // ----- #22 event-driven early close --------------------------------------
+    /// `halt_trading` recorded: trading ends at this timestamp instead of at
+    /// `Market::close_time`. Absent = no halt, so `effective_close == close_time`
+    /// and every pre-upgrade market behaves exactly as before. One entry per
+    /// market, written at most once (there is no unfinalised state to clear:
+    /// disputes are settled on the resolver side *before* `halt_trading` runs).
+    EarlyClose(u64),
+    /// Timestamp of the last accepted `buy`/`sell`, written on every trade and
+    /// read back by `TradingHalted` so the disclosed late-trade window
+    /// `[effective_at, halted_at)` can be anchored to a real on-chain trade
+    /// (issue #22). One entry per market; it never grows.
+    LastTrade(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +279,11 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// `halt_trading` called for a market that is already halted (issue #22).
+    /// A halt is a single, permanent fact: there is no re-halt and no lift.
+    AlreadyHalted = 27,
+    /// `halt_trading` backdated further than `MAX_BACKDATE_SECS` (issue #22).
+    HaltTooOld = 28,
 }
 
 impl From<MathError> for Error {
@@ -364,6 +443,48 @@ pub struct LpTransferred {
     pub market_id: u64,
     pub from: Address,
     pub to: Address,
+}
+
+/// Emitted by `create_market_with_policy` (issue #21), *after* the unchanged
+/// `MarketCreated` event: an indexer that knows nothing about void policies
+/// still sees the market being created, and one that does can attribute the
+/// policy without re-reading storage. Markets created through `create_market`
+/// never emit this — their policy is the default `HalfPerShare`.
+#[contractevent]
+pub struct VoidPolicyChosen {
+    #[topic]
+    pub market_id: u64,
+    pub policy: VoidPolicy,
+}
+
+/// Emitted by `void_market` for a `CostBasis` market (issue #21): the refund
+/// pot and the positive basis total are frozen here, so every later `redeem`
+/// and `claim_pool_remainder` pays from these numbers only.
+#[contractevent]
+pub struct CostBasisVoidSnapshotted {
+    #[topic]
+    pub market_id: u64,
+    pub pot: i128,
+    pub basis_total: i128,
+}
+
+/// Emitted by `halt_trading` (issue #22). `effective_at` is when trading *ended*
+/// and `halted_at` when the chain learned about it, so the pair is exactly the
+/// window the agreed late-trade policy has to cover: trades in
+/// `[effective_at, halted_at)` happened at a price the event says is stale and
+/// are **not** reverted (see `docs/architecture.md`, "Early close and the
+/// late-trade window", and ADR 0001). `last_trade_at` anchors the window to the
+/// market's real final trade, which is the number an off-chain auditor needs to
+/// quantify the damage; `close_time` is carried so a consumer does not have to
+/// re-read a market whose state has since moved on.
+#[contractevent]
+pub struct TradingHalted {
+    #[topic]
+    pub market_id: u64,
+    pub effective_at: u64,
+    pub halted_at: u64,
+    pub close_time: u64,
+    pub last_trade_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +690,12 @@ impl MarketCore {
     /// Creates a market and seeds the pool. `creator` becomes the sole LP.
     /// `initial_yes_bps` in [100, 9900] sets the opening YES probability;
     /// the creator receives the leftover shares of the likelier outcome.
+    ///
+    /// The void refund policy is the default [`VoidPolicy::HalfPerShare`];
+    /// see [`MarketCore::create_market_with_policy`] to choose another one.
+    /// This entrypoint's behaviour and signature are unchanged, and it writes
+    /// no policy entry at all, so markets created through it are stored
+    /// bit-for-bit as before this change.
     #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         env: Env,
@@ -580,6 +707,45 @@ impl MarketCore {
         close_time: u64,
         seed_amount: i128,
         initial_yes_bps: u32,
+    ) -> Result<u64, Error> {
+        Self::create_market_with_policy(
+            env,
+            creator,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+            VoidPolicy::HalfPerShare,
+        )
+    }
+
+    /// `create_market` plus the [`VoidPolicy`] the creator commits to for the
+    /// life of the market (issue #21).
+    ///
+    /// A **new entrypoint** rather than a trailing parameter on `create_market`
+    /// (which the issue also allows): `create_market`'s signature is part of
+    /// the interface that resolver, treasury and router decode from their
+    /// vendored copies of this contract's wasm, and those blobs are pinned by
+    /// sha256 and cannot be rebuilt here. Adding a parameter would change the
+    /// exported spec and every client's call site; adding an entrypoint changes
+    /// neither. Consequence: `treasury::agent_create_market` keeps creating
+    /// `HalfPerShare` markets until somebody with stellar-cli 27.1.0 refreshes
+    /// the vendored blob — an adoption limit, not a bug.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_market_with_policy(
+        env: Env,
+        creator: Address,
+        question_hash: BytesN<32>,
+        resolution_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        void_policy: VoidPolicy,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
         creator.require_auth();
@@ -645,6 +811,18 @@ impl MarketCore {
                 },
             );
         }
+        // #21: only a CostBasis market gets the sidecar entries. For
+        // HalfPerShare this block is skipped entirely, so no `VoidPolicy`,
+        // `CostBasis` or `BasisTotal` key is ever written.
+        if void_policy == VoidPolicy::CostBasis {
+            Self::save_void_policy(&env, id, &void_policy);
+            // The creator paid `seed_amount` into the pool and received no
+            // collateral back, so its basis is the whole seed — the same
+            // "net collateral paid" rule used for `buy`. With it
+            // `Σ basis_h == sets_minted` right after creation, i.e. the LP's
+            // implicit residual basis (`sets_minted − Σ basis_h`) is 0.
+            Self::add_basis(&env, id, &creator, seed_amount, false)?;
+        }
 
         Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
 
@@ -657,6 +835,13 @@ impl MarketCore {
             initial_yes_bps,
         }
         .publish(&env);
+        if void_policy == VoidPolicy::CostBasis {
+            VoidPolicyChosen {
+                market_id: id,
+                policy: void_policy,
+            }
+            .publish(&env);
+        }
         Ok(id)
     }
 
@@ -744,7 +929,7 @@ impl MarketCore {
         }
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
-        Self::assert_tradable(&env, &m)?;
+        Self::assert_tradable(&env, market_id, &m)?;
 
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
@@ -783,6 +968,13 @@ impl MarketCore {
             Outcome::No => pos.no += q.shares_out,
         }
         Self::save_position(&env, market_id, &trader, &pos);
+        // #21: `q.net` is the collateral that minted complete sets, i.e. what
+        // left the trader's pocket into `sets_minted` (the fee went to the
+        // protocol and is never refunded, so it is excluded by design).
+        Self::add_basis(&env, market_id, &trader, q.net, false)?;
+        // #22: one extra persistent write per accepted trade, always to the same
+        // key, so the cost is a fixed 8-byte entry per market and never growth.
+        Self::save_last_trade(&env, market_id);
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -878,7 +1070,7 @@ impl MarketCore {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
-        Self::assert_tradable(&env, &m)?;
+        Self::assert_tradable(&env, market_id, &m)?;
 
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
@@ -913,7 +1105,18 @@ impl MarketCore {
             Outcome::Yes => pos.yes -= q.shares_in,
             Outcome::No => pos.no -= q.shares_in,
         }
+        let emptied = pos.yes == 0 && pos.no == 0;
         Self::save_position(&env, market_id, &trader, &pos);
+        // #21: reduce the basis by `q.gross` — the collateral that left
+        // `sets_minted` — and *not* proportionally to the shares sold, which
+        // is what keeps `Σ basis_h + basis_LP == sets_minted` exact. A holder
+        // who sells more than they paid in ends with a negative basis (they
+        // already took their refund out of the pool); the entry goes with the
+        // position once it empties, and its unrecovered positive part, if any,
+        // becomes the LP's residual.
+        Self::add_basis(&env, market_id, &trader, -q.gross, emptied)?;
+        // #22: see the note in `do_buy`.
+        Self::save_last_trade(&env, market_id);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
         m.sets_minted -= q.gross;
         let protocol_fee = Self::accrue_fees(&env, market_id, q.fee)?;
@@ -945,13 +1148,73 @@ impl MarketCore {
     // Only the configured resolver contract may call these. When the resolver
     // contract is the direct caller, `require_auth` on its address passes.
 
+    /// Brings the end of trading forward to `effective_at` (issue #22).
+    ///
+    /// A "Will X happen by D?" question can be settled by the world long before
+    /// `D`; until now the pool stayed open and anyone faster than the repricing
+    /// crowd bought the already-known outcome at a stale price, with the loss
+    /// landing on the LP. `halt_trading` closes that window: from the moment it
+    /// is called, `assert_tradable`, `resolve` and the resolver's attestation
+    /// gate all read `effective_close = min(close_time, effective_at)`.
+    ///
+    /// Rules, in order:
+    /// - resolver-only, exactly like `resolve` / `void_market`;
+    /// - the market must still be `Open` (a resolved or void market has nothing
+    ///   to halt, and `finalize_early_close` reaching a market that was voided
+    ///   mid-dispute fails here rather than half-applying a halt);
+    /// - one halt per market — a halt is permanent, there is no lift entrypoint,
+    ///   which is what makes "the halt is final" trivially true on-chain;
+    /// - `effective_at <= close_time` (a halt may only move the close earlier)
+    ///   and `effective_at <= now` (a halt records a fact, it cannot schedule
+    ///   one), plus `effective_at >= now - MAX_BACKDATE_SECS`.
+    ///
+    /// Because the halt only *records* a past instant, trades that landed
+    /// between `effective_at` and this transaction still happened. The chosen
+    /// policy is **accept and disclose**: they are not reverted, and the event
+    /// publishes the window so the backend can flag them. Rationale and the
+    /// rejected alternative are in `docs/adr/0001-resolution-commitment.md`.
+    pub fn halt_trading(env: Env, market_id: u64, effective_at: u64) -> Result<(), Error> {
+        Self::require_resolver(&env)?;
+        let m = Self::load_market(&env, market_id)?;
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if Self::load_early_close(&env, market_id).is_some() {
+            return Err(Error::AlreadyHalted);
+        }
+        if effective_at > m.close_time {
+            return Err(Error::InvalidCloseTime);
+        }
+        let now = env.ledger().timestamp();
+        if effective_at > now {
+            return Err(Error::InvalidCloseTime);
+        }
+        if effective_at < now.saturating_sub(MAX_BACKDATE_SECS) {
+            return Err(Error::HaltTooOld);
+        }
+        Self::save_early_close(&env, market_id, effective_at);
+        TradingHalted {
+            market_id,
+            effective_at,
+            halted_at: now,
+            close_time: m.close_time,
+            last_trade_at: Self::load_last_trade(&env, market_id),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_resolver(&env)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
-        if env.ledger().timestamp() < m.close_time {
+        // Issue #22: an early halt is final the instant it is written (it can
+        // only come from the resolver, and there is no way to lift it), so the
+        // effective close is the only gate. With no halt recorded this is the
+        // original `m.close_time` comparison, byte for byte.
+        if env.ledger().timestamp() < Self::effective_close(&env, market_id, &m) {
             return Err(Error::NotClosedYet);
         }
         m.status = MarketStatus::Resolved(outcome);
@@ -965,6 +1228,11 @@ impl MarketCore {
     }
 
     /// Invalid or unresolvable market. Allowed any time before finality.
+    ///
+    /// For a `CostBasis` market (issue #21) this is also the moment the refund
+    /// pot is frozen: `void_market` snapshots `sets_minted` and the positive
+    /// basis total, and every later `redeem` / `claim_pool_remainder` pays from
+    /// that snapshot only. A `HalfPerShare` market writes nothing here.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_resolver(&env)?;
         let mut m = Self::load_market(&env, market_id)?;
@@ -973,6 +1241,19 @@ impl MarketCore {
         }
         m.status = MarketStatus::Void;
         Self::save_market(&env, market_id, &m);
+        if Self::load_void_policy(&env, market_id) == VoidPolicy::CostBasis {
+            let snapshot = VoidSnapshot {
+                pot: m.sets_minted,
+                basis_total: Self::load_basis_total(&env, market_id),
+            };
+            Self::save_void_snapshot(&env, market_id, &snapshot);
+            CostBasisVoidSnapshotted {
+                market_id,
+                pot: snapshot.pot,
+                basis_total: snapshot.basis_total,
+            }
+            .publish(&env);
+        }
         MarketResolved {
             market_id,
             outcome: None,
@@ -985,6 +1266,10 @@ impl MarketCore {
 
     /// Pays out `holder`'s position for a final market and clears it.
     /// Losing positions clear with a payout of 0.
+    ///
+    /// Under the `CostBasis` void policy (issue #21) the payout is the holder's
+    /// share of the frozen refund pot instead of `settle_value`; a resolved
+    /// market ignores the policy entirely, and so does a `HalfPerShare` one.
     pub fn redeem(env: Env, holder: Address, market_id: u64) -> Result<i128, Error> {
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
@@ -993,9 +1278,26 @@ impl MarketCore {
         if pos.yes == 0 && pos.no == 0 {
             return Err(Error::NothingToRedeem);
         }
-        let payout = math::settle_value(kind, pos.yes, pos.no);
+        let payout = match (kind, Self::load_void_policy(&env, market_id)) {
+            (Settlement::Void, VoidPolicy::CostBasis) => {
+                match Self::load_void_snapshot_opt(&env, market_id) {
+                    Some(snapshot) => math::cost_basis_refund(
+                        Self::load_basis(&env, market_id, &holder),
+                        snapshot.pot,
+                        snapshot.basis_total,
+                    )?,
+                    // `void_market` always writes the snapshot for a CostBasis
+                    // market, so falling back to the legacy rule here is only
+                    // reachable if the entry was archived. Paying `settle_value`
+                    // is the safe direction: paying 0 would strand the refund.
+                    None => math::settle_value(kind, pos.yes, pos.no),
+                }
+            }
+            _ => math::settle_value(kind, pos.yes, pos.no),
+        };
 
         Self::save_position(&env, market_id, &holder, &Position { yes: 0, no: 0 });
+        Self::clear_basis(&env, market_id, &holder)?;
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
         }
@@ -1010,6 +1312,13 @@ impl MarketCore {
 
     /// Creator (the LP) withdraws whatever the pool still holds once final,
     /// plus any unclaimed LP fees. Returns the total paid out.
+    ///
+    /// Under the `CostBasis` void policy (issue #21) the LP takes the snapshot
+    /// residual `pot − min(basis_total, pot)` and never a live read of what
+    /// holders have already redeemed: the amount is fixed at void time, so
+    /// claiming before anybody else redeems cannot take their refunds, and
+    /// claiming last cannot take more either. Together with the floored holder
+    /// refunds this bounds the total void payout by `pot == sets_minted`.
     pub fn claim_pool_remainder(env: Env, market_id: u64) -> Result<i128, Error> {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
@@ -1017,7 +1326,17 @@ impl MarketCore {
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
-        let pool_value = math::settle_value(kind, m.reserve_yes, m.reserve_no);
+        let pool_value = match (kind, Self::load_void_policy(&env, market_id)) {
+            (Settlement::Void, VoidPolicy::CostBasis) => {
+                match Self::load_void_snapshot_opt(&env, market_id) {
+                    Some(snapshot) => {
+                        math::cost_basis_lp_residual(snapshot.pot, snapshot.basis_total)?
+                    }
+                    None => math::settle_value(kind, m.reserve_yes, m.reserve_no),
+                }
+            }
+            _ => math::settle_value(kind, m.reserve_yes, m.reserve_no),
+        };
         let payout = pool_value
             .checked_add(Self::load_lp_fees(&env, market_id))
             .ok_or(Error::Overflow)?;
@@ -1118,6 +1437,18 @@ impl MarketCore {
         Self::load_market(&env, market_id)?;
         let mut a = Self::load_position(&env, market_id, &from);
         let mut b = Self::load_position(&env, market_id, &to);
+        // #21: cost basis is a property of the collateral, so it follows the
+        // shares it paid for. A `CostBasis` transfer moves the same fraction of
+        // the sender's *positive* basis as the fraction of their shares moving;
+        // a negative basis (the sender already took out more than they paid in)
+        // stays with its owner, because it is a claim already spent and not an
+        // asset to hand over. No-op for every other market.
+        let held_before = a.yes.checked_add(a.no).ok_or(Error::Overflow)?;
+        let basis_slice = if held_before > 0 {
+            Self::transferable_basis(&env, market_id, &from, amount, held_before)?
+        } else {
+            0
+        };
         match outcome {
             Outcome::Yes => {
                 if a.yes < amount {
@@ -1134,8 +1465,13 @@ impl MarketCore {
                 b.no = b.no.checked_add(amount).ok_or(Error::Overflow)?;
             }
         }
+        let from_emptied = a.yes == 0 && a.no == 0;
         Self::save_position(&env, market_id, &from, &a);
         Self::save_position(&env, market_id, &to, &b);
+        if basis_slice != 0 || from_emptied {
+            Self::add_basis(&env, market_id, &from, -basis_slice, from_emptied)?;
+            Self::add_basis(&env, market_id, &to, basis_slice, false)?;
+        }
         PositionTransferred {
             market_id,
             from,
@@ -1150,6 +1486,11 @@ impl MarketCore {
     /// Transfers the single LP role (the right to `claim_pool_remainder` and
     /// `claim_lp_fees`) to `new_creator`. Only until the remainder has been
     /// claimed; after that the role has no remaining value.
+    ///
+    /// No `CostBasis` bookkeeping is needed here (issue #21): the LP's own basis
+    /// is the *implicit* residual `sets_minted − Σ basis_h` and is never stored,
+    /// so it follows `m.creator` automatically and the new LP is the one who
+    /// claims `cost_basis_lp_residual`.
     pub fn transfer_lp(env: Env, market_id: u64, new_creator: Address) -> Result<(), Error> {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
@@ -1204,6 +1545,60 @@ impl MarketCore {
 
     pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
         Self::load_position(&env, market_id, &holder)
+    }
+
+    /// The market's [`VoidPolicy`] (issue #21). A market with no sidecar entry
+    /// — every market created before this change, and every one created through
+    /// `create_market` — reports `HalfPerShare`.
+    pub fn get_void_policy(env: Env, market_id: u64) -> Result<VoidPolicy, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_void_policy(&env, market_id))
+    }
+
+    /// Signed net collateral `holder` has put into a `CostBasis` market and
+    /// not taken back (issue #21). Always 0 for a `HalfPerShare` market, which
+    /// never writes the entry.
+    pub fn get_cost_basis(env: Env, market_id: u64, holder: Address) -> Result<i128, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_basis(&env, market_id, &holder))
+    }
+
+    /// Sum of the positive holder bases of a `CostBasis` market (issue #21),
+    /// the denominator of the void pro-rata.
+    pub fn get_basis_total(env: Env, market_id: u64) -> Result<i128, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_basis_total(&env, market_id))
+    }
+
+    /// The refund pot frozen by `void_market` for a `CostBasis` market
+    /// (issue #21). `Ok(None)` while the market is open, resolved, or voided
+    /// under `HalfPerShare`.
+    pub fn get_void_snapshot(env: Env, market_id: u64) -> Result<Option<VoidSnapshot>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_void_snapshot_opt(&env, market_id))
+    }
+
+    /// The instant recorded by `halt_trading` (issue #22), `None` while the
+    /// market has never been halted. Read-only and permissionless, so the
+    /// resolver can gate attestation on it without a second source of truth.
+    pub fn get_early_close(env: Env, market_id: u64) -> Result<Option<u64>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_early_close(&env, market_id))
+    }
+
+    /// `min(close_time, early_close)` — when trading really ends (issue #22).
+    /// Equals `get_market(..).close_time` for every market that was never
+    /// halted, which is the whole compatibility argument for the sidecar.
+    pub fn get_effective_close(env: Env, market_id: u64) -> Result<u64, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        Ok(Self::effective_close(&env, market_id, &m))
+    }
+
+    /// Timestamp of the last accepted `buy`/`sell`, 0 if the market never
+    /// traded (issue #22: the anchor for the disclosed late-trade window).
+    pub fn get_last_trade_at(env: Env, market_id: u64) -> Result<u64, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_last_trade(&env, market_id))
     }
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
@@ -1353,11 +1748,17 @@ impl MarketCore {
         Ok(())
     }
 
-    fn assert_tradable(env: &Env, m: &Market) -> Result<(), Error> {
+    /// Trading gates: open, and strictly before the **effective** close.
+    ///
+    /// Issue #22 adds the early-close term. A market with no `EarlyClose` entry
+    /// — every market created before this change, and every one never halted —
+    /// compares against `m.close_time` exactly as before, at the cost of one
+    /// storage read that misses.
+    fn assert_tradable(env: &Env, market_id: u64, m: &Market) -> Result<(), Error> {
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
-        if env.ledger().timestamp() >= m.close_time {
+        if env.ledger().timestamp() >= Self::effective_close(env, market_id, m) {
             return Err(Error::MarketClosed);
         }
         Ok(())
@@ -1438,6 +1839,219 @@ impl MarketCore {
                 .persistent()
                 .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         }
+    }
+
+    // ----- #21 cost-basis void refunds --------------------------------------
+    //
+    // Every one of these is a no-op (or a single storage read that misses) for
+    // a market without a `CostBasis` policy entry, which is what keeps
+    // `HalfPerShare` markets — including all pre-upgrade ones — bit-for-bit
+    // unchanged in storage.
+    //
+    // The invariant they maintain is `Σ basis_h + basis_LP == sets_minted`,
+    // where `basis_LP` is not stored but *is* `sets_minted − Σ basis_h`: every
+    // path that moves collateral across the pool boundary changes `sets_minted`
+    // by exactly the amount it changes one holder's basis (`+q.net` on a buy,
+    // `-q.gross` on a sell, `+seed_amount` at creation), so the identity holds
+    // at every step by construction. Deleting a basis with its emptied position
+    // hands its unrecovered positive part to the LP, which the identity absorbs.
+
+    fn load_void_policy(env: &Env, id: u64) -> VoidPolicy {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VoidPolicy(id))
+            .unwrap_or(VoidPolicy::HalfPerShare)
+    }
+
+    fn save_void_policy(env: &Env, id: u64, policy: &VoidPolicy) {
+        let key = DataKey::VoidPolicy(id);
+        env.storage().persistent().set(&key, policy);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// The holder's signed basis, 0 when absent. Never extends or creates an
+    /// entry: `add_basis` is the only writer.
+    fn load_basis(env: &Env, id: u64, holder: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CostBasis(id, holder.clone()))
+            .unwrap_or(0)
+    }
+
+    fn load_basis_total(env: &Env, id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BasisTotal(id))
+            .unwrap_or(0)
+    }
+
+    fn save_basis_total(env: &Env, id: u64, total: i128) {
+        let key = DataKey::BasisTotal(id);
+        if total <= 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &total);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+    }
+
+    fn load_void_snapshot_opt(env: &Env, id: u64) -> Option<VoidSnapshot> {
+        let key = DataKey::VoidSnapshot(id);
+        let snapshot = env.storage().persistent().get(&key);
+        if snapshot.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        snapshot
+    }
+
+    fn save_void_snapshot(env: &Env, id: u64, snapshot: &VoidSnapshot) {
+        let key = DataKey::VoidSnapshot(id);
+        env.storage().persistent().set(&key, snapshot);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// Applies `delta` to a `CostBasis` holder's basis and keeps
+    /// `DataKey::BasisTotal` exact. `position_empty` mirrors `save_position`:
+    /// an emptied position takes its entry with it, so what it was owed falls
+    /// back to the LP. Does nothing at all for `HalfPerShare` markets.
+    fn add_basis(
+        env: &Env,
+        id: u64,
+        holder: &Address,
+        delta: i128,
+        position_empty: bool,
+    ) -> Result<(), Error> {
+        if Self::load_void_policy(env, id) != VoidPolicy::CostBasis {
+            return Ok(());
+        }
+        let before = Self::load_basis(env, id, holder);
+        let after = before.checked_add(delta).ok_or(Error::Overflow)?;
+        let key = DataKey::CostBasis(id, holder.clone());
+        if position_empty || after == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &after);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        let counted = if position_empty { 0 } else { after.max(0) };
+        let total = Self::load_basis_total(env, id)
+            .checked_sub(before.max(0))
+            .and_then(|t| t.checked_add(counted))
+            .ok_or(Error::Overflow)?;
+        Self::save_basis_total(env, id, total);
+        Ok(())
+    }
+
+    /// Drops a redeemed holder's basis entry (issue #21). Called on every
+    /// `redeem`, including of a resolved market, so a `CostBasis` market cannot
+    /// accumulate entries for positions that no longer exist.
+    fn clear_basis(env: &Env, id: u64, holder: &Address) -> Result<(), Error> {
+        if Self::load_void_policy(env, id) != VoidPolicy::CostBasis {
+            return Ok(());
+        }
+        let before = Self::load_basis(env, id, holder);
+        if before == 0 {
+            return Ok(());
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CostBasis(id, holder.clone()));
+        let total = Self::load_basis_total(env, id)
+            .checked_sub(before.max(0))
+            .ok_or(Error::Overflow)?;
+        Self::save_basis_total(env, id, total);
+        Ok(())
+    }
+
+    /// The slice of `from`'s basis that moves with `amount` of its
+    /// `held_before` shares: `floor(basis * amount / held_before)`, or 0 when
+    /// the basis is not positive (see `transfer_position`).
+    fn transferable_basis(
+        env: &Env,
+        id: u64,
+        from: &Address,
+        amount: i128,
+        held_before: i128,
+    ) -> Result<i128, Error> {
+        if Self::load_void_policy(env, id) != VoidPolicy::CostBasis {
+            return Ok(0);
+        }
+        let basis = Self::load_basis(env, id, from);
+        if basis <= 0 {
+            return Ok(0);
+        }
+        Ok(math::mul_div_floor(basis, amount, held_before)?)
+    }
+
+    // ----- #22 event-driven early close -------------------------------------
+    //
+    // A halt is sidecar state, not a `Market` field: `Market`'s XDR is decoded by
+    // resolver, treasury and router out of vendored copies of this contract's
+    // wasm that the repo pins by sha256, so adding a field would need a blob
+    // rebuild that cannot be performed here (the same reason as #21). The one
+    // behavioural consequence is that `close_time` stays the *nominal* close and
+    // every consumer that cares about the real one has to go through
+    // `effective_close` / the new views.
+
+    /// The recorded halt instant, `None` when the market was never halted.
+    fn load_early_close(env: &Env, id: u64) -> Option<u64> {
+        let key = DataKey::EarlyClose(id);
+        let at: Option<u64> = env.storage().persistent().get(&key);
+        if at.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        at
+    }
+
+    fn save_early_close(env: &Env, id: u64, effective_at: u64) {
+        let key = DataKey::EarlyClose(id);
+        env.storage().persistent().set(&key, &effective_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// When trading really ends: an early halt can only move the close
+    /// *earlier*, so the effective close is the minimum. Clamped defensively —
+    /// `halt_trading` already refuses `effective_at > close_time`, and a halt
+    /// must never extend a market's life.
+    fn effective_close(env: &Env, id: u64, m: &Market) -> u64 {
+        match Self::load_early_close(env, id) {
+            Some(at) if at < m.close_time => at,
+            _ => m.close_time,
+        }
+    }
+
+    /// Timestamp of the last accepted trade, 0 when the market has never
+    /// traded. Read by `halt_trading` to anchor the disclosed late-trade window
+    /// and exposed as `get_last_trade_at` for the backend.
+    fn load_last_trade(env: &Env, id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LastTrade(id))
+            .unwrap_or(0)
+    }
+
+    fn save_last_trade(env: &Env, id: u64) {
+        let key = DataKey::LastTrade(id);
+        env.storage()
+            .persistent()
+            .set(&key, &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
     }
 
     fn load_fee_terms(env: &Env, id: u64) -> Option<FeeTerms> {
@@ -3065,6 +3679,662 @@ mod test {
             }])
             .try_propose_treasury(&peer)
             .is_err());
+    }
+
+    // ----- #21: optional cost-basis refunds for voided markets --------------
+
+    /// Seed used by every market in this module (100 USDC, 7 decimals).
+    const TEST_SEED: i128 = 100 * 10_000_000;
+
+    /// A market created through `create_market_with_policy` (issue #21).
+    fn new_market_policy(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        initial_yes_bps: u32,
+        policy: VoidPolicy,
+        salt: u8,
+    ) -> u64 {
+        client.create_market_with_policy(
+            creator,
+            &BytesN::from_array(env, &[salt; 32]),
+            &BytesN::from_array(env, &[salt.wrapping_add(100); 32]),
+            &String::from_str(env, "ipfs://cost-basis"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &TEST_SEED,
+            &initial_yes_bps,
+            &policy,
+        )
+    }
+
+    /// Direct storage probe, so a test can assert an entry was never written.
+    fn has_entry(env: &Env, client: &MarketCoreClient, key: DataKey) -> bool {
+        let contract = client.address.clone();
+        env.as_contract(&contract, || env.storage().persistent().has(&key))
+    }
+
+    /// The trade inputs a test needs to mirror the contract's own quotes.
+    fn quote(client: &MarketCoreClient, market_id: u64, outcome: &Outcome) -> (i128, i128, u32) {
+        let m = client.get_market(&market_id);
+        let reserves = match outcome {
+            Outcome::Yes => (m.reserve_yes, m.reserve_no),
+            Outcome::No => (m.reserve_no, m.reserve_yes),
+        };
+        (reserves.0, reserves.1, m.fee_bps)
+    }
+
+    /// The market's whole position book (used by the redemption loops below).
+    fn position_total(client: &MarketCoreClient, market_id: u64, holder: &Address) -> i128 {
+        let p = client.get_position(&market_id, holder);
+        p.yes + p.no
+    }
+
+    #[test]
+    fn half_per_share_void_unchanged() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 9000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(30 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        // `create_market` writes no policy sidecar at all, so a pre-upgrade
+        // market stays byte-identical in storage.
+        assert!(!has_entry(&env, &client, DataKey::VoidPolicy(market_id)));
+        assert!(!has_entry(
+            &env,
+            &client,
+            DataKey::CostBasis(market_id, trader.clone())
+        ));
+        assert!(!has_entry(&env, &client, DataKey::BasisTotal(market_id)));
+        assert_eq!(client.get_void_policy(&market_id), VoidPolicy::HalfPerShare);
+        assert_eq!(client.get_cost_basis(&market_id, &trader), 0);
+
+        client.void_market(&market_id);
+        assert!(!has_entry(&env, &client, DataKey::VoidSnapshot(market_id)));
+        assert!(client.get_void_snapshot(&market_id).is_none());
+
+        // The legacy rule, unchanged: half a unit per share, floor.
+        let pos = client.get_position(&market_id, &trader);
+        let expected = (pos.yes + pos.no) / 2;
+        assert_eq!(client.redeem(&trader, &market_id), expected);
+        let m = client.get_market(&market_id);
+        assert_eq!(
+            client.claim_pool_remainder(&market_id),
+            (m.reserve_yes + m.reserve_no) / 2
+        );
+        // The 44% haircut that motivates #21 is still there for a 0.9 entry.
+        assert!(expected < 30 * 10_000_000_i128);
+    }
+
+    #[test]
+    fn cost_basis_void_refunds_buyer_at_high_price() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        // Opens at 90% YES: the case where half-per-share pays 0.5 for a 0.9
+        // entry. `create_market_with_policy` costs the same market 5% more.
+        let market_id = new_market_policy(&env, &client, &creator, 9000, VoidPolicy::CostBasis, 22);
+        assert_eq!(client.get_void_policy(&market_id), VoidPolicy::CostBasis);
+
+        let paid = 30 * 10_000_000_i128;
+        let (r_bought, r_other, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let q = math::calc_buy(r_bought, r_other, paid, fee_bps).unwrap();
+        client.buy(&trader, &market_id, &Outcome::Yes, &paid, &0_i128);
+
+        // Basis is the *net* collateral: the fee is the protocol's and is never
+        // refunded, so the pot stays exactly `sets_minted`.
+        assert_eq!(client.get_cost_basis(&market_id, &trader), q.net);
+        assert_eq!(client.get_cost_basis(&market_id, &creator), TEST_SEED);
+        assert_eq!(client.get_basis_total(&market_id), TEST_SEED + q.net);
+        assert_eq!(client.get_market(&market_id).sets_minted, TEST_SEED + q.net);
+
+        client.void_market(&market_id);
+        let snapshot = client.get_void_snapshot(&market_id).unwrap();
+        assert_eq!(snapshot.pot, TEST_SEED + q.net);
+        assert_eq!(snapshot.basis_total, snapshot.pot);
+
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+        let before = token.balance(&trader);
+        assert_eq!(client.redeem(&trader, &market_id), q.net);
+        assert_eq!(token.balance(&trader), before + q.net);
+        // The refunded entry is gone with the position.
+        assert!(!has_entry(
+            &env,
+            &client,
+            DataKey::CostBasis(market_id, trader.clone())
+        ));
+        assert_eq!(client.get_basis_total(&market_id), TEST_SEED);
+    }
+
+    #[test]
+    fn partial_sell_reduces_basis_by_gross() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market_policy(&env, &client, &creator, 5000, VoidPolicy::CostBasis, 23);
+        let buy_in = 20 * 10_000_000_i128;
+        let (rb, ro, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let qb = math::calc_buy(rb, ro, buy_in, fee_bps).unwrap();
+        client.buy(&trader, &market_id, &Outcome::Yes, &buy_in, &0_i128);
+
+        let sell_out = 5 * 10_000_000_i128;
+        let (rs, ro2, _) = quote(&client, market_id, &Outcome::Yes);
+        let qs = math::calc_sell(rs, ro2, sell_out, fee_bps).unwrap();
+        client.sell(&trader, &market_id, &Outcome::Yes, &sell_out, &qs.shares_in);
+
+        // Minus the *gross* the pool burned, not a share-proportional slice:
+        // that is what keeps Σ basis + LP == sets_minted exact.
+        assert_eq!(
+            client.get_cost_basis(&market_id, &trader),
+            qb.net - qs.gross
+        );
+        assert_eq!(qs.gross, sell_out + qs.fee);
+        assert_eq!(
+            client.get_market(&market_id).sets_minted,
+            TEST_SEED + qb.net - qs.gross
+        );
+        assert_eq!(
+            client.get_basis_total(&market_id),
+            TEST_SEED + qb.net - qs.gross
+        );
+        assert!(position_total(&client, market_id, &trader) > 0);
+    }
+
+    #[test]
+    fn negative_basis_holder_gets_zero() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let other = Address::generate(&env);
+        // YES opens at 10%, so the trader's entry is cheap; `other` then buys
+        // heavily and the trader exits *half* their position at a profit, which
+        // is what pushes a basis negative while shares remain.
+        let market_id = new_market_policy(&env, &client, &creator, 1000, VoidPolicy::CostBasis, 24);
+        StellarAssetClient::new(&env, &collateral).mint(&other, &(1_000 * 10_000_000_i128));
+
+        let buy_in = 20 * 10_000_000_i128;
+        client.buy(&trader, &market_id, &Outcome::Yes, &buy_in, &0_i128);
+        let net = client.get_cost_basis(&market_id, &trader);
+        client.buy(
+            &other,
+            &market_id,
+            &Outcome::Yes,
+            &(300 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        let held = client.get_position(&market_id, &trader).yes;
+        let half = held / 2;
+        let (rs, ro, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let sell_out = math::collateral_out_for_shares(rs, ro, half, fee_bps).unwrap();
+        let qs = math::calc_sell(rs, ro, sell_out, fee_bps).unwrap();
+        client.sell(&trader, &market_id, &Outcome::Yes, &sell_out, &qs.shares_in);
+
+        assert!(qs.gross > net, "the sell must exceed what was paid in");
+        let basis = client.get_cost_basis(&market_id, &trader);
+        assert!(basis < 0);
+        assert!(client.get_position(&market_id, &trader).yes > 0);
+
+        client.void_market(&market_id);
+        // Still holds shares, still gets nothing: they already took more out of
+        // the pool than they put in.
+        assert_eq!(client.redeem(&trader, &market_id), 0);
+        let snapshot = client.get_void_snapshot(&market_id).unwrap();
+        assert!(snapshot.basis_total <= snapshot.pot);
+    }
+
+    #[test]
+    fn redeem_order_independent_under_cost_basis() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let other = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&other, &(1_000 * 10_000_000_i128));
+        // Indexed by holder, so the two runs can be compared slot by slot no
+        // matter which order the redemptions were issued in.
+        let people = [trader.clone(), other.clone(), creator.clone()];
+
+        let mut run = |reverse: bool, salt: u8, out: &mut [i128; 3]| {
+            let market_id =
+                new_market_policy(&env, &client, &creator, 5000, VoidPolicy::CostBasis, salt);
+            client.buy(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &(20 * 10_000_000_i128),
+                &0_i128,
+            );
+            client.buy(
+                &other,
+                &market_id,
+                &Outcome::No,
+                &(10 * 10_000_000_i128),
+                &0_i128,
+            );
+            client.void_market(&market_id);
+            let snapshot = client.get_void_snapshot(&market_id).unwrap();
+            assert_eq!(snapshot.pot, client.get_market(&market_id).sets_minted);
+            let order = if reverse { [2, 1, 0] } else { [0, 1, 2] };
+            for index in order {
+                out[index] += client.redeem(&people[index], &market_id);
+            }
+            // The creator is also the LP; their residual claim is order-free
+            // too, because the snapshot formula never reads live balances.
+            out[2] += client.claim_pool_remainder(&market_id);
+        };
+
+        let mut forwards = [0_i128; 3];
+        let mut backwards = [0_i128; 3];
+        run(false, 25, &mut forwards);
+        run(true, 26, &mut backwards);
+        assert_eq!(forwards, backwards);
+        assert!(forwards[0] > 0 && forwards[1] > 0);
+    }
+
+    #[test]
+    fn lp_receives_residual_after_cost_basis_void() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let market_id = new_market_policy(&env, &client, &creator, 6800, VoidPolicy::CostBasis, 27);
+        let buy_in = 20 * 10_000_000_i128;
+        let (rb, ro, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let qb = math::calc_buy(rb, ro, buy_in, fee_bps).unwrap();
+        client.buy(&trader, &market_id, &Outcome::Yes, &buy_in, &0_i128);
+
+        // The trader exits completely at a loss: their unrecovered basis has to
+        // go to the LP, because the position (and its entry) is deleted.
+        let held = client.get_position(&market_id, &trader).yes;
+        let (rs, ro2, _) = quote(&client, market_id, &Outcome::Yes);
+        let sell_out = math::collateral_out_for_shares(rs, ro2, held, fee_bps).unwrap();
+        let qs = math::calc_sell(rs, ro2, sell_out, fee_bps).unwrap();
+        client.sell(&trader, &market_id, &Outcome::Yes, &sell_out, &qs.shares_in);
+        let unrecovered = qb.net - qs.gross;
+        assert!(unrecovered > 0);
+        assert_eq!(position_total(&client, market_id, &trader), 0);
+        assert!(!has_entry(
+            &env,
+            &client,
+            DataKey::CostBasis(market_id, trader.clone())
+        ));
+
+        client.void_market(&market_id);
+        let snapshot = client.get_void_snapshot(&market_id).unwrap();
+        assert_eq!(snapshot.basis_total, TEST_SEED);
+        assert_eq!(snapshot.pot, TEST_SEED + unrecovered);
+
+        // The LP claims FIRST: the snapshot formula does not read live
+        // balances, so it cannot take the creator's own holder refund either.
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+        let before = token.balance(&creator);
+        assert_eq!(client.claim_pool_remainder(&market_id), unrecovered);
+        assert_eq!(token.balance(&creator), before + unrecovered);
+        assert_eq!(client.redeem(&creator, &market_id), TEST_SEED);
+    }
+
+    #[test]
+    fn cost_basis_void_solvent_under_random_sequences() {
+        // Same tiny LCG as `math::tests::k_never_decreases_and_round_trip_never_profits`
+        // so the sequence is reproducible. 5 holders, 500 random buys and sells,
+        // then a void. The solvency proof is partly structural: a payout the
+        // contract cannot fund would trap the host and fail this test, so
+        // reaching the assertions at all already shows every transfer settled.
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let holders = [
+            trader.clone(),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        let bank = StellarAssetClient::new(&env, &collateral);
+        for holder in holders.iter().skip(1) {
+            bank.mint(holder, &(10_000 * 10_000_000_i128));
+        }
+        let market_id = new_market_policy(&env, &client, &creator, 6800, VoidPolicy::CostBasis, 28);
+
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        let mut basis = [0_i128; 5];
+        for _ in 0..500 {
+            let i = (next() % 5) as usize;
+            let outcome = if next() % 2 == 0 {
+                Outcome::Yes
+            } else {
+                Outcome::No
+            };
+            let (r_bought, r_other, fee_bps) = quote(&client, market_id, &outcome);
+            if next() % 3 == 0 {
+                let held = match outcome {
+                    Outcome::Yes => client.get_position(&market_id, &holders[i]).yes,
+                    Outcome::No => client.get_position(&market_id, &holders[i]).no,
+                };
+                if held <= 1 {
+                    continue;
+                }
+                let shares = 1 + (next() % held);
+                let Ok(sell_out) =
+                    math::collateral_out_for_shares(r_bought, r_other, shares, fee_bps)
+                else {
+                    continue;
+                };
+                let qs = math::calc_sell(r_bought, r_other, sell_out, fee_bps).unwrap();
+                match client.try_sell(&holders[i], &market_id, &outcome, &sell_out, &qs.shares_in) {
+                    Ok(Ok(_)) => {
+                        basis[i] -= qs.gross;
+                        if position_total(&client, market_id, &holders[i]) == 0 {
+                            // mirrors `add_basis`: an emptied position takes its
+                            // entry (and its positive part of the total) with it
+                            basis[i] = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                let amount = 1 + next() % (10 * 10_000_000);
+                let qb = math::calc_buy(r_bought, r_other, amount, fee_bps).unwrap();
+                match client.try_buy(&holders[i], &market_id, &outcome, &amount, &qb.shares_out) {
+                    Ok(Ok(_)) => basis[i] += qb.net,
+                    _ => {}
+                }
+            }
+            // The on-chain sidecar must agree with the model at every step.
+            assert_eq!(client.get_cost_basis(&market_id, &holders[i]), basis[i]);
+        }
+
+        let mut positive_total = TEST_SEED; // the creator's basis is the seed
+        for holder_basis in basis.iter() {
+            if *holder_basis > 0 {
+                positive_total += *holder_basis;
+            }
+        }
+        assert_eq!(client.get_basis_total(&market_id), positive_total);
+
+        let pot = client.get_market(&market_id).sets_minted;
+        client.void_market(&market_id);
+        let snapshot = client.get_void_snapshot(&market_id).unwrap();
+        assert_eq!(snapshot.pot, pot);
+        assert_eq!(snapshot.basis_total, positive_total);
+
+        let mut payouts = [0_i128; 5];
+        let mut paid = 0_i128;
+        for i in 0..5 {
+            if position_total(&client, market_id, &holders[i]) == 0 {
+                continue;
+            }
+            payouts[i] = client.redeem(&holders[i], &market_id);
+            assert!(payouts[i] >= 0 && payouts[i] <= basis[i].max(0));
+            paid += payouts[i];
+        }
+        let creator_payout = client.redeem(&creator, &market_id);
+        paid += creator_payout;
+        paid += client.claim_pool_remainder(&market_id);
+
+        // The invariant #21 exists to guarantee: holder refunds plus the LP
+        // residual never exceed the collateral the market actually holds.
+        assert!(paid <= pot, "void paid {paid} out of a pot of {pot}");
+        assert!(creator_payout <= TEST_SEED);
+    }
+
+    // ----- #22: event-driven early close ------------------------------------
+
+    /// 10 USDC, the size every #22 test trades.
+    const BUY_10: i128 = 10 * 10_000_000;
+
+    /// A market whose nominal close is `close_in` seconds away. `new_market`
+    /// fixes it at 60_000s, which is shorter than `MAX_BACKDATE_SECS`; the
+    /// backdating tests need a market that is still open days later.
+    fn new_market_long_close(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        close_in: u64,
+        salt: u8,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[salt; 32]),
+            &BytesN::from_array(env, &[salt.wrapping_add(100); 32]),
+            &String::from_str(env, "ipfs://early-close"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + close_in),
+            &TEST_SEED,
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn halt_trading_blocks_buys_after_effective_time() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+
+        // The event happens 500s in; the resolver finalises its early-close
+        // flow 500s after that, so the halt is recorded at now = start + 1_000
+        // with effective_at = start + 500.
+        env.ledger().set_timestamp(start + 1_000);
+        client.halt_trading(&market_id, &(start + 500));
+
+        assert_eq!(client.get_early_close(&market_id), Some(start + 500));
+        assert_eq!(client.get_effective_close(&market_id), start + 500);
+        // `close_time` is untouched: `Market`'s XDR is frozen, so the halt only
+        // lives in the sidecar and the nominal close stays reportable.
+        assert_eq!(client.get_market(&market_id).close_time, start + 60_000);
+        // A halt closes trading, it does not resolve anything.
+        assert_eq!(client.get_market(&market_id).status, MarketStatus::Open);
+
+        // Every later trade is refused even though `close_time` is 59_000s away.
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        assert_eq!(
+            client.try_sell(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        // `buy_v2` / `sell_v2` share `do_buy` / `do_sell`, so they inherit it.
+        assert_eq!(
+            client.try_buy_v2(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &BUY_10,
+                &0_i128,
+                &0u32,
+                &(start + 5_000u64)
+            ),
+            Err(Ok(Error::MarketClosed))
+        );
+    }
+
+    #[test]
+    fn halt_trading_rejects_future_or_after_close() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        // 40 days out, so a 7-day backdate is still comfortably before the close.
+        let close_in = 40 * 86_400;
+        let market_id = new_market_long_close(&env, &client, &creator, close_in, 31);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+        let now = start + 1_000;
+
+        // Never future-dated: a halt records a fact, it cannot schedule one.
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(now + 1)),
+            Err(Ok(Error::InvalidCloseTime))
+        );
+        // Cannot move the close later than itself: recorded after the nominal
+        // close has passed, `effective_at` still has to be at or before it.
+        let close_time = start + close_in;
+        env.ledger().set_timestamp(close_time + 10);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(close_time + 5)),
+            Err(Ok(Error::InvalidCloseTime))
+        );
+        // Backdating is bounded by MAX_BACKDATE_SECS.
+        env.ledger().set_timestamp(start + 10 * 86_400);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(start + 1)),
+            Err(Ok(Error::HaltTooOld))
+        );
+        // Exactly at the boundary is fine, and `effective_at == now` is too.
+        let at = env.ledger().timestamp() - MAX_BACKDATE_SECS;
+        client.halt_trading(&market_id, &at);
+        assert_eq!(client.get_effective_close(&market_id), at);
+        assert_eq!(
+            client.try_halt_trading(&market_id, &at),
+            Err(Ok(Error::AlreadyHalted))
+        );
+        // A halt is permanent: the effective close stays at the first one and
+        // `close_time` still dominates the nominal view.
+        assert_eq!(client.get_early_close(&market_id), Some(at));
+        assert_eq!(client.get_market(&market_id).close_time, close_time);
+    }
+
+    #[test]
+    fn resolve_allowed_after_early_close() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+
+        // Before the halt the original rule still bites.
+        assert_eq!(
+            client.try_resolve(&market_id, &Outcome::Yes),
+            Err(Ok(Error::NotClosedYet))
+        );
+
+        client.halt_trading(&market_id, &(start + 500));
+        // The halt is final the moment it is written (resolver-only, no lift),
+        // so resolution unlocks immediately.
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_eq!(
+            client.get_market(&market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+        // A resolved market has nothing left to halt. `finalize_early_close`
+        // racing a guardian void lands here too, which is why the resolver can
+        // treat a failed halt as harmless.
+        assert_eq!(
+            client.try_halt_trading(&market_id, &(start + 500)),
+            Err(Ok(Error::MarketNotOpen))
+        );
+    }
+
+    #[test]
+    fn void_market_still_works_after_a_halt() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        env.ledger().set_timestamp(start + 1_000);
+        client.halt_trading(&market_id, &(start + 500));
+
+        // Halting is not resolving: the market stays Open, so the resolver can
+        // still call it invalid afterwards.
+        client.void_market(&market_id);
+        assert_eq!(client.get_market(&market_id).status, MarketStatus::Void);
+        let pos = client.get_position(&market_id, &trader);
+        assert_eq!(client.redeem(&trader, &market_id), (pos.yes + pos.no) / 2);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_halt_trading() {
+        let (env, client, creator, trader, resolver, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let at = env.ledger().timestamp();
+        let attacker = Address::generate(&env);
+
+        // `halt_trading` authorises the *resolver address*, exactly like
+        // `resolve`, so no other key can produce the auth it needs — not the
+        // admin, not the creator, not a trader.
+        env.set_auths(&[]);
+        for signer in [
+            attacker.clone(),
+            trader.clone(),
+            creator.clone(),
+            resolver.clone(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (index, address) = signer;
+            let result = client
+                .mock_auths(&[MockAuth {
+                    address,
+                    invoke: &MockAuthInvoke {
+                        contract: &client.address,
+                        fn_name: "halt_trading",
+                        args: (market_id, at).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_halt_trading(&market_id, &at);
+            if index == 3 {
+                // The resolver key is the one path that must succeed.
+                assert_eq!(result, Ok(Ok(())));
+            } else {
+                assert!(result.is_err(), "non-resolver {index} could halt trading");
+                assert_eq!(client.get_early_close(&market_id), None);
+            }
+        }
+    }
+
+    #[test]
+    fn last_trade_at_updated() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let start = env.ledger().timestamp();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        // Seeding the pool is not a trade.
+        assert_eq!(client.get_last_trade_at(&market_id), 0);
+
+        env.ledger().set_timestamp(start + 10);
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 10);
+
+        env.ledger().set_timestamp(start + 20);
+        let held = client.get_position(&market_id, &trader).yes;
+        let (r_sold, r_other, fee_bps) = quote(&client, market_id, &Outcome::Yes);
+        let out = math::collateral_out_for_shares(r_sold, r_other, held / 2, fee_bps).unwrap();
+        let qs = math::calc_sell(r_sold, r_other, out, fee_bps).unwrap();
+        client.sell(&trader, &market_id, &Outcome::Yes, &out, &qs.shares_in);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+
+        // A rejected trade must not move it: the market is closed by then, and
+        // the write happens after every check that can fail.
+        env.ledger().set_timestamp(start + 30);
+        client.halt_trading(&market_id, &(start + 25));
+        // `env.events().all()` only reports the *last* invocation, so this is
+        // the halt's own event count: `TradingHalted` publishes the whole
+        // disclosure window — effective_at, halted_at, close_time, last_trade_at
+        // — in that single event, so an indexer never has to re-read the market.
+        assert_eq!(env.events().all().events().len(), 1);
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+        assert_eq!(
+            client.try_buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128),
+            Err(Ok(Error::MarketClosed))
+        );
+        assert_eq!(client.get_last_trade_at(&market_id), start + 20);
+    }
+
+    #[test]
+    fn unhalted_markets_never_touch_the_early_close_keys() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert!(!has_entry(&env, &client, DataKey::EarlyClose(market_id)));
+        assert_eq!(client.get_early_close(&market_id), None);
+        // The compatibility claim in one line: an un-halted market's effective
+        // close *is* its close_time, so `assert_tradable` and `resolve` compare
+        // against the same number they did before this change.
+        assert_eq!(
+            client.get_effective_close(&market_id),
+            client.get_market(&market_id).close_time
+        );
+        client.buy(&trader, &market_id, &Outcome::Yes, &BUY_10, &0_i128);
+        assert!(has_entry(&env, &client, DataKey::LastTrade(market_id)));
+        assert!(!has_entry(&env, &client, DataKey::EarlyClose(market_id)));
     }
 }
 

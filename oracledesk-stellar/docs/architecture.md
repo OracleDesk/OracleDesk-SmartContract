@@ -604,3 +604,134 @@ no admin.
   deployments (this repo's or a fork's) from trading against the same
   market-core markets; the treasury's caps bound one agent deployment's own
   risk, not systemic market behavior.
+
+## Void refund policies (#21)
+
+`void_market` has always refunded every share at half a set (`Settlement::Void`,
+floor division, so a void never overpays). That is the right default for a
+question that turns out to be unanswerable *before anything is known*, but it is
+the wrong number for a market voided after the event it described: a holder who
+bought Yes at 90 cents on the dollar and is paid 50 has lost 40 to a decision
+they had no part in. Markets may now choose which of the two they owe.
+
+- `VoidPolicy { HalfPerShare, CostBasis }`, stored per market under
+  `DataKey::VoidPolicy(u64)`. **Absent means `HalfPerShare`.** Every market
+  created before this change, and every caller of `create_market`, is
+  therefore bit-for-bit unchanged: no field was added to `Market` or `Position`,
+  and `create_market`'s signature is untouched. A creator that wants the other
+  policy calls `create_market_with_policy(...)`, which is the same entrypoint
+  plus a trailing policy argument. Adding an optional trailing argument to
+  `create_market` itself would have changed the XDR signature every consumer
+  (including the sha256-pinned `market_core.wasm` vendored in resolver and
+  treasury, and `packages/bindings`) decodes, so it is not what happened here.
+- **Cost basis is a sidecar, not a field.** `DataKey::CostBasis(u64, Address)`
+  holds one holder's signed net collateral flow into that market, and
+  `DataKey::BasisTotal(u64)` holds the sum of the *positive* bases. Both are
+  updated by the code paths that already move a position, and only when the
+  market's policy is `CostBasis` (otherwise `add_basis`/`clear_basis` return
+  immediately, so a `HalfPerShare` market never writes either key):
+
+  | Path | Basis delta |
+  | --- | --- |
+  | creator seed (`create_market`) | `+seed_amount` |
+  | `buy` / `buy_v2` | `+q.net` (collateral in, after fee) |
+  | `sell` / `sell_v2` | `-q.gross` (collateral out, before fee) |
+  | `transfer_position` | sliced from the sender, added to the receiver |
+  | `redeem` | entry removed (the position is gone) |
+
+  A **partial sell reduces basis by `q.gross`, not proportionally.** That is
+  what keeps the global identity exact, because the pool's `sets_minted` drops
+  by precisely the same `q.gross`. Consequence, and it looks wrong until you
+  meet it: a holder who takes out more than they paid in — selling creator seed
+  shares, or buying cheap and selling into a spike — carries a **negative**
+  basis, and a negative basis refunds **0** at void even though the holder still
+  holds shares. They kept their money out of the pool; the pool is not their
+  counterparty. `get_cost_basis(market_id, holder)` exposes the number so nobody
+  has to guess from a token balance.
+
+- **The formula** is pure (`math::cost_basis_refund`), so it is testable without
+  a chain:
+  `refund_h = floor(basis_h * pot / basis_total)` clamped to
+  `[0, basis_h]`, where `pot == m.sets_minted` at void time and `basis_total`
+  sums only positive bases. The LP then receives
+  `math::cost_basis_lp_residual(pot, basis_total) = pot − min(basis_total, pot)`.
+  Together these pay `min(basis_total, pot)` to holders plus the remainder to
+  the LP, exactly the pot: **`Σ holder payouts + LP residual ≤ sets_minted`**,
+  which is the property the randomized Rust test
+  (`cost_basis_void_solvent_under_random_sequences`) asserts over arbitrary
+  buy/sell/transfer sequences.
+- **Rounding and the dust bound.** Every holder payout floors, so no holder is
+  ever overpaid and the pot can never be overdrawn. The shortfall is strictly
+  less than one unit per holder with a positive basis — i.e. `< H` stroops for a
+  market with `H` such holders — and it stays in the pool as the LP residual
+  (it is included in `pot − min(basis_total, pot)`), not burned. A `pot` of 0
+  pays nobody; a `basis_total` of 0 pays the LP the whole pot.
+- **Order independence.** `void_market` freezes `VoidSnapshot { pot, basis_total }`
+  once and emits `CostBasisVoidSnapshotted`. Every later `redeem` and
+  `claim_pool_remainder` pays from that snapshot and never from live storage, so
+  the order in which holders redeem cannot change anyone's amount (tested:
+  A-B-C vs C-B-A). This matters because the *first* redemption of a void market
+  would otherwise alter `basis_total` for the second.
+- **Treasury note.** `reserve_capacity` and the treasury's own exposure
+  accounting are unaffected — the void pot is the market's collateral either
+  way. But a treasury `redeem` against a `CostBasis` market returns a different
+  amount than against a `HalfPerShare` one, and treasury's
+  `agent_create_market` keeps `HalfPerShare` (see `docs/STATUS.md`); switching
+  an agent's markets over is a deliberate later decision, not a side effect of
+  this change.
+
+## Early close and the late-trade window (#22)
+
+A "Will X happen by D?" market keeps trading until `D` even after `X` has
+happened. Anyone faster than the repricing crowd buys the now-known outcome at a
+stale price and the LP absorbs the difference; `resolve` could not help, because
+it required `now >= close_time`. Trading may now end at the event instead of at
+the deadline.
+
+- **Effective close.** `effective_close = min(close_time, early_close)`, where
+  `early_close` is `DataKey::EarlyClose(u64)` — an `Option<u64>` sidecar, absent
+  for every market that was never halted. `assert_tradable` (so `buy`/`sell` and
+  `buy_v2`/`sell_v2`), `resolve`, and the resolver's attestation gate all read
+  through it; `close_time` itself remains the *nominal* close, because `Market`
+  is frozen and consumers that decode it must keep seeing the same bytes.
+  `get_market` is unchanged; the real date is `get_effective_close`.
+- **Halting.** `halt_trading(market_id, effective_at)` is resolver-only (same
+  `require_resolver` as `resolve`/`void_market`), requires the market to be
+  `Open`, allows exactly one halt per market, and accepts only
+  `close_time >= effective_at >= now − MAX_BACKDATE_SECS`. A halt records a fact,
+  so it can neither schedule a future close (`effective_at > now`) nor push one
+  later. `MAX_BACKDATE_SECS` is 7 days — the same window `SIGNER_GRACE_SECS`
+  already grants late signers before the guardian may void an unresponsive
+  market, so a halt cannot reach back further than the period in which late
+  trading is already tolerated. Anything older would be un-attestable anyway.
+- **The agreed policy for trades in `[effective_at, halted_at)` is *accept and
+  disclose*.** They happened, they settled, and reverting them would mean
+  clawing back transfers that other parties already relied on, which #22 lists
+  as a non-goal. `TradingHalted` therefore publishes the whole window in one
+  event — `effective_at`, `halted_at`, `close_time`, `last_trade_at` — so the
+  backend can flag and reprice exactly the trades that landed at a price the
+  event says is stale. `DataKey::LastTrade(u64)` is written by `do_buy`/`do_sell`
+  after every check that can fail, so `last_trade_at` is anchored to an accepted
+  on-chain trade rather than to an indexer's opinion. The rejected alternative —
+  *void-if-late*, voiding the market when `last_trade_at > effective_at + grace`
+  — is the reason `LateTradePolicy::VoidIfLate` exists and is registerable today:
+  a creator may commit to it, and nothing acts on it yet. See
+  `docs/adr/0001-resolution-commitment.md` for why, and for the threat model.
+- **Who may halt, and how far.** The resolver, not the creator and not the
+  fastest caller: `register_signer_early_close_spec` (a commitment that includes
+  the early-close authority), `propose_early_close` votes from the market's
+  existing signer group, `early_close_threshold` agreement opens an
+  `EarlyCloseProposed` dispute window during which the guardian may
+  `cancel_early_close` (clearing the proposal *and* the votes), and
+  `finalize_early_close` — permissionless, like `finalize_signers` — asks
+  market-core to halt. Freezing a market is never easier than resolving it:
+  `early_close_threshold >= SignerConfig.threshold` is validated at registration.
+- **Adoption limit, stated rather than hidden.** `finalize_early_close` calls
+  `halt_trading` by name through `env.try_invoke_contract`, because the
+  `market_core.wasm` vendored in `contracts/resolver/` is pinned by sha256 and
+  predates the method, so it is absent from the generated client's spec. Against
+  that blob `finalize_early_close` returns `HaltRejected` and writes nothing,
+  leaving the proposal cancellable; against a core that has the export the same
+  code works unchanged. Re-rendering the pinned blob (and `create_market` in
+  `packages/bindings`) is a `make build` step for someone with a working
+  stellar-cli, not something this change can fake by editing a binary.

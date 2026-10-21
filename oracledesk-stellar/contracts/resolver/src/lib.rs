@@ -4,8 +4,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, vec, xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 // market-core is imported from its compiled wasm rather than as a normal
@@ -278,12 +278,100 @@ pub fn spec_v2_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
     env.crypto().sha256(&preimage).into()
 }
 
+/// Domain tag of the issue #22 commitment, whose preimage is
+/// `sha256(EARLY_CLOSE_SPEC_DOMAIN || XDR(SignerConfig) || XDR(EarlyCloseSignerSpec))`.
+///
+/// A *third*, disjoint hash space, for the same reason ADR 0004's V2 space is
+/// disjoint from the legacy one: every legacy preimage is the XDR of an `ScVal`
+/// and therefore starts `00 00 00 10` (`ScValType::Vec`), while this tag starts
+/// with ASCII `o`; and it differs from `SPEC_DOMAIN` inside the first 13 bytes,
+/// so no preimage can be valid under both tags. `register_signer_spec` and
+/// `legacy_spec_hash` are untouched, so every existing spec hash — and every
+/// existing golden vector — holds by construction.
+pub const EARLY_CLOSE_SPEC_DOMAIN: &str = "oracledesk:early-close-spec";
+
+/// How far back an early close may claim the event happened. The same seven days
+/// market-core allows `halt_trading` to backdate (`market_core::MAX_BACKDATE_SECS`,
+/// equal to `SIGNER_GRACE_SECS`), so a proposal that passes the checks here is
+/// never rejected by market-core for staleness.
+pub const MAX_BACKDATE_SECS: u64 = SIGNER_GRACE_SECS;
+
+/// Commitment hash of a signer market that also grants early-close powers
+/// (issue #22). `signers` is the *frozen* `oracledesk_types::SignerConfig` the
+/// market already commits to for outcome resolution; `early_close` is the
+/// resolver-local companion struct. Hashing them together is what makes the
+/// grant impossible to spring on traders after the fact.
+pub fn signer_with_early_close_hash(
+    env: &Env,
+    signers: &SignerConfig,
+    early_close: &EarlyCloseSignerSpec,
+) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, EARLY_CLOSE_SPEC_DOMAIN.as_bytes());
+    preimage.append(&signers.clone().to_xdr(env));
+    preimage.append(&early_close.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
 /// A proposed admin handover (#62). Absent when no transfer is pending.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAdmin {
     pub address: Address,
     pub expires_at: u64,
+}
+
+/// What happens to trades that land between the moment the underlying event
+/// occurred and the moment the halt reaches the chain (issue #22). Part of the
+/// market's commitment, so traders know it before they trade.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LateTradePolicy {
+    /// The chosen default. Late trades stand — they cannot be reverted without
+    /// clawing back settled transfers, which #22 lists as a non-goal — and
+    /// market-core's `TradingHalted` publishes `[effective_at, halted_at)` plus
+    /// the market's `last_trade_at` so the backend can flag and reprice them.
+    AcceptAndDisclose,
+    /// Reserved for a follow-up: the resolver voids instead of resolving when
+    /// `last_trade_at > event_time + grace`. Registering a market under it is
+    /// accepted (the commitment is honest), but nothing acts on it yet, so a
+    /// creator who wants enforcement today must use `AcceptAndDisclose`.
+    VoidIfLate,
+}
+
+/// The early-close half of an issue #22 commitment.
+///
+/// **Local to this crate on purpose.** The obvious home is a new
+/// `ResolutionSpec::SignersWithEarlyClose` variant in `oracledesk-types`, but
+/// that crate is the XDR-consensus surface shared by every consumer and is
+/// frozen against us here (it is also the crate that fails `cargo +stable check`
+/// with 21 pre-existing errors at this tip). So the config lives next to its
+/// only consumer, with its own domain tag, exactly the pattern PR #171 proved:
+/// legacy `Price`/`Signers` preimages stay byte-identical, and the canonical
+/// append into `ResolutionSpec`/`SignerConfig` is named as a maintainer
+/// follow-up in the PR.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EarlyCloseSignerSpec {
+    /// Votes from the market's existing signer group needed to *propose* a halt.
+    /// Must be `>= SignerConfig.threshold` (anti-grief: freezing a market cannot
+    /// be easier than resolving one) and `<= signers.len()`.
+    pub early_close_threshold: u32,
+    /// How long `EarlyCloseProposed` stays cancellable by the guardian before
+    /// `finalize_early_close` becomes permissionless. Separate from
+    /// `SignerConfig.dispute_window` because a halt is only a freeze — it never
+    /// decides the outcome — so a shorter window is acceptable.
+    pub early_close_window: u64,
+    pub late_trade_policy: LateTradePolicy,
+}
+
+/// A pending early close, written when `early_close_threshold` votes agree.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EarlyCloseProposal {
+    /// The instant the signers claim the underlying event happened; becomes
+    /// market-core's `effective_at` verbatim.
+    pub event_time: u64,
+    pub proposed_at: u64,
 }
 
 #[contracterror]
@@ -335,6 +423,24 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    /// #22: the `event_time` a signer proposed cannot be used — it is in the
+    /// future, older than `MAX_BACKDATE_SECS`, or disagrees with the event time
+    /// already under vote. Votes must agree exactly (see `propose_early_close`).
+    EventTimeMismatch = 44,
+    /// #22: an early close is already proposed (inside its dispute window) or
+    /// already applied for this market; there is nothing left to propose or
+    /// finalise.
+    AlreadyEarlyClosed = 45,
+    /// #22: market-core rejected `halt_trading` (or could not be reached). The
+    /// proposal survives so the guardian can investigate or cancel.
+    HaltRejected = 46,
+    /// #22: `propose_early_close` at or after the market's effective close, or
+    /// on a market that is no longer open: halting then changes nothing.
+    EarlyCloseTooLate = 47,
+    /// A market-core call failed in the #22 paths. Kept separate from
+    /// `MarketNotConfigured` (which means "this resolver has no rule for the
+    /// market") so an unreadable core is never reported as a missing rule.
+    CoreUnavailable = 48,
 }
 
 #[contracttype]
@@ -382,6 +488,32 @@ pub enum DataKey {
     CountV2(u64, AttestedOutcome),
     ProposalV2(u64),
     Snapshot(u64),
+    // ----- #22 event-driven early close -------------------------------------
+    // Append-only, like every other `DataKey` here: the discriminants are
+    // positional in XDR, so nothing above may move or renumber. All six are
+    // absent for markets that never committed to early close, which is what
+    // keeps the legacy paths byte-identical.
+    /// The market's [`EarlyCloseSignerSpec`], written only by
+    /// `register_signer_early_close_spec` next to a normal `Signers` rule.
+    /// Absent = the market has no early-close powers (`WrongMode`).
+    EarlyCloseSpec(u64),
+    /// The `event_time` currently under vote, written with the first vote so
+    /// later votes can be required to match it exactly. Cleared with the
+    /// proposal.
+    EarlyCloseEvent(u64),
+    /// One entry per proposing signer, valued with the `event_time` they voted
+    /// for: deduplication and agreement in a single read.
+    EarlyCloseVote(u64, Address),
+    /// Votes cast for the current early-close round.
+    EarlyCloseCount(u64),
+    /// [`EarlyCloseProposal`] once `early_close_threshold` votes agree.
+    EarlyCloseProposal(u64),
+    /// The `event_time` that was actually applied to market-core. This is the
+    /// resolver's own record of the halt, which is what `attest` gates on:
+    /// reading the effective close back from market-core would need a new
+    /// market-core view, and the vendored `market_core.wasm` pinned here predates
+    /// one (it also predates `halt_trading` itself — see `finalize_early_close`).
+    EarlyCloseApplied(u64),
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -621,6 +753,58 @@ pub struct AdminTransferred {
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferCancelled {}
+
+// ----- #22 event-driven early close: appended after every event above -------
+
+/// Emitted once per market by `register_signer_early_close_spec`, recording on
+/// the event log which early-close authority the commitment actually granted —
+/// the disclosure half of the issue's "cannot spring it on traders" rule.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarlyCloseSpecRegistered {
+    #[topic]
+    pub market_id: u64,
+    pub early_close_threshold: u32,
+    pub early_close_window: u64,
+    pub late_trade_policy: LateTradePolicy,
+}
+
+/// `early_close_threshold` signers agreed on `event_time`; the halt can now be
+/// cancelled by the guardian until `proposed_at + early_close_window`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarlyCloseProposed {
+    #[topic]
+    pub market_id: u64,
+    pub event_time: u64,
+    pub proposed_at: u64,
+    pub votes: u32,
+}
+
+/// The guardian blocked a proposal inside its window. Votes are cleared with it,
+/// so a fresh quorum is needed to try again (unlike `cancel_proposal`, which
+/// leaves the outcome counters in place).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarlyCloseCancelled {
+    #[topic]
+    pub market_id: u64,
+    pub event_time: u64,
+    pub cancelled_at: u64,
+}
+
+/// The halt reached market-core. `effective_at` is what `assert_tradable` and
+/// `resolve` now use; the disclosure of trades in `[effective_at, halted_at)`
+/// is market-core's `TradingHalted`, which is published in the same call.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarlyCloseFinalized {
+    #[topic]
+    pub market_id: u64,
+    pub effective_at: u64,
+    pub halted_at: u64,
+    pub late_trade_policy: LateTradePolicy,
+}
 
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
@@ -1543,6 +1727,281 @@ impl Resolver {
         Ok(proposal.outcome)
     }
 
+    // ----- #22: event-driven early close ------------------------------------
+
+    /// Reveals the *two-part* commitment of a signer market that also grants
+    /// early-close powers (issue #22).
+    ///
+    /// `resolution_hash` must be `signer_with_early_close_hash(signers,
+    /// early_close)`, so the creator fixed the halt authority before anybody
+    /// traded and no later call can add it. The outcome-resolution half is
+    /// stored through the ordinary `Signers` path, which means `attest`,
+    /// `finalize_signers`, `dispute`, `expire_market` and the committee modes
+    /// behave exactly as they do today; only `propose_early_close` and friends
+    /// read the extra entry.
+    ///
+    /// A market committed to the plain `Signers` hash cannot register here (and
+    /// vice versa): each entrypoint checks its own commitment, so the two
+    /// authorities are not interchangeable after the fact.
+    pub fn register_signer_early_close_spec(
+        env: Env,
+        market_id: u64,
+        spec: SignerConfig,
+        early_close: EarlyCloseSignerSpec,
+    ) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        Self::validate_rule(&ResolutionSpec::Signers(spec.clone()))?;
+        Self::validate_early_close_spec(&spec, &early_close)?;
+        let commitment = signer_with_early_close_hash(&env, &spec, &early_close);
+        // The same check `assert_matches_commitment` performs, but reached
+        // through `Self::core_market`. The shared helper runs on `core_call`,
+        // which this file calls 21 times without defining it (it lives in
+        // `contracts/treasury/src/lib.rs` — a pre-existing breakage of
+        // `cargo check -p resolver` that this PR discloses rather than repairs).
+        // Issue #22's paths stay self-contained so they stand on their own.
+        let market = Self::core_market(&env, market_id)?;
+        if commitment != market.resolution_hash {
+            return Err(Error::SpecHashMismatch);
+        }
+        Self::store_rule(&env, market_id, &ResolutionSpec::Signers(spec));
+        Self::persist(&env, &DataKey::EarlyCloseSpec(market_id), &early_close);
+        EarlyCloseSpecRegistered {
+            market_id,
+            early_close_threshold: early_close.early_close_threshold,
+            early_close_window: early_close.early_close_window,
+            late_trade_policy: early_close.late_trade_policy,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// One signer's vote that the underlying event already happened, at
+    /// `event_time` (issue #22).
+    ///
+    /// The event time is an evidentiary claim, so votes must agree *exactly*
+    /// with the first one cast (the issue asks for "match or take the maximum";
+    /// matching is what is auditable — a maximum would let a single late voter
+    /// silently move refunds, and a signer who believes a different instant is
+    /// the true one should attest `Invalid` on the outcome instead). One vote
+    /// per signer, `event_time` within `[now - MAX_BACKDATE_SECS, now]`, and the
+    /// market must still have a live trading window to shorten.
+    ///
+    /// Reaching `early_close_threshold` writes the proposal and starts the
+    /// guardian's chance to object; it does **not** halt anything yet.
+    pub fn propose_early_close(
+        env: Env,
+        market_id: u64,
+        signer: Address,
+        event_time: u64,
+    ) -> Result<(), Error> {
+        signer.require_auth();
+        let spec = Self::load_early_close_spec(&env, market_id)?;
+        let cfg: SignerConfig = Self::load(&env, DataKey::Signers(market_id))?;
+        if !Self::contains(&cfg.signers, &signer) {
+            return Err(Error::NotSigner);
+        }
+
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::EarlyCloseApplied(market_id))
+            || Self::load_early_close_proposal(&env, market_id).is_some()
+        {
+            return Err(Error::AlreadyEarlyClosed);
+        }
+        if storage.has(&DataKey::EarlyCloseVote(market_id, signer.clone())) {
+            // Reuses the outcome path's code: one signature per signer per
+            // round, for the same reason.
+            return Err(Error::AlreadyAttested);
+        }
+
+        let market = Self::core_market(&env, market_id)?;
+        let now = env.ledger().timestamp();
+        // Either the nominal close has passed (nothing left to shorten) or the
+        // market is no longer open; both are "too late", and a halt against a
+        // resolved/void market would be rejected by market-core anyway.
+        if now >= Self::effective_close(&env, market_id, market.close_time)
+            || market.status != market_core::MarketStatus::Open
+        {
+            return Err(Error::EarlyCloseTooLate);
+        }
+        if !Self::event_time_is_usable(now, event_time) {
+            return Err(Error::EventTimeMismatch);
+        }
+
+        let event_key = DataKey::EarlyCloseEvent(market_id);
+        if let Some(under_vote) = storage.get::<_, u64>(&event_key) {
+            if under_vote != event_time {
+                return Err(Error::EventTimeMismatch);
+            }
+        } else {
+            Self::persist(&env, &event_key, &event_time);
+        }
+        Self::persist(
+            &env,
+            &DataKey::EarlyCloseVote(market_id, signer),
+            &event_time,
+        );
+        let count_key = DataKey::EarlyCloseCount(market_id);
+        let votes: u32 = storage.get(&count_key).unwrap_or(0) + 1;
+        Self::persist(&env, &count_key, &votes);
+
+        if votes >= spec.early_close_threshold {
+            let proposal = EarlyCloseProposal {
+                event_time,
+                proposed_at: now,
+            };
+            Self::persist(&env, &DataKey::EarlyCloseProposal(market_id), &proposal);
+            EarlyCloseProposed {
+                market_id,
+                event_time,
+                proposed_at: now,
+                votes,
+            }
+            .publish(&env);
+        }
+        Ok(())
+    }
+
+    /// Settles an early-close proposal once its dispute window elapsed and asks
+    /// market-core to record the halt (issue #22). Permissionless, like
+    /// `finalize_signers`: the votes, not the caller, carry the authority.
+    ///
+    /// `halt_trading` is dispatched **by name** through
+    /// `env.try_invoke_contract`, not through the generated `MarketCoreClient`.
+    /// The client is built from the `market_core.wasm` vendored in this crate
+    /// and pinned by sha256, and that blob predates `halt_trading`, so the
+    /// method simply does not exist in its spec. A dynamic call needs no
+    /// compile-time interface, which means the resolution works unchanged
+    /// against a deployed core once somebody with stellar-cli 27.1.0 refreshes
+    /// the blob — and against today's blob it fails loudly
+    /// (`HaltRejected`, leaving the proposal intact for the guardian) instead of
+    /// silently no-op-ing a halt the market never received.
+    pub fn finalize_early_close(env: Env, market_id: u64) -> Result<u64, Error> {
+        let spec = Self::load_early_close_spec(&env, market_id)?;
+        let proposal = Self::load_early_close_proposal(&env, market_id).ok_or(Error::NoProposal)?;
+        if env.ledger().timestamp() < proposal.proposed_at.saturating_add(spec.early_close_window) {
+            return Err(Error::DisputeWindowOpen);
+        }
+        if Self::load_early_close_applied(&env, market_id).is_some() {
+            return Err(Error::AlreadyEarlyClosed);
+        }
+
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        Self::call_halt_trading(&env, &market_core, market_id, proposal.event_time)?;
+
+        // Applied. Remember the instant locally (this is what `attest` now gates
+        // on) and clear the round so nothing can be re-finalised or re-cancelled.
+        let storage = env.storage().persistent();
+        Self::persist(
+            &env,
+            &DataKey::EarlyCloseApplied(market_id),
+            &proposal.event_time,
+        );
+        storage.remove(&DataKey::EarlyCloseProposal(market_id));
+        storage.remove(&DataKey::EarlyCloseEvent(market_id));
+        storage.remove(&DataKey::EarlyCloseCount(market_id));
+        let cfg: SignerConfig = Self::load(&env, DataKey::Signers(market_id))?;
+        for signer in cfg.signers.iter() {
+            storage.remove(&DataKey::EarlyCloseVote(market_id, signer));
+        }
+        EarlyCloseFinalized {
+            market_id,
+            effective_at: proposal.event_time,
+            halted_at: env.ledger().timestamp(),
+            late_trade_policy: spec.late_trade_policy,
+        }
+        .publish(&env);
+        Ok(proposal.event_time)
+    }
+
+    /// The guardian blocks a pending early close while its dispute window is
+    /// still open (issue #22), which is the anti-grief valve: the worst a
+    /// captured signer majority can do is freeze trading, and that freeze is
+    /// visible and cancellable before it lands.
+    ///
+    /// Unlike `cancel_proposal` this clears the *votes* as well as the proposal
+    /// (the issue requires it: a stale set of votes for a rejected event time
+    /// must not count towards the next round), and it deliberately does **not**
+    /// consume `MAX_CANCELS_PER_MARKET`: that budget bounds churn of an outcome
+    /// proposal, whereas a guardian refusing a halt cannot strand a market —
+    /// trading simply continues to `close_time`, and resolution is untouched.
+    pub fn cancel_early_close(
+        env: Env,
+        market_id: u64,
+        reason: GuardianReason,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        // Same authority as `cancel_proposal`: "a proposal is pending and its
+        // window is open". No new variant, so no existing consumer changes.
+        if reason != GuardianReason::DisputeUpheld {
+            return Err(Error::GuardianNotAllowed);
+        }
+        let spec = Self::load_early_close_spec(&env, market_id)?;
+        let proposal = Self::load_early_close_proposal(&env, market_id).ok_or(Error::NoProposal)?;
+        if env.ledger().timestamp() >= proposal.proposed_at.saturating_add(spec.early_close_window)
+        {
+            return Err(Error::DisputeWindowClosed);
+        }
+
+        let storage = env.storage().persistent();
+        storage.remove(&DataKey::EarlyCloseProposal(market_id));
+        storage.remove(&DataKey::EarlyCloseEvent(market_id));
+        storage.remove(&DataKey::EarlyCloseCount(market_id));
+        let cfg: SignerConfig = Self::load(&env, DataKey::Signers(market_id))?;
+        for signer in cfg.signers.iter() {
+            storage.remove(&DataKey::EarlyCloseVote(market_id, signer));
+        }
+        GuardianAction {
+            market_id,
+            action: GuardianActionKind::CancelProposal,
+            reason,
+            at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        EarlyCloseCancelled {
+            market_id,
+            event_time: proposal.event_time,
+            cancelled_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// The market's early-close authority, `None` when it committed to plain
+    /// `Signers` (or another mode): then every #22 entrypoint is closed to it.
+    pub fn get_early_close_spec(env: Env, market_id: u64) -> Option<EarlyCloseSignerSpec> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EarlyCloseSpec(market_id))
+    }
+
+    /// The pending early close, if any.
+    pub fn get_early_close_proposal(env: Env, market_id: u64) -> Option<EarlyCloseProposal> {
+        Self::load_early_close_proposal(&env, market_id)
+    }
+
+    /// Votes cast in the current early-close round.
+    pub fn get_early_close_votes(env: Env, market_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EarlyCloseCount(market_id))
+            .unwrap_or(0)
+    }
+
+    /// The `event_time` that was actually applied to market-core, `None` until
+    /// `finalize_early_close` succeeds.
+    pub fn get_applied_early_close(env: Env, market_id: u64) -> Option<u64> {
+        Self::load_early_close_applied(&env, market_id)
+    }
+
+    /// When this market's trading really ends, as the resolver sees it (issue
+    /// #22): `min(close_time, applied halt)`. Reads the nominal close through
+    /// the same generated `get_market` call the attestation path already uses,
+    /// so it works against the pinned blob.
+    pub fn get_effective_close(env: Env, market_id: u64) -> Result<u64, Error> {
+        let market = Self::core_market(&env, market_id)?;
+        Ok(Self::effective_close(&env, market_id, market.close_time))
+    }
+
     /// Challenges the current proposal of a `SignersDisputable` market while
     /// its dispute window is still open (strictly before `proposed_at +
     /// dispute_window`, the instant `finalize_signers` becomes callable). The
@@ -1911,6 +2370,143 @@ impl Resolver {
             proposed_at: proposal.proposed_at,
         }
         .publish(env);
+    }
+
+    // ----- #22 event-driven early close: private helpers --------------------
+
+    /// The market record, read through the generated client. Issue #22 needs
+    /// the nominal close and the status; the *effective* close is deliberately
+    /// not read back from market-core, because the `market_core.wasm` vendored
+    /// here predates `get_effective_close` — see `DataKey::EarlyCloseApplied`.
+    fn core_market(env: &Env, market_id: u64) -> Result<market_core::Market, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        match MarketCoreClient::new(env, &market_core).try_get_market(&market_id) {
+            Ok(Ok(market)) => Ok(market),
+            // Unknown market or unreadable core: either way the caller cannot
+            // proceed. Kept distinct from `MarketNotConfigured`, which means
+            // "this resolver holds no rule for the market".
+            _ => Err(Error::CoreUnavailable),
+        }
+    }
+
+    fn load_early_close_spec(env: &Env, market_id: u64) -> Result<EarlyCloseSignerSpec, Error> {
+        let storage = env.storage().persistent();
+        let key = DataKey::EarlyCloseSpec(market_id);
+        // `WrongMode` is the code every other "this market's authority is a
+        // different kind" path already returns (`record_attestation` uses it for
+        // weighted and hybrid markets) and is what issue #22 names for "no
+        // committed early-close variant".
+        let spec: EarlyCloseSignerSpec = storage.get(&key).ok_or(Error::WrongMode)?;
+        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(spec)
+    }
+
+    fn load_early_close_proposal(env: &Env, market_id: u64) -> Option<EarlyCloseProposal> {
+        let storage = env.storage().persistent();
+        let key = DataKey::EarlyCloseProposal(market_id);
+        let proposal: Option<EarlyCloseProposal> = storage.get(&key);
+        if proposal.is_some() {
+            storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        proposal
+    }
+
+    fn load_early_close_applied(env: &Env, market_id: u64) -> Option<u64> {
+        let storage = env.storage().persistent();
+        let key = DataKey::EarlyCloseApplied(market_id);
+        let applied: Option<u64> = storage.get(&key);
+        if applied.is_some() {
+            storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        applied
+    }
+
+    /// The effective-close rule as a pure function, so it is testable on a host
+    /// that cannot accept a halt (see [`Self::attestation_gate`]).
+    fn effective_close_of(nominal_close: u64, applied: Option<u64>) -> u64 {
+        match applied {
+            // Clamped: a halt may only move the close earlier, so a corrupt or
+            // later value can never extend a market's life.
+            Some(at) if at < nominal_close => at,
+            _ => nominal_close,
+        }
+    }
+
+    fn effective_close(env: &Env, market_id: u64, nominal_close: u64) -> u64 {
+        let applied = Self::load_early_close_applied(env, market_id);
+        Self::effective_close_of(nominal_close, applied)
+    }
+
+    /// `attest`'s timing gate (issue #22): the market must be past its
+    /// **effective** close, so an applied early halt unlocks attestation while
+    /// the nominal `close_time` is still in the future. With no halt recorded
+    /// locally this is the pre-#22 comparison `now < market.close_time`,
+    /// unchanged — including its boundary.
+    ///
+    /// Note the evidence check further down `record_attestation` still compares
+    /// `trace.published_at` to the *nominal* close. Leaving it is deliberate:
+    /// `EvidenceTooEarly` guards against reasoning written before the market was
+    /// due, and tightening it to an early close would reject traces that are
+    /// perfectly good evidence for the halt. Widening it is a follow-up.
+    fn attestation_gate(now: u64, nominal_close: u64, applied: Option<u64>) -> Result<(), Error> {
+        if now < Self::effective_close_of(nominal_close, applied) {
+            Err(Error::MarketNotClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The window an `event_time` claim may land in: `[now - MAX_BACKDATE_SECS,
+    /// now]`. The upper bound is what makes the claim a *record* of something
+    /// that already happened rather than a schedule (market-core enforces the
+    /// same shape on `halt_trading`'s `effective_at`, so a vote accepted here
+    /// is never rejected there for being in the future); the lower bound is
+    /// `MAX_BACKDATE_SECS`, so a halt cannot reach back further than the seven
+    /// days the signer grace period already tolerates late trading. Pure, so
+    /// the boundary is testable without a live market-core.
+    fn event_time_is_usable(now: u64, event_time: u64) -> bool {
+        event_time <= now && event_time >= now.saturating_sub(MAX_BACKDATE_SECS)
+    }
+
+    /// `early_close_threshold` may make freezing a market harder than resolving
+    /// it, never easier (issue #22 §7): the set that can halt trading must be at
+    /// least as large as the set that can propose an outcome, and it must exist.
+    fn validate_early_close_spec(
+        cfg: &SignerConfig,
+        spec: &EarlyCloseSignerSpec,
+    ) -> Result<(), Error> {
+        if spec.early_close_threshold == 0
+            || spec.early_close_threshold < cfg.threshold
+            || spec.early_close_threshold > cfg.signers.len()
+            || spec.early_close_window == 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    /// Dynamic `market_core::halt_trading(market_id, effective_at)`; see
+    /// [`Self::finalize_early_close`] for why the generated client cannot be
+    /// used. Same name-dispatch pattern as `treasury::core_trade`.
+    fn call_halt_trading(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        effective_at: u64,
+    ) -> Result<(), Error> {
+        let args: Vec<Val> = vec![env, market_id.into_val(env), effective_at.into_val(env)];
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(
+            market_core,
+            &Symbol::new(env, "halt_trading"),
+            args,
+        ) {
+            Ok(Ok(_)) => Ok(()),
+            // Covers "this core has no halt_trading export" (the pinned blob),
+            // "the market is not open" and "a halt is already applied". The
+            // proposal survives so the guardian can cancel or a signer can
+            // retry once the market's state is understood.
+            _ => Err(Error::HaltRejected),
+        }
     }
 
     fn signer_authority(env: &Env, market_id: u64) -> Result<SignerAuthority, Error> {
@@ -2398,9 +2994,19 @@ impl Resolver {
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
-        if env.ledger().timestamp() < market.close_time {
-            return Err(Error::MarketNotClosed);
-        }
+        //
+        // Issue #22: the gate is the market's *effective* close, so signers can
+        // attest as soon as an early halt has ended trading instead of waiting
+        // out the nominal `close_time`. The halt is read from this contract's
+        // own record of applying it (`DataKey::EarlyCloseApplied`), never from
+        // market-core: the vendored blob has no `early_close` field to decode
+        // and no `get_effective_close` to call. With no halt applied the
+        // comparison is `now < market.close_time`, exactly as before.
+        Self::attestation_gate(
+            env.ledger().timestamp(),
+            market.close_time,
+            Self::load_early_close_applied(env, market_id),
+        )?;
 
         if let Some(trace_id) = evidence {
             if policy == EvidencePolicy::Disabled {
@@ -5086,5 +5692,577 @@ mod golden {
         let a = DeclaredAlphabetically { alpha: 1, beta: 2 }.to_xdr(&env);
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
+    }
+
+    // ----- #22: event-driven early close, resolver side ---------------------
+    //
+    // The halt itself is market-core's (`halt_trading`, covered in
+    // `contracts/market-core/src/lib.rs`). This section covers the resolver
+    // half: the commitment that grants the power, the signer quorum that
+    // exercises it, the guardian's window, and what every other resolver
+    // entrypoint does once a halt is on the record.
+    //
+    // One host limit shapes two of them and is worth stating plainly rather
+    // than designing around: the `market_core.wasm` vendored next to this crate
+    // predates `halt_trading` and is pinned by sha256, so `finalize_early_close`
+    // cannot succeed against it here. Where a test needs the state *after* a
+    // halt, it performs the same `DataKey::EarlyCloseApplied` write
+    // `finalize_early_close` performs after the core call, instead of pretending
+    // the pinned blob can accept one. `finalize_early_close`'s `HaltRejected`
+    // path is tested directly, because "fails loudly until the blob is
+    // refreshed" is itself the behaviour being claimed.
+
+    const EC_WINDOW: u64 = 50;
+
+    fn early_close_cfg(threshold: u32) -> EarlyCloseSignerSpec {
+        EarlyCloseSignerSpec {
+            early_close_threshold: threshold,
+            early_close_window: EC_WINDOW,
+            late_trade_policy: LateTradePolicy::AcceptAndDisclose,
+        }
+    }
+
+    /// A market committing to the #22 preimage: signer group *and* early-close
+    /// authority together, hashed under the resolver's own domain tag.
+    fn early_close_fixture(early: &EarlyCloseSignerSpec) -> Fixture {
+        let early = *early;
+        fixture_with(
+            |env, _reflector, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)),
+            move |env, rule, _core| {
+                let ResolutionSpec::Signers(cfg) = rule else {
+                    unreachable!()
+                };
+                signer_with_early_close_hash(env, cfg, &early)
+            },
+        )
+    }
+
+    /// [`early_close_fixture`] with the rule already revealed, which is what
+    /// every later entrypoint requires.
+    fn registered_early_close_fixture(early: &EarlyCloseSignerSpec) -> Fixture {
+        let f = early_close_fixture(early);
+        let ResolutionSpec::Signers(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver
+            .register_signer_early_close_spec(&f.market_id, &cfg, early);
+        f
+    }
+
+    /// `early_close_threshold` votes agreeing on `event_time`, at `now`.
+    fn reach_early_close_quorum(f: &Fixture, now: u64, event_time: u64) {
+        f.env.ledger().set_timestamp(now);
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_a, &event_time);
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_b, &event_time);
+    }
+
+    #[test]
+    fn early_close_commitment_is_a_third_disjoint_hash_space() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let cfg = signer_spec(&env, &a, &b);
+        let early = early_close_cfg(2);
+
+        let legacy = legacy_spec_hash(&env, &ResolutionSpec::Signers(cfg.clone()));
+        let ec = signer_with_early_close_hash(&env, &cfg, &early);
+        // The grant is never the hash a plain `Signers` market already holds, so
+        // no existing market can be reinterpreted as early-closable, and no
+        // existing spec-hash golden moves.
+        assert_ne!(legacy, ec);
+        assert_eq!(ec, signer_with_early_close_hash(&env, &cfg, &early));
+
+        // Every disclosed field is part of the commitment: none of them can be
+        // swapped after traders have relied on the hash.
+        assert_ne!(
+            ec,
+            signer_with_early_close_hash(&env, &cfg, &early_close_cfg(3))
+        );
+        let mut void_late = early;
+        void_late.late_trade_policy = LateTradePolicy::VoidIfLate;
+        assert_ne!(ec, signer_with_early_close_hash(&env, &cfg, &void_late));
+        let mut shorter = early;
+        shorter.early_close_window = EC_WINDOW - 1;
+        assert_ne!(ec, signer_with_early_close_hash(&env, &cfg, &shorter));
+    }
+
+    #[test]
+    fn early_close_and_plain_signers_commitments_are_not_interchangeable() {
+        // A market that committed to plain `Signers` cannot acquire the power.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        let ResolutionSpec::Signers(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_signer_early_close_spec(
+                &f.market_id,
+                &cfg,
+                &early_close_cfg(2)
+            ),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+
+        // And a market that committed to the #22 preimage is not revealed by the
+        // legacy entrypoint: the two authorities are chosen before creation, not
+        // negotiated afterwards.
+        let g = early_close_fixture(&early_close_cfg(2));
+        let ResolutionSpec::Signers(gcfg) = g.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            g.resolver.try_register_signer_spec(&g.market_id, &gcfg),
+            Err(Ok(Error::SpecHashMismatch))
+        );
+    }
+
+    #[test]
+    fn register_early_close_records_the_authority_it_grants() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        assert_eq!(f.resolver.get_early_close_spec(&f.market_id), Some(early));
+
+        // The disclosure half of "cannot spring it on traders": the grant is on
+        // the event log, not only in storage.
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [soroban_sdk::Event::to_xdr(
+                &EarlyCloseSpecRegistered {
+                    market_id: f.market_id,
+                    early_close_threshold: 2,
+                    early_close_window: EC_WINDOW,
+                    late_trade_policy: LateTradePolicy::AcceptAndDisclose,
+                },
+                &f.env,
+                &f.resolver_id
+            )]
+        );
+
+        // One reveal per market, like every other mode.
+        let ResolutionSpec::Signers(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver
+                .try_register_signer_early_close_spec(&f.market_id, &cfg, &early),
+            Err(Ok(Error::MarketAlreadyConfigured))
+        );
+    }
+
+    #[test]
+    fn register_early_close_rejects_configs_that_make_freezing_easier() {
+        let f = early_close_fixture(&early_close_cfg(2));
+        let ResolutionSpec::Signers(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        // The group's `threshold` is 2 and it has 2 members, so anything below
+        // 2 would let a subset halt trading that could not resolve it, 0 or 3
+        // is not a quorum of this group at all, and a window of 0 would skip the
+        // guardian's chance to object entirely.
+        for bad in [
+            early_close_cfg(0),
+            early_close_cfg(1),
+            early_close_cfg(3),
+            {
+                let mut w = early_close_cfg(2);
+                w.early_close_window = 0;
+                w
+            },
+        ] {
+            assert_eq!(
+                f.resolver
+                    .try_register_signer_early_close_spec(&f.market_id, &cfg, &bad),
+                Err(Ok(Error::InvalidConfig))
+            );
+        }
+        assert_eq!(f.resolver.get_early_close_spec(&f.market_id), None);
+    }
+
+    #[test]
+    fn early_close_entrypoints_are_closed_without_the_commitment() {
+        let f = signer_fixture();
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_500),
+            Err(Ok(Error::WrongMode))
+        );
+        assert_eq!(
+            f.resolver.try_finalize_early_close(&f.market_id),
+            Err(Ok(Error::WrongMode))
+        );
+        assert_eq!(
+            f.resolver
+                .try_cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld),
+            Err(Ok(Error::WrongMode))
+        );
+        assert_eq!(f.resolver.get_early_close_spec(&f.market_id), None);
+        assert_eq!(f.resolver.get_early_close_proposal(&f.market_id), None);
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 0);
+        assert_eq!(f.resolver.get_applied_early_close(&f.market_id), None);
+        // With nothing applied the effective close *is* the nominal one: the
+        // plain-signer market sees no change anywhere.
+        assert_eq!(f.resolver.get_effective_close(&f.market_id), 2_000);
+    }
+
+    #[test]
+    fn propose_early_close_needs_an_agreeing_quorum_once() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        let intruder = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &intruder, &1_400),
+            Err(Ok(Error::NotSigner))
+        );
+
+        f.env.ledger().set_timestamp(1_500);
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_a, &1_400);
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 1);
+        assert_eq!(f.resolver.get_early_close_proposal(&f.market_id), None);
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_400),
+            Err(Ok(Error::AlreadyAttested)),
+            "one vote per signer per round, as in the outcome path"
+        );
+
+        // A vote for a different instant does not move the one under vote, and
+        // does not count.
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_b, &1_450),
+            Err(Ok(Error::EventTimeMismatch))
+        );
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 1);
+
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_b, &1_400);
+        assert_eq!(
+            f.resolver.get_early_close_proposal(&f.market_id),
+            Some(EarlyCloseProposal {
+                event_time: 1_400,
+                proposed_at: 1_500,
+            })
+        );
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 2);
+
+        // Reaching the threshold is a proposal, not a halt: nothing moved in
+        // market-core and the effective close is unchanged.
+        assert_eq!(f.resolver.get_applied_early_close(&f.market_id), None);
+        assert_eq!(f.resolver.get_effective_close(&f.market_id), 2_000);
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_400),
+            Err(Ok(Error::AlreadyEarlyClosed))
+        );
+
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [
+                soroban_sdk::Event::to_xdr(
+                    &EarlyCloseSpecRegistered {
+                        market_id: f.market_id,
+                        early_close_threshold: 2,
+                        early_close_window: EC_WINDOW,
+                        late_trade_policy: LateTradePolicy::AcceptAndDisclose,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &EarlyCloseProposed {
+                        market_id: f.market_id,
+                        event_time: 1_400,
+                        proposed_at: 1_500,
+                        votes: 2,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn propose_early_close_bounds_the_event_time() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        f.env.ledger().set_timestamp(1_500);
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_501),
+            Err(Ok(Error::EventTimeMismatch)),
+            "a halt records that an event already happened, it cannot schedule one"
+        );
+        // The boundary: "this very ledger" is a legitimate claim.
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_a, &1_500);
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 1);
+
+        // The lower bound cannot be exercised through a fixture whose market
+        // closes at 2_000 (`now - MAX_BACKDATE_SECS` saturates to 0 well inside
+        // it), so it is pinned against the pure helper market-core mirrors.
+        let now = MAX_BACKDATE_SECS + 10_000;
+        assert!(Resolver::event_time_is_usable(now, now));
+        assert!(Resolver::event_time_is_usable(now, now - MAX_BACKDATE_SECS));
+        assert!(!Resolver::event_time_is_usable(
+            now,
+            now - MAX_BACKDATE_SECS - 1
+        ));
+        assert!(!Resolver::event_time_is_usable(now, now + 1));
+    }
+
+    #[test]
+    fn propose_early_close_is_too_late_once_trading_has_ended() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_999),
+            Err(Ok(Error::EarlyCloseTooLate)),
+            "shortening a close that already happened changes nothing"
+        );
+
+        // A resolved market is rejected for the same reason even before its
+        // nominal close: there is nothing left to halt.
+        let g = registered_early_close_fixture(&early);
+        g.env.ledger().set_timestamp(2_000);
+        g.resolver
+            .attest(&g.market_id, &g.signer_a, &AttestedOutcome::No);
+        g.resolver
+            .attest(&g.market_id, &g.signer_b, &AttestedOutcome::No);
+        g.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            g.resolver.finalize_signers(&g.market_id),
+            AttestedOutcome::No
+        );
+        assert_eq!(
+            g.resolver
+                .try_propose_early_close(&g.market_id, &g.signer_a, &2_050),
+            Err(Ok(Error::EarlyCloseTooLate))
+        );
+    }
+
+    #[test]
+    fn finalize_early_close_waits_for_the_window_then_fails_loudly_on_the_pinned_core() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        assert_eq!(
+            f.resolver.try_finalize_early_close(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+
+        reach_early_close_quorum(&f, 1_500, 1_400);
+        for at in [1_500, 1_500 + EC_WINDOW - 1] {
+            f.env.ledger().set_timestamp(at);
+            assert_eq!(
+                f.resolver.try_finalize_early_close(&f.market_id),
+                Err(Ok(Error::DisputeWindowOpen)),
+                "the guardian's window is the whole point of the two-step"
+            );
+        }
+
+        f.env.ledger().set_timestamp(1_500 + EC_WINDOW);
+        assert_eq!(
+            f.resolver.try_finalize_early_close(&f.market_id),
+            Err(Ok(Error::HaltRejected)),
+            "`market_core.wasm` pinned here predates `halt_trading`; the dynamic \
+             call must reject rather than silently no-op a halt the market never got"
+        );
+        // And it fails *before* writing: the proposal, the votes and the event
+        // time all survive, so the guardian can cancel or the signers retry
+        // against a refreshed core.
+        assert_eq!(f.resolver.get_applied_early_close(&f.market_id), None);
+        assert_eq!(
+            f.resolver.get_early_close_proposal(&f.market_id),
+            Some(EarlyCloseProposal {
+                event_time: 1_400,
+                proposed_at: 1_500,
+            })
+        );
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 2);
+        assert_eq!(f.resolver.get_effective_close(&f.market_id), 2_000);
+    }
+
+    #[test]
+    fn an_applied_halt_moves_the_effective_close_and_unlocks_attestation() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        f.env.ledger().set_timestamp(1_500);
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::No),
+            Err(Ok(Error::MarketNotClosed)),
+            "before any halt, 1_500 is still inside the nominal trading window"
+        );
+
+        // The write `finalize_early_close` performs once `halt_trading` returns
+        // Ok, made directly because the pinned blob cannot return Ok here.
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::persist(&f.env, &DataKey::EarlyCloseApplied(f.market_id), &1_400u64);
+        });
+        assert_eq!(f.resolver.get_effective_close(&f.market_id), 1_400);
+        assert_eq!(
+            f.resolver.get_applied_early_close(&f.market_id),
+            Some(1_400)
+        );
+
+        // Same timestamp, now legal: signers settle the outcome as soon as the
+        // event is known instead of waiting out `close_time` (#22's goal).
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
+
+        // The halt is final and one-shot: no re-proposing, no re-finalising.
+        assert_eq!(
+            f.resolver
+                .try_propose_early_close(&f.market_id, &f.signer_a, &1_450),
+            Err(Ok(Error::AlreadyEarlyClosed))
+        );
+        assert_eq!(
+            f.resolver.try_finalize_early_close(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+        assert_eq!(
+            f.resolver
+                .try_cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld),
+            Err(Ok(Error::NoProposal))
+        );
+    }
+
+    #[test]
+    fn effective_close_is_a_clamped_minimum_and_gates_attestation() {
+        assert_eq!(Resolver::effective_close_of(2_000, None), 2_000);
+        assert_eq!(Resolver::effective_close_of(2_000, Some(1_400)), 1_400);
+        // A halt may only move the close earlier; a corrupt or later value can
+        // never extend a market's life, and the boundary is not "earlier than".
+        assert_eq!(Resolver::effective_close_of(2_000, Some(2_000)), 2_000);
+        assert_eq!(Resolver::effective_close_of(2_000, Some(3_000)), 2_000);
+
+        assert_eq!(
+            Resolver::attestation_gate(1_500, 2_000, None),
+            Err(Error::MarketNotClosed)
+        );
+        assert_eq!(Resolver::attestation_gate(2_000, 2_000, None), Ok(()));
+        assert_eq!(
+            Resolver::attestation_gate(1_400, 2_000, Some(1_400)),
+            Ok(())
+        );
+        assert_eq!(
+            Resolver::attestation_gate(1_399, 2_000, Some(1_400)),
+            Err(Error::MarketNotClosed)
+        );
+    }
+
+    #[test]
+    fn cancel_early_close_clears_the_whole_round_for_the_guardian() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        assert_eq!(
+            f.resolver
+                .try_cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld),
+            Err(Ok(Error::NoProposal))
+        );
+
+        reach_early_close_quorum(&f, 1_500, 1_400);
+        f.env.ledger().set_timestamp(1_510);
+        assert_eq!(
+            f.resolver
+                .try_cancel_early_close(&f.market_id, &GuardianReason::UnrevealedSpec),
+            Err(Ok(Error::GuardianNotAllowed)),
+            "same authority and the same reason set as `cancel_proposal`"
+        );
+
+        f.env.ledger().set_timestamp(1_500 + EC_WINDOW - 1);
+        f.resolver
+            .cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld);
+        assert_eq!(f.resolver.get_early_close_proposal(&f.market_id), None);
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 0);
+        assert_eq!(f.resolver.get_applied_early_close(&f.market_id), None);
+        assert_eq!(f.resolver.get_effective_close(&f.market_id), 2_000);
+
+        // Votes are cleared with the proposal, unlike `cancel_proposal`'s
+        // outcome counters: a stale set of votes for a rejected event time must
+        // not count towards the next round, so a fresh quorum is required.
+        f.env.ledger().set_timestamp(1_520);
+        f.resolver
+            .propose_early_close(&f.market_id, &f.signer_a, &1_510);
+        assert_eq!(f.resolver.get_early_close_votes(&f.market_id), 1);
+        assert_eq!(f.resolver.get_early_close_proposal(&f.market_id), None);
+    }
+
+    #[test]
+    fn cancel_early_close_after_the_window_is_too_late() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        reach_early_close_quorum(&f, 1_500, 1_400);
+        f.env.ledger().set_timestamp(1_500 + EC_WINDOW);
+        assert_eq!(
+            f.resolver
+                .try_cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld),
+            Err(Ok(Error::DisputeWindowClosed)),
+            "the instant `finalize_early_close` becomes callable is the instant \
+             the guardian loses its veto, exactly as in the outcome path"
+        );
+    }
+
+    #[test]
+    fn wrong_caller_cannot_cancel_early_close() {
+        let early = early_close_cfg(2);
+        let f = registered_early_close_fixture(&early);
+        reach_early_close_quorum(&f, 1_500, 1_400);
+        f.env.ledger().set_timestamp(1_510);
+
+        let intruder = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &intruder,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "cancel_early_close",
+                    args: (f.market_id, GuardianReason::DisputeUpheld).into_val(&f.env),
+                    sub_invokes: &[],
+                }
+            }])
+            .try_cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld)
+            .is_err());
+
+        f.resolver
+            .mock_auths(&[MockAuth {
+                address: &f.admin,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "cancel_early_close",
+                    args: (f.market_id, GuardianReason::DisputeUpheld).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_early_close(&f.market_id, &GuardianReason::DisputeUpheld);
+        assert_eq!(f.resolver.get_early_close_proposal(&f.market_id), None);
+    }
+
+    #[test]
+    fn void_if_late_is_registerable_and_deliberately_not_yet_enforced() {
+        let mut early = early_close_cfg(2);
+        early.late_trade_policy = LateTradePolicy::VoidIfLate;
+        let f = registered_early_close_fixture(&early);
+        assert_eq!(f.resolver.get_early_close_spec(&f.market_id), Some(early));
+        // The commitment is honest, the behaviour is not: nothing acts on the
+        // flag yet, so the halt path is byte-identical to the default policy.
+        reach_early_close_quorum(&f, 1_500, 1_400);
+        assert_eq!(
+            f.resolver.get_early_close_proposal(&f.market_id),
+            Some(EarlyCloseProposal {
+                event_time: 1_400,
+                proposed_at: 1_500,
+            })
+        );
     }
 }

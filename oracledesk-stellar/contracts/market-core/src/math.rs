@@ -328,6 +328,43 @@ pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
     }
 }
 
+/// One holder's refund when a `CostBasis` market is voided (issue #21).
+///
+/// `basis` is the holder's signed net collateral in the pool, `pot` the
+/// complete sets frozen at void time and `total` the sum of the *positive*
+/// bases. A holder who took more out than they paid in (negative basis) is
+/// refunded nothing even though they still hold shares, and a pot smaller than
+/// the positive bases scales everybody down pro-rata.
+///
+/// Always floors, so `Σ cost_basis_refund(..) <= min(total, pot)`: the pot can
+/// never be over-drawn, and the dust that flooring leaves behind stays in the
+/// pool (bounded by one base unit per redeeming holder).
+pub fn cost_basis_refund(basis: i128, pot: i128, total: i128) -> Result<i128, MathError> {
+    if pot < 0 || total < 0 {
+        return Err(MathError::InvalidInput);
+    }
+    let positive = if basis > 0 { basis } else { 0 };
+    if positive == 0 || pot == 0 {
+        return Ok(0);
+    }
+    if total <= pot {
+        return Ok(positive);
+    }
+    mul_div_floor(positive, pot, total)
+}
+
+/// The LP's share of a `CostBasis` void pot (issue #21): whatever the pot has
+/// left once every holder's (unscaled) positive basis has been paid. Paired
+/// with [`cost_basis_refund`] this pays out `min(total, pot)` to holders plus
+/// `pot - min(total, pot)` to the LP, i.e. exactly `pot`, so holder payouts
+/// plus the LP residual can never exceed `sets_minted`.
+pub fn cost_basis_lp_residual(pot: i128, total: i128) -> Result<i128, MathError> {
+    if pot < 0 || total < 0 {
+        return Err(MathError::InvalidInput);
+    }
+    Ok(pot - total.min(pot))
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -557,5 +594,70 @@ mod tests {
             price_after(false, 910, 1_100).unwrap(),
             price_yes_bps(1_100, 910).unwrap()
         );
+    }
+
+    // ----- #21 cost-basis void refunds --------------------------------------
+
+    #[test]
+    fn cost_basis_refund_exact_when_pot_sufficient() {
+        // pot >= positive total: everybody gets exactly what they put in and
+        // the LP takes the rest. `20 + 30 == 50 <= pot`.
+        assert_eq!(cost_basis_refund(20, 100, 50).unwrap(), 20);
+        assert_eq!(cost_basis_refund(30, 100, 50).unwrap(), 30);
+        assert_eq!(cost_basis_lp_residual(100, 50).unwrap(), 50);
+        // The boundary case `total == pot` is still "sufficient": no scaling.
+        assert_eq!(cost_basis_refund(50, 50, 50).unwrap(), 50);
+        assert_eq!(cost_basis_lp_residual(50, 50).unwrap(), 0);
+        // Basis is signed: a holder who already took more out than they paid
+        // in is refunded nothing, and the residual is not reduced by it.
+        assert_eq!(cost_basis_refund(-1, 100, 50).unwrap(), 0);
+        assert_eq!(cost_basis_refund(0, 100, 50).unwrap(), 0);
+    }
+
+    #[test]
+    fn cost_basis_refund_never_exceeds_pot() {
+        // pot < positive total (possible because negative bases pull the
+        // signed sum down while `total` only counts the positive ones): scale
+        // pro-rata, flooring.
+        assert_eq!(cost_basis_refund(60, 100, 150).unwrap(), 40);
+        assert_eq!(cost_basis_refund(90, 100, 150).unwrap(), 60);
+        assert_eq!(cost_basis_lp_residual(100, 150).unwrap(), 0);
+        // An empty pot pays nobody, and an empty basis total pays the LP all.
+        assert_eq!(cost_basis_refund(500, 0, 500).unwrap(), 0);
+        assert_eq!(cost_basis_refund(500, 100, 0).unwrap(), 0);
+        assert_eq!(cost_basis_lp_residual(100, 0).unwrap(), 100);
+        // Negative pot / total are nonsense, not a way to mint collateral.
+        assert_eq!(cost_basis_refund(1, -1, 1), Err(MathError::InvalidInput));
+        assert_eq!(cost_basis_refund(1, 1, -1), Err(MathError::InvalidInput));
+        assert_eq!(cost_basis_lp_residual(-1, 1), Err(MathError::InvalidInput));
+
+        // Property: over arbitrary bases, the scaled refunds plus the LP
+        // residual never exceed the pot, and no refund exceeds its basis.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let pot = next() % 1_000_000_000;
+            let total = next() % 1_000_000_000;
+            let mut sum = 0;
+            for _ in 0..5 {
+                let basis = next() % total.max(1);
+                let payout = cost_basis_refund(basis, pot, total).unwrap();
+                assert!(payout >= 0 && payout <= basis.max(0));
+                sum += payout;
+            }
+            assert!(
+                sum <= total.min(pot),
+                "holder refunds {sum} exceed min(total, pot)"
+            );
+            assert!(
+                sum + cost_basis_lp_residual(pot, total).unwrap() <= pot,
+                "void over-pays the pot"
+            );
+        }
     }
 }
