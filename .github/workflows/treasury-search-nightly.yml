@@ -1,0 +1,44 @@
+name: Treasury cap search (nightly, deep)
+
+# The default `cargo test` run searches to depth 6 with the lean alphabet.
+# This job goes deeper and keeps the output. Depth grows the work ~3.5x per
+# level: depth 8 is estimated (not measured) at about 20 minutes on 8 cores, so
+# expect a few times that on a 4-core hosted runner. Raise `depth` (up to 10) only on a larger runner.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: "TREASURY_SEARCH_DEPTH"
+        default: "8"
+      alphabet:
+        description: "TREASURY_SEARCH_ALPHABET (lean or full)"
+        default: "lean"
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TREASURY_SEARCH_DEPTH: ${{ inputs.depth || '8' }}
+      TREASURY_SEARCH_ALPHABET: ${{ inputs.alphabet || 'lean' }}
+    defaults:
+      run:
+        working-directory: oracledesk-stellar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oracledesk-stellar
+      - name: Deep treasury cap search
+        run: |
+          set -o pipefail
+          cargo test -p integration-tests treasury_caps_exhaustive -- --nocapture 2>&1 | tee treasury-search.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: treasury-search-depth-${{ env.TREASURY_SEARCH_DEPTH }}
+          path: oracledesk-stellar/treasury-search.log

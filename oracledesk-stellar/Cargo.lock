@@ -1085,13 +1085,9 @@ checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
 name = "integration-tests"
 version = "0.1.0"
 dependencies = [
- "proptest",
- "resolver",
- "serde",
- "serde_json",
+ "market-core",
  "soroban-sdk",
- "stellar-xdr",
- "wasmparser",
+ "treasury",
 ]
 
 [[package]]
@@ -1531,6 +1527,7 @@ name = "resolver"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "market-core",
  "soroban-sdk",
 ]
 
@@ -2203,6 +2200,7 @@ dependencies = [
 name = "treasury"
 version = "0.1.0"
 dependencies = [
+ "market-core",
  "soroban-sdk",
 ]
 

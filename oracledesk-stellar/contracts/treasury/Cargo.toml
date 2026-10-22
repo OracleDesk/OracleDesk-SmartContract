@@ -14,3 +14,7 @@ soroban-sdk = { version = "27.0.6", features = ["experimental_spec_shaking_v2"] 
 
 [dev-dependencies]
 soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+# A native registration of market-core in tests, so `cargo llvm-cov` sees its
+# code (the wasm copy runs in the VM, which produces no host coverage).
+# Renamed: this crate already has a `market_core` module from `contractimport!`.
+market-core-native = { package = "market-core", path = "../market-core" }

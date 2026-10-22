@@ -1,0 +1,4231 @@
+{
+  "schema": 1,
+  "contract": "treasury",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Registers `agent` as the first agent with every role and the global caps as its own. `max_net_exposure` caps capital deployed in open positions across all markets at once (see `net_exposure`); it must be at least `max_trade`. `config_delay` (seconds, at least `MIN_CONFIG_DELAY`) is the timelock on every loosening change. Any collateral the treasury already holds is minted as shares to `admin`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_net_exposure",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "config_delay",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "window_days",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "creation_policy",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "acknowledge_drawdown": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "acknowledge_drawdown",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "agent_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "i",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_at",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "agent_buy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Buys `outcome` shares in an existing market using treasury capital (`ROLE_TRADE`). Price-checked, see `do_agent_buy`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "agent_buy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_buy_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`agent_buy` with a per-share limit price (`limit_price_bps`, 0 = none) and a deadline (unix seconds, network time). market-core's `buy_v2` enforces both; an expired or out-of-limit trade reverts the whole invocation, so the treasury's caps are never consumed by a reverted trade.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_buy_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_claim_lp_fees": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the market's LP fee share for a market the treasury created (`ROLE_SETTLE`). The LP portion accrues separately on market-core (see its `claim_lp_fees`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_claim_lp_fees",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Agents ever registered (removed ones included).",
+        "inputs": [],
+        "name": "agent_count",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "agent_create_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates and seeds a market using treasury capital (`ROLE_CREATE`). The treasury becomes the market's creator/LP. `initial_yes_bps` must lie within the price policy's `[min_sell, max_buy]` band, so the treasury never seeds a market whose creator side is near worthless.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_create_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "agent_create_market_and_reveal": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Like [`Treasury::agent_create_market`], but reveals the resolution rule in the same transaction (#64). The market is created with the commitment derived from `spec_v2` itself, so the follow-up reveal necessarily matches and the market can never be left unresolvable. `resolver` is the deployed resolver contract; it must be configured for this treasury's market-core. The router cannot serve this path: seeding pulls collateral from the treasury contract (not the end user) via a contract self-authorization, which only this contract can perform — a stateless router between the agent and market-core would not be authorized on the token.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "agent_create_market_and_reveal",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "agent_daily_usage": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`agent`'s own sliding-window usage, counted against its `max_daily`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "agent_daily_usage",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "DailyUsage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "agent_sell": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sells `outcome` shares back into the pool for exactly `collateral_out` (`ROLE_TRADE`). This returns capital to the treasury (market-core pays out of its own balance), so it is not capped and does not need the nested-transfer pre-authorization that buying does. It frees net headroom (`collateral_out` is recorded) but never lifetime headroom. Price-checked, see `do_agent_sell`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "agent_sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_sell_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`agent_sell` with a per-share limit price (`limit_price_bps`, 0 = no limit) and a deadline (unix seconds, network time), both enforced by market-core's `sell_v2`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_sell_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "allocate_to_yield": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "allocate_to_yield",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "available_capital": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Total capital deployable: liquid collateral balance plus supplied yield value.",
+        "inputs": [],
+        "name": "available_capital",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "cancel_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_price_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "capital_breakdown": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Breakdown of treasury capital across liquid, yield principal, and yield value.",
+        "inputs": [],
+        "name": "capital_breakdown",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "CapitalBreakdown"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "claim_pool_remainder": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the LP pool remainder for a market the treasury created (`ROLE_SETTLE`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_pool_remainder",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "claim_withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pays the ticket at the head of the queue as far as idle collateral allows. Permissionless: the money always goes to the ticket's owner. Only the head ticket can be paid (`NothingToPay` for later ones).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "close_trade": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Marks a market's exposure as exited (`ROLE_SETTLE`). Pure bookkeeping (see `MarketExposure`) for the future exposure dashboard; it does not move funds or free either the cumulative per-market cap or net headroom.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "close_trade",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "collect_market_fees": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pulls accrued **protocol** fees from a configured market-core contract. Only the protocol's share of each market's fees: the LP portion accrues separately on market-core and belongs to the market's creator — for agent-created markets that is the treasury itself, via `agent_claim_lp_fees`. Fees raise NAV for every shareholder at the moment they arrive.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "collect_market_fees",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "config_delay": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "config_delay",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "creation_usage": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "creation_usage",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "daily_headroom": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "How much more the agents together may deploy right now before `max_daily` (`max_daily - window sum`, floored at 0).",
+        "inputs": [],
+        "name": "daily_headroom",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "daily_usage": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Usage over the sliding window as of now: `amount` sums every bucket still counted against `max_daily`, `day_start` is the start of the oldest of them. Side-effect free (it advances a copy), so repeated reads without trades in between return the same value.",
+        "inputs": [],
+        "name": "daily_usage",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "DailyUsage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "daily_usage_detail": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The hourly buckets behind `daily_usage`, advanced to now (not stored).",
+        "inputs": [],
+        "name": "daily_usage_detail",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "UsageWindow"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "deposit": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Deposits `amount` of collateral and mints shares to `from` at the NAV as it was before the deposit. Returns the shares minted.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "deposit",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "disable_yield": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "disable_yield",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "drawdown_status": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "drawdown_status",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "DrawdownStatus"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "emergency_withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "While paused only: burns `shares` for their pro-rata part of the free idle collateral, without reading market-core (for when it is the thing that broke). The owner forfeits their part of open positions, which stays with the remaining shareholders.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "name": "emergency_withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "execute_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Applies `agent`'s pending policy once its delay has passed. Permissionless: the delay is the protection.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "execute_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Applies the pending config once its delay has passed. Permissionless, so execution never depends on the admin being available. A `market_core` change records the old core as legacy: its positions stay where they are (recover them with `legacy_redeem` / `legacy_claim_pool_remainder`), and exposure for the new core is kept under keys namespaced by core so market ids cannot collide. The new core must be pointed at this treasury with its own `set_treasury`.",
+        "inputs": [],
+        "name": "execute_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_price_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Applies the pending price policy once its delay has passed. Permissionless.",
+        "inputs": [],
+        "name": "execute_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "get_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "get_agent",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "AgentPolicy"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Deprecated compatibility view in the pre-registry `RiskConfig` shape: `agent` is the first registered agent (whatever its current policy). Use `get_global` and `get_agent` instead.",
+        "inputs": [],
+        "name": "get_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "RiskConfig"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_creation_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_creation_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "CreationPolicy"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_global": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_global",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "GlobalConfig"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_net_cap": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`max_net_exposure`.",
+        "inputs": [],
+        "name": "get_net_cap",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "get_price_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_price_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "PricePolicy"
+            }
+          }
+        ]
+      }
+    },
+    "legacy_claim_pool_remainder": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`claim_pool_remainder` against a legacy market-core.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "legacy_claim_pool_remainder",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "legacy_redeem": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`redeem` against a market-core this treasury was switched away from (see `execute_config`), so positions there are never stranded.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "legacy_redeem",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "liquid_capital": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Liquid collateral balance held directly in the treasury.",
+        "inputs": [],
+        "name": "liquid_capital",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "market_pnl": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_pnl",
+        "outputs": [
+          {
+            "udt": {
+              "name": "MarketPnl"
+            }
+          }
+        ]
+      }
+    },
+    "market_valuation": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Conservative valuation of the treasury's holdings in `market_id` (see [`Valuation`]). Two cross-contract reads (`get_market`, `get_position`); a view only, never on the trading path.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_valuation",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Valuation"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "migrate_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Moves the treasury's position in `market_id` — and the LP role, when the treasury is the market's creator and has not claimed the remainder yet — to the successor set via `set_successor`, then closes the local exposure. Admin-only: relocating capital is not an agent trading action, and the agent key must not be able to drain positions. market-core's `transfer_position` / `transfer_lp` require the treasury itself to authorize. Because the treasury is their *direct* caller here, the implicit invoker authorization covers both — no `authorize_as_current_contract` entry is needed (unlike the nested token transfer in `agent_buy`, see `docs/adr/0002-treasury-nested-auth.md`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "migrate_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "nav": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Net asset value: idle collateral plus, for every market in the open- market index, what the holdings are worth whatever the outcome (complete sets and the LP's `min` reserve while open, the exact settlement value once final), minus what queued withdrawals are owed. Directional exposure is valued at zero, so no trade against a pool can raise NAV.",
+        "inputs": [],
+        "name": "nav",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "net_exposure": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Capital currently deployed across all markets: `sum(max(0, collateral_in - collateral_out))`, the figure `max_net_exposure` is enforced against.",
+        "inputs": [],
+        "name": "net_exposure",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
+    "net_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Net position in `market_id` of the current market-core.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "net_position",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "NetPosition"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "open_market_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "i",
+            "type_": "u32"
+          }
+        ],
+        "name": "open_market_at",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "OpenMarket"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "open_market_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "open_market_count",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "pending_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "pending_agent",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingAgent"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pending_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_config",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingConfig"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pending_price_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_price_policy",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingPricePolicy"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "propose_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Proposes `config` as the global config (admin). Tighten-only proposals apply at once and leave any pending proposal and its timer as they are; anything else is queued.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          }
+        ],
+        "name": "propose_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "queue_bounds": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The ticket `claim_withdraw` pays next, and the id the next one gets.",
+        "inputs": [],
+        "name": "queue_bounds",
+        "outputs": [
+          {
+            "tuple": {
+              "value_types": [
+                "u64",
+                "u64"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "queue_reserved": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Collateral owed to queued withdrawals; agents cannot spend it.",
+        "inputs": [],
+        "name": "queue_reserved",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
+    "realize": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "realize",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "realized": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "realized",
+        "outputs": [
+          {
+            "udt": {
+              "name": "Realized"
+            }
+          }
+        ]
+      }
+    },
+    "recall_from_yield": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "recall_from_yield",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "redeem": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Redeems the treasury's position in a resolved/voided market (`ROLE_SETTLE`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "redeem",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "remove_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Deactivates `agent` at once, keeping its usage history. At least one active agent with `ROLE_SETTLE` must remain, so open positions can always be settled.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "remove_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "request_withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket (FIFO, paid by `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "name": "request_withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "tuple": {
+                  "value_types": [
+                    "i128",
+                    "u64"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "reset_pnl_window": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "reset_pnl_window",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Adds or updates `agent`. Validation: `roles` non-empty and known, `0 < max_trade <= max_daily`, both within the global caps, `active`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "AgentPolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_config_delay": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Lengthens the timelock. Shortening is refused outright: it would itself have to wait out the old delay to be safe, and a lengthening can always be undone by redeploying.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_config_delay",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_creation_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_policy",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_creation_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_drawdown_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "window_days",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_drawdown_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_paused": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "name": "set_paused",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_price_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the price limits on agent trades (admin). Like the caps, tightening (lower `max_buy`/`max_impact`/`max_slippage`, higher `min_sell`) applies at once and anything else waits `config_delay`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_successor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the successor treasury that `migrate_market` hands positions and the LP role to. Admin-only; overwrites any previous successor (the `SuccessorSet` events are the audit trail).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "successor",
+            "type_": "address"
+          }
+        ],
+        "name": "set_successor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_yield_venue": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "max_allocation",
+            "type_": "i128"
+          }
+        ],
+        "name": "set_yield_venue",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "settle_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionless settlement of a resolved or voided market's position and LP remainder. Operates even when the treasury is paused. Idempotent on retry.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "settle_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "SettlementReport"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "shares_of": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          }
+        ],
+        "name": "shares_of",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
+    "total_shares": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "total_shares",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
+    "window_pnl": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "window_pnl",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "withdraw_ticket": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "withdraw_ticket",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "WithdrawTicket"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "AgentPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One registered agent. `max_trade` / `max_daily` sit under the global caps; both are checked on every spend.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "active",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "roles",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "AgentPolicy"
+      }
+    },
+    "CapitalBreakdown": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "liquid",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "yield_principal",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "yield_value",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "CapitalBreakdown"
+      }
+    },
+    "Category": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Crypto"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Culture"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Geopolitics"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Macro"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Other"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sports"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Category"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "min_epoch",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CommitteeRef"
+      }
+    },
+    "CreationPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "allowed_categories",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "creation_window_secs",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_close_horizon",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_markets_per_window",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "max_seed",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_close_horizon",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "CreationPolicy"
+      }
+    },
+    "DailyUsage": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Summary of the sliding daily window, returned by `daily_usage`. `day_start` is the start of the oldest hour still counted and `amount` the usage summed over the whole window (see [`UsageWindow`]).",
+        "fields": [
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "day_start",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "DailyUsage"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "escalation_timeout",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "DrawdownStatus": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "tripped",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "window_pnl",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "DrawdownStatus"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Guardian"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Escalation"
+      }
+    },
+    "GlobalConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Treasury-wide caps, enforced on top of every agent's own policy.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "doc": "Cap on capital deployed in open positions across all markets at once (see `net_exposure`).",
+            "name": "max_net_exposure",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_trade",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "GlobalConfig"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfig"
+      }
+    },
+    "MarketPnl": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "cost",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "proceeds",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "realized",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "MarketPnl"
+      }
+    },
+    "NetPosition": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Collateral the treasury has sent into (`collateral_in`) and received back from (`collateral_out`) one market. Accounting starts when this code was deployed: a missing entry reads as zero.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "NetPosition"
+      }
+    },
+    "OpenMarket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "An entry of the open-market index `nav()` walks.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "OpenMarket"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "OracleAsset"
+      }
+    },
+    "Outcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Outcome"
+      }
+    },
+    "PendingAgent": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "AgentPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingAgent"
+      }
+    },
+    "PendingConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingConfig"
+      }
+    },
+    "PendingPricePolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingPricePolicy"
+      }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "PriceConfig"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "PriceDirection"
+      }
+    },
+    "PricePolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Price limits on every agent trade, in bps of the outcome's spot price.",
+        "fields": [
+          {
+            "doc": "Never buy an outcome priced above this.",
+            "name": "max_buy_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Largest `|p_after - p_before|` a single trade may cause.",
+            "name": "max_impact_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Tolerance applied to the same-transaction quote to derive the effective `min_shares_out` / `max_shares_in`.",
+            "name": "max_slippage_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Never sell an outcome priced below this.",
+            "name": "min_sell_price_bps",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "PricePolicy"
+      }
+    },
+    "Realized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "lp_proceeds",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "position_proceeds",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "settled",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "Realized"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "RiskConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Legacy single-agent configuration. Still the shape returned by the deprecated `get_config` view; live state is [`GlobalConfig`] plus the agent registry.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_trade",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "RiskConfig"
+      }
+    },
+    "SettlementReport": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "already_settled",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "lp_claimed",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "redeemed",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "SettlementReport"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "SignerConfig"
+      }
+    },
+    "UsageWindow": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400 bytes that every call loads anyway, so it costs no extra ledger-entry read (a persistent entry would add one per trade). Per-agent windows have the same shape but live in persistent storage.",
+        "fields": [
+          {
+            "doc": "Always `BUCKETS` long. `amounts[i]` is the usage of hour `head_hour - ((head_idx - i) mod BUCKETS)`.",
+            "name": "amounts",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          },
+          {
+            "doc": "Hour index (`timestamp / BUCKET_SECONDS`) of the newest bucket.",
+            "name": "head_hour",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "head_idx",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "UsageWindow"
+      }
+    },
+    "Valuation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "`market_valuation` result. Only `cost_basis` is enforced (by `max_net_exposure`); the others are informational.",
+        "fields": [
+          {
+            "doc": "`max(0, cost_basis - floor_value)`.",
+            "name": "at_risk",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "cost_basis",
+            "type_": "i128"
+          },
+          {
+            "doc": "What the treasury gets back whatever the outcome, from state a price move cannot raise: complete sets `min(yes, no)` plus, as the unclaimed LP, `min(reserve_yes, reserve_no)`. After finality, the settlement value.",
+            "name": "floor_value",
+            "type_": "i128"
+          },
+          {
+            "doc": "Holdings at the pool's spot price. Manipulable by any trader, so it is never used for enforcement.",
+            "name": "spot_value",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "Valuation"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight_threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKeyConfig"
+      }
+    },
+    "WithdrawTicket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Collateral still owed to `owner` for shares already burned.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "created_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "remaining",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "WithdrawTicket"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "AgentDailyCapExceeded",
+            "value": 13
+          },
+          {
+            "doc": "Close-date bucket exposure would exceed its cap (#49).",
+            "name": "BucketCapExceeded",
+            "value": 30
+          },
+          {
+            "doc": "",
+            "name": "CapitalReserved",
+            "value": 19
+          },
+          {
+            "doc": "Category exposure would exceed its correlation cap (#49).",
+            "name": "CategoryCapExceeded",
+            "value": 29
+          },
+          {
+            "doc": "",
+            "name": "CategoryNotAllowed",
+            "value": 53
+          },
+          {
+            "doc": "",
+            "name": "CloseTimeTooFar",
+            "value": 52
+          },
+          {
+            "doc": "",
+            "name": "CloseTimeTooSoon",
+            "value": 51
+          },
+          {
+            "doc": "",
+            "name": "CreationRateExceeded",
+            "value": 50
+          },
+          {
+            "doc": "",
+            "name": "DailyCapExceeded",
+            "value": 7
+          },
+          {
+            "doc": "",
+            "name": "DepositTooSmall",
+            "value": 20
+          },
+          {
+            "doc": "",
+            "name": "DrawdownTripped",
+            "value": 46
+          },
+          {
+            "doc": "",
+            "name": "InsufficientBalance",
+            "value": 9
+          },
+          {
+            "doc": "",
+            "name": "InsufficientShares",
+            "value": 21
+          },
+          {
+            "doc": "",
+            "name": "InvalidAmount",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "InvalidConfig",
+            "value": 3
+          },
+          {
+            "doc": "",
+            "name": "InvalidDrawdownConfig",
+            "value": 47
+          },
+          {
+            "doc": "",
+            "name": "InvalidPricePolicy",
+            "value": 26
+          },
+          {
+            "doc": "`agent_create_market_and_reveal` was given a malformed resolution envelope or a rule outside the two primary modes (#64).",
+            "name": "InvalidResolution",
+            "value": 33
+          },
+          {
+            "doc": "",
+            "name": "LegacyCoreUnknown",
+            "value": 17
+          },
+          {
+            "doc": "",
+            "name": "MarketCapExceeded",
+            "value": 6
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreError",
+            "value": 45
+          },
+          {
+            "doc": "",
+            "name": "MarketNotFinal",
+            "value": 44
+          },
+          {
+            "doc": "",
+            "name": "MarketNotOpen",
+            "value": 8
+          },
+          {
+            "doc": "",
+            "name": "NetExposureExceeded",
+            "value": 12
+          },
+          {
+            "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
+            "name": "NoPendingAdmin",
+            "value": 31
+          },
+          {
+            "doc": "",
+            "name": "NoPendingConfig",
+            "value": 16
+          },
+          {
+            "doc": "",
+            "name": "NoSuccessor",
+            "value": 11
+          },
+          {
+            "doc": "",
+            "name": "NotAcknowledged",
+            "value": 48
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "",
+            "name": "NotPaused",
+            "value": 28
+          },
+          {
+            "doc": "",
+            "name": "NothingToPay",
+            "value": 23
+          },
+          {
+            "doc": "",
+            "name": "Paused",
+            "value": 10
+          },
+          {
+            "doc": "A proposed admin handover was not accepted within its `expires_at`.",
+            "name": "PendingAdminExpired",
+            "value": 32
+          },
+          {
+            "doc": "",
+            "name": "PolicyLoosening",
+            "value": 54
+          },
+          {
+            "doc": "",
+            "name": "PriceImpactExceeded",
+            "value": 25
+          },
+          {
+            "doc": "",
+            "name": "PriceOutOfBand",
+            "value": 24
+          },
+          {
+            "doc": "",
+            "name": "ProposalPending",
+            "value": 14
+          },
+          {
+            "doc": "",
+            "name": "SeedCapExceeded",
+            "value": 49
+          },
+          {
+            "doc": "",
+            "name": "SlippageExceeded",
+            "value": 27
+          },
+          {
+            "doc": "",
+            "name": "TicketNotFound",
+            "value": 22
+          },
+          {
+            "doc": "",
+            "name": "TimelockActive",
+            "value": 15
+          },
+          {
+            "doc": "",
+            "name": "TooManyOpenMarkets",
+            "value": 18
+          },
+          {
+            "doc": "",
+            "name": "TradeCapExceeded",
+            "value": 5
+          },
+          {
+            "doc": "",
+            "name": "Unauthorized",
+            "value": 2
+          },
+          {
+            "doc": "",
+            "name": "VenueHasPrincipal",
+            "value": 58
+          },
+          {
+            "doc": "",
+            "name": "YieldCapExceeded",
+            "value": 56
+          },
+          {
+            "doc": "",
+            "name": "YieldDisabled",
+            "value": 55
+          },
+          {
+            "doc": "",
+            "name": "YieldWithdrawFailed",
+            "value": 57
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "AgentPolicyCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentPolicyCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "agent_policy_cancelled"
+        ]
+      }
+    },
+    "AgentPolicyProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentPolicyProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "roles",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "agent_policy_proposed"
+        ]
+      }
+    },
+    "AgentPolicySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentPolicySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "roles",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "max_daily",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "agent_policy_set"
+        ]
+      }
+    },
+    "AgentRemoved": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentRemoved",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "agent_removed"
+        ]
+      }
+    },
+    "ConfigCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConfigCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "config_cancelled"
+        ]
+      }
+    },
+    "ConfigDelaySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConfigDelaySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "config_delay_set"
+        ]
+      }
+    },
+    "ConfigExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConfigExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "doc": "`true` for a tighten-only change applied at proposal time.",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "config_executed"
+        ]
+      }
+    },
+    "ConfigProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConfigProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "config_proposed"
+        ]
+      }
+    },
+    "CreationPolicyUpdated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CreationPolicyUpdated",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "creation_policy_updated"
+        ]
+      }
+    },
+    "Deposited": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "Deposited",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "NAV before the deposit.",
+            "location": "data",
+            "name": "nav",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "deposited"
+        ]
+      }
+    },
+    "DrawdownPause": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "DrawdownPause",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "realized_loss",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "window_start_day",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "triggered_by_market",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "drawdown_pause"
+        ]
+      }
+    },
+    "EmergencyWithdrawn": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "EmergencyWithdrawn",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "emergency_withdrawn"
+        ]
+      }
+    },
+    "FeesCollected": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "FeesCollected",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "fees_collected"
+        ]
+      }
+    },
+    "MarketMigrated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketMigrated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "successor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "lp",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "market_migrated"
+        ]
+      }
+    },
+    "MarketSettled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketSettled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "redeemed",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "lp_claimed",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "settled_by",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "market_settled"
+        ]
+      }
+    },
+    "NetExposureUpdated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Net exposure after any treasury money movement in `market_id`.",
+        "lib": "",
+        "name": "NetExposureUpdated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "net_market",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "net_total",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "net_exposure_updated"
+        ]
+      }
+    },
+    "PnlRealized": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PnlRealized",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "cost",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "proceeds",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "pnl",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "pnl_realized"
+        ]
+      }
+    },
+    "PnlWindowReset": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PnlWindowReset",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "admin",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "pnl_window_reset"
+        ]
+      }
+    },
+    "PositionClosed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PositionClosed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "position_closed"
+        ]
+      }
+    },
+    "PricePolicyCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PricePolicyCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "price_policy_cancelled"
+        ]
+      }
+    },
+    "PricePolicyProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PricePolicyProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "price_policy_proposed"
+        ]
+      }
+    },
+    "PricePolicySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PricePolicySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "price_policy_set"
+        ]
+      }
+    },
+    "SuccessorSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "SuccessorSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "successor_set"
+        ]
+      }
+    },
+    "TradeAuthorized": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TradeAuthorized",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "The acting agent.",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "market_total",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "daily_total",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "trade_authorized"
+        ]
+      }
+    },
+    "WithdrawPaid": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "WithdrawPaid",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "ticket_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "withdraw_paid"
+        ]
+      }
+    },
+    "WithdrawRequested": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "WithdrawRequested",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "assets",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paid_now",
+            "type_": "i128"
+          },
+          {
+            "doc": "0 when everything was paid at once.",
+            "location": "data",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "withdraw_requested"
+        ]
+      }
+    },
+    "YieldAllocated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "YieldAllocated",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "principal",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "yield_allocated"
+        ]
+      }
+    },
+    "YieldRecalled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "YieldRecalled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "principal",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "prefix_topics": [
+          "yield_recalled"
+        ]
+      }
+    },
+    "YieldVenueSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "YieldVenueSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "max_allocation",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "yield_venue_set"
+        ]
+      }
+    }
+  },
+  "type_origins": {
+    "Category": "market-core",
+    "CommitteeRef": "resolver",
+    "DisputableSignerConfig": "resolver",
+    "Escalation": "resolver",
+    "HybridConfig": "resolver",
+    "OracleAsset": "resolver",
+    "Outcome": "market-core",
+    "PriceConfig": "resolver",
+    "PriceDirection": "resolver",
+    "ResolutionSpec": "resolver",
+    "ResolutionSpecV2": "resolver",
+    "SignerConfig": "resolver",
+    "WeightedKey": "resolver",
+    "WeightedKeyConfig": "resolver"
+  },
+  "hash_critical": []
+}

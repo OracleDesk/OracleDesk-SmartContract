@@ -1,0 +1,27 @@
+name: Formal model (resolver)
+
+# Optional model check of the resolution lifecycle (oracledesk-stellar/docs/formal).
+# Runs only when the resolver, market-core or the model itself changes.
+
+on:
+  pull_request:
+    paths:
+      - "oracledesk-stellar/contracts/resolver/**"
+      - "oracledesk-stellar/contracts/market-core/**"
+      - "oracledesk-stellar/docs/formal/**"
+      - "oracledesk-stellar/scripts/formal.sh"
+      - ".github/workflows/formal.yml"
+
+jobs:
+  tlc:
+    name: TLC model check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: make formal
+        working-directory: oracledesk-stellar
+        run: make formal

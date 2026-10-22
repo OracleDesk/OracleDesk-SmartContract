@@ -1,0 +1,1207 @@
+{
+  "schema": 1,
+  "contract": "reasoning-registry",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "accept_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "agent_chain_head": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Current chain head for `agent` (genesis if it has never chained).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "agent_chain_head",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ChainHead"
+            }
+          }
+        ]
+      }
+    },
+    "agent_trace_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Trace id at position `seq` (1-based) of `agent`'s chain.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "seq",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_trace_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_admin_transfer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_admin_transfer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "consume_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Marks a trace as having backed an action, exactly once (#50). Only an allow-listed consumer contract can call it; the treasury passes its own address, which satisfies `require_auth` as the direct invoker.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "consumer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "consume_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Trace"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Trace"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_trace_ledger": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Ledger sequence the trace was written in (#50). `None` for traces written before this field existed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_trace_ledger",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "get_trace_link": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Chain link for a trace; `None` for legacy, unchained traces.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_trace_link",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "ChainLink"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "is_consumed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "is_consumed",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "is_consumer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "is_consumer",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "is_registered": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "is_registered",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "market_trace_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The `index`-th (0-based, publish order) trace id for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_trace_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "market_trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Number of traces published for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_trace_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "pending_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The pending admin proposal, including its expiry, if one exists.",
+        "inputs": [],
+        "name": "pending_admin",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingAdmin"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "propose_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Starts a two-step handover of the admin role. The new admin must call `accept_admin` itself, so a typo cannot hand control to an address nobody holds.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "publish_chained_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Publishes a trace that extends `agent`'s hash chain (#52). Fails with `ChainHeadMismatch` unless `expected_seq == head.seq + 1` and `prev_trace_hash == head.head_hash`, so a skipped decision shows up as a gap and a fork is impossible.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "expected_seq",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "publish_chained_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "publish_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          }
+        ],
+        "name": "publish_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "register_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "register_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_consumer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Allow-lists a contract (e.g. the treasury) to call `consume_trace` (#50).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "register_consumer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "trace_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "unregister_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "unregister_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "unregister_consumer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "unregister_consumer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "verify_commitment": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Checks a commit-reveal commitment (#51): `commitment == sha256(\"oracledesk.trace.commit.v1\" || trace_hash || salt)`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "commitment",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "verify_commitment",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "verify_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "received_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "verify_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "bool"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "ChainHead": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Head of an agent's append-only trace log (#52). Genesis is `seq = 0` with an all-zero hash.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "head_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "head_trace_id",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "seq",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "ChainHead"
+      }
+    },
+    "ChainLink": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "seq",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "ChainLink"
+      }
+    },
+    "DataKey": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Admin"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Agent",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Per-agent hash-chain head (#52).",
+              "name": "AgentHead",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Per-agent `seq -> trace_id` (#52).",
+              "name": "AgentTrace",
+              "type_": [
+                "address",
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Set once a trace has backed an action (#50).",
+              "name": "Consumed",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Contracts allowed to call `consume_trace` (#50).",
+              "name": "Consumer",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "MarketTrace",
+              "type_": [
+                "u64",
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Number of traces published for a market, so a client can page through `MarketTrace(market_id, 0..count)` without the contract ever holding an unbounded Vec of trace ids in one storage entry.",
+              "name": "MarketTraceCount",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NextId"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdmin"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Trace",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Ledger sequence a trace was written in (#50). Kept beside `Trace` rather than inside it so the `Trace` XDR shape doesn't change.",
+              "name": "TraceLedger",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "`trace_id -> ChainLink`; absent for legacy traces (#52).",
+              "name": "TraceLink",
+              "type_": [
+                "u64"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "DataKey"
+      }
+    },
+    "PendingAdmin": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A proposed admin handover (#62). Absent when no transfer is pending.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "address",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "expires_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingAdmin"
+      }
+    },
+    "Trace": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "action",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "published_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "Trace"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "AgentAlreadyRegistered",
+            "value": 3
+          },
+          {
+            "doc": "",
+            "name": "AgentNotRegistered",
+            "value": 4
+          },
+          {
+            "doc": "`expected_seq` / `prev_trace_hash` don't extend the agent's chain head (#52).",
+            "name": "ChainHeadMismatch",
+            "value": 8
+          },
+          {
+            "doc": "Agent already has a chain, so unchained `publish_trace` is refused (#52).",
+            "name": "ChainedAgentMustChain",
+            "value": 9
+          },
+          {
+            "doc": "",
+            "name": "EmptyAction",
+            "value": 6
+          },
+          {
+            "doc": "",
+            "name": "EmptyCid",
+            "value": 7
+          },
+          {
+            "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
+            "name": "NoPendingAdmin",
+            "value": 11
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "A proposed admin handover was not accepted within its `expires_at`.",
+            "name": "PendingAdminExpired",
+            "value": 12
+          },
+          {
+            "doc": "Trace already backed an action (#50).",
+            "name": "TraceAlreadyConsumed",
+            "value": 10
+          },
+          {
+            "doc": "",
+            "name": "TraceNotFound",
+            "value": 5
+          },
+          {
+            "doc": "",
+            "name": "Unauthorized",
+            "value": 2
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "AdminTransferCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferCancelled",
+        "params": [],
+        "prefix_topics": [
+          "admin_transfer_cancelled"
+        ]
+      }
+    },
+    "AdminTransferProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transfer_proposed"
+        ]
+      }
+    },
+    "AdminTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transferred"
+        ]
+      }
+    },
+    "AgentRegistered": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentRegistered",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "agent_registered"
+        ]
+      }
+    },
+    "ConsumerRegistered": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConsumerRegistered",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "consumer_registered"
+        ]
+      }
+    },
+    "ConsumerUnregistered": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ConsumerUnregistered",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "consumer_unregistered"
+        ]
+      }
+    },
+    "TraceChained": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TraceChained",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "seq",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "trace_chained"
+        ]
+      }
+    },
+    "TraceConsumed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TraceConsumed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "trace_consumed"
+        ]
+      }
+    },
+    "TracePublished": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TracePublished",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "action",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "trace_published"
+        ]
+      }
+    }
+  },
+  "type_origins": {},
+  "hash_critical": []
+}

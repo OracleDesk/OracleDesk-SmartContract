@@ -9,6 +9,8 @@
 //! - Rounding always favours the pool: fees round up, shares out round down,
 //!   shares in round up. This is what keeps the pool invariant `k = r_yes * r_no`
 //!   non-decreasing and blocks dust-splitting attacks.
+//! - See `docs/fpmm-economics.md` for the proofs of the rounding, LP-loss and
+//!   no-arbitrage claims made here (checked by `model/fpmm_bounds.py`).
 //! - `MAX_SETS` bounds market size so that any product of two quantities
 //!   (both <= 1e15) is <= 1e30, far below `i128::MAX` (~1.7e38). Every
 //!   multiplication is still `checked_*` as a second line of defence.

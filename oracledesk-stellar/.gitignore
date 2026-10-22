@@ -39,6 +39,11 @@ deployments/traces-*/
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
 
+# Agent runtime state and single-instance lock (agents/runtime, docs/agent-runtime.md)
+.agent-state/
+# Market-maker resolution specs (agents/core/spec-store.ts). Losing one makes
+# its market unresolvable: keep AGENT_SPEC_DIR on backed-up storage, never in git.
+.specs/
 # Simulator output (agents/sim/cli.ts)
 agents/sim/results/
 
@@ -46,4 +51,8 @@ agents/sim/results/
 .vscode/
 .idea/
 .DS_Store
-__pycache__/
+
+# Payment ledger, WAL and shared-memory files contain purchase records.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

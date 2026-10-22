@@ -185,49 +185,11 @@ a verified reasoning trace in the UI:
 `x402/trace-verification.ts` has the reference hash-check implementation the
 frontend's check should match.
 
-## Browsing markets via the on-chain directories
+### Bindings interface versions
 
-`market-core` exposes three paginated directory views (issue #25) so a
-client can enumerate markets without replaying events or scanning
-`0..market_count()`:
-
-```ts
-// open_markets / markets_by_category / markets_of
-const page = await contract.open_markets({ start: 0, limit: 50 });
-// -> bigint[] of market ids (limit is capped at MAX_PAGE = 50 server-side)
-
-const crypto = await contract.markets_by_category({
-  category: { tag: "Crypto", values: undefined },
-  start: 0,
-  limit: 50,
-});
-
-const mine = await contract.markets_of({ holder: userAddress, start: 0, limit: 50 });
-
-// counters, for total pages and for badges:
-const n = await contract.open_count();
-const nCrypto = await contract.category_count({ category: { tag: "Crypto", values: undefined } });
-const nMine = await contract.holder_count({ holder: userAddress });
-```
-
-Paging rules and caveats:
-
-- Page through with `start += MAX_PAGE` until a page comes back shorter
-  than requested; `start >= count` returns an empty array, never an error.
-- **Pages are not a stable snapshot.** Removals from the open and holder
-  directories are O(1) swap-removes, so a market resolved (or a position
-  emptied) between two page fetches can make an id appear twice or shift
-  into an already-scanned slot. Collect ids into a `Set` across pages and
-  keep paging until a full pass yields no new ids. The category directory
-  is append-only, so its order is stable.
-- Views return ids only; hydrate each with `get_market(id)` /
-  `get_position(id, holder)` and sort or filter (status, close time)
-  client-side.
-- `markets_of` lists a holder's markets only from the moment the directory
-  existed: positions opened before the upgrade appear after their next
-  change (buy/sell/transfer/redeem). Keep the position-scanning fallback in
-  the indexer until then, and note that `rebuild_open_index` (admin-only)
-  backfills only the *open* directory.
-- The view reads themselves bump the TTL of the entries they touch, but a
-  simulated read does not persist the bump — long-term liveness is the
-  keeper's job (see `docs/architecture.md`, directory restore requirement).
+`packages/bindings/*` start at `0.1.0`. A breaking interface change requires a
+minor bump while the major is zero, then a major bump after 1.0.0; additions need
+at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
+syncing. The manifest describes functions, named/tuple types, numeric errors and
+event payloads directly from the built WASM. Hash-critical resolver types carry
+ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.

@@ -22,6 +22,14 @@ export interface MarketSignal {
   /** The market maker's estimate of the true probability, in basis points
    * (0..=10000), if this signal implies one. */
   fairValueBps?: number;
+  /** For signals about an oracle-tracked asset: the price rule the market
+   * should resolve by (`asset` is `stellar:<address>` or `other:<symbol>`).
+   * Selects a PriceConfig spec in the market-maker (see core/spec.ts). */
+  priceRule?: {
+    asset: string;
+    threshold: string;
+    direction: "above" | "at-or-above" | "below" | "at-or-below";
+  };
   source: string;
   observedAt: number; // unix seconds
 }

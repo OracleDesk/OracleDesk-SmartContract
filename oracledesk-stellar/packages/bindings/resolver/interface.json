@@ -1,0 +1,3011 @@
+{
+  "schema": 1,
+  "contract": "resolver",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "accept_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "accept_market_core_role": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_market_core_role",
+        "outputs": []
+      }
+    },
+    "admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "attest": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Records `signer`'s vote for `outcome` (allowed only once `close_time` has passed). `Invalid` claims the question is unanswerable; an `Invalid` proposal finalizes by voiding the market. Split votes: every outcome, `Invalid` included, has its own counter, and a signer is deduplicated per `(outcome, signer)`, so one signer may attest several outcomes (existing behaviour, extended to `Invalid`). The first outcome to reach threshold becomes the proposal and later `Yes`/`No` quorums never move it. The one exception: `Invalid` reaching threshold replaces a pending `Yes`/`No` proposal and restarts the dispute window, because a quorum saying the question cannot be answered outranks an answer to it. An `Invalid` proposal is never replaced. (Requiring `Invalid` to beat every other count is a possible follow-up.)",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          }
+        ],
+        "name": "attest",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "attest_with_evidence": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Attests to an outcome backed by an on-chain reasoning trace in reasoning-registry.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "attest_with_evidence",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_admin_transfer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_admin_transfer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Total proposal cancellations executed by the guardian for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel_count",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "cancel_proposal": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Guardian action: withdraws an unfinalized signer proposal during the dispute window subject to a rate limit of MAX_CANCELS_PER_MARKET. Works the same for an `Invalid` proposal. Only the proposal is removed: attestations and per-outcome counts stay, so the next attestation that brings any outcome to threshold (for example a further `Yes` once `Yes` already has quorum) proposes again.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": {
+              "udt": {
+                "name": "GuardianReason"
+              }
+            }
+          }
+        ],
+        "name": "cancel_proposal",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_rotation": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cancels a pending rotation for a committee (admin only).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel_rotation",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "claim_dispute_bond": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pays a settled dispute's bond to its payee (the disputer, or the market-core treasury when the proposal was upheld). Permissionless.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_dispute_bond",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "create_committee": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a reusable committee with an admin, member set, threshold, and time-lock delay.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "rotation_delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "create_committee",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "current_round": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Current attestation round of a weighted-key market; the `round` argument of `submit_signatures` and part of every signed message.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "current_round",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "dispute": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Challenges the current proposal of a `SignersDisputable` market while its dispute window is still open (strictly before `proposed_at + dispute_window`, the instant `finalize_signers` becomes callable). The disputer escrows `dispute_bond` of the collateral token, which freezes finalization until the escalation authority rules or `escalation_timeout` lapses. `alternative` is the outcome the disputer claims is correct (`None`: the market is invalid); it only informs the ruling and must differ from the proposal (so `None` is rejected for an `Invalid` proposal). The disputer may also be a proposing signer.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "disputer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "alternative",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "dispute",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "escalation_attest": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Committee escalation: each member votes once; the first verdict to gather `k` votes settles the dispute.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "member",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "verdict",
+            "type_": {
+              "udt": {
+                "name": "Verdict"
+              }
+            }
+          }
+        ],
+        "name": "escalation_attest",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "evidence_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reads the evidence citation at `index` for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u32"
+          }
+        ],
+        "name": "evidence_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "AttestationEvidence"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "evidence_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reads the currently configured evidence settings, if any.",
+        "inputs": [],
+        "name": "evidence_config",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "tuple": {
+                  "value_types": [
+                    "address",
+                    {
+                      "udt": {
+                        "name": "EvidencePolicy"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "evidence_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Total evidence citations recorded for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "evidence_count",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "execute_rotation": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionlessly executes a matured rotation for a committee, bumping its epoch.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "execute_rotation",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "expire_dispute": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionless fallback when the escalation authority never rules: `escalation_timeout` after the dispute opened, the bond is refunded and the market is voided, so neither side wins by default.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "expire_dispute",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "expire_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionless liveness fallback: once `resolution_deadline` has passed, anyone may void a market that is still unresolved, so collateral is never locked behind a missing reveal, a dead feed or silent signers. Resolution is preferred over voiding. A price market whose feed is valid right now is *resolved* instead (so a stalled caller can never force a void on a resolvable market), and a market with a pending signer proposal is refused with `ResolutionAvailable` until `finalize_signers` settles it.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "expire_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "finalize_signers": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Settles the pending proposal once its dispute window has elapsed: `Yes`/`No` resolve the market, `Invalid` voids it (and emits `CommitteeVoided`). market-core's `void_market` has no `close_time` guard, but every attestation path requires `now >= close_time` before any write, so no proposal (and no void) can exist before close.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_signers",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "AttestedOutcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_committee": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reads committee state and extends its storage TTL.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_committee",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Committee"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "guardian_options": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Returns the guardian reason codes valid for `market_id` right now.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "guardian_options",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": {
+                "udt": {
+                  "name": "GuardianReason"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "guardian_void_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Guardian action: voids a market subject to verified on-chain reason codes and grace periods.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": {
+              "udt": {
+                "name": "GuardianReason"
+              }
+            }
+          }
+        ],
+        "name": "guardian_void_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "market_core": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "market_core",
+        "outputs": [
+          "address"
+        ]
+      }
+    },
+    "open_fallback": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "open_fallback",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "pending_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The pending admin proposal, including its expiry, if one exists.",
+        "inputs": [],
+        "name": "pending_admin",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingAdmin"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "propose_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Starts a two-step handover of the admin role. The new admin must call `accept_admin` itself, so a typo cannot hand control to an address nobody holds.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "propose_rotation": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Proposes a new member set and threshold for a committee, executable after rotation_delay.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "name": "propose_rotation",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "register_committee_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Registers a reusable committee specification for `market_id`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "CommitteeRef"
+              }
+            }
+          }
+        ],
+        "name": "register_committee_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_disputable_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See `register_price_spec` — same commit/reveal rule, signer mode whose proposals can be challenged with a bond (see `dispute`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "DisputableSignerConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_disputable_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_hybrid_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Registers a hybrid resolution specification (price feed with attested fallback).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "HybridConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_hybrid_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_price_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reveals the resolution rule committed to at market creation. Anyone may call this (there is no admin gate) because the only thing that makes a spec acceptable is that it hashes to `market.resolution_hash` — the commitment, not the caller, is the authority. Fails if a spec was already registered for this market.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_price_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_signer_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See `register_price_spec` — same commit/reveal rule, signer mode.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_signer_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_spec_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reveals a rule committed to through a [`ResolutionSpecV2`] envelope. The envelope must name this network and this resolver's market-core (`DomainMismatch`), use a non-zero salt and the current `version` (`InvalidConfig`), and hash to the market's commitment (`SpecHashMismatch`). The inner rule is then validated and stored exactly as the legacy entrypoints do.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "register_spec_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_weighted_key_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See `register_price_spec` — same commit/reveal rule, weighted Ed25519 committee that signs off-chain and is verified by `submit_signatures`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "WeightedKeyConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_weighted_key_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "resolution_deadline": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "When `expire_market` becomes callable for `market_id`: `close_time` plus [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it is known before (and without) a spec reveal.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolution_deadline",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "resolve_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolve_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Outcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "set_evidence_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Configures the reasoning registry contract address and evidence policy (admin only).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "registry",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "EvidencePolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_evidence_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "settle_dispute": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Guardian escalation: the admin rules on an open dispute.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "verdict",
+            "type_": {
+              "udt": {
+                "name": "Verdict"
+              }
+            }
+          }
+        ],
+        "name": "settle_dispute",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "snapshot": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The price pinned by `snapshot_price`, if any.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "snapshot",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PriceSnapshot"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "snapshot_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pins the committed feed's price for `close_time` in resolver storage, so `resolve_price` still works after the oracle's bounded history has aged that record out (SEP-40 `price(asset, timestamp)` returns `None` outside the retained window). Permissionless: `caller` only authorizes being recorded as `taken_by`. Callable any time after `close_time` while the market is unresolved, but in practice it must run within the oracle's retention window (see `docs/architecture.md`, \"Oracle history retention\"). The first valid snapshot wins (`SnapshotExists` afterwards): for a fixed `(asset, close_time)` the answer is deterministic, and freezing it deliberately prefers determinism over an oracle later rewriting history. A price `resolve_price` would reject is never stored.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          }
+        ],
+        "name": "snapshot_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "PriceData"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "state",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ResolutionState"
+            }
+          }
+        ]
+      }
+    },
+    "submit_signatures": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Counts Ed25519 signatures from a weighted committee. Permissionless: the signatures, not the submitter, carry the authority. Each signature is over the message built by `attestation_message`; non-members and keys that already signed this round (for either outcome) are skipped, and a single invalid signature aborts the whole batch, so submitters should pre-filter with a verifier. Once the accumulated weight for `outcome` first reaches the threshold a proposal is recorded and the dispute window starts; later calls never move it.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "round",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "sigs",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "tuple": {
+                    "value_types": [
+                      {
+                        "bytes_n": {
+                          "n": 32
+                        }
+                      },
+                      {
+                        "bytes_n": {
+                          "n": 64
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "submit_signatures",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "AttestationEvidence": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Stored link connecting an attestation to a reasoning registry trace. `outcome` was a market-core `Outcome` before `Invalid` attestations; the two enums encode `Yes`/`No` identically, so earlier entries still decode.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "attested_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "AttestationEvidence"
+      }
+    },
+    "AttestedOutcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "The question is ambiguous or unanswerable; finalizing voids the market.",
+              "name": "Invalid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "What a signer attests to. Resolver-local so market-core's `Outcome` (and the vendored `market_core.wasm`) never gains an `Invalid` variant: an `Invalid` proposal finalizes through market-core's `void_market` instead of `resolve`. Never part of a `ResolutionSpec`, so commitment hashes are unaffected (ADR 0001).",
+        "lib": "",
+        "name": "AttestedOutcome"
+      }
+    },
+    "Committee": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Reusable committee managed by an admin under time-locked rotation rules.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "epoch",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rotation_delay",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "Committee"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Binds a market to a reusable committee registry subject to rotation bounds.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "min_epoch",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CommitteeRef"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Attested resolution whose proposal can be challenged with a bond during the dispute window. Hashed as `ResolutionSpec::SignersDisputable`, a separate variant, so existing `Signers` commitments are unaffected.",
+        "fields": [
+          {
+            "doc": "Collateral escrowed by `dispute`; must be positive.",
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "doc": "Seconds after a dispute opens before anyone may void it unresolved.",
+            "name": "escalation_timeout",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "`k` of these members, through `escalation_attest`. Must be disjoint from the proposing signers.",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The resolver admin, through `settle_dispute`.",
+              "name": "Guardian"
+            }
+          }
+        ],
+        "doc": "Who rules on a dispute.",
+        "lib": "",
+        "name": "Escalation"
+      }
+    },
+    "EvidencePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Disabled"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "doc": "Evidence policy governing whether attestation evidence is required.",
+        "lib": "",
+        "name": "EvidencePolicy"
+      }
+    },
+    "ExpiryMode": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Unrevealed"
+            }
+          }
+        ],
+        "doc": "Which resolution path a market was on when it expired.",
+        "lib": "",
+        "name": "ExpiryMode"
+      }
+    },
+    "GuardianActionKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CancelProposal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Void"
+            }
+          }
+        ],
+        "doc": "Guardian action type emitted for audit trails.",
+        "lib": "",
+        "name": "GuardianActionKind"
+      }
+    },
+    "GuardianReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "Proposal exists and dispute window is currently active.",
+              "name": "DisputeUpheld"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Price mode, past close_time + ORACLE_GRACE_SECS, price feed unavailable or stale.",
+              "name": "OracleUnavailable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Signer mode, past close_time + SIGNER_GRACE_SECS, no proposal.",
+              "name": "SignersStalled"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Past close_time + REVEAL_GRACE_SECS, no spec revealed.",
+              "name": "UnrevealedSpec"
+            }
+          }
+        ],
+        "doc": "Reason code constraining guardian interventions.",
+        "lib": "",
+        "name": "GuardianReason"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Dual-path resolution mode: price feed first, falling back to signers.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfig"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "OracleAsset"
+      }
+    },
+    "Outcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Outcome"
+      }
+    },
+    "PendingAdmin": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A proposed admin handover (#62). Absent when no transfer is pending.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "address",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "expires_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingAdmin"
+      }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "PriceConfig"
+      }
+    },
+    "PriceData": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PriceData"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "PriceDirection"
+      }
+    },
+    "PriceSnapshot": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A price read pinned by [`Resolver::snapshot_price`] so resolution survives the oracle aging the `close_time` record out of its history.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "data",
+            "type_": {
+              "udt": {
+                "name": "PriceData"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "taken_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "taken_by",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "PriceSnapshot"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "The full resolution rule a market's `resolution_hash` commits to. Hashing this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two modes in disjoint hash spaces even if their field encodings could otherwise collide. See `docs/adr/0001-resolution-commitment.md`.",
+        "lib": "",
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the network and the market-core instance, and carries a creator-chosen `salt` that makes a pre-reveal brute-force of the (low-entropy) rule infeasible.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "`sha256(network passphrase)`, i.e. `env.ledger().network_id()`.",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "ResolutionState": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "A bonded dispute is open; finalization is frozen until it settles.",
+              "name": "Disputed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Voided by [`Resolver::expire_market`] after the resolution deadline.",
+              "name": "Expired"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Finalized"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HybridFallbackOpen"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HybridPricePending"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SignersPending"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Unconfigured"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "ResolutionState"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "SignerConfig"
+      }
+    },
+    "Verdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Invalid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "The escalation authority's ruling. `Invalid` voids the market.",
+        "lib": "",
+        "name": "Verdict"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "Raw Ed25519 public key. For a `G...` account address this is `StrKey.decodeEd25519PublicKey(address)`; `C...` addresses have none.",
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Total weight that must sign one outcome. Choose it above half the total weight so two outcomes can never both reach it.",
+            "name": "weight_threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKeyConfig"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "AlreadyAttested",
+            "value": 12
+          },
+          {
+            "doc": "",
+            "name": "AlreadyFinalized",
+            "value": 17
+          },
+          {
+            "doc": "",
+            "name": "CommitteeNotFound",
+            "value": 26
+          },
+          {
+            "doc": "",
+            "name": "CommitteeTooLarge",
+            "value": 31
+          },
+          {
+            "doc": "",
+            "name": "DeadlineNotReached",
+            "value": 19
+          },
+          {
+            "doc": "",
+            "name": "DisputeActive",
+            "value": 14
+          },
+          {
+            "doc": "",
+            "name": "DisputeWindowClosed",
+            "value": 24
+          },
+          {
+            "doc": "",
+            "name": "DisputeWindowOpen",
+            "value": 15
+          },
+          {
+            "doc": "",
+            "name": "DomainMismatch",
+            "value": 21
+          },
+          {
+            "doc": "",
+            "name": "DuplicateMember",
+            "value": 30
+          },
+          {
+            "doc": "",
+            "name": "EvidenceAlreadyUsed",
+            "value": 38
+          },
+          {
+            "doc": "",
+            "name": "EvidenceAuthorMismatch",
+            "value": 35
+          },
+          {
+            "doc": "",
+            "name": "EvidenceDisabled",
+            "value": 32
+          },
+          {
+            "doc": "",
+            "name": "EvidenceMarketMismatch",
+            "value": 36
+          },
+          {
+            "doc": "",
+            "name": "EvidenceNotFound",
+            "value": 34
+          },
+          {
+            "doc": "",
+            "name": "EvidenceRequired",
+            "value": 33
+          },
+          {
+            "doc": "",
+            "name": "EvidenceTooEarly",
+            "value": 37
+          },
+          {
+            "doc": "",
+            "name": "GuardianNotAllowed",
+            "value": 39
+          },
+          {
+            "doc": "",
+            "name": "InvalidConfig",
+            "value": 3
+          },
+          {
+            "doc": "",
+            "name": "InvalidPrice",
+            "value": 10
+          },
+          {
+            "doc": "",
+            "name": "MarketAlreadyConfigured",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "MarketNotClosed",
+            "value": 7
+          },
+          {
+            "doc": "",
+            "name": "MarketNotConfigured",
+            "value": 5
+          },
+          {
+            "doc": "",
+            "name": "NoDispute",
+            "value": 25
+          },
+          {
+            "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
+            "name": "NoPendingAdmin",
+            "value": 42
+          },
+          {
+            "doc": "",
+            "name": "NoProposal",
+            "value": 16
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "",
+            "name": "NotSigner",
+            "value": 11
+          },
+          {
+            "doc": "A proposed admin handover was not accepted within its `expires_at`.",
+            "name": "PendingAdminExpired",
+            "value": 43
+          },
+          {
+            "doc": "",
+            "name": "PriceUnavailable",
+            "value": 8
+          },
+          {
+            "doc": "",
+            "name": "ResolutionAvailable",
+            "value": 20
+          },
+          {
+            "doc": "",
+            "name": "RotationBoundExceeded",
+            "value": 29
+          },
+          {
+            "doc": "",
+            "name": "RotationNotReady",
+            "value": 28
+          },
+          {
+            "doc": "",
+            "name": "RotationPending",
+            "value": 27
+          },
+          {
+            "doc": "",
+            "name": "SnapshotExists",
+            "value": 41
+          },
+          {
+            "doc": "",
+            "name": "SpecHashMismatch",
+            "value": 18
+          },
+          {
+            "doc": "",
+            "name": "StalePrice",
+            "value": 9
+          },
+          {
+            "doc": "",
+            "name": "StaleRound",
+            "value": 22
+          },
+          {
+            "doc": "",
+            "name": "ThresholdNotReached",
+            "value": 13
+          },
+          {
+            "doc": "",
+            "name": "TooManyCancels",
+            "value": 40
+          },
+          {
+            "doc": "",
+            "name": "TooManySignatures",
+            "value": 23
+          },
+          {
+            "doc": "",
+            "name": "Unauthorized",
+            "value": 2
+          },
+          {
+            "doc": "",
+            "name": "WrongMode",
+            "value": 6
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "AdminTransferCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferCancelled",
+        "params": [],
+        "prefix_topics": [
+          "admin_transfer_cancelled"
+        ]
+      }
+    },
+    "AdminTransferProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transfer_proposed"
+        ]
+      }
+    },
+    "AdminTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transferred"
+        ]
+      }
+    },
+    "Attested": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "Attested",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trace_id",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "count",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "attested"
+        ]
+      }
+    },
+    "CommitteeCreated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CommitteeCreated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "committee_created"
+        ]
+      }
+    },
+    "CommitteeVoided": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "A signer committee finalized an `Invalid` proposal and voided the market. Distinguishes committee voids from `GuardianAction { action: Void }`.",
+        "lib": "",
+        "name": "CommitteeVoided",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "finalized_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "invalid_count",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "committee_voided"
+        ]
+      }
+    },
+    "DisputeSettled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "`disputer_won` is true when the bond returns to the disputer because the ruling overturned the proposal. A timeout (`expire_dispute`) also refunds the bond but is reported as `verdict: Invalid, disputer_won: false`. That pair also describes a ruling of `Invalid` that upholds an `Invalid` proposal; the two differ in the bond's payee (disputer on timeout, market-core treasury when upheld), readable from the `Dispute` entry until `claim_dispute_bond` runs. `payout` is the escrowed bond, claimable by its payee.",
+        "lib": "",
+        "name": "DisputeSettled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "verdict",
+            "type_": {
+              "udt": {
+                "name": "Verdict"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "disputer_won",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "dispute_settled"
+        ]
+      }
+    },
+    "Disputed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "Disputed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "disputer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "What the disputer claims is correct; `None` claims the market is invalid.",
+            "location": "data",
+            "name": "alternative",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "disputed"
+        ]
+      }
+    },
+    "FallbackOpened": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "FallbackOpened",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "opened_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "last_error",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "fallback_opened"
+        ]
+      }
+    },
+    "FallbackSuperseded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "`proposal_outcome` (like `Attested::outcome`) was a market-core `Outcome`; `Yes`/`No` encode identically, so only `Invalid` is new to decoders.",
+        "lib": "",
+        "name": "FallbackSuperseded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "proposal_outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "fallback_superseded"
+        ]
+      }
+    },
+    "GuardianAction": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "GuardianAction",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "GuardianActionKind"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": {
+              "udt": {
+                "name": "GuardianReason"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "guardian_action"
+        ]
+      }
+    },
+    "MarketExpired": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketExpired",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "mode",
+            "type_": {
+              "udt": {
+                "name": "ExpiryMode"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "market_expired"
+        ]
+      }
+    },
+    "PriceResolution": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PriceResolution",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "price_resolution"
+        ]
+      }
+    },
+    "PriceResolutionV2": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "`PriceResolution` plus whether the price came from a stored [`PriceSnapshot`]. Both are emitted for one release so indexers decoding `PriceResolution` keep working while they move to this event.",
+        "lib": "",
+        "name": "PriceResolutionV2",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "from_snapshot",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "price_resolution_v2"
+        ]
+      }
+    },
+    "PriceSnapshotted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PriceSnapshotted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "taken_by",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "price_snapshotted"
+        ]
+      }
+    },
+    "ResolutionFinalizedV2": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolutionFinalizedV2",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "finalized_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "resolution_finalized_v2"
+        ]
+      }
+    },
+    "ResolutionProposedV2": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolutionProposedV2",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "resolution_proposed_v2"
+        ]
+      }
+    },
+    "RotationCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "RotationCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "committee_id",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "rotation_cancelled"
+        ]
+      }
+    },
+    "RotationExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "RotationExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "epoch",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "rotation_executed"
+        ]
+      }
+    },
+    "RotationProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "RotationProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "rotation_proposed"
+        ]
+      }
+    }
+  },
+  "type_origins": {
+    "Outcome": "market-core"
+  },
+  "hash_critical": [
+    "CommitteeRef",
+    "DisputableSignerConfig",
+    "Escalation",
+    "HybridConfig",
+    "OracleAsset",
+    "PriceConfig",
+    "PriceDirection",
+    "ResolutionSpec",
+    "ResolutionSpecV2",
+    "SignerConfig",
+    "WeightedKey",
+    "WeightedKeyConfig"
+  ]
+}

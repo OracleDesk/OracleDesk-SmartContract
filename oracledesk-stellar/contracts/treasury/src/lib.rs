@@ -533,23 +533,23 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
-    MarketNotFinal = 29,
-    MarketCoreError = 30,
-    DrawdownTripped = 31,
-    InvalidDrawdownConfig = 32,
-    NotAcknowledged = 33,
-    SeedCapExceeded = 34,
-    CreationRateExceeded = 35,
-    CloseTimeTooSoon = 36,
-    CloseTimeTooFar = 37,
-    CategoryNotAllowed = 38,
-    PolicyLoosening = 39,
-    YieldDisabled = 40,
-    YieldCapExceeded = 41,
-    YieldWithdrawFailed = 42,
-    VenueHasPrincipal = 43,
+    MarketNotFinal = 44,
+    MarketCoreError = 45,
+    DrawdownTripped = 46,
+    InvalidDrawdownConfig = 47,
+    NotAcknowledged = 48,
+    SeedCapExceeded = 49,
+    CreationRateExceeded = 50,
+    CloseTimeTooSoon = 51,
+    CloseTimeTooFar = 52,
+    CategoryNotAllowed = 53,
+    PolicyLoosening = 54,
+    YieldDisabled = 55,
+    YieldCapExceeded = 56,
+    YieldWithdrawFailed = 57,
+    VenueHasPrincipal = 58,
     /// Category exposure would exceed its correlation cap (#49).
-    CategoryCapExceeded = 2029,
+    CategoryCapExceeded = 44,
     /// Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 45,
     /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
@@ -3945,6 +3945,82 @@ mod test {
         BytesN, String,
     };
 
+    // ---- dual registration of market-core (coverage, issue #75) ---------------
+    //
+    // The wasm copy is what ships and what ADR 0002 requires the contract to be
+    // *built* against, but code running inside the wasm VM is invisible to
+    // `cargo llvm-cov`. A native `market-core` registration (a dev-dependency:
+    // the duplicate `__constructor` export that forbids this in the wasm build
+    // does not exist in a native test binary) runs the same scenarios as host
+    // code. `MARKET_CORE_IMPL=native cargo test` flips the whole suite;
+    // `both_modes!` pins individual scenarios to both.
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum McImpl {
+        Wasm,
+        Native,
+    }
+
+    std::thread_local! {
+        static MC_OVERRIDE: core::cell::Cell<Option<McImpl>> = const { core::cell::Cell::new(None) };
+    }
+
+    fn mc_impl() -> McImpl {
+        MC_OVERRIDE.with(|c| c.get()).unwrap_or_else(|| {
+            match std::env::var("MARKET_CORE_IMPL").as_deref() {
+                Ok("native") => McImpl::Native,
+                _ => McImpl::Wasm,
+            }
+        })
+    }
+
+    /// Runs `f` with market-core registered as `how`, restoring the previous
+    /// choice even if `f` panics.
+    fn with_market_core<R>(how: McImpl, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<McImpl>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MC_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(MC_OVERRIDE.with(|c| c.replace(Some(how))));
+        f()
+    }
+
+    /// `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
+    fn register_market_core(
+        env: &Env,
+        args: (Address, Address, Address, Address, u32, u32),
+    ) -> Address {
+        match mc_impl() {
+            McImpl::Wasm => env.register(market_core::WASM, args),
+            McImpl::Native => env.register(
+                ::market_core_native::MarketCore,
+                ::market_core_native::MarketCoreArgs::__constructor(
+                    &args.0, &args.1, &args.2, &args.3, &args.4, &args.5,
+                ),
+            ),
+        }
+    }
+
+    /// Re-runs existing scenario tests (`#[test]` functions are plain functions
+    /// too) once per market-core registration, as `<name>::wasm` and
+    /// `<name>::native`.
+    macro_rules! both_modes {
+        ($($name:ident),+ $(,)?) => {$(
+            mod $name {
+                #[test]
+                fn wasm() {
+                    super::with_market_core(super::McImpl::Wasm, super::$name);
+                }
+                #[test]
+                fn native() {
+                    super::with_market_core(super::McImpl::Native, super::$name);
+                }
+            }
+        )+};
+    }
+
     // Comfortably past every timestamp advance the tests make, so a market
     // never closes out from under a trade mid-test.
     const MARKET_CLOSE: u64 = 1_000 + 30 * DAY_SECONDS;
@@ -4055,8 +4131,8 @@ mod test {
         }
 
         let resolver = Address::generate(&env);
-        let market_core_id = env.register(
-            market_core::WASM,
+        let market_core_id = register_market_core(
+            &env,
             (
                 admin.clone(),
                 collateral.address(),
@@ -4885,6 +4961,57 @@ mod test {
         // ...and gone from hour 25's.
         f.env.ledger().set_timestamp(25 * BUCKET_SECONDS);
         assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
+    }
+
+    /// Regression for I4 ("no `max_daily` in any 24h"), the shape of the
+    /// shortest counterexample the exhaustive explorer
+    /// (`contracts/integration-tests`, `treasury_caps_exhaustive`) reports when
+    /// the window is mutated to 24 buckets instead of 25: spend near the end of
+    /// an hour, then again 86_399s later. 24h earlier than the second trade is
+    /// still inside the window because the first trade's hour is only
+    /// partially covered. The original fixed daily window (reset to `now` at
+    /// the first call after 24h) allowed up to 2x `max_daily` here; the
+    /// sliding window allows exactly `max_daily`.
+    #[test]
+    fn explorer_i4_sequence_stays_within_max_daily() {
+        let u = 100 * USDC;
+        let f = fixture_with_caps(2 * u, 3 * u, 4 * u);
+        // A second market, so the daily cap binds before the per-market cap.
+        let creator = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &f.token).mint(&creator, &(1_000 * USDC));
+        let second = f.market_core.create_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[12u8; 32]),
+            &BytesN::from_array(&f.env, &[112u8; 32]),
+            &String::from_str(&f.env, "ipfs://second-market"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        );
+        let first = 24 * BUCKET_SECONDS + 3_599;
+        f.env.ledger().set_timestamp(first);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &u, &0);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(2 * u), &0);
+
+        // 86_399s later the first hour is still counted: 3u + 2u > 4u.
+        f.env.ledger().set_timestamp(first + 86_399);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &second, &Outcome::Yes, &(2 * u), &0),
+            Err(Ok(Error::DailyCapExceeded))
+        );
+        // The failed call spent nothing; a buy that fits the remaining 1u does.
+        assert_eq!(f.treasury.daily_headroom(), u);
+        f.treasury
+            .agent_buy(&f.agent, &second, &Outcome::Yes, &u, &0);
+
+        // Once the first trade's hour has left the 25-bucket window (hour 49
+        // covers hours 25..=49) its 3u are free again.
+        f.env.ledger().set_timestamp(49 * BUCKET_SECONDS);
+        assert_eq!(f.treasury.daily_headroom(), 3 * u);
     }
 
     #[test]
@@ -6052,8 +6179,8 @@ mod test {
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
 
         let creator = f.market_core.get_market(&f.market_id).creator;
-        let new_core_id = f.env.register(
-            market_core::WASM,
+        let new_core_id = register_market_core(
+            &f.env,
             (
                 f.admin.clone(),
                 f.token.clone(),
@@ -6961,7 +7088,7 @@ mod test {
 
     #[test]
     fn settle_market_claims_lp_for_treasury_created_market() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -6990,7 +7117,7 @@ mod test {
 
     #[test]
     fn settle_market_handles_position_and_lp_together() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7049,7 +7176,7 @@ mod test {
 
     #[test]
     fn settle_market_after_agent_redeem_reports_only_lp() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7168,8 +7295,6 @@ mod test {
 
         let caller = Address::generate(&f.env);
         let report = f.treasury.settle_market(&caller, &f.market_id);
-        // Check the event before any other contract call: env.events().all()
-        // only retains the most recent invocation's events.
         assert!(has_event(
             &f,
             &MarketSettled {
@@ -7268,7 +7393,7 @@ mod test {
 
     #[test]
     fn lp_remainder_counts_toward_proceeds_for_created_markets() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let seed = 100 * USDC;
         let market_id = f.treasury.agent_create_market(
@@ -7295,7 +7420,7 @@ mod test {
 
     #[test]
     fn drawdown_breach_pauses_buys_but_allows_reduce_only_sells() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         // Lower max_drawdown to 15 USDC
         f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
 
@@ -7304,7 +7429,7 @@ mod test {
         f.treasury
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
 
-        let close = MARKET_CLOSE + 1000; // still open when market 1 settles
+        let close = MARKET_CLOSE + 1000;
         let market2 = f.treasury.agent_create_market(
             &f.agent,
             &BytesN::from_array(&f.env, &[33u8; 32]),
@@ -7427,11 +7552,14 @@ mod test {
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::No);
 
-        // Settlement redeems the worthless position first; a third party can
-        // then call realize, but it must not change the already-booked loss.
+        // Finality alone does not burn positions; realize must wait for settlement.
+        f.treasury.realize(&f.market_id);
+        assert!(!f.treasury.market_pnl(&f.market_id).realized);
         let caller = Address::generate(&f.env);
         f.treasury.settle_market(&caller, &f.market_id);
+        let before = f.treasury.window_pnl();
         f.treasury.realize(&f.market_id);
+        assert_eq!(f.treasury.window_pnl(), before);
         let pnl = f.treasury.market_pnl(&f.market_id);
         assert_eq!(pnl.cost, cost);
         assert_eq!(pnl.proceeds, 0);
@@ -7703,7 +7831,7 @@ mod test {
 
     #[test]
     fn seed_still_counts_toward_daily_and_market_caps() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let seed = 100 * USDC;
         let close = f.env.ledger().timestamp() + 500;
         let market_id = f.treasury.agent_create_market(

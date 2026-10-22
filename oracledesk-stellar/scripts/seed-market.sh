@@ -19,6 +19,10 @@
 # unresolvable market. Pass --commit-only to keep the legacy two-step
 # behaviour (agent_create_market, then register_spec_v2 separately).
 #
+# The market-maker agent runs the same commit -> persist -> create -> reveal
+# flow itself, with crash recovery: see agents/core/maker-flow.ts and
+# docs/adr/0001-resolution-commitment.md ("Agent flow and recovery").
+#
 # Usage: scripts/seed-market.sh [--commit-only] [seed_amount_stroops] [initial_yes_bps] [close_in_seconds]
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -78,15 +82,23 @@ spec_hash() {
   cargo run --quiet --manifest-path scripts/spec-hash/Cargo.toml -- "$@"
 }
 
+# Canonical signer order (lexicographic strkey), shared with the agent
+# (agents/core/spec.ts canonicalizeSpec). Vec order is part of the XDR, so
+# hashing and the reveal must both use this order.
+canonical_signers() {
+  printf '%s\n' "$@" | LC_ALL=C sort
+}
+
 # $1 = salt. Prints the V2 flags spec-hash expects, one per line.
 v2_flags() {
   printf '%s\n' --v2 --salt "$1" --network-passphrase "$NETWORK_PASSPHRASE" --market-core "$MARKET_CORE"
 }
 
 echo "==> computing salted V2 resolution commitment (signers: [$AGENT], threshold 1)" >&2
+mapfile -t SIGNERS < <(canonical_signers "$AGENT")
 SALT=$(spec_hash gen-salt)
 mapfile -t V2_FLAGS < <(v2_flags "$SALT")
-RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "$AGENT")
+RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}")
 
 echo "==> persisting the salt to $SPECS_DIR before creating the market" >&2
 mkdir -p "$SPECS_DIR"
@@ -95,20 +107,20 @@ SPEC_FILE="$SPECS_DIR/$RESOLUTION_HASH.json"
   umask 077
   jq -n --arg question "$QUESTION_TEXT" --arg hash "$RESOLUTION_HASH" --arg salt "$SALT" \
     --arg network_id "$(sha256_hex "$NETWORK_PASSPHRASE")" --arg market_core "$MARKET_CORE" \
-    --arg agent "$AGENT" --argjson window "$DISPUTE_WINDOW" '{
+    --argjson signers "$(printf '%s\n' "${SIGNERS[@]}" | jq -R . | jq -sc .)" --argjson window "$DISPUTE_WINDOW" '{
       market_question: $question,
       resolution_hash: $hash,
       salt: $salt,
       spec: {
         version: 2, network_id: $network_id, market_core: $market_core, salt: $salt,
-        rule: { Signers: { dispute_window: $window, signers: [$agent], threshold: 1 } }
+        rule: { Signers: { dispute_window: $window, signers: $signers, threshold: 1 } }
       }
     }' >"$SPEC_FILE.tmp"
   mv "$SPEC_FILE.tmp" "$SPEC_FILE"
 )
 # Prove the stored salt reproduces the commitment before any funds move.
 mapfile -t V2_FLAGS < <(v2_flags "$(jq -r .salt "$SPEC_FILE")")
-spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "$AGENT" >/dev/null
+spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}" >/dev/null
 
 QUESTION_HASH=$(sha256_hex "$QUESTION_TEXT")
 CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))

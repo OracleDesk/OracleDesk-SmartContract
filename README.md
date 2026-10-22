@@ -175,7 +175,7 @@ issuer address is hardcoded anywhere in this repo; see
 
 - Rust (stable) with the `wasm32v1-none` target
 - The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+
-- Node.js 20+ and npm
+- Node.js 22+ and npm
 - Python 3.10+
 - `jq`
 
