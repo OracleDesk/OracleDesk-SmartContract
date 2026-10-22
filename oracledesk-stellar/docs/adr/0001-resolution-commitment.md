@@ -176,3 +176,64 @@ To eliminate unbounded administrative discretion and guarantee credible decentra
   - `guardian_void_market` can only be invoked after grace periods have expired: `close_time + REVEAL_GRACE_SECS` (3 days) for unrevealed specs, `close_time + ORACLE_GRACE_SECS` (1 day) for failing price feeds, and `close_time + SIGNER_GRACE_SECS` (7 days) for unresponsive signer sets.
 - Cancellation rate limiting: `cancel_proposal` is strictly capped at `MAX_CANCELS_PER_MARKET = 2` cancellations per market to prevent indefinite griefing.
 - Audit trail: both `cancel_proposal` and `guardian_void_market` require a typed `GuardianReason` enum (`StaleOracleFeed = 1`, `CompromisedSigner = 2`, `AmbiguousSpec = 3`, `LivenessFailure = 4`, `Other = 5`), emitting structured `GuardianAction` events with execution metadata.
+
+## Agent flow and recovery
+
+Create and reveal are two transactions, and between them only the agent
+holds the preimage of `resolution_hash`. If the spec is lost there (crash,
+wiped working directory, container restart), the market can only end
+through `guardian_void_market`. The market-maker
+(`agents/bin/market-maker.ts`, `agents/core/maker-flow.ts`) therefore runs:
+
+1. **Build** a `SpecJson` (`agents/core/spec.ts`) from `MM_*` config:
+   signers mode (`MM_SIGNERS`, default `deployments.agent`;
+   `MM_SIGNER_THRESHOLD`; `MM_DISPUTE_WINDOW_SECS`) or price mode
+   (`MM_REFLECTOR`, `MM_ASSET`, `MM_PRICE_THRESHOLD`, `MM_PRICE_DIRECTION`,
+   `MM_MAX_STALENESS_SECS`, or a signal's own `priceRule`). `validateSpec`
+   mirrors the resolver's `InvalidConfig` rules exactly, and `close_time`
+   must exceed `now + dispute_window + MM_CLOSE_MARGIN_SECS`.
+2. **Canonicalize**: signers are sorted lexicographically by strkey. `Vec`
+   order is part of the XDR (`signer_spec_hash_depends_on_signer_order`), so
+   the same order is used to hash and to reveal. `scripts/seed-market.sh`
+   sorts the same way.
+3. **Commit** through `SpecHasher` (`agents/core/spec-hasher.ts`):
+   `scripts/spec-hash` via `execFile` (`SPEC_HASH_BIN` for a prebuilt binary,
+   else `cargo run`), or the TypeScript resolution-spec library when
+   installed. `--verify-spec-hash` runs both and fails on disagreement.
+4. **Persist** a `pending_create` entry to `AGENT_SPEC_DIR` (default
+   `./.specs`, gitignored, separate from `.traces/`) with
+   `agents/core/spec-store.ts`: temp file, fsync, atomic rename, fsync of
+   the directory, then the optional `SPEC_BACKUP_CMD`. The create is not
+   built until this write has resolved. **Back up this directory.**
+5. **Create** with `resolution_hash = commitment`, mark the entry `created`
+   with its market id, **reveal** with `register_signer_spec` /
+   `register_price_spec`, and mark it `revealed`.
+
+`recoverSpecs` runs at startup and after every create attempt, and drives
+every non-terminal entry forward:
+
+- `created`: if the market's spec is not registered yet, reveal it. A price
+  reveal leaves `state()` at `Unconfigured`, so the resolver's
+  `Price(market_id)` entry is checked too. Reveal is permissionless, so
+  `MarketAlreadyConfigured` from someone who revealed first counts as
+  success once the market's `resolution_hash` is confirmed to equal the
+  stored commitment. A failed reveal stays `created` and is retried; entries
+  older than `MM_STALE_REVEAL_SECS` are logged as alerts.
+- `pending_create` (crash or RPC failure after the write, market id unknown):
+  scan the newest `MM_RECOVERY_MAX_SCAN` market ids for
+  `resolution_hash == commitment && creator == treasury`, plus a matching
+  `question_hash` and `close_time`. Each market is claimed by at most one
+  entry, because identical specs (the spec does not include the question)
+  share a commitment. A match moves to `created` and is revealed. With no
+  match after `MM_PENDING_TTL_SECS`, the entry is marked `abandoned` and its
+  file is kept.
+- A create that failed before submission (simulation rejected it, e.g.
+  `TradeCapExceeded`; the adapter raises `NotSubmittedError`) created no
+  market, so its entry is marked `abandoned` immediately instead of waiting
+  for the TTL.
+
+Dry-run mode uses an in-memory store and skips recovery, so it never
+leaves entries behind for a live run. Creating and revealing atomically in
+one transaction (`agent_create_market_and_reveal`, used by
+`scripts/seed-market.sh`) removes this window entirely; this flow and its
+recovery loop cover agents that still use the two-step path.

@@ -3,28 +3,12 @@ name = "integration-tests"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Cross-contract authorization matrix and system-model harness (test-only)."
+description = "Cross-contract and bounded-exhaustive tests; ships no contract."
 
 [lib]
-crate-type = ["rlib"]
 doctest = false
 
-[dependencies]
-# Imported clients are generated from the wasm built by `make build`. This is
-# deliberate: the matrix must exercise the same bytecode that ships, not a
-# Rust-symbol-linked copy of the contracts. See docs/adr/0002-cross-contract-calls.md.
-soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
-stellar-xdr = "27.0.0"
-wasmparser = "0.116"
-
-# Pure hash helpers only (never a contract client): fixtures commit to the
-# same rule they later reveal. Contract calls still go through the wasm clients.
-resolver-contract = { package = "resolver", path = "../resolver" }
-
 [dev-dependencies]
-proptest = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+treasury = { path = "../treasury" }
+market-core = { path = "../market-core" }

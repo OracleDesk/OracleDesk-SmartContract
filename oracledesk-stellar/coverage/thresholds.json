@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimum line coverage (%) per package, set from the measured value minus 2. Raise them when coverage rises; scripts/coverage-gate.py fails below them.",
+  "market-core": 92,
+  "resolver": 66,
+  "treasury": 89,
+  "reasoning-registry": 94,
+  "router": 92,
+  "timelock": 82,
+  "x402": 36,
+  "agents": 80
+}

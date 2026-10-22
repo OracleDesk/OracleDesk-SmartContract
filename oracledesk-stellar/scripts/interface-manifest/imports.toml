@@ -1,0 +1,10 @@
+# contractimport! erases the defining library from embedded specs. Record only
+# imported public types; names such as Config/DataKey/PendingAdmin are local.
+[resolver]
+market-core = ["Outcome"]
+[treasury]
+market-core = ["Category", "Outcome"]
+resolver = ["CommitteeRef", "DisputableSignerConfig", "Escalation", "HybridConfig", "OracleAsset", "PriceConfig", "PriceDirection", "ResolutionSpec", "ResolutionSpecV2", "SignerConfig", "WeightedKey", "WeightedKeyConfig"]
+[router]
+market-core = ["Category", "Outcome"]
+resolver = ["CommitteeRef", "DisputableSignerConfig", "Escalation", "HybridConfig", "OracleAsset", "PriceConfig", "PriceDirection", "ResolutionSpec", "ResolutionSpecV2", "SignerConfig", "WeightedKey", "WeightedKeyConfig"]

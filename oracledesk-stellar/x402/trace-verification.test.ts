@@ -27,6 +27,13 @@ test("builds an encoded IPFS gateway URL", () => {
   );
 });
 
+test("ipfsUrl leaves a bare CIDv1 unchanged", () => {
+  // What agents/core/ipfs-store.ts publishes: raw-codec CIDv1, base32 lower.
+  const cid = "bafkreicecnx2gvntm6fbcrvnc336qze6st5u7qq7457igegamd3bzkx7ri";
+  assert.equal(ipfsUrl("https://ipfs.io/ipfs", cid), `https://ipfs.io/ipfs/${cid}`);
+  assert.equal(ipfsUrl("https://ipfs.io/ipfs/", cid), `https://ipfs.io/ipfs/${cid}`);
+});
+
 // ─── Hash-chained traces (#52) ───────────────────────────────────────────────
 
 

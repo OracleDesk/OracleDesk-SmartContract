@@ -184,3 +184,12 @@ a verified reasoning trace in the UI:
 
 `x402/trace-verification.ts` has the reference hash-check implementation the
 frontend's check should match.
+
+### Bindings interface versions
+
+`packages/bindings/*` start at `0.1.0`. A breaking interface change requires a
+minor bump while the major is zero, then a major bump after 1.0.0; additions need
+at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
+syncing. The manifest describes functions, named/tuple types, numeric errors and
+event payloads directly from the built WASM. Hash-critical resolver types carry
+ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.

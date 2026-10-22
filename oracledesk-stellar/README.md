@@ -64,7 +64,7 @@ Design decisions with real trade-offs are written up in `docs/adr/`:
 - Rust (stable) with the `wasm32v1-none` target — `rust-toolchain.toml`
   pins this for you if you use `rustup`.
 - The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+.
-- Node.js 20+ and npm.
+- Node.js 22+ and npm.
 - Python 3.10+ (for `model/fpmm_model.py`'s property tests).
 - `jq` (used by the deploy/seed scripts).
 

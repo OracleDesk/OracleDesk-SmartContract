@@ -9,8 +9,9 @@
  * packages/bindings/<name> — see README.md's quickstart).
  */
 
-import { Keypair } from "@stellar/stellar-sdk";
+import { Address, Keypair, rpc, xdr } from "@stellar/stellar-sdk";
 import { KeypairSigner } from "@stellar/stellar-sdk/contract";
+import { toContractArg, type PriceConfigArg, type SignerConfigArg, type SpecJson } from "../core/spec.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -91,6 +92,19 @@ export type LiveResult<T> = { dryRun: false; value: T };
 export type AdapterResult<T> = DryRunResult | LiveResult<T>;
 
 /**
+ * The call failed before a transaction was submitted (building or
+ * simulating it — e.g. a treasury cap rejection), so it certainly has no
+ * on-chain effect. Anything else thrown by a live call may or may not have
+ * landed.
+ */
+export class NotSubmittedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "NotSubmittedError";
+  }
+}
+
+/**
  * Thin, mode-aware wrapper. Each method builds the same call regardless of
  * mode; in dry-run it stops after simulate/describe and never signs, so a
  * misconfigured agent can never accidentally submit a real transaction.
@@ -119,6 +133,11 @@ export class StellarAdapter {
    * `agent` argument), and the agent traces are published for. */
   get agent(): string {
     return this.publicKey ?? this.opts.agentAddress ?? this.opts.deployments.agent;
+  }
+
+  /** The deployment this adapter is bound to. */
+  get deployments(): Deployments {
+    return this.opts.deployments;
   }
 
   /**
@@ -154,10 +173,19 @@ export class StellarAdapter {
     if (this.opts.mode === "dry-run") {
       return { dryRun: true, contractId, method: methodName, args };
     }
-    const client = await this.client<any>(pkg, moduleName);
-    const assembled = await call(client);
+    let assembled: Awaited<ReturnType<typeof call>>;
+    try {
+      const client = await this.client<any>(pkg, moduleName);
+      assembled = await call(client);
+    } catch (err) {
+      throw new NotSubmittedError(`${methodName}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+    }
+    const simulation = (assembled as { simulation?: { error?: string } }).simulation;
+    if (simulation?.error) {
+      throw new NotSubmittedError(`${methodName} simulation failed: ${simulation.error}`);
+    }
     const { result } = await assembled.signAndSend();
-    return { dryRun: false, value: result };
+    return { dryRun: false, value: unwrapContractResult(methodName, result) };
   }
 
   async agentCreateMarket(args: {
@@ -254,6 +282,73 @@ export class StellarAdapter {
     return result as bigint;
   }
 
+  /**
+   * Reveals a signer-mode spec (resolver `register_signer_spec`).
+   * Permissionless: the commitment, not the caller, authorizes it.
+   */
+  async registerSignerSpec(args: { market_id: bigint; spec: SignerConfigArg }): Promise<AdapterResult<void>> {
+    return this.run("resolver", "@oracledesk/bindings-resolver", "register_signer_spec", args, (client) =>
+      client.register_signer_spec(args),
+    );
+  }
+
+  /** Reveals a price-mode spec (resolver `register_price_spec`). */
+  async registerPriceSpec(args: { market_id: bigint; spec: PriceConfigArg }): Promise<AdapterResult<void>> {
+    return this.run("resolver", "@oracledesk/bindings-resolver", "register_price_spec", args, (client) =>
+      client.register_price_spec(args),
+    );
+  }
+
+  /** Reveals `spec` through whichever wrapper its mode needs, in canonical order. */
+  async revealSpec(marketId: bigint, spec: SpecJson): Promise<AdapterResult<void>> {
+    return spec.mode === "signers"
+      ? this.registerSignerSpec({ market_id: marketId, spec: toContractArg(spec) as SignerConfigArg })
+      : this.registerPriceSpec({ market_id: marketId, spec: toContractArg(spec) as PriceConfigArg });
+  }
+
+  /** market-core `market_count` (read-only simulation; also runs in dry-run). */
+  async marketCount(): Promise<bigint> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.market_count();
+    return BigInt(result);
+  }
+
+  /** market-core `get_market` (read-only), or `undefined` if it does not exist. */
+  async getMarket(
+    marketId: bigint,
+  ): Promise<{ creator: string; questionHash: string; resolutionHash: string; closeTime: bigint } | undefined> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.get_market({ market_id: marketId });
+    if (result?.isErr?.()) return undefined;
+    const m = typeof result?.unwrap === "function" ? result.unwrap() : result;
+    return {
+      creator: m.creator,
+      questionHash: Buffer.from(m.question_hash).toString("hex"),
+      resolutionHash: Buffer.from(m.resolution_hash).toString("hex"),
+      closeTime: BigInt(m.close_time),
+    };
+  }
+
+  /**
+   * Whether a legacy spec is registered for `marketId`. A signer reveal
+   * moves `state()` to SignersPending, but a price reveal leaves it
+   * Unconfigured, so the resolver's `Price(market_id)` entry is read too.
+   */
+  async isSpecRevealed(marketId: bigint): Promise<boolean> {
+    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const { result } = await client.state({ market_id: marketId });
+    if (result?.tag && result.tag !== "Unconfigured") return true;
+    const key = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(this.opts.deployments.contracts.resolver).toScAddress(),
+        key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Price"), xdr.ScVal.scvU64(new xdr.Uint64(marketId))]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+    const { entries } = await new rpc.Server(this.opts.rpcUrl).getLedgerEntries(key);
+    return entries.length > 0;
+  }
+
   async publishTrace(args: {
     agent: string;
     market_id: bigint;
@@ -335,3 +430,17 @@ export class StellarAdapter {
   }
 }
 
+/**
+ * Generated clients return `Result<T>` for fallible contract methods: an
+ * `Err` becomes a thrown error carrying the contract error name (e.g.
+ * `MarketAlreadyConfigured`), an `Ok` its value; anything else passes through.
+ */
+function unwrapContractResult<T>(methodName: string, result: T): T {
+  const r = result as { isErr?: () => boolean; unwrapErr?: () => { message?: string }; unwrap?: () => unknown };
+  if (typeof r?.isErr !== "function") return result;
+  if (r.isErr()) {
+    const e = r.unwrapErr?.();
+    throw new Error(`${methodName} failed: ${e?.message ?? JSON.stringify(e)}`);
+  }
+  return r.unwrap!() as T;
+}

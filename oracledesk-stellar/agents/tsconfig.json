@@ -10,5 +10,6 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
+  "include": ["core/**/*.ts", "stellar/**/*.ts", "bin/**/*.ts", "runtime/**/*.ts"]
   "include": ["core/**/*.ts", "stellar/**/*.ts", "bin/**/*.ts", "sim/**/*.ts"]
 }
