@@ -1763,12 +1763,39 @@ impl Treasury {
         {
             return Err(Error::PriceOutOfBand);
         }
+
+        // #23: market-core pulls `seed_amount + creation_bond` in ONE transfer,
+        // so treasury has to fund and pre-authorise the larger amount or the
+        // nested `transfer` auth entry never matches and the creation reverts.
+        // Read by name — the vendored `market_core.wasm` predates the view.
+        let bond = Self::core_creation_bond(&env, &global.market_core);
+        let total_outlay = seed_amount.checked_add(bond).ok_or(Error::InvalidAmount)?;
+        // The bond is real treasury collateral leaving the vault, so the
+        // per-trade caps see the whole outlay and this fails with
+        // `TradeCapExceeded` *before* any market-core call (issue #23's
+        // "a bond pushing seed + bond over max_trade must fail first").
+        //
+        // Deliberately only when a bond is in play: `agent_create_market` has
+        // never checked `max_trade` on the seed itself (it checks
+        // `creation_policy.max_seed`), so applying the check to a bond-free
+        // creation would silently tighten a pre-existing gap that is not part
+        // of #23 and would preempt `SeedCapExceeded` in
+        // `agent_create_market_rejects_seed_above_trade_cap`. With `bond == 0`
+        // every amount below is exactly `seed_amount`, so that path is
+        // unchanged.
+        if bond > 0 {
+            Self::check_trade_size(&global, &policy, total_outlay)?;
+        }
+
         Self::record_creation(&env, &creation_policy)?;
-        Self::ensure_liquid(&env, &global, seed_amount)?;
-        Self::ensure_unreserved(&env, &global, seed_amount)?;
+        Self::ensure_liquid(&env, &global, total_outlay)?;
+        Self::ensure_unreserved(&env, &global, total_outlay)?;
 
         let treasury_addr = env.current_contract_address();
-        Self::authorize_token_pull(&env, &global, &treasury_addr, seed_amount);
+        // Must be exactly `seed + bond`: `authorize_transfer` matches a single
+        // `(from, to, amount)` triple, so any other value leaves market-core's
+        // transfer unauthorised (see docs/adr/0002-treasury-nested-auth.md).
+        Self::authorize_token_pull(&env, &global, &treasury_addr, total_outlay);
         let market_id = core_call(MarketCoreClient::new(&env, &global.market_core).try_create_market(
             &treasury_addr,
             &question_hash,
@@ -1779,7 +1806,14 @@ impl Treasury {
             &seed_amount,
             &initial_yes_bps,
         ))?;
-        Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
+        // Market + daily caps count the full outlay (#23). Net position
+        // exposure and P&L cost basis stay on the seed: the bond is refundable
+        // collateral, not part of the position, so it must not be double-counted
+        // against `DataKey::Net(id)`/pnl. A refund (or a forfeit back to this
+        // same treasury, which is market-core's fee recipient by default)
+        // arrives in `idle()` and is therefore reflected in `nav()` exactly once,
+        // with no receivable tracked anywhere.
+        Self::reserve_capacity(&env, &global, &agent, &policy, market_id, total_outlay)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
         Self::record_cost(&env, market_id, seed_amount)?;
         Ok(market_id)
@@ -2913,6 +2947,40 @@ impl Treasury {
             }
             Err(Ok(e)) => Err(map_market_core_code(e)),
             Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+        }
+    }
+
+    /// Name-dispatched `market_core.get_creation_bond()` (#23), returning the
+    /// creation bond a market-core currently charges, or `0` when there is none.
+    ///
+    /// Read by name rather than through `MarketCoreClient`, for the same reason
+    /// `core_trade` is: `contractimport!` generates bindings from the *vendored*
+    /// `market_core.wasm`, which predates this entrypoint, so
+    /// `try_get_creation_bond` does not exist on the generated client and a
+    /// client-based call would not compile until `make build` regenerates the
+    /// blob (see docs/adr/0002-cross-contract-calls.md). `get_creation_bond`
+    /// takes no arguments and returns a bare `i128`, so unlike the resolver's
+    /// `VoidReason` dispatch there is no `#[contracttype]` to encode by variant
+    /// name here — just a plain `ScVal::I128`.
+    ///
+    /// **Absent means zero, on purpose.** A market-core deployed before #23 has
+    /// no such function, and `try_invoke_contract` reports that as an invocation
+    /// failure rather than a contract error. Treating every failure as `0`
+    /// matches market-core's own absent-means-default rule (`DataKey::CreationBond`
+    /// unset == no bond), so treasury keeps funding legacy cores instead of
+    /// failing every creation. It is also fail-closed in the dangerous
+    /// direction: if the read ever under-reports a bond that market-core does
+    /// require, treasury under-authorises the pull, market-core's nested
+    /// `transfer` fails its auth check, and the whole creation reverts — no
+    /// market is created with an unfunded bond.
+    fn core_creation_bond(env: &Env, core: &Address) -> i128 {
+        match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            core,
+            &Symbol::new(env, "get_creation_bond"),
+            Vec::new(env),
+        ) {
+            Ok(Ok(amount)) if amount > 0 => amount,
+            _ => 0,
         }
     }
 
@@ -4399,6 +4467,152 @@ mod test {
                 &5000u32,
             ),
             Err(Ok(Error::SeedCapExceeded))
+        );
+    }
+
+    // ----- Issue #23: creation bond in the treasury creation path -----------
+    //
+    // `get_creation_bond`/`set_creation_bond` do not exist in the vendored
+    // `market_core.wasm` the fixture's `MarketCoreClient` was generated from,
+    // so these run under an explicit native registration (the in-repo idiom,
+    // see `register_market_core` / `with_market_core`) and reach the setter by
+    // name. The default wasm registration, where the read fails and must
+    // degrade to "no bond", is pinned separately below.
+
+    /// Name-dispatched `market_core.set_creation_bond(amount)` from the test
+    /// side — the generated client has no such method.
+    fn set_core_creation_bond(env: &Env, core: &Address, amount: i128) {
+        env.invoke_contract::<()>(
+            core,
+            &Symbol::new(env, "set_creation_bond"),
+            vec![env, amount.into_val(env)],
+        );
+    }
+
+    /// Reads a bare-integer view from market-core by name, for the same reason.
+    fn core_u64(env: &Env, core: &Address, fn_name: &str) -> u64 {
+        env.invoke_contract::<u64>(core, &Symbol::new(env, fn_name), vec![env])
+    }
+
+    fn core_i128(env: &Env, core: &Address, fn_name: &str) -> i128 {
+        env.invoke_contract::<i128>(core, &Symbol::new(env, fn_name), vec![env])
+    }
+
+    #[test]
+    fn agent_create_market_counts_bond_toward_caps() {
+        with_market_core(McImpl::Native, || {
+            let f = fixture_with_caps(150 * USDC, 300 * USDC, 300 * USDC);
+            let core = f.market_core.address.clone();
+            let bond = 50 * USDC;
+            set_core_creation_bond(&f.env, &core, bond);
+            assert_eq!(core_i128(&f.env, &core, "get_creation_bond"), bond);
+
+            let seed = 100 * USDC;
+            let token = StellarAssetClient::new(&f.env, &f.token);
+            let before = token.balance(&f.treasury_id);
+            let markets_before = core_u64(&f.env, &core, "market_count");
+
+            let market_id = f.treasury.agent_create_market(
+                &f.agent,
+                &BytesN::from_array(&f.env, &[23u8; 32]),
+                &BytesN::from_array(&f.env, &[123u8; 32]),
+                &String::from_str(&f.env, "ipfs://bonded"),
+                &Category::Macro,
+                &MARKET_CLOSE,
+                &seed,
+                &5000u32,
+            );
+
+            // The whole `seed + bond` left the treasury: proves both the
+            // combined pull and that `authorize_token_pull` matched it exactly
+            // (a mismatch would have reverted the nested transfer outright).
+            assert_eq!(token.balance(&f.treasury_id), before - (seed + bond));
+            // Outflow caps count the bond.
+            assert_eq!(f.treasury.daily_usage().amount, seed + bond);
+            assert_eq!(
+                Treasury::market_exposure(&f.env, &core, market_id).amount,
+                seed + bond
+            );
+            // ...and the bond is NOT double-counted as position exposure: the
+            // net book and the P&L cost basis are the seed alone, so a later
+            // refund is not silently read as a profit on the position.
+            assert_eq!(f.treasury.net_position(&market_id).collateral_in, seed);
+            assert_eq!(Treasury::load_pnl(&f.env, market_id).cost, seed);
+            // Exactly one market was created.
+            assert_eq!(core_u64(&f.env, &core, "market_count"), markets_before + 1);
+        });
+    }
+
+    /// Issue #23's cap edge case: a bond that pushes `seed + bond` past
+    /// `max_trade` must fail with `TradeCapExceeded` *before* any market-core
+    /// call, with nothing spent and nothing recorded.
+    #[test]
+    fn agent_create_market_rejects_seed_plus_bond_above_trade_cap() {
+        with_market_core(McImpl::Native, || {
+            let f = fixture_with_caps(150 * USDC, 300 * USDC, 300 * USDC);
+            let core = f.market_core.address.clone();
+            let bond = 51 * USDC;
+            set_core_creation_bond(&f.env, &core, bond);
+
+            let token = StellarAssetClient::new(&f.env, &f.token);
+            let before = token.balance(&f.treasury_id);
+            let markets_before = core_u64(&f.env, &core, "market_count");
+
+            // seed 100 passes `max_seed` (150), but 100 + 51 > max_trade (150).
+            assert_eq!(
+                f.treasury.try_agent_create_market(
+                    &f.agent,
+                    &BytesN::from_array(&f.env, &[24u8; 32]),
+                    &BytesN::from_array(&f.env, &[124u8; 32]),
+                    &String::from_str(&f.env, "ipfs://over-bonded"),
+                    &Category::Macro,
+                    &MARKET_CLOSE,
+                    &(100 * USDC),
+                    &5000u32,
+                ),
+                Err(Ok(Error::TradeCapExceeded))
+            );
+
+            // rejected before the market-core call: no market, no spend, and
+            // no cap consumption (`record_creation` is also after the check).
+            assert_eq!(core_u64(&f.env, &core, "market_count"), markets_before);
+            assert_eq!(token.balance(&f.treasury_id), before);
+            assert_eq!(f.treasury.daily_usage().amount, 0);
+        });
+    }
+
+    /// The absent-entrypoint case, which is what today's vendored blob
+    /// actually presents: the name-dispatched read must degrade to `0`, the
+    /// creation must still succeed, and exactly `seed` must be authorised and
+    /// pulled. This is what keeps #23 from breaking treasury against a
+    /// pre-#23 market-core deployment, and it runs in the default (wasm)
+    /// registration on purpose.
+    #[test]
+    fn agent_create_market_funds_no_bond_against_pre_23_core() {
+        let f = fixture_with_caps(150 * USDC, 300 * USDC, 300 * USDC);
+        let core = f.market_core.address.clone();
+        let seed = 100 * USDC;
+        let token = StellarAssetClient::new(&f.env, &f.token);
+        let before = token.balance(&f.treasury_id);
+
+        let market_id = f.treasury.agent_create_market(
+            &f.agent,
+            &BytesN::from_array(&f.env, &[25u8; 32]),
+            &BytesN::from_array(&f.env, &[125u8; 32]),
+            &String::from_str(&f.env, "ipfs://legacy-core"),
+            &Category::Macro,
+            &MARKET_CLOSE,
+            &seed,
+            &5000u32,
+        );
+
+        // the vendored blob has no `get_creation_bond`, so the read degrades to
+        // 0 and the pull is exactly the seed, as before #23
+        assert_eq!(token.balance(&f.treasury_id), before - seed);
+        assert_eq!(f.treasury.daily_usage().amount, seed);
+        assert_eq!(
+            Treasury::market_exposure(&f.env, &core, market_id).amount,
+            seed
         );
     }
 

@@ -114,6 +114,54 @@ pub struct BandState {
     pub ref_price_bps: u32,
 }
 
+/// Why a market was voided (#23). Both variants are unit variants with no
+/// explicit discriminants, so the XDR encoding is `ScVal::Symbol("NoFault")`
+/// / `ScVal::Symbol("GuardianFault")`. That is what lets the resolver call
+/// `void_market_with_reason` through name dispatch without a regenerated
+/// vendored client — the encoding is decided by variant *names*, not by
+/// spec, so the stale `market_core.wasm` clients simply cannot see the new
+/// entrypoint (see `docs/adr/0002-cross-contract-calls.md`).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoidReason {
+    NoFault,
+    GuardianFault,
+}
+
+/// Lifecycle of a market's creation bond (#23).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BondState {
+    None,
+    Held,
+    Refunded,
+    Forfeited,
+}
+
+/// Sidecar entry `DataKey::Bond(id)` holding a market's creation bond (#23),
+/// snapshotted at creation as a side entry exactly like `FeeTerms` so
+/// `Market`'s XDR shape never changes.
+///
+/// Markets created while `get_creation_bond()` was 0 have no `Bond` entry
+/// and no bond accounting (`claim_bond` fails with `NoBond`), which makes
+/// the upgrade migration-free.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketBond {
+    /// Amount pulled from the creator on top of `seed_amount` at creation.
+    pub amount: i128,
+    pub state: BondState,
+    /// Recorded by the void path that finalized the market. `None` while the
+    /// market has not been voided; `Some(NoFault)` also on plain
+    /// `void_market`, which keeps its pre-#23 NoFault semantics.
+    pub void_reason: Option<VoidReason>,
+    /// Fee recipient snapshotted when a `GuardianFault` void is recorded, so
+    /// a later `propose_treasury`/`accept_treasury` cannot redirect the
+    /// forfeit between the void and `claim_bond`. Falls back to the current
+    /// `DataKey::Treasury` when absent (mirrors the `sweep_fees` legacy path).
+    pub forfeit_to: Option<Address>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -161,6 +209,21 @@ pub enum DataKey {
     Breaker(u64),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // ----- appended tails (#23/#24) ---------------------------------------
+    // Strictly append-only: the discriminants of every pre-existing variant
+    // are unchanged.
+    // Instance storage: creation-bond default for new markets, absent = 0.
+    CreationBond,
+    // Instance storage: integrator-fee cap default for new markets, absent = 0.
+    MaxIntegratorFeeBps,
+    // Persistent sidecars; absent = legacy default, same pattern as FeeTerms.
+    Bond(u64),
+    /// Per-market snapshot of `MaxIntegratorFeeBps` taken at creation,
+    /// absent (or legacy market) means 0.
+    MarketMaxIntegratorFee(u64),
+    /// Unclaimed integrator fee balances, one entry per integrator address
+    /// across all markets.
+    IntegratorFees(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +268,14 @@ pub enum Error {
     NoPendingAdmin = 25,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 26,
+    /// `buy_via`/`sell_via`/`quote_buy_via`/`quote_sell_via` called with an
+    /// `integrator_fee_bps` above the market's creation-time snapshot cap.
+    /// NOTE: PRs #239/#240/#242 each claim 27 on their own branches; the
+    /// last PR to merge re-appends (append-only tails, collision disclosed).
+    IntegratorFeeTooHigh = 27,
+    /// `claim_bond` called on a market with no `Bond(id)` sidecar entry,
+    /// i.e. created before the creation bond existed (#23).
+    NoBond = 28,
 }
 
 impl From<MathError> for Error {
@@ -364,6 +435,53 @@ pub struct LpTransferred {
     pub market_id: u64,
     pub from: Address,
     pub to: Address,
+}
+
+/// The global creation-bond default changed. Applies to markets created
+/// after the call, never to existing snapshots (#23).
+#[contractevent]
+pub struct CreationBondChanged {
+    pub old: i128,
+    pub new: i128,
+}
+
+/// A creator posted the bond on top of the seed at creation (#23).
+#[contractevent]
+pub struct BondPosted {
+    #[topic]
+    pub market_id: u64,
+    pub amount: i128,
+}
+
+/// A held bond was settled: refunded to the creator or forfeited to the
+/// fee-recipient snapshot taken at void time (#23).
+#[contractevent]
+pub struct BondSettled {
+    #[topic]
+    pub market_id: u64,
+    pub to: Address,
+    pub amount: i128,
+    pub forfeited: bool,
+}
+
+/// A `*_via` trade credited an integrator (#24). Emitted next to (never
+/// instead of) `Trade`; the `Trade.fee` field stays the protocol portion so
+/// existing consumers keep their meaning.
+#[contractevent]
+pub struct IntegratorFeeAccrued {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub integrator: Address,
+    pub amount: i128,
+}
+
+/// An integrator withdrew its accrued balance across all markets (#24).
+#[contractevent]
+pub struct IntegratorFeesClaimed {
+    #[topic]
+    pub integrator: Address,
+    pub amount: i128,
 }
 
 // ---------------------------------------------------------------------------
@@ -564,11 +682,74 @@ impl MarketCore {
         Ok(())
     }
 
+    /// Sets the creation bond pulled from every new market's creator on top
+    /// of the seed (#23). Affects markets created after the call; existing
+    /// markets keep their snapshot, exactly like `set_default_fee_bps`.
+    /// 0 disables the bond and is the default (absent entry).
+    pub fn set_creation_bond(env: Env, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !(0..=MAX_SETS).contains(&amount) {
+            return Err(Error::InvalidAmount);
+        }
+        let old = Self::get_creation_bond(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::CreationBond, &amount);
+        CreationBondChanged { old, new: amount }.publish(&env);
+        Ok(())
+    }
+
+    /// The creation-bond default new markets snapshot at creation (#23).
+    /// Absent = 0 (pre-feature deployments and fresh instances). Treasury
+    /// reads this by name across the vendored-client boundary.
+    pub fn get_creation_bond(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CreationBond)
+            .unwrap_or(0)
+    }
+
+    /// Sets the global cap new markets snapshot for `integrator_fee_bps` on
+    /// `buy_via`/`sell_via` (#24). The cap is validated against the current
+    /// default protocol fee so a market created at the cap can still charge
+    /// the default fee plus the maximum integrator cut without exceeding
+    /// `MAX_FEE_BPS` in aggregate. Existing markets keep their snapshot,
+    /// exactly like the fee/breaker defaults. Absent = 0 (integrator routing
+    /// disabled until an admin opts in).
+    pub fn set_max_integrator_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let default_fee: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultFeeBps)
+            .unwrap_or(0);
+        if default_fee.checked_add(bps).ok_or(Error::Overflow)? > MAX_FEE_BPS {
+            return Err(Error::InvalidFee);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxIntegratorFeeBps, &bps);
+        Ok(())
+    }
+
+    /// The global integrator-fee cap new markets snapshot at creation (#24).
+    pub fn get_max_integrator_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxIntegratorFeeBps)
+            .unwrap_or(0)
+    }
+
     // ----- market lifecycle -----------------------------------------------
 
     /// Creates a market and seeds the pool. `creator` becomes the sole LP.
     /// `initial_yes_bps` in [100, 9900] sets the opening YES probability;
     /// the creator receives the leftover shares of the likelier outcome.
+    ///
+    /// When `get_creation_bond()` is non-zero the creator additionally posts
+    /// that refundable bond (#23): `seed_amount + bond` leaves the creator
+    /// in one transfer, and the bond is recorded in the `Bond(id)` sidecar
+    /// (`DataKey::Bond`), never in `Market` itself.
     #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         env: Env,
@@ -606,6 +787,8 @@ impl MarketCore {
             .ok_or(Error::NotInitialized)?;
         let treasury: Address = s.get(&DataKey::Treasury).ok_or(Error::NotInitialized)?;
         let breaker: Option<BreakerConfig> = s.get(&DataKey::DefaultBreaker);
+        let creation_bond: i128 = s.get(&DataKey::CreationBond).unwrap_or(0);
+        let max_integrator_fee_bps: u32 = s.get(&DataKey::MaxIntegratorFeeBps).unwrap_or(0);
 
         let market = Market {
             creator: creator.clone(),
@@ -634,6 +817,12 @@ impl MarketCore {
         if let Some(b) = breaker {
             Self::save_breaker(&env, id, &b);
         }
+        // Integrator-fee cap sidecar (#24): snapshotted so a later admin
+        // change cannot widen (or narrow) what this market honours. Absent
+        // entry means 0, so nothing is written for the default.
+        if max_integrator_fee_bps > 0 {
+            Self::save_market_max_integrator_fee(&env, id, max_integrator_fee_bps);
+        }
         if seed.creator_yes > 0 || seed.creator_no > 0 {
             Self::save_position(
                 &env,
@@ -646,7 +835,31 @@ impl MarketCore {
             );
         }
 
-        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
+        // Creation bond sidecar (#23): recorded before the pull, and the
+        // whole `seed + bond` leaves the creator in ONE transfer so the
+        // treasury's nested-call pre-authorisation (which matches on the
+        // exact `(from, to, amount)` triple) stays a single entry.
+        if creation_bond > 0 {
+            Self::save_bond(
+                &env,
+                id,
+                &MarketBond {
+                    amount: creation_bond,
+                    state: BondState::Held,
+                    void_reason: None,
+                    forfeit_to: None,
+                },
+            );
+            BondPosted {
+                market_id: id,
+                amount: creation_bond,
+            }
+            .publish(&env);
+        }
+        let total_pull = seed_amount
+            .checked_add(creation_bond)
+            .ok_or(Error::Overflow)?;
+        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &total_pull);
 
         MarketCreated {
             market_id: id,
@@ -682,6 +895,7 @@ impl MarketCore {
             outcome,
             collateral_in,
             min_shares_out,
+            None,
             None,
         )
     }
@@ -721,11 +935,42 @@ impl MarketCore {
             } else {
                 Some(limit_price_bps)
             },
+            None,
         )
     }
 
-    /// Shared implementation of `buy` / `buy_v2` (single copy of the
-    /// breaker, effect and interaction logic).
+    /// `buy` with an integrator (#24): `integrator_fee_bps` of the input is
+    /// charged on top of the protocol fee and credited to `integrator`'s
+    /// unclaimed balance, retrievable via `claim_integrator_fees`. The fee
+    /// must fit the market's creation-time cap
+    /// (`get_market_max_integrator_fee_bps`) and the sum with the market's
+    /// protocol fee must stay within `MAX_FEE_BPS`; otherwise the trade
+    /// reverts, so an agent front-end can never silently overcharge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buy_via(
+        env: Env,
+        trader: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        integrator: Address,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        Self::do_buy(
+            env,
+            trader,
+            market_id,
+            outcome,
+            collateral_in,
+            min_shares_out,
+            None,
+            Some((integrator, integrator_fee_bps)),
+        )
+    }
+
+    /// Shared implementation of `buy` / `buy_v2` / `buy_via` (single copy of
+    /// the breaker, effect and interaction logic).
     #[allow(clippy::too_many_arguments)]
     fn do_buy(
         env: Env,
@@ -735,6 +980,7 @@ impl MarketCore {
         collateral_in: i128,
         min_shares_out: i128,
         limit_price_bps: Option<u32>,
+        integrator_opt: Option<(Address, u32)>,
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         if let Some(limit) = limit_price_bps {
@@ -746,8 +992,11 @@ impl MarketCore {
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, integrator_opt.map(|(_, bps)| bps))?;
+
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
-        let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
+        let q = math::calc_buy_with(r_bought, r_other, collateral_in, m.fee_bps, int_fee_bps)?;
         if q.shares_out < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
@@ -777,6 +1026,17 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
+        if q.integrator_fee > 0 {
+            if let Some((ref integrator, _)) = integrator_opt {
+                Self::accrue_integrator_fee(&env, integrator, q.integrator_fee)?;
+                IntegratorFeeAccrued {
+                    market_id,
+                    integrator: integrator.clone(),
+                    amount: q.integrator_fee,
+                }
+                .publish(&env);
+            }
+        }
         let mut pos = Self::load_position(&env, market_id, &trader);
         match outcome {
             Outcome::Yes => pos.yes += q.shares_out,
@@ -825,6 +1085,7 @@ impl MarketCore {
             collateral_out,
             max_shares_in,
             None,
+            None,
         )
     }
 
@@ -861,10 +1122,39 @@ impl MarketCore {
             } else {
                 Some(limit_price_bps)
             },
+            None,
         )
     }
 
-    /// Shared implementation of `sell` / `sell_v2`.
+    /// `sell` with an integrator (#24): the gross spread is widened to cover
+    /// `integrator_fee_bps` and the integrator's floor-rounded share of it is
+    /// credited to `integrator`'s unclaimed balance. The protocol never
+    /// receives less than plain `sell` would have taken. Same cap validation
+    /// as `buy_via`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sell_via(
+        env: Env,
+        trader: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        integrator: Address,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        Self::do_sell(
+            env,
+            trader,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            None,
+            Some((integrator, integrator_fee_bps)),
+        )
+    }
+
+    /// Shared implementation of `sell` / `sell_v2` / `sell_via`.
     #[allow(clippy::too_many_arguments)]
     fn do_sell(
         env: Env,
@@ -874,14 +1164,18 @@ impl MarketCore {
         collateral_out: i128,
         max_shares_in: i128,
         limit_price_bps: Option<u32>,
+        integrator_opt: Option<(Address, u32)>,
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
 
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, integrator_opt.map(|(_, bps)| bps))?;
+
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
-        let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
+        let q = math::calc_sell_with(r_sold, r_other, collateral_out, m.fee_bps, int_fee_bps)?;
         if q.shares_in > max_shares_in {
             return Err(Error::SlippageExceeded);
         }
@@ -921,6 +1215,17 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
+        if q.integrator_fee > 0 {
+            if let Some((ref integrator, _)) = integrator_opt {
+                Self::accrue_integrator_fee(&env, integrator, q.integrator_fee)?;
+                IntegratorFeeAccrued {
+                    market_id,
+                    integrator: integrator.clone(),
+                    amount: q.integrator_fee,
+                }
+                .publish(&env);
+            }
+        }
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -939,6 +1244,27 @@ impl MarketCore {
         }
         .publish(&env);
         Ok(q.shares_in)
+    }
+
+    /// Pay out `integrator`'s accrued #24 fees across all markets and zero
+    /// the balance. Permissionless besides the integrator's own auth: anyone
+    /// can submit the call, only the integrator can authorise it, and the
+    /// integrator itself cannot invoke trading — it just claims. Returns 0
+    /// (no event, no transfer) when there is nothing to claim.
+    pub fn claim_integrator_fees(env: Env, integrator: Address) -> Result<i128, Error> {
+        integrator.require_auth();
+        let key = DataKey::IntegratorFees(integrator.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            return Ok(0);
+        }
+        // effects before interaction (CEI): the balance is gone before the
+        // token transfer, so a re-entrant or failing transfer cannot
+        // double-pay.
+        env.storage().persistent().remove(&key);
+        Self::token(&env)?.transfer(&env.current_contract_address(), &integrator, &amount);
+        IntegratorFeesClaimed { integrator, amount }.publish(&env);
+        Ok(amount)
     }
 
     // ----- resolution -----------------------------------------------------
@@ -965,7 +1291,33 @@ impl MarketCore {
     }
 
     /// Invalid or unresolvable market. Allowed any time before finality.
+    ///
+    /// Keeps its pre-#23 semantics: this is the `NoFault` path. A market's
+    /// creation bond is refunded, never forfeited, when it voids through
+    /// here (which includes every `Verdict::Invalid` and expiry route).
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
+        Self::void_inner(env, market_id, VoidReason::NoFault)
+    }
+
+    /// `void_market` plus the reason (#23). Resolver-only, like `void_market`.
+    /// `GuardianFault` marks a guardian-initiated void for cause and forfeits
+    /// the market's creation bond at `claim_bond`, snapshotting the forfeit
+    /// recipient at void time.
+    ///
+    /// Callers outside this crate may not have a generated client that can
+    /// see this entrypoint (the vendored `market_core.wasm` predates it);
+    /// the resolver reaches it via `env.try_invoke_contract` name dispatch.
+    /// `VoidReason` is an all-unit-variant `#[contracttype]` enum and
+    /// therefore encodes as a plain `ScVal::Symbol` variant name.
+    pub fn void_market_with_reason(
+        env: Env,
+        market_id: u64,
+        reason: VoidReason,
+    ) -> Result<(), Error> {
+        Self::void_inner(env, market_id, reason)
+    }
+
+    fn void_inner(env: Env, market_id: u64, reason: VoidReason) -> Result<(), Error> {
         Self::require_resolver(&env)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
@@ -973,12 +1325,74 @@ impl MarketCore {
         }
         m.status = MarketStatus::Void;
         Self::save_market(&env, market_id, &m);
+
+        // Record the reason on the bond sidecar; markets without a bond
+        // entry (created pre-#23 or with a zero default) are untouched.
+        if let Some(mut bond) = Self::load_bond(&env, market_id) {
+            bond.void_reason = Some(reason);
+            if reason == VoidReason::GuardianFault && bond.state == BondState::Held {
+                // Snapshot the same destination `sweep_fees` would use, at
+                // void time, so a later treasury swap cannot redirect it.
+                let recipient = match Self::load_fee_terms(&env, market_id) {
+                    Some(t) => t.recipient,
+                    None => Self::instance_get(&env, &DataKey::Treasury)?,
+                };
+                bond.forfeit_to = Some(recipient);
+            }
+            Self::save_bond(&env, market_id, &bond);
+        }
+
         MarketResolved {
             market_id,
             outcome: None,
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Settles a market's creation bond once the market is final (#23).
+    /// Permissionless so a keeper can drive it; the state flip is written
+    /// before the transfer (effects before interactions), so a second call
+    /// can never pay again and fails with `AlreadyClaimed`.
+    ///
+    /// Pays the creator on `Resolved` and on a `NoFault` void; pays the
+    /// `GuardianFault` void amount to the fee recipient snapshotted at void
+    /// time. Returns the settled amount.
+    pub fn claim_bond(env: Env, market_id: u64) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        Self::settlement(&m)?;
+        let mut bond = Self::load_bond(&env, market_id).ok_or(Error::NoBond)?;
+        if bond.state != BondState::Held {
+            return Err(Error::AlreadyClaimed);
+        }
+        let forfeited = matches!(m.status, MarketStatus::Void)
+            && bond.void_reason == Some(VoidReason::GuardianFault);
+        let to = if forfeited {
+            match bond.forfeit_to.clone() {
+                Some(a) => a,
+                None => Self::instance_get(&env, &DataKey::Treasury)?,
+            }
+        } else {
+            m.creator.clone()
+        };
+        bond.state = if forfeited {
+            BondState::Forfeited
+        } else {
+            BondState::Refunded
+        };
+        Self::save_bond(&env, market_id, &bond);
+        let amount = bond.amount;
+        if amount > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &to, &amount);
+        }
+        BondSettled {
+            market_id,
+            to,
+            amount,
+            forfeited,
+        }
+        .publish(&env);
+        Ok(amount)
     }
 
     // ----- settlement -----------------------------------------------------
@@ -1241,11 +1655,72 @@ impl MarketCore {
         Ok(math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?.shares_in)
     }
 
+    /// Shares a `buy_via` of `collateral_in` would return right now, running
+    /// the same cap validation as the trade itself (#24).
+    pub fn quote_buy_via(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, Some(integrator_fee_bps))?;
+        let (r_bought, r_other) = Self::reserves_for(&m, outcome);
+        Ok(
+            math::calc_buy_with(r_bought, r_other, collateral_in, m.fee_bps, int_fee_bps)?
+                .shares_out,
+        )
+    }
+
+    /// Shares a `sell_via` for exactly `collateral_out` would consume right
+    /// now, running the same cap validation as the trade itself (#24).
+    pub fn quote_sell_via(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        integrator_fee_bps: u32,
+    ) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let int_fee_bps =
+            Self::validate_integrator_fee(&env, market_id, &m, Some(integrator_fee_bps))?;
+        let (r_sold, r_other) = Self::reserves_for(&m, outcome);
+        Ok(
+            math::calc_sell_with(r_sold, r_other, collateral_out, m.fee_bps, int_fee_bps)?
+                .shares_in,
+        )
+    }
+
+    /// `integrator`'s unclaimed #24 balance across all markets.
+    pub fn get_integrator_fees(env: Env, integrator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IntegratorFees(integrator))
+            .unwrap_or(0)
+    }
+
+    /// The integrator-fee cap this market snapshotted at creation (#24).
+    /// Zero for markets created before the feature or while the global cap
+    /// was zero — integrator routing on such markets always reverts.
+    pub fn get_market_max_integrator_fee_bps(env: Env, market_id: u64) -> Result<u32, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_market_max_integrator_fee(&env, market_id))
+    }
+
     /// The market's snapshotted breakers (`None` for legacy markets created
     /// before breakers existed — those are never checked).
     pub fn breaker_config(env: Env, market_id: u64) -> Result<Option<BreakerConfig>, Error> {
         Self::load_market(&env, market_id)?;
         Ok(Self::load_breaker(&env, market_id))
+    }
+
+    /// The market's creation-bond sidecar (#23). `None` for markets created
+    /// without a bond (legacy markets or a zero default at creation).
+    pub fn get_bond(env: Env, market_id: u64) -> Result<Option<MarketBond>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_bond(&env, market_id))
     }
 
     /// The current ledger's band reference, if a band check has run this
@@ -1477,6 +1952,85 @@ impl MarketCore {
                 .persistent()
                 .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         }
+    }
+
+    fn load_bond(env: &Env, id: u64) -> Option<MarketBond> {
+        let key = DataKey::Bond(id);
+        let bond = env.storage().persistent().get(&key);
+        if bond.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        bond
+    }
+
+    fn save_bond(env: &Env, id: u64, bond: &MarketBond) {
+        let key = DataKey::Bond(id);
+        env.storage().persistent().set(&key, bond);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    fn load_market_max_integrator_fee(env: &Env, id: u64) -> u32 {
+        let key = DataKey::MarketMaxIntegratorFee(id);
+        let cap: Option<u32> = env.storage().persistent().get(&key);
+        if cap.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        cap.unwrap_or(0)
+    }
+
+    fn save_market_max_integrator_fee(env: &Env, id: u64, cap: u32) {
+        let key = DataKey::MarketMaxIntegratorFee(id);
+        env.storage().persistent().set(&key, &cap);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    /// Common cap check for `*_via` trades and quotes (#24): the requested
+    /// integrator bps must fit the market's creation-time snapshot and the
+    /// combined protocol + integrator take must stay within `MAX_FEE_BPS`.
+    /// Returns the bps to feed into the math (0 when there is no integrator).
+    fn validate_integrator_fee(
+        env: &Env,
+        market_id: u64,
+        m: &Market,
+        integrator_bps: Option<u32>,
+    ) -> Result<u32, Error> {
+        match integrator_bps {
+            Some(bps) => {
+                if bps > Self::load_market_max_integrator_fee(env, market_id) {
+                    return Err(Error::IntegratorFeeTooHigh);
+                }
+                if bps.checked_add(m.fee_bps).ok_or(Error::Overflow)? > MAX_FEE_BPS {
+                    return Err(Error::InvalidFee);
+                }
+                Ok(bps)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Credit `amount` to `integrator`'s unclaimed balance (#24). Balances
+    /// are per integrator across all markets, mirroring `LpFees` being
+    /// per market: an integrator serves many markets with one claim call.
+    fn accrue_integrator_fee(env: &Env, integrator: &Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let key = DataKey::IntegratorFees(integrator.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = current.checked_add(amount).ok_or(Error::Overflow)?;
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(())
     }
 
     /// Splits a trade `fee` per the market's snapshotted `FeeTerms` (legacy
@@ -3065,6 +3619,948 @@ mod test {
             }])
             .try_propose_treasury(&peer)
             .is_err());
+    }
+
+    // ----- Issue #23: creation bond --------------------------------------
+
+    const BOND: i128 = 10_000_000; // 1 USDC on top of the 100 USDC seed
+
+    /// Held-bond term of the global solvency invariant: the contract's
+    /// collateral balance must equal
+    /// `Σ (sets_minted + fees_accrued + lp_fees) + Σ held bonds
+    ///  + Σ unclaimed integrator balances`
+    /// (#23/#24 extend the pre-#23 invariant `sets_minted + fees_accrued`
+    /// documented in `docs/architecture.md`; integrator balances are added
+    /// by the #24 tests via the `integrator` argument).
+    fn assert_global_solvency(
+        env: &Env,
+        client: &MarketCoreClient,
+        collateral: &Address,
+        integrators: &[Address],
+    ) {
+        let token = StellarAssetClient::new(env, collateral);
+        let core = client.address.clone();
+        let mut expected = 0i128;
+        for id in 0..client.market_count() {
+            let m = client.get_market(&id);
+            expected += m.sets_minted + m.fees_accrued;
+            let lp: i128 = env.as_contract(&core, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::LpFees(id))
+                    .unwrap_or(0)
+            });
+            expected += lp;
+            if let Some(b) = client.get_bond(&id) {
+                if b.state == BondState::Held {
+                    expected += b.amount;
+                }
+            }
+        }
+        for integrator in integrators {
+            expected += env.as_contract(&core, || {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::IntegratorFees(integrator.clone()))
+                    .unwrap_or(0)
+            });
+        }
+        assert_eq!(token.balance(&core), expected);
+    }
+
+    #[test]
+    fn create_market_pulls_seed_plus_bond() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        assert_eq!(client.get_creation_bond(), BOND);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let creator_before = collateral_client.balance(&creator);
+
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        // One atomic pull of seed + bond, per the treasury pre-authorisation
+        // contract (`authorize_token_pull` matches a single exact amount).
+        assert_eq!(
+            collateral_client.balance(&creator),
+            creator_before - (100 * 10_000_000_i128) - BOND
+        );
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.amount, BOND);
+        assert_eq!(bond.state, BondState::Held);
+        assert_eq!(bond.void_reason, None);
+        assert_eq!(bond.forfeit_to, None);
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_refunded_on_resolution() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        let refunded = client.claim_bond(&market_id);
+        assert_eq!(refunded, BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+
+        assert_eq!(
+            client.get_bond(&market_id).unwrap().state,
+            BondState::Refunded
+        );
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_refunded_on_plain_void_keeps_no_fault_semantics() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        // `void_market` itself — the compatibility path — must refund.
+        client.void_market(&market_id);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Refunded);
+        assert_eq!(bond.void_reason, Some(VoidReason::NoFault));
+    }
+
+    #[test]
+    fn bond_refunded_on_explicit_no_fault_void() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::NoFault);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&creator);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&creator), before + BOND);
+        assert_eq!(
+            client.get_bond(&market_id).unwrap().state,
+            BondState::Refunded
+        );
+    }
+
+    #[test]
+    fn bond_forfeited_on_guardian_fault_void() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        let treasury = client.get_config().treasury;
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::GuardianFault);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let treasury_before = collateral_client.balance(&treasury);
+        let creator_before = collateral_client.balance(&creator);
+
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        assert_eq!(collateral_client.balance(&treasury), treasury_before + BOND);
+        assert_eq!(collateral_client.balance(&creator), creator_before);
+
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Forfeited);
+        assert_eq!(bond.void_reason, Some(VoidReason::GuardianFault));
+        // Recipient snapshotted at void time, not read at claim time.
+        assert_eq!(bond.forfeit_to, Some(treasury.clone()));
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn bond_forfeit_survives_later_treasury_change() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        let treasury = client.get_config().treasury;
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        client.void_market_with_reason(&market_id, &VoidReason::GuardianFault);
+
+        // Two-step treasury handover to a wired peer after the void; the
+        // forfeit must still pay the snapshot, not the new treasury.
+        let new_treasury = register_wiring_peer(&env, &client);
+        client.propose_treasury(&new_treasury);
+        client.accept_treasury();
+        assert_eq!(client.get_config().treasury, new_treasury);
+
+        assert_eq!(client.claim_bond(&market_id), BOND);
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        assert_eq!(collateral_client.balance(&new_treasury), 0);
+        assert!(collateral_client.balance(&treasury) >= BOND);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #17)")]
+    fn claim_bond_twice_fails() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+        client.claim_bond(&market_id);
+        client.claim_bond(&market_id);
+    }
+
+    #[test]
+    fn claim_bond_before_finality_fails() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        assert_eq!(client.try_claim_bond(&market_id), Err(Ok(Error::NotFinal)));
+    }
+
+    #[test]
+    fn claim_pool_remainder_does_not_touch_bond() {
+        let (env, client, creator, _, _, _) = setup_market();
+        client.set_creation_bond(&BOND);
+        let market_id = new_market(&env, &client, &creator, 5000);
+
+        let close_time = client.get_market(&market_id).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&market_id, &Outcome::Yes);
+        client.claim_pool_remainder(&market_id);
+
+        // The LP payout is computed from reserves only; the bond sidecar is
+        // untouched and still claimable.
+        let bond = client.get_bond(&market_id).unwrap();
+        assert_eq!(bond.state, BondState::Held);
+        assert_eq!(client.claim_bond(&market_id), BOND);
+    }
+
+    #[test]
+    fn legacy_market_has_no_bond() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(client.get_bond(&market_id), Ok(None));
+
+        // Remove the sidecar to simulate a market created before this
+        // feature: `claim_bond` reports `NoBond`, not a zero refund.
+        remove_side_entry(&env, &client, DataKey::Bond(market_id));
+        assert_eq!(client.get_bond(&market_id), Ok(None));
+        client.void_market(&market_id);
+        assert_eq!(client.try_claim_bond(&market_id), Err(Ok(Error::NoBond)));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_set_creation_bond() {
+        let (env, client, _, trader, _, _) = setup_market();
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "set_creation_bond",
+                    args: (BOND,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_creation_bond(&BOND)
+            .is_err());
+    }
+
+    #[test]
+    fn wrong_caller_cannot_void_with_reason() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "void_market_with_reason",
+                    args: (market_id, VoidReason::GuardianFault).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_void_market_with_reason(&market_id, &VoidReason::GuardianFault)
+            .is_err());
+    }
+
+    #[test]
+    fn global_solvency_includes_bonds_multi_market() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_creation_bond(&BOND);
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 6000);
+
+        client.buy(&trader, &m0, &Outcome::Yes, &(10 * 10_000_000_i128), &0);
+        // Give the trader NO shares in m1 first, then sell some back.
+        client.buy(&trader, &m1, &Outcome::No, &(5 * 10_000_000_i128), &0);
+        client.sell(
+            &trader,
+            &m1,
+            &Outcome::No,
+            &(1 * 10_000_000_i128),
+            &(100 * 10_000_000_i128),
+        );
+        assert_global_solvency(&env, &client, &collateral, &[]);
+
+        // One market resolves and its bond leaves the held set; the
+        // invariant tracks it through the payout.
+        let close_time = client.get_market(&m0).close_time;
+        env.ledger().set_timestamp(close_time + 1);
+        client.resolve(&m0, &Outcome::Yes);
+        client.claim_bond(&m0);
+        assert_global_solvency(&env, &client, &collateral, &[]);
+    }
+
+    #[test]
+    fn set_creation_bond_bounds() {
+        let (env, client, _, _, _, _) = setup_market();
+        assert_eq!(
+            client.try_set_creation_bond(&-1_i128),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            client.try_set_creation_bond(&(MAX_SETS + 1)),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(client.try_set_creation_bond(&0_i128), Ok(Ok(())));
+        assert_eq!(client.get_creation_bond(), 0);
+        let _ = env;
+    }
+
+    // ----- Issue #24: integrator fees -------------------------------------
+
+    #[test]
+    fn buy_via_accrues_integrator_fee() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let trader_before = collateral_client.balance(&trader);
+        let contract_before = collateral_client.balance(&client.address);
+
+        let collateral_in = 10_000_000_i128;
+        let int_fee_bps = 50u32;
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &int_fee_bps,
+        );
+        assert!(shares > 0);
+
+        // charged on top of the protocol fee, always rounded up
+        let expected_ifee = math::mul_div_ceil(collateral_in, int_fee_bps as i128, BPS).unwrap();
+        assert_eq!(client.get_integrator_fees(&integrator), expected_ifee);
+        assert_eq!(
+            collateral_client.balance(&trader),
+            trader_before - collateral_in
+        );
+        assert_eq!(
+            collateral_client.balance(&client.address),
+            contract_before + collateral_in
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    fn sell_via_accrues_integrator_fee() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(20_000_000_i128),
+            &0_i128,
+        );
+
+        let collateral_out = 5_000_000_i128;
+        let shares_sold = client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_out,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert!(shares_sold > 0);
+        assert!(client.get_integrator_fees(&integrator) > 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn buy_via_rejects_fee_above_market_cap() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &100u32,
+        );
+    }
+
+    #[test]
+    fn integrator_plus_market_fee_above_max_is_invalid_fee() {
+        // The global cap is validated against the default fee at set time;
+        // if an admin raises the default fee afterwards, markets created at
+        // the higher fee must still refuse trades whose combined take would
+        // exceed MAX_FEE_BPS.
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&900);
+        client.set_default_fee_bps(&200);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        // 850 <= cap(900) but 850 + market fee 200 > MAX_FEE_BPS
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &850u32,
+            ),
+            Err(Ok(Error::InvalidFee))
+        );
+        // exactly at the ceiling passes the fee check
+        assert!(client
+            .try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &800u32,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn markets_without_a_cap_snapshot_reject_integrator_routing() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        // default global cap is absent = 0
+        assert_eq!(client.get_max_integrator_fee_bps(), 0);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 0);
+        let integrator = Address::generate(&env);
+
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &1u32,
+            ),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+        // zero bps is still "no integrator cut", even on a capped market
+        assert_eq!(
+            client.quote_buy_via(&market_id, &Outcome::Yes, &10_000_000_i128, &0u32),
+            client.quote_buy(&market_id, &Outcome::Yes, &10_000_000_i128)
+        );
+    }
+
+    #[test]
+    fn claim_integrator_fees_pays_and_zeroes() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+
+        let fee = client.get_integrator_fees(&integrator);
+        assert!(fee > 0);
+
+        let collateral_client = StellarAssetClient::new(&env, &collateral);
+        let before = collateral_client.balance(&integrator);
+        let claimed = client.claim_integrator_fees(&integrator);
+        assert_eq!(claimed, fee);
+        assert_eq!(collateral_client.balance(&integrator), before + fee);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+
+        // claiming again is a no-op returning 0, and never moves tokens
+        assert_eq!(client.claim_integrator_fees(&integrator), 0);
+        assert_eq!(collateral_client.balance(&integrator), before + fee);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_claim_integrator_fees() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "claim_integrator_fees",
+                    args: (integrator.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_claim_integrator_fees(&integrator)
+            .is_err());
+        // the accrual is untouched
+        assert!(client.get_integrator_fees(&integrator) > 0);
+    }
+
+    #[test]
+    fn solvency_includes_integrator_balances() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &2_000_000_i128,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator.clone()]);
+
+        // and keeps holding after the claim moves the balance out
+        client.claim_integrator_fees(&integrator);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    #[test]
+    fn max_integrator_fee_snapshot_not_affected_by_admin_change() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.set_max_integrator_fee_bps(&200);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 50);
+
+        // the market still enforces its snapshot of 50
+        assert_eq!(
+            client.try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &100u32,
+            ),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+        // 50 (its cap) is exactly allowed; market fee 100 keeps the sum
+        // within MAX_FEE_BPS
+        assert!(client
+            .try_buy_via(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+                &integrator,
+                &50u32,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn quote_via_matches_execution() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        let collateral_in = 10_000_000_i128;
+        let quoted = client.quote_buy_via(&market_id, &Outcome::Yes, &collateral_in, &50u32);
+        let got = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_eq!(quoted, got);
+
+        let collateral_out = 2_000_000_i128;
+        let quoted = client.quote_sell_via(&market_id, &Outcome::Yes, &collateral_out, &50u32);
+        let got = client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_out,
+            &100_000_000_i128,
+            &integrator,
+            &50u32,
+        );
+        assert_eq!(quoted, got);
+
+        // quotes enforce the same caps as the trades
+        assert_eq!(
+            client.try_quote_buy_via(&market_id, &Outcome::Yes, &collateral_in, &101u32),
+            Err(Ok(Error::IntegratorFeeTooHigh))
+        );
+    }
+
+    #[test]
+    fn set_max_integrator_fee_bps_bounds_and_auth() {
+        let (env, client, _, trader, _, _) = setup_market();
+        // default protocol fee is 100; cap must keep fee + cap <= 1_000
+        assert_eq!(
+            client.try_set_max_integrator_fee_bps(&901u32),
+            Err(Ok(Error::InvalidFee))
+        );
+        assert_eq!(client.try_set_max_integrator_fee_bps(&900u32), Ok(Ok(())));
+        assert_eq!(client.get_max_integrator_fee_bps(), 900);
+
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "set_max_integrator_fee_bps",
+                    args: (50u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_max_integrator_fee_bps(&50u32)
+            .is_err());
+    }
+
+    // ----- #23/#24 boundary and compatibility invariants -------------------
+    //
+    // The cases above cover the rejecting side of each cap. These pin the
+    // boundary itself (`>` vs `>=`), the "no integrator means no change"
+    // compatibility guarantee that #24's acceptance criteria rest on, and the
+    // single wire-compatibility claim the whole resolver name-dispatch route
+    // of #23 rests on.
+
+    /// `validate_integrator_fee` rejects `bps > cap`, so `bps == cap` must be
+    /// accepted. Off-by-one guard on the per-market cap (#24).
+    #[test]
+    fn buy_via_fee_at_exact_market_cap_is_accepted() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 100);
+
+        let collateral_in = 10_000_000_i128;
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &100u32, // exactly the cap
+        );
+        assert!(shares > 0);
+        assert_eq!(
+            client.get_integrator_fees(&integrator),
+            math::mul_div_ceil(collateral_in, 100_i128, BPS).unwrap()
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The combined take is rejected at `> MAX_FEE_BPS`, so a take of exactly
+    /// `MAX_FEE_BPS` (integrator 900 + protocol 100 = 1_000) must go through.
+    /// Off-by-one guard on the global ceiling (#24).
+    #[test]
+    fn combined_take_at_exact_max_fee_bps_is_accepted() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&900);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let m = client.get_market(&market_id);
+        assert_eq!(m.fee_bps, 100);
+        assert_eq!(m.fee_bps + 900, MAX_FEE_BPS);
+
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &900u32,
+        );
+        // 900 bps of the input goes to the integrator and 100 bps to the
+        // protocol, so the trader still receives a strictly positive amount.
+        assert!(shares > 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The cap is enforced on the sell side too, not only on buy (#24).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn sell_via_rejects_fee_above_market_cap() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(20_000_000_i128),
+            &0_i128,
+        );
+        client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &5_000_000_i128,
+            &100_000_000_i128,
+            &integrator,
+            &51u32, // one bps over the 50 cap
+        );
+    }
+
+    /// #24's compatibility criterion, at contract level: `buy_via` with a zero
+    /// integrator fee must be indistinguishable from plain `buy` — same shares,
+    /// same reserves, same minted sets, same accrued protocol fees, and no
+    /// integrator balance created. Proved against two identically seeded
+    /// markets so any divergence in the quote is visible.
+    #[test]
+    fn buy_via_with_zero_integrator_fee_matches_buy() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let collateral_in = 20_000_000_i128;
+
+        let plain = client.buy(&trader, &m0, &Outcome::Yes, &collateral_in, &0_i128);
+        let via = client.buy_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &0u32,
+        );
+        assert_eq!(via, plain);
+
+        let a = client.get_market(&m0);
+        let b = client.get_market(&m1);
+        assert_eq!(a.reserve_yes, b.reserve_yes);
+        assert_eq!(a.reserve_no, b.reserve_no);
+        assert_eq!(a.sets_minted, b.sets_minted);
+        assert_eq!(a.fees_accrued, b.fees_accrued);
+        // a zero fee must not open an integrator balance at all
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The sell-side half of the same compatibility criterion: the
+    /// protocol/integrator split at `integrator_fee_bps = 0` must reproduce
+    /// plain `sell` exactly (see `calc_sell_with`'s floor-on-integrator rule).
+    #[test]
+    fn sell_via_with_zero_integrator_fee_matches_sell() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let buy_in = 20_000_000_i128;
+
+        client.buy(&trader, &m0, &Outcome::Yes, &buy_in, &0_i128);
+        client.buy_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &buy_in,
+            &0_i128,
+            &integrator,
+            &0u32,
+        );
+
+        let collateral_out = 5_000_000_i128;
+        let max_shares_in = 100_000_000_i128;
+        let plain = client.sell(&trader, &m0, &Outcome::Yes, &collateral_out, &max_shares_in);
+        let via = client.sell_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &collateral_out,
+            &max_shares_in,
+            &integrator,
+            &0u32,
+        );
+        assert_eq!(via, plain);
+
+        let a = client.get_market(&m0);
+        let b = client.get_market(&m1);
+        assert_eq!(a.reserve_yes, b.reserve_yes);
+        assert_eq!(a.reserve_no, b.reserve_no);
+        assert_eq!(a.sets_minted, b.sets_minted);
+        assert_eq!(a.fees_accrued, b.fees_accrued);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// `claim_integrator_fees` is zero-before-transfer, so the second call
+    /// finds nothing, returns 0, emits no event and moves no collateral — it
+    /// must not panic (#24).
+    #[test]
+    fn claim_integrator_fees_second_call_is_a_noop() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        let accrued = client.get_integrator_fees(&integrator);
+        assert!(accrued > 0);
+
+        let token = StellarAssetClient::new(&env, &collateral);
+        let first = client.claim_integrator_fees(&integrator);
+        assert_eq!(first, accrued);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+
+        let balance_after_first = token.balance(&integrator);
+        assert_eq!(client.claim_integrator_fees(&integrator), 0);
+        assert_eq!(token.balance(&integrator), balance_after_first);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// Integrator balances are per integrator *across all markets*, so one
+    /// claim must pay the sum of both accruals and clear the entry (#24).
+    #[test]
+    fn integrator_fees_accumulate_across_markets() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 6000);
+        let integrator = Address::generate(&env);
+
+        let collateral_in = 10_000_000_i128;
+        for m in [m0, m1] {
+            client.buy_via(
+                &trader,
+                &m,
+                &Outcome::Yes,
+                &collateral_in,
+                &0_i128,
+                &integrator,
+                &50u32,
+            );
+        }
+        let per_trade = math::mul_div_ceil(collateral_in, 50_i128, BPS).unwrap();
+        assert_eq!(client.get_integrator_fees(&integrator), 2 * per_trade);
+
+        assert_eq!(client.claim_integrator_fees(&integrator), 2 * per_trade);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The single assumption the whole #23 cross-crate route rests on: a
+    /// `#[contracttype]` enum whose variants are all unit and carry no explicit
+    /// discriminants encodes as the bare variant-name symbol, so the resolver
+    /// can dispatch `void_market_with_reason` by name with
+    /// `Symbol::new(env, "GuardianFault")` and stay wire-compatible whether or
+    /// not `market_core.wasm` has been regenerated.
+    ///
+    /// If this ever stops holding, the guardian-fault route silently stops
+    /// forfeiting, so it is asserted here rather than only in a comment.
+    #[test]
+    fn void_reason_encodes_as_plain_symbol_name() {
+        let env = Env::default();
+        let fault: soroban_sdk::Val = VoidReason::GuardianFault.into_val(&env);
+        let no_fault: soroban_sdk::Val = VoidReason::NoFault.into_val(&env);
+
+        assert_eq!(
+            fault,
+            soroban_sdk::Symbol::new(&env, "GuardianFault").into_val(&env)
+        );
+        assert_eq!(
+            no_fault,
+            soroban_sdk::Symbol::new(&env, "NoFault").into_val(&env)
+        );
+        assert_ne!(fault, no_fault);
+
+        // and the argument tuple the resolver builds is exactly (u64, Symbol),
+        // constructed the same way `core_void_with_reason` builds it
+        let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(&env);
+        args.push_back(7u64.into_val(&env));
+        args.push_back(soroban_sdk::Symbol::new(&env, "GuardianFault").into_val(&env));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args.get_unchecked(0), 7u64.into_val(&env));
+        assert_eq!(args.get_unchecked(1), fault);
     }
 }
 

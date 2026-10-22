@@ -251,6 +251,33 @@ pub enum GuardianReason {
     DisputeUpheld,
 }
 
+/// Mirror of `market_core::VoidReason` (#23, refundable creation bond).
+///
+/// Cross-contract calls from this crate must be **name dispatches**
+/// (`env.try_invoke_contract` + `Symbol`), not generated-client calls,
+/// because `contractimport!` compiles against the vendored
+/// `market_core.wasm` whose bindings only gain `void_market_with_reason`
+/// after a `make build` regeneration. A `#[contracttype]` enum whose
+/// variants all carry no fields encodes as `ScVal::Symbol("VariantName")`
+/// (soroban-sdk-macros `derive_enum.rs`), so passing the variant name as a
+/// `Symbol` here is wire-compatible with market-core's `VoidReason` on both
+/// sides of the regeneration.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoidReason {
+    NoFault,
+    GuardianFault,
+}
+
+impl VoidReason {
+    fn as_symbol_name(&self) -> &'static str {
+        match self {
+            VoidReason::NoFault => "NoFault",
+            VoidReason::GuardianFault => "GuardianFault",
+        }
+    }
+}
+
 /// Guardian action type emitted for audit trails.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,6 +362,12 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    /// A name-dispatched cross-contract call to market-core failed outright
+    /// (contract not present, function missing, or the call itself trapped).
+    /// NOTE: the sibling issue branches (#241) also claim 44 on theirs; the
+    /// last PR to merge re-appends this append-only tail (collision
+    /// disclosed in the PR body).
+    MarketCoreCallFailed = 44,
 }
 
 #[contracttype]
@@ -603,6 +636,18 @@ pub struct GuardianAction {
     pub action: GuardianActionKind,
     pub reason: GuardianReason,
     pub at: u64,
+}
+
+/// Emitted alongside `GuardianAction { action: Void }` when the void was
+/// routed through market-core's `void_market_with_reason` (#23): `at_fault`
+/// records whether the creator's creation bond will be forfeited to the
+/// fee-recipient snapshot instead of refunded.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianVoided {
+    #[topic]
+    pub market_id: u64,
+    pub at_fault: bool,
 }
 
 #[contractevent]
@@ -1131,6 +1176,33 @@ impl Resolver {
         market_id: u64,
         reason: GuardianReason,
     ) -> Result<(), Error> {
+        Self::guardian_void_inner(env, market_id, reason, None)
+    }
+
+    /// `guardian_void_market` plus an explicit at-fault flag for the
+    /// creator's refundable bond (#23). `at_fault = true` routes the core
+    /// void through name-dispatched `void_market_with_reason(market_id,
+    /// GuardianFault)`, which marks the bond for forfeiture to the
+    /// fee-recipient snapshot; `false` keeps exactly the plain
+    /// `void_market`/NoFault semantics of the legacy entrypoint. The
+    /// signature of `guardian_void_market` itself is frozen — callers that
+    /// predate the bond keep compiling — so the flag arrives on a new
+    /// entrypoint instead of a new positional argument.
+    pub fn guardian_void_market_v2(
+        env: Env,
+        market_id: u64,
+        reason: GuardianReason,
+        at_fault: bool,
+    ) -> Result<(), Error> {
+        Self::guardian_void_inner(env, market_id, reason, Some(at_fault))
+    }
+
+    fn guardian_void_inner(
+        env: Env,
+        market_id: u64,
+        reason: GuardianReason,
+        at_fault: Option<bool>,
+    ) -> Result<(), Error> {
         Self::require_admin(&env)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
@@ -1200,7 +1272,21 @@ impl Resolver {
             }
         }
 
-        core_call(core.try_void_market(&market_id))?;
+        match at_fault {
+            // #23 at-fault route: name dispatch, so this call compiles and
+            // runs against the vendored bindings whether or not
+            // `market_core.wasm` has been regenerated yet (the function is
+            // only *resolved* by a core that has it).
+            Some(true) => Self::core_void_with_reason(
+                &env,
+                &market_core,
+                market_id,
+                &VoidReason::GuardianFault,
+            )?,
+            // Legacy and explicit-NoFault routes: the unchanged generated
+            // client call, valid against every vendored blob.
+            _ => core_call(core.try_void_market(&market_id))?,
+        }
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
         GuardianAction {
@@ -1210,7 +1296,43 @@ impl Resolver {
             at: now,
         }
         .publish(&env);
+        if let Some(fault) = at_fault {
+            GuardianVoided {
+                market_id,
+                at_fault: fault,
+            }
+            .publish(&env);
+        }
         Ok(())
+    }
+
+    /// Name-dispatched `market_core.void_market_with_reason(market_id,
+    /// VoidReason)` — see the `VoidReason` docs for why this bypasses the
+    /// generated vendored client. `VoidReason` is an all-unit-variant
+    /// `#[contracttype]` enum and therefore encodes as a plain
+    /// `ScVal::Symbol`, which is what `Symbol::new` produces here.
+    /// This helper is deliberately self-contained (no `core_call`, which
+    /// this crate does not define).
+    fn core_void_with_reason(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        reason: &VoidReason,
+    ) -> Result<(), Error> {
+        let mut args = Vec::new(env);
+        args.push_back(soroban_sdk::IntoVal::into_val(&market_id, env));
+        args.push_back(soroban_sdk::IntoVal::into_val(
+            &Symbol::new(env, reason.as_symbol_name()),
+            env,
+        ));
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(
+            market_core,
+            &Symbol::new(env, "void_market_with_reason"),
+            args,
+        ) {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(Error::MarketCoreCallFailed),
+        }
     }
 
     pub fn resolve_price(env: Env, market_id: u64) -> Result<Outcome, Error> {
@@ -5266,6 +5388,164 @@ mod test {
         model_trace_expire_blocked_by_valid_proposal,
         model_trace_admin_bypass_resolves_without_threshold,
     );
+
+    // ----- Issue #23: at-fault guardian void routing -----------------------
+    //
+    // The at-fault route name-dispatches market-core's
+    // `void_market_with_reason`, an entrypoint the vendored
+    // `market_core.wasm` predates, so the two registrations of market-core
+    // behave differently here and BOTH are pinned:
+    //
+    //   * `McImpl::Wasm` (the default, and what CI runs): the dispatch cannot
+    //     resolve and must fail *closed* — `MarketCoreCallFailed`, with the
+    //     market left `Open`. No half-applied void and no silently refunded
+    //     bond.
+    //   * `McImpl::Native` (the same source that ships the new entrypoint):
+    //     the at-fault route completes.
+    //
+    // `guardian_void_v2_at_fault_fails_closed_on_stale_wasm` therefore passes
+    // against the blob as it stands today, and
+    // `guardian_void_v2_at_fault_forwards_guardian_fault` is asserted under an
+    // explicit native registration (the in-repo idiom, see
+    // `native_and_wasm_market_core_agree`) rather than being left as a test
+    // that cannot pass until `make build` refreshes the vendored blob.
+    //
+    // The two NoFault/auth cases are mode-independent — the legacy branch uses
+    // the unchanged generated `void_market` call, and both guards below
+    // return before the cross-contract dispatch — so they run in the default
+    // registration.
+
+    #[test]
+    fn guardian_void_v2_no_fault_keeps_plain_void_semantics() {
+        let d = dispute_fixture(false);
+        open(&d);
+        d.f.resolver.guardian_void_market_v2(
+            &d.f.market_id,
+            &GuardianReason::DisputeUpheld,
+            &false,
+        );
+        assert_eq!(status(&d), MarketStatus::Void);
+        let expected = soroban_sdk::Event::to_xdr(
+            &GuardianVoided {
+                market_id: d.f.market_id,
+                at_fault: false,
+            },
+            &d.f.env,
+            &d.f.resolver_id,
+        );
+        assert!(d
+            .f
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&d.f.resolver_id)
+            .contains(&expected));
+    }
+
+    #[test]
+    fn guardian_void_v2_at_fault_forwards_guardian_fault() {
+        with_market_core(McImpl::Native, || {
+            let d = dispute_fixture(false);
+            open(&d);
+            d.f.resolver.guardian_void_market_v2(
+                &d.f.market_id,
+                &GuardianReason::DisputeUpheld,
+                &true,
+            );
+            assert_eq!(status(&d), MarketStatus::Void);
+            let expected = soroban_sdk::Event::to_xdr(
+                &GuardianVoided {
+                    market_id: d.f.market_id,
+                    at_fault: true,
+                },
+                &d.f.env,
+                &d.f.resolver_id,
+            );
+            assert!(d
+                .f
+                .env
+                .events()
+                .all()
+                .filter_by_contract(&d.f.resolver_id)
+                .contains(&expected));
+            // The bond sidecar itself is asserted in market-core
+            // (`bond_forfeited_on_guardian_fault_void`), because reading it
+            // back from here would need `MarketBond` mirrored into this crate.
+        });
+    }
+
+    /// The at-fault route must fail *closed* against the vendored blob: no
+    /// void, no state change, no `GuardianVoided` event. This is the guard
+    /// that keeps a pre-`make build` deployment from voiding a market while
+    /// silently skipping the forfeiture the caller asked for.
+    #[test]
+    fn guardian_void_v2_at_fault_fails_closed_on_stale_wasm() {
+        let d = dispute_fixture(false);
+        open(&d);
+        assert_eq!(
+            d.f.resolver.try_guardian_void_market_v2(
+                &d.f.market_id,
+                &GuardianReason::DisputeUpheld,
+                &true
+            ),
+            Err(Ok(Error::MarketCoreCallFailed))
+        );
+        // nothing was applied: still Open, still Disputed, no audit event
+        assert_eq!(status(&d), MarketStatus::Open);
+        assert_eq!(
+            d.f.resolver.state(&d.f.market_id),
+            ResolutionState::Disputed
+        );
+        let not_published = soroban_sdk::Event::to_xdr(
+            &GuardianVoided {
+                market_id: d.f.market_id,
+                at_fault: true,
+            },
+            &d.f.env,
+            &d.f.resolver_id,
+        );
+        assert!(!d
+            .f
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&d.f.resolver_id)
+            .contains(&not_published));
+    }
+
+    #[test]
+    fn guardian_void_v2_shares_validation_and_auth() {
+        // terminal-state guard applies to the new entrypoint too, and returns
+        // before the cross-contract dispatch is reached
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(DEADLINE);
+        f.resolver.expire_market(&f.market_id);
+        assert_eq!(
+            f.resolver.try_guardian_void_market_v2(
+                &f.market_id,
+                &GuardianReason::SignersStalled,
+                &true
+            ),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+
+        // and only the admin may call it
+        let g = signer_fixture();
+        let attacker = Address::generate(&g.env);
+        assert!(g
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &g.resolver_id,
+                    fn_name: "guardian_void_market_v2",
+                    args: (g.market_id, GuardianReason::SignersStalled, true).into_val(&g.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_guardian_void_market_v2(&g.market_id, &GuardianReason::SignersStalled, &true)
+            .is_err());
+    }
 }
 
 #[cfg(test)]

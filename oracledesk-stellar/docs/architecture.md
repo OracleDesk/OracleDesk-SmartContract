@@ -24,6 +24,41 @@ protocol's pending share of trading fees, `lp_fees` the creator's — see the
 fee split below), and `reserve_yes + Σ(user yes positions) == sets_minted`
 (symmetrically for `no`).
 
+Since #23/#24 the contract also holds two kinds of money that are not part of
+any market's pool, so the global form of the invariant is
+
+```
+balance == Σ_markets (sets_minted + fees_accrued + lp_fees)
+         + Σ_held creation bonds
+         + Σ unclaimed integrator balances
+```
+
+Held bonds are those whose `Bond(id)` entry is still `BondState::Held`; a
+`Refunded`/`Forfeited` bond has already left the contract and drops out of the
+sum. Unclaimed integrator balances live in `IntegratorFees(address)` entries.
+`test::assert_global_solvency` computes exactly this over `0..market_count()`
+and is called by both the bond and the integrator-fee tests.
+
+**Creation bond (#23).** `create_market` pulls `seed_amount + bond` in one
+transfer (one `transfer` keeps treasury's single `(from, to, amount)`
+pre-authorisation intact) and records a `Bond(market_id)` side entry, so
+`Market`'s XDR shape never changes. The bond is refunded to the creator when the
+market resolves or voids through a no-fault path, and forfeited to the fee
+recipient snapshotted at void time only when the void is a `GuardianFault`.
+`claim_bond` is permissionless, settles each bond once (state written before the
+transfer), and errors `NoBond` for markets that predate the feature. See
+`docs/adr/0010-bond-and-fee-sidecars.md`.
+
+**Integrator fees (#24).** `buy_via`/`sell_via` charge an integrator cut on top
+of the protocol fee, bounded by a per-market `MarketMaxIntegratorFee` snapshot
+and by `protocol + integrator <= MAX_FEE_BPS`. On buys both fees round up, so
+the pool's spread only widens; on sells the integrator's share of the gross
+spread rounds down, so the protocol never receives less than plain `sell` would
+have taken. Credits accumulate per integrator across markets and are withdrawn
+by `claim_integrator_fees`, which clears the balance before transferring.
+`buy`/`sell` are unchanged and behave exactly as before when no integrator is
+given.
+
 **Fee split and recipient snapshot.** `create_market` snapshots a
 `FeeTerms { recipient, protocol_share_bps }` side entry per market, so
 `propose_treasury` / `set_protocol_fee_share_bps` only affect markets created
