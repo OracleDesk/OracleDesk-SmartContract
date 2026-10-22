@@ -5388,6 +5388,158 @@ mod test {
         model_trace_expire_blocked_by_valid_proposal,
         model_trace_admin_bypass_resolves_without_threshold,
     );
+
+    // ----- Issue #23: at-fault guardian void routing -----------------------
+    //
+    // The at-fault route name-dispatches market-core's
+    // `void_market_with_reason`, an entrypoint the vendored
+    // `market_core.wasm` predates, so the two registrations of market-core
+    // behave differently here and BOTH are pinned:
+    //
+    //   * `McImpl::Wasm` (the default, and what CI runs): the dispatch cannot
+    //     resolve and must fail *closed* — `MarketCoreCallFailed`, with the
+    //     market left `Open`. No half-applied void and no silently refunded
+    //     bond.
+    //   * `McImpl::Native` (the same source that ships the new entrypoint):
+    //     the at-fault route completes.
+    //
+    // `guardian_void_v2_at_fault_fails_closed_on_stale_wasm` therefore passes
+    // against the blob as it stands today, and
+    // `guardian_void_v2_at_fault_forwards_guardian_fault` is asserted under an
+    // explicit native registration (the in-repo idiom, see
+    // `native_and_wasm_market_core_agree`) rather than being left as a test
+    // that cannot pass until `make build` refreshes the vendored blob.
+    //
+    // The two NoFault/auth cases are mode-independent — the legacy branch uses
+    // the unchanged generated `void_market` call, and both guards below
+    // return before the cross-contract dispatch — so they run in the default
+    // registration.
+
+    #[test]
+    fn guardian_void_v2_no_fault_keeps_plain_void_semantics() {
+        let d = dispute_fixture(false);
+        open(&d);
+        d.f.resolver.guardian_void_market_v2(
+            &d.f.market_id,
+            &GuardianReason::DisputeUpheld,
+            &false,
+        );
+        assert_eq!(status(&d), MarketStatus::Void);
+        let expected = soroban_sdk::Event::to_xdr(
+            &GuardianVoided {
+                market_id: d.f.market_id,
+                at_fault: false,
+            },
+            &d.f.env,
+            &d.f.resolver_id,
+        );
+        assert!(d
+            .f
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&d.f.resolver_id)
+            .contains(&expected));
+    }
+
+    #[test]
+    fn guardian_void_v2_at_fault_forwards_guardian_fault() {
+        with_market_core(McImpl::Native, || {
+            let d = dispute_fixture(false);
+            open(&d);
+            d.f.resolver.guardian_void_market_v2(
+                &d.f.market_id,
+                &GuardianReason::DisputeUpheld,
+                &true,
+            );
+            assert_eq!(status(&d), MarketStatus::Void);
+            let expected = soroban_sdk::Event::to_xdr(
+                &GuardianVoided {
+                    market_id: d.f.market_id,
+                    at_fault: true,
+                },
+                &d.f.env,
+                &d.f.resolver_id,
+            );
+            assert!(d
+                .f
+                .env
+                .events()
+                .all()
+                .filter_by_contract(&d.f.resolver_id)
+                .contains(&expected));
+            // The bond sidecar itself is asserted in market-core
+            // (`bond_forfeited_on_guardian_fault_void`), because reading it
+            // back from here would need `MarketBond` mirrored into this crate.
+        });
+    }
+
+    /// The at-fault route must fail *closed* against the vendored blob: no
+    /// void, no state change, no `GuardianVoided` event. This is the guard
+    /// that keeps a pre-`make build` deployment from voiding a market while
+    /// silently skipping the forfeiture the caller asked for.
+    #[test]
+    fn guardian_void_v2_at_fault_fails_closed_on_stale_wasm() {
+        let d = dispute_fixture(false);
+        open(&d);
+        assert_eq!(
+            d.f.resolver.try_guardian_void_market_v2(
+                &d.f.market_id,
+                &GuardianReason::DisputeUpheld,
+                &true
+            ),
+            Err(Ok(Error::MarketCoreCallFailed))
+        );
+        // nothing was applied: still Open, still Disputed, no audit event
+        assert_eq!(status(&d), MarketStatus::Open);
+        assert_eq!(d.f.resolver.state(&d.f.market_id), ResolutionState::Disputed);
+        let not_published = soroban_sdk::Event::to_xdr(
+            &GuardianVoided {
+                market_id: d.f.market_id,
+                at_fault: true,
+            },
+            &d.f.env,
+            &d.f.resolver_id,
+        );
+        assert!(!d
+            .f
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&d.f.resolver_id)
+            .contains(&not_published));
+    }
+
+    #[test]
+    fn guardian_void_v2_shares_validation_and_auth() {
+        // terminal-state guard applies to the new entrypoint too, and returns
+        // before the cross-contract dispatch is reached
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(DEADLINE);
+        f.resolver.expire_market(&f.market_id);
+        assert_eq!(
+            f.resolver
+                .try_guardian_void_market_v2(&f.market_id, &GuardianReason::SignersStalled, &true),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+
+        // and only the admin may call it
+        let g = signer_fixture();
+        let attacker = Address::generate(&g.env);
+        assert!(g
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &g.resolver_id,
+                    fn_name: "guardian_void_market_v2",
+                    args: (g.market_id, GuardianReason::SignersStalled, true).into_val(&g.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_guardian_void_market_v2(&g.market_id, &GuardianReason::SignersStalled, &true)
+            .is_err());
+    }
 }
 
 #[cfg(test)]
@@ -5652,102 +5804,5 @@ mod golden {
         let a = DeclaredAlphabetically { alpha: 1, beta: 2 }.to_xdr(&env);
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
-    }
-
-    // ----- Issue #23: at-fault guardian void routing -----------------------
-    // NOTE: the at-fault path name-dispatches `void_market_with_reason`,
-    // which only exists in market-core once `market_core.wasm` is
-    // regenerated for this branch (`make build`). With the vendored blob
-    // that predates the feature the dispatch fails with
-    // `MarketCoreCallFailed` and the whole guardian call reverts — no state
-    // corruption either way. The tests below assert the intended behaviour
-    // and are expected to pass against the regenerated blob only.
-
-    #[test]
-    fn guardian_void_v2_no_fault_keeps_plain_void_semantics() {
-        let d = dispute_fixture(false);
-        open(&d);
-        d.f.resolver.guardian_void_market_v2(
-            &d.f.market_id,
-            &GuardianReason::DisputeUpheld,
-            &false,
-        );
-        assert_eq!(status(&d), MarketStatus::Void);
-        let expected = soroban_sdk::Event::to_xdr(
-            &GuardianVoided {
-                market_id: d.f.market_id,
-                at_fault: false,
-            },
-            &d.f.env,
-            &d.f.resolver_id,
-        );
-        assert!(d
-            .f
-            .env
-            .events()
-            .all()
-            .filter_by_contract(&d.f.resolver_id)
-            .contains(&expected));
-    }
-
-    #[test]
-    fn guardian_void_v2_at_fault_forwards_guardian_fault() {
-        let d = dispute_fixture(false);
-        open(&d);
-        d.f.resolver
-            .guardian_void_market_v2(&d.f.market_id, &GuardianReason::DisputeUpheld, &true);
-        assert_eq!(status(&d), MarketStatus::Void);
-        let expected = soroban_sdk::Event::to_xdr(
-            &GuardianVoided {
-                market_id: d.f.market_id,
-                at_fault: true,
-            },
-            &d.f.env,
-            &d.f.resolver_id,
-        );
-        assert!(d
-            .f
-            .env
-            .events()
-            .all()
-            .filter_by_contract(&d.f.resolver_id)
-            .contains(&expected));
-        // The market-core bond sidecar now reads Forfeited-on-settlement;
-        // asserting it here needs the regenerated core client bindings, so
-        // the forfeiture end-to-end case lives with the market-core tests
-        // (`bond_forfeited_on_guardian_fault_void`).
-    }
-
-    #[test]
-    fn guardian_void_v2_shares_validation_and_auth() {
-        // terminal-state guard applies to the new entrypoint too
-        let f = signer_fixture();
-        f.env.ledger().set_timestamp(DEADLINE);
-        f.resolver.expire_market(&f.market_id);
-        assert_eq!(
-            f.resolver.try_guardian_void_market_v2(
-                &f.market_id,
-                &GuardianReason::SignersStalled,
-                &true
-            ),
-            Err(Ok(Error::AlreadyFinalized))
-        );
-
-        // and only the admin may call it
-        let g = signer_fixture();
-        let attacker = Address::generate(&g.env);
-        assert!(g
-            .resolver
-            .mock_auths(&[MockAuth {
-                address: &attacker,
-                invoke: &MockAuthInvoke {
-                    contract: &g.resolver_id,
-                    fn_name: "guardian_void_market_v2",
-                    args: (g.market_id, GuardianReason::SignersStalled, true).into_val(&g.env),
-                    sub_invokes: &[],
-                },
-            }])
-            .try_guardian_void_market_v2(&g.market_id, &GuardianReason::SignersStalled, &true)
-            .is_err());
     }
 }
