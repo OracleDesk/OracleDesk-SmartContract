@@ -123,6 +123,103 @@ def calc_sell(r_sold: int, r_other: int, collateral_out: int, fee_bps: int) -> S
     return SellQuote(shares_in, fee, gross, new_sold, new_other)
 
 
+@dataclass(frozen=True)
+class BuyQuoteWith:
+    """`BuyQuote` plus the integrator leg (#24).
+
+    A separate dataclass rather than a new field on `BuyQuote`, on purpose:
+    `_check_shared_vectors` compares `out.__dict__` against the committed
+    `scripts/fpmm-diff/vectors.jsonl`, and adding `integrator_fee` to
+    `BuyQuote` would add an unexpected key to every `calc_buy` vector and
+    break them. `math.rs` can carry the extra field because its
+    `shared_vectors_match` enumerates the compared keys explicitly (verified by
+    reading that test). The arithmetic below is the mirror; the *shape* is not.
+    """
+
+    shares_out: int
+    fee: int
+    integrator_fee: int
+    net: int
+    new_reserve_bought: int
+    new_reserve_other: int
+
+
+@dataclass(frozen=True)
+class SellQuoteWith:
+    """`SellQuote` plus the integrator leg (#24). See `BuyQuoteWith` for why
+    this is a separate type."""
+
+    shares_in: int
+    fee: int
+    integrator_fee: int
+    gross: int
+    new_reserve_sold: int
+    new_reserve_other: int
+
+
+def calc_buy_with(
+    r_bought: int, r_other: int, collateral_in: int, fee_bps: int, integrator_fee_bps: int
+) -> BuyQuoteWith:
+    """Mirror of math.rs::calc_buy_with. Both fees are rounded **up**, so the
+    trader (who opted into the integrator) absorbs the rounding and the pool
+    can never be credited less than `net` mints."""
+    if collateral_in <= 0 or r_bought <= 0 or r_other <= 0:
+        raise MathError("invalid input")
+    fee = mul_div_ceil(collateral_in, fee_bps, BPS)
+    ifee = mul_div_ceil(collateral_in, integrator_fee_bps, BPS)
+    net = collateral_in - fee - ifee
+    if net <= 0:
+        raise MathError("invalid input")
+    new_other = r_other + net
+    new_bought = mul_div_ceil(r_bought, r_other, new_other)
+    shares_out = r_bought + net - new_bought
+    if shares_out <= 0:
+        raise MathError("invalid input")
+    return BuyQuoteWith(shares_out, fee, ifee, net, new_bought, new_other)
+
+
+def calc_sell_with(
+    r_sold: int, r_other: int, collateral_out: int, fee_bps: int, integrator_fee_bps: int
+) -> SellQuoteWith:
+    """Mirror of math.rs::calc_sell_with. `gross` is rounded up on the
+    **combined** bps, then the integrator leg is rounded **down** out of the
+    total spread and the protocol takes the remainder, so the protocol never
+    receives less than a protocol-only computation would have given it."""
+    sum_fees = fee_bps + integrator_fee_bps
+    if collateral_out <= 0 or r_sold <= 0 or r_other <= 0 or sum_fees >= BPS:
+        raise MathError("invalid input")
+    gross = mul_div_ceil(collateral_out, BPS, BPS - sum_fees)
+    total_fee = gross - collateral_out
+    if sum_fees == 0:
+        # The split would divide by zero; there is no fee to split.
+        fee, ifee = 0, 0
+    else:
+        ifee = mul_div_floor(total_fee, integrator_fee_bps, sum_fees)
+        fee = total_fee - ifee
+    if gross >= r_other:
+        raise MathError("insufficient liquidity")
+    new_other = r_other - gross
+    new_sold = mul_div_ceil(r_sold, r_other, new_other)
+    shares_in = new_sold + gross - r_sold
+    if shares_in <= 0:
+        raise MathError("invalid input")
+    return SellQuoteWith(shares_in, fee, ifee, gross, new_sold, new_other)
+
+
+def _lcg_stream(seed: int = 0x9E37_79B9_7F4A_7C15):
+    """The exact LCG `math.rs`'s integrator property tests use (`PCG` step
+    constants over `u64`, shifted right by 33), so Python sweeps the *same*
+    inputs as Rust rather than a fresh random sample."""
+    x = seed
+
+    def next_int() -> int:
+        nonlocal x
+        x = (x * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407) & (2**64 - 1)
+        return x >> 33
+
+    return next_int
+
+
 def split_fee(fee: int, protocol_share_bps: int) -> tuple[int, int]:
     """Split a trade fee into (protocol, lp) portions. Mirrors
     math.rs::split_fee: the protocol share is rounded up so the pool can
@@ -239,6 +336,124 @@ def _check_known_values():
     assert split_fee(100, 0) == (0, 100)
     assert split_fee(100, BPS) == (100, 0)
     assert split_fee(101, 5_000) == (51, 50)
+
+
+def _check_integrator_known_values():
+    """The literal expectations asserted by math.rs's
+    `buy_with_integrator_known_values` / `sell_with_integrator_known_values`.
+    Transcribed from the Rust source, not recomputed, so an arithmetic
+    divergence here shows up as a Python failure."""
+    q = calc_buy_with(1000, 1000, 100, 100, 50)
+    assert q.fee == 1, q
+    assert q.integrator_fee == 1, q
+    assert q.net == 98, q
+    assert q.shares_out == 187, q
+    assert q.new_reserve_bought == 911, q
+    assert q.new_reserve_other == 1098, q
+
+    s = calc_sell_with(10_000, 20_000, 1000, 100, 50)
+    assert s.gross == 1016, s
+    assert s.integrator_fee == 5, s
+    assert s.fee == 11, s
+    assert s.fee + s.integrator_fee == s.gross - 1000, s
+    assert s.new_reserve_other == 18_984, s
+    assert s.new_reserve_sold == 10_536, s
+    assert s.shares_in == 1552, s
+
+
+def _check_integrator_accounting_is_exact(trials: int = 2_000):
+    """math.rs's `do_buy` / `do_sell` assert these identities on chain:
+    `collateral_in == net + fee + ifee` and `gross == collateral_out + fee +
+    ifee`. If either broke, `sets_minted` would drift from the collateral the
+    contract actually holds, which is the solvency invariant. Swept over the
+    Rust LCG inputs so the two languages test the same domain."""
+    next_int = _lcg_stream()
+    for _ in range(trials):
+        ry = 1_000_000 + next_int() % 1_000_000_000
+        rn = 1_000_000 + next_int() % 1_000_000_000
+        amt = 1 + next_int() % (min(ry, rn) // 2)
+        fee = next_int() % 200
+        ifee = next_int() % 200
+        q = calc_buy_with(ry, rn, amt, fee, ifee)
+        assert q.net + q.fee + q.integrator_fee == amt, q
+        try:
+            s = calc_sell_with(ry, rn, amt, fee, ifee)
+        except MathError:
+            continue
+        assert s.gross == amt + s.fee + s.integrator_fee, s
+
+
+def _check_calc_buy_with_zero_integrator_matches_calc_buy(trials: int = 2_000):
+    next_int = _lcg_stream()
+    for _ in range(trials):
+        ry = 1_000_000 + next_int() % 1_000_000_000
+        rn = 1_000_000 + next_int() % 1_000_000_000
+        amt = 1 + next_int() % (min(ry, rn) // 2)
+        fee = next_int() % 300
+        q1 = calc_buy(ry, rn, amt, fee)
+        q2 = calc_buy_with(ry, rn, amt, fee, 0)
+        assert (q1.shares_out, q1.fee, q1.net, q1.new_reserve_bought, q1.new_reserve_other) == (
+            q2.shares_out,
+            q2.fee,
+            q2.net,
+            q2.new_reserve_bought,
+            q2.new_reserve_other,
+        ), (q1, q2)
+        assert q2.integrator_fee == 0
+
+
+def _check_calc_sell_with_zero_integrator_matches_calc_sell(trials: int = 2_000):
+    next_int = _lcg_stream()
+    for _ in range(trials):
+        ry = 1_000_000 + next_int() % 1_000_000_000
+        rn = 1_000_000 + next_int() % 1_000_000_000
+        amt = 1 + next_int() % (rn // 2)
+        fee = next_int() % 300
+        q1 = calc_sell(ry, rn, amt, fee)
+        q2 = calc_sell_with(ry, rn, amt, fee, 0)
+        assert (q1.shares_in, q1.fee, q1.gross, q1.new_reserve_sold, q1.new_reserve_other) == (
+            q2.shares_in,
+            q2.fee,
+            q2.gross,
+            q2.new_reserve_sold,
+            q2.new_reserve_other,
+        ), (q1, q2)
+        assert q2.integrator_fee == 0
+
+
+def _check_sell_split_never_shortchanges_protocol(trials: int = 2_000):
+    next_int = _lcg_stream()
+    for _ in range(trials):
+        ry = 1_000_000 + next_int() % 1_000_000_000
+        rn = 1_000_000 + next_int() % 1_000_000_000
+        amt = 1 + next_int() % (rn // 4)
+        fee = next_int() % 200
+        ifee = next_int() % 200
+        try:
+            q_with = calc_sell_with(ry, rn, amt, fee, ifee)
+            q_solo = calc_sell(ry, rn, amt, fee)
+        except MathError:
+            continue
+        assert q_with.fee >= q_solo.fee, "protocol shortchanged"
+        assert q_with.fee + q_with.integrator_fee == q_with.gross - amt
+
+
+def _check_round_trip_with_integrator_never_profits(trials: int = 2_000):
+    next_int = _lcg_stream()
+    for _ in range(trials):
+        ry = 1_000_000 + next_int() % 1_000_000_000
+        rn = 1_000_000 + next_int() % 1_000_000_000
+        amt = 1 + next_int() % (min(ry, rn) // 2)
+        fee = next_int() % 200
+        ifee = next_int() % 100
+        k0 = ry * rn
+        q = calc_buy_with(ry, rn, amt, fee, ifee)
+        assert q.new_reserve_bought * q.new_reserve_other >= k0
+        try:
+            s = calc_sell_with(q.new_reserve_bought, q.new_reserve_other, amt, fee, ifee)
+        except MathError:
+            continue
+        assert s.shares_in >= q.shares_out, "free money with integrator"
 
 
 def _check_seed_opens_at_requested_probability():
@@ -382,6 +597,12 @@ def _check_shared_vectors():
 def run_all():
     _check_known_values()
     _check_shared_vectors()
+    _check_integrator_known_values()
+    _check_integrator_accounting_is_exact()
+    _check_calc_buy_with_zero_integrator_matches_calc_buy()
+    _check_calc_sell_with_zero_integrator_matches_calc_sell()
+    _check_sell_split_never_shortchanges_protocol()
+    _check_round_trip_with_integrator_never_profits()
     _check_seed_opens_at_requested_probability()
     _check_k_never_decreases_and_round_trip_never_profits()
     _check_gross_for_shares_inverts_calc_sell()
