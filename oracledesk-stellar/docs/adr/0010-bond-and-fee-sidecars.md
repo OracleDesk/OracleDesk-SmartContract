@@ -149,10 +149,17 @@ caller-side checks.
   `LpFees` does per market.
 - The enum tails collide by design with sibling PRs: #239 appends
   `ModeRestricted = 27`, #240 `DirectoryEntryArchived = 27`, and #242
-  `AlreadyHalted = 27` + `HaltTooOld = 28` (verified by reading each PR's patch,
-  not inferred). This is the agreed cost of solving each issue standalone against
-  `develop`; the last PR to merge re-appends. It is not resolved by rebasing one
-  PR onto another.
+  `AlreadyHalted = 27` + `HaltTooOld = 28` at market-core (verified by reading
+  each PR's patch, not inferred). The resolver side has its own collision: this
+  work appends `MarketCoreCallFailed = 44` to an enum that ends at 43 on
+  `develop`, and #241 (`QuorumNotReached = 44`) and #242 (`EventTimeMismatch =
+  44`) reach for the same number. This is the agreed cost of solving each issue
+  standalone against `develop`; the last PR to merge re-appends. It is not
+  resolved by rebasing one PR onto another. Tests should assert the *named*
+  variant, not the numeric literal — `Err(Ok(Error::NoBond))` and
+  `Err(Ok(Error::MarketCoreCallFailed))` survive a renumber untouched, whereas
+  the two `should_panic(expected = "Error(Contract, #27)")` cases have to be
+  chased.
 
 **Required follow-up, not doable here**
 
