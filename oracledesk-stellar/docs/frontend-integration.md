@@ -107,6 +107,93 @@ const tx = await contract.buy_v2({
 `buy` / `sell` remain for backward compatibility but carry no deadline or
 limit; the share-count bound alone does not stop a stale transaction.
 
+## Integrator (frontend) fees
+
+An integrator — a UI, a wallet, a Telegram bot — can take a cut of the flow
+it routes by calling `buy_via` / `sell_via` instead of `buy` / `sell`. The
+fee is charged **on top of** the market's protocol fee and accrues on-chain
+to `integrator`'s own balance; nothing is transferred to you at trade time.
+
+```ts
+const quote = (await contract.quote_buy_via({
+  market_id, outcome, collateral_in, integrator_fee_bps: 50,
+})).result;
+const tx = await contract.buy_via({
+  trader: userAddress,          // the user signs; you do not
+  market_id, outcome, collateral_in,
+  min_shares_out: (quote * 9_950n) / 10_000n,
+  integrator: yourAddress,
+  integrator_fee_bps: 50,       // 0.50% of collateral_in
+});
+```
+
+Three rules the contract enforces, so do not try to compute them client-side:
+
+- `integrator_fee_bps` must be `<= get_market_max_integrator_fee_bps(market_id)`,
+  the cap the market snapshotted at creation. A later
+  `set_max_integrator_fee_bps` never moves it for existing markets.
+- `market.fee_bps + integrator_fee_bps <= MAX_FEE_BPS` (1000 bps), checked per
+  trade as well as by the admin setter.
+- Either violation reverts the whole trade with
+  `Error(Contract, #27)` (`IntegratorFeeTooHigh`). `quote_buy_via` /
+  `quote_sell_via` run the same validation, so a quote that succeeds is a
+  quote for a trade that can succeed.
+
+The integrator fee is part of `collateral_in` on a buy, so
+`min_shares_out` derived from `quote_buy_via` (not `quote_buy`) is the
+correct bound — `quote_buy` over-states the shares by the integrator's cut.
+On a sell the fee is retained out of the `gross` pulled from the pool, so the
+protocol's share is never reduced by the split's rounding
+(`calc_sell_with` floors the integrator leg).
+
+Balances are per address across all markets. Read yours with
+`get_integrator_fees(integrator)` and withdraw with
+`claim_integrator_fees(integrator)`, which requires your own signature,
+zeroes the balance *before* transferring, and emits
+`IntegratorFeesClaimed { integrator, amount }`. A second call is a no-op
+returning `0`, not an error. Fees accrue as `IntegratorFeeAccrued` events;
+the `Trade` event's field list is unchanged so existing indexers keep
+decoding it.
+
+`buy_via` / `sell_via` take no `deadline` or `limit_price_bps`: the two
+v2 guards above and the integrator leg have not been combined into one
+entrypoint. A user-facing UI that needs both must accept the weaker of the
+two protections, which in practice means: keep the deadline-bounded path
+`buy_v2`, and use the `*_via` path only for flows that are not
+sign-and-forget. Note also that an integrator may name *itself* as the
+`trader`; that is harmless economically but inflates reported volume.
+
+## Creation bond
+
+`create_market` now pulls **two** things in a single transfer: the seed
+liquidity and the creation bond. Read the bond with `get_creation_bond()`
+(instance config, default `0`) and show `seed_amount + bond` in any
+confirmation the user signs — a UI that displays only the seed will produce
+transactions that fail with an insufficient balance.
+
+```ts
+const bond = (await contract.get_creation_bond()).result;
+const total = seed_amount + bond;   // this is what leaves the wallet
+```
+
+The bond is held separately from the market's trading collateral (its own
+storage entry; the `Market` struct is unchanged) and is settled by the
+permissionless `claim_bond(market_id)`, callable by anyone once the market is
+final so a keeper can drive it:
+
+| Market outcome | Bond goes to |
+| --- | --- |
+| Resolved normally | the creator |
+| Voided with `VoidReason::NoFault` (incl. plain `void_market`) | the creator |
+| Voided with `VoidReason::GuardianFault` | the fee recipient (`forfeit_to`, snapshotted at void time) |
+
+Markets created before this change have no bond entry at all: `claim_bond`
+reverts with `Error(Contract, #28)` (`NoBond`), and `bond = 0` is snapshotted
+for them retroactively by the solvency accounting. The bond is never touched
+by `claim_pool_remainder` — LP withdrawal and bond settlement are separate
+rails. The admin setter `set_creation_bond(amount)` applies only to markets
+created afterwards, exactly like `set_default_fee_bps`.
+
 ## Circuit breakers
 
 Markets can carry per-market breakers (snapshotted at creation): a maximum
