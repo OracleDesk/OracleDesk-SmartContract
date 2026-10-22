@@ -5492,7 +5492,10 @@ mod test {
         );
         // nothing was applied: still Open, still Disputed, no audit event
         assert_eq!(status(&d), MarketStatus::Open);
-        assert_eq!(d.f.resolver.state(&d.f.market_id), ResolutionState::Disputed);
+        assert_eq!(
+            d.f.resolver.state(&d.f.market_id),
+            ResolutionState::Disputed
+        );
         let not_published = soroban_sdk::Event::to_xdr(
             &GuardianVoided {
                 market_id: d.f.market_id,
@@ -5518,8 +5521,11 @@ mod test {
         f.env.ledger().set_timestamp(DEADLINE);
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
-            f.resolver
-                .try_guardian_void_market_v2(&f.market_id, &GuardianReason::SignersStalled, &true),
+            f.resolver.try_guardian_void_market_v2(
+                &f.market_id,
+                &GuardianReason::SignersStalled,
+                &true
+            ),
             Err(Ok(Error::AlreadyFinalized))
         );
 

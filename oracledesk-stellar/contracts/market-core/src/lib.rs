@@ -4291,6 +4291,277 @@ mod test {
             .try_set_max_integrator_fee_bps(&50u32)
             .is_err());
     }
+
+    // ----- #23/#24 boundary and compatibility invariants -------------------
+    //
+    // The cases above cover the rejecting side of each cap. These pin the
+    // boundary itself (`>` vs `>=`), the "no integrator means no change"
+    // compatibility guarantee that #24's acceptance criteria rest on, and the
+    // single wire-compatibility claim the whole resolver name-dispatch route
+    // of #23 rests on.
+
+    /// `validate_integrator_fee` rejects `bps > cap`, so `bps == cap` must be
+    /// accepted. Off-by-one guard on the per-market cap (#24).
+    #[test]
+    fn buy_via_fee_at_exact_market_cap_is_accepted() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        assert_eq!(client.get_market_max_integrator_fee_bps(&market_id), 100);
+
+        let collateral_in = 10_000_000_i128;
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &100u32, // exactly the cap
+        );
+        assert!(shares > 0);
+        assert_eq!(
+            client.get_integrator_fees(&integrator),
+            math::mul_div_ceil(collateral_in, 100_i128, BPS).unwrap()
+        );
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The combined take is rejected at `> MAX_FEE_BPS`, so a take of exactly
+    /// `MAX_FEE_BPS` (integrator 900 + protocol 100 = 1_000) must go through.
+    /// Off-by-one guard on the global ceiling (#24).
+    #[test]
+    fn combined_take_at_exact_max_fee_bps_is_accepted() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&900);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let m = client.get_market(&market_id);
+        assert_eq!(m.fee_bps, 100);
+        assert_eq!(m.fee_bps + 900, MAX_FEE_BPS);
+
+        let shares = client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &900u32,
+        );
+        // 900 bps of the input goes to the integrator and 100 bps to the
+        // protocol, so the trader still receives a strictly positive amount.
+        assert!(shares > 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The cap is enforced on the sell side too, not only on buy (#24).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn sell_via_rejects_fee_above_market_cap() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        client.set_max_integrator_fee_bps(&50);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(20_000_000_i128),
+            &0_i128,
+        );
+        client.sell_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &5_000_000_i128,
+            &100_000_000_i128,
+            &integrator,
+            &51u32, // one bps over the 50 cap
+        );
+    }
+
+    /// #24's compatibility criterion, at contract level: `buy_via` with a zero
+    /// integrator fee must be indistinguishable from plain `buy` — same shares,
+    /// same reserves, same minted sets, same accrued protocol fees, and no
+    /// integrator balance created. Proved against two identically seeded
+    /// markets so any divergence in the quote is visible.
+    #[test]
+    fn buy_via_with_zero_integrator_fee_matches_buy() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let collateral_in = 20_000_000_i128;
+
+        let plain = client.buy(&trader, &m0, &Outcome::Yes, &collateral_in, &0_i128);
+        let via = client.buy_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &collateral_in,
+            &0_i128,
+            &integrator,
+            &0u32,
+        );
+        assert_eq!(via, plain);
+
+        let a = client.get_market(&m0);
+        let b = client.get_market(&m1);
+        assert_eq!(a.reserve_yes, b.reserve_yes);
+        assert_eq!(a.reserve_no, b.reserve_no);
+        assert_eq!(a.sets_minted, b.sets_minted);
+        assert_eq!(a.fees_accrued, b.fees_accrued);
+        // a zero fee must not open an integrator balance at all
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The sell-side half of the same compatibility criterion: the
+    /// protocol/integrator split at `integrator_fee_bps = 0` must reproduce
+    /// plain `sell` exactly (see `calc_sell_with`'s floor-on-integrator rule).
+    #[test]
+    fn sell_via_with_zero_integrator_fee_matches_sell() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+        let buy_in = 20_000_000_i128;
+
+        client.buy(&trader, &m0, &Outcome::Yes, &buy_in, &0_i128);
+        client.buy_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &buy_in,
+            &0_i128,
+            &integrator,
+            &0u32,
+        );
+
+        let collateral_out = 5_000_000_i128;
+        let max_shares_in = 100_000_000_i128;
+        let plain = client.sell(&trader, &m0, &Outcome::Yes, &collateral_out, &max_shares_in);
+        let via = client.sell_via(
+            &trader,
+            &m1,
+            &Outcome::Yes,
+            &collateral_out,
+            &max_shares_in,
+            &integrator,
+            &0u32,
+        );
+        assert_eq!(via, plain);
+
+        let a = client.get_market(&m0);
+        let b = client.get_market(&m1);
+        assert_eq!(a.reserve_yes, b.reserve_yes);
+        assert_eq!(a.reserve_no, b.reserve_no);
+        assert_eq!(a.sets_minted, b.sets_minted);
+        assert_eq!(a.fees_accrued, b.fees_accrued);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// `claim_integrator_fees` is zero-before-transfer, so the second call
+    /// finds nothing, returns 0, emits no event and moves no collateral — it
+    /// must not panic (#24).
+    #[test]
+    fn claim_integrator_fees_second_call_is_a_noop() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let market_id = new_market(&env, &client, &creator, 5000);
+        let integrator = Address::generate(&env);
+
+        client.buy_via(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+            &integrator,
+            &50u32,
+        );
+        let accrued = client.get_integrator_fees(&integrator);
+        assert!(accrued > 0);
+
+        let token = StellarAssetClient::new(&env, &collateral);
+        let first = client.claim_integrator_fees(&integrator);
+        assert_eq!(first, accrued);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+
+        let balance_after_first = token.balance(&integrator);
+        assert_eq!(client.claim_integrator_fees(&integrator), 0);
+        assert_eq!(token.balance(&integrator), balance_after_first);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// Integrator balances are per integrator *across all markets*, so one
+    /// claim must pay the sum of both accruals and clear the entry (#24).
+    #[test]
+    fn integrator_fees_accumulate_across_markets() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        client.set_max_integrator_fee_bps(&100);
+        let m0 = new_market(&env, &client, &creator, 5000);
+        let m1 = new_market(&env, &client, &creator, 6000);
+        let integrator = Address::generate(&env);
+
+        let collateral_in = 10_000_000_i128;
+        for m in [m0, m1] {
+            client.buy_via(
+                &trader,
+                &m,
+                &Outcome::Yes,
+                &collateral_in,
+                &0_i128,
+                &integrator,
+                &50u32,
+            );
+        }
+        let per_trade = math::mul_div_ceil(collateral_in, 50_i128, BPS).unwrap();
+        assert_eq!(client.get_integrator_fees(&integrator), 2 * per_trade);
+
+        assert_eq!(client.claim_integrator_fees(&integrator), 2 * per_trade);
+        assert_eq!(client.get_integrator_fees(&integrator), 0);
+        assert_global_solvency(&env, &client, &collateral, &[integrator]);
+    }
+
+    /// The single assumption the whole #23 cross-crate route rests on: a
+    /// `#[contracttype]` enum whose variants are all unit and carry no explicit
+    /// discriminants encodes as the bare variant-name symbol, so the resolver
+    /// can dispatch `void_market_with_reason` by name with
+    /// `Symbol::new(env, "GuardianFault")` and stay wire-compatible whether or
+    /// not `market_core.wasm` has been regenerated.
+    ///
+    /// If this ever stops holding, the guardian-fault route silently stops
+    /// forfeiting, so it is asserted here rather than only in a comment.
+    #[test]
+    fn void_reason_encodes_as_plain_symbol_name() {
+        let env = Env::default();
+        let fault: soroban_sdk::Val = VoidReason::GuardianFault.into_val(&env);
+        let no_fault: soroban_sdk::Val = VoidReason::NoFault.into_val(&env);
+
+        assert_eq!(
+            fault,
+            soroban_sdk::Symbol::new(&env, "GuardianFault").into_val(&env)
+        );
+        assert_eq!(
+            no_fault,
+            soroban_sdk::Symbol::new(&env, "NoFault").into_val(&env)
+        );
+        assert_ne!(fault, no_fault);
+
+        // and the argument tuple the resolver builds is exactly (u64, Symbol),
+        // constructed the same way `core_void_with_reason` builds it
+        let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(&env);
+        args.push_back(7u64.into_val(&env));
+        args.push_back(soroban_sdk::Symbol::new(&env, "GuardianFault").into_val(&env));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args.get_unchecked(0), 7u64.into_val(&env));
+        assert_eq!(args.get_unchecked(1), fault);
+    }
 }
 
 // ---------------------------------------------------------------------------
