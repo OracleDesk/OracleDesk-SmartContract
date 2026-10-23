@@ -126,9 +126,39 @@ Independent resolution modes, all ultimately calling
 `market_core.resolve(market_id, outcome)`:
 
 - **PriceThreshold**: reads a [Reflector](https://reflector.network) SEP-40
-  price feed at (or after) the market's `close_time`, compares to a
-  threshold, enforces a max staleness window. Anyone may first pin that
-  read with `snapshot_price` (see "Oracle history retention" below).
+  price feed at a timestamp aligned to the feed's `resolution()` grid at or
+  *before* the market's `close_time` (`close_time - close_time % resolution`),
+  walking back along the grid — at most `MAX_LOOKBACK_RECORDS` (12) records,
+  and never past `max_staleness` — until it finds a published record. A feed
+  with `resolution() == 0` or a non-positive published price is `InvalidPrice`;
+  a grid the feed simply has no record on (or one the bounded walkback
+  exhausts) is `StalePrice`, so operators should resolve before the window
+  closes and guardians may void via the `OracleUnavailable` path after grace.
+  The legacy `Price` spec compares the threshold in feed-native units (raw
+  integer, no scaling); the decimal-explicit scaled spec
+  (`ScaledPriceConfig`) carries
+  `threshold_decimals` and rescales both sides to the coarser of
+  `decimals()` and `threshold_decimals` before comparing — see ADR 0001,
+  "Price threshold units". `preview_price(market_id)` reads the feed's newest
+  record (`lastprice`) read-only, without resolving or storing anything.
+  Anyone may first pin the grid read with `snapshot_price` (legacy and hybrid
+  specs only; scaled markets reply `WrongMode` — see "Oracle history retention"
+  below).
+- **PriceTwap**: the time-weighted-average price threshold (issue #27,
+  `TwapConfig` + `register_twap_spec`/`resolve_twap`). Samples
+  `price(asset, ts)` at every `resolution()`-aligned timestamp in
+  `(close_time - window, close_time]` — at most `MAX_TWAP_SAMPLES` (32)
+  reads — skips missing records, and rejects fewer than `min_samples`
+  samples or any gap above `max_gap` (start→first, consecutive, and
+  last→close) with `StalePrice`. The average is an integer-only, checked
+  `i128` sum weighted by time-to-next-sample (the last sample's weight runs
+  through `close_time` inclusive), floored before the threshold comparison,
+  and emitted as `TwapResolution` alongside the unchanged
+  `PriceResolution`/`V2` pair. It commits through its own domain-tagged
+  preimage (ADR 0001, "TWAP resolution variant") and is `WrongMode` for
+  `snapshot_price`/`preview_price`, which pin single prints. A market uses
+  at most one price shape: `assert_unconfigured` covers
+  `Price`/`PriceScaled`/`PriceTwap` together.
 - **Attested**: m-of-n signer votes on a resolver-local
   `AttestedOutcome { Yes, No, Invalid }`; once `threshold` signers agree, a
   dispute window opens; anyone can finalize after it elapses, or a guardian
@@ -198,8 +228,10 @@ voided.
 
 `snapshot_price(market_id, caller)` closes that gap. Anyone may call it
 after `close_time` while the market is unresolved; it reads the committed
-feed exactly as resolution does, validates it with the same rule
-(`validate_price`: not after close, no older than `max_staleness`), and
+feed exactly as resolution does (on the `resolution()` grid, at or before
+`close_time`), validates it with the same rule
+(`validate_price`: not after close, price strictly positive, no older than
+`max_staleness`), and
 stores it as a `PriceSnapshot`. An invalid read is never stored, and the
 first valid snapshot wins (`SnapshotExists`): the answer for a fixed
 `(asset, close_time)` is deterministic, so this deliberately prefers

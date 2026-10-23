@@ -56,6 +56,136 @@ The commitment format is extended by [ADR 0004](0004-spec-versioning.md): a
 salted, versioned, domain-separated `ResolutionSpecV2` envelope accepted
 alongside the legacy format described above.
 
+## Price threshold units
+
+A SEP-40 feed (Reflector included) reports `price` as a decimal-scaled integer:
+the value is `actual x 10^decimals`, where `decimals()` is published by the
+feed itself (14 for Reflector's canonical feeds). That makes the units of a
+committed threshold load-bearing, and the original `PriceConfig` never declared
+them.
+
+* **Legacy `Price`.** `PriceConfig.threshold` is compared *raw* against the
+  feed's reported integer — feed-native units, no scaling, no decimals call.
+  This meaning is frozen: field names, types and the enum's variant order are
+  exactly what every already-committed `resolution_hash` was built over, and
+  the golden vectors in `contracts/resolver/src/lib.rs` (`mod golden`) and
+  `scripts/spec-hash` pin it. Do not "fix" the legacy variant by adding
+  scaling to it — that silently breaks every existing commitment.
+* **Decimal-explicit scaled price.** Issue #26 adds
+  `ScaledPriceConfig` (defined in `contracts/resolver`, alongside
+  `register_scaled_price_spec`), which carries `threshold_decimals`
+  alongside the threshold. At resolution both sides are rescaled with
+  checked base-10 arithmetic to
+  `max(feed_decimals, threshold_decimals)` before comparison; an `i128`
+  overflow traps the read as `InvalidPrice`, and `threshold_decimals` above
+  `MAX_THRESHOLD_DECIMALS` (38, the largest power of ten an `i128` holds) is
+  rejected with `InvalidConfig` at reveal, before any commitment is stored.
+* **Hash compatibility.** PR #176 moved `ResolutionSpec` (and every config
+  type it wraps) into `contracts/oracledesk-types`, the shared types crate
+  that router, treasury and `scripts/spec-hash` all flow through, so a
+  seventh variant cannot be appended from inside the resolver without
+  editing that crate. The scaled commitment therefore lives in its own
+  domain-tagged preimage:
+  `sha256("oracledesk:scaled-price-spec" || XDR(ScaledPriceConfig))`
+  (`resolver::scaled_spec_hash`), the same construction ADR 0004 uses for
+  the V2 envelope. The three spaces are provably disjoint: every legacy
+  preimage is an `ScVal` XDR starting `00 00 00 10`; the V2 tag starts
+  `oracledesk:resolution-spec` and the scaled tag `oracledesk:scaled-`, so
+  they differ at a fixed offset. Consequently every previously committed
+  hash — legacy `Price`, `Signers`, and every later-appended variant — is
+  byte-identical; nothing was reordered or renumbered. The scaled config is
+  a distinct struct, not a field added to `PriceConfig`, for the same
+  reason, and because bare `PriceConfig` XDR is already stored under
+  `DataKey::Price` and must never be reinterpreted. A market is either
+  legacy-price or scaled-price, never both (`assert_unconfigured` checks
+  `DataKey::Price`, `DataKey::Signers` and the appended
+  `DataKey::PriceScaled`).
+* **Maintainer follow-up (canonical home).** The append-only shape this ADR
+  originally planned — a `PriceScaled(ScaledPriceConfig)` variant added
+  *last* in `oracledesk-types::ResolutionSpec` and in `DataKey` — remains
+  the canonical end state once `oracledesk-types` compiles again (it
+  currently fails on every toolchain because its line 27 never imports
+  `contracttype`). Adding it there is additive for hashing: the six
+  existing variants keep their preimages, so the domain-tagged form above
+  can be migrated variant-by-variant without breaking committed markets.
+
+## TWAP resolution variant
+
+Issue #27 adds a time-weighted-average price rule, `TwapConfig` (defined in
+`contracts/resolver`, alongside `register_twap_spec` / `resolve_twap`): the
+market settles on the average of the feed's records over a window ending at
+`close_time`, so a single manipulated or anomalous close print can no longer
+decide it. It is described here because it changes what `resolution_hash`
+can commit to.
+
+* **Hash space.** Same construction as the scaled mode above: the TWAP
+  commitment is
+  `sha256("oracledesk:price-twap-spec" || XDR(TwapConfig))`
+  (`resolver::twap_spec_hash`). The issue's sketch appended a
+  `PriceTwap(TwapConfig)` variant to `ResolutionSpec` (discriminant 2 in
+  the then-two-variant enum); under PR #176's shared-types layout that
+  enum is frozen in `contracts/oracledesk-types`, exactly the constraint
+  documented in "Price threshold units", so the variant form is a listed
+  maintainer follow-up and the domain-tagged form ships now. Disjointness
+  extends to four provably separate spaces: legacy `ScVal` preimages start
+  `00 00 00 10`; the V2 tag starts `oracledesk:resolution-`; the scaled
+  tag is `oracledesk:scaled-price-spec`; the TWAP tag is
+  `oracledesk:price-twap-spec` — all differ at fixed offsets, so no
+  preimage of one mode is ever a preimage of another and every previously
+  committed hash stays byte-identical (pinned by the golden vectors in
+  `contracts/resolver` and `scripts/spec-hash`, unchanged by this ADR).
+  A market is exactly one of the price shapes
+  (`DataKey::Price` / `PriceScaled` / the appended `PriceTwap`), enforced
+  by `assert_unconfigured` checking all keys.
+* **Sampling.** `resolve_twap` (and `resolve_price`, which dispatches)
+  reads `price(asset, ts)` at every `resolution()`-aligned timestamp in
+  `(close_time - window, close_time]`, newest grid slot first, using the
+  same grid alignment as the #26 single-read lookup. Missing records are
+  skipped; a trapping feed is `PriceUnavailable`; `resolution() == 0` is
+  rejected at both registration (`InvalidConfig`) and resolution
+  (`InvalidPrice`). Duplicated timestamps — a feed answering with the
+  nearest earlier record — are counted once. Registration additionally
+  calls `resolution()` on the committed reflector and rejects (
+  `InvalidConfig`) a `window / resolution` above the sample cap or a
+  `min_samples` above the slot count, so an unresolvable market is caught
+  at reveal, not at close.
+* **Rejection rules.** Fewer than `min_samples` present samples, a gap
+  above `max_gap` between `start` and the first sample, between any two
+  consecutive samples, or between the last sample and `close_time`, all
+  fail `StalePrice`; a sample price `<= 0` or any arithmetic overflow
+  fails `InvalidPrice`. Failed resolution leaves the market untouched, and
+  `expire_market` treats those errors as "feed unusable" exactly as for
+  the other price shapes.
+* **Weighting formula.** Each sample is weighted by the time until the
+  next sample; the newest sample is weighted `close_time - last_ts + 1`
+  (the closing second is included — the convention the issue offered as
+  "`close_time - ts_last + 1` or `resolution()`", this ADR picks the
+  former and both the numerator and denominator apply it consistently).
+  `twap = floor( Σ price_i * dt_i / Σ dt_i )` in `i128` with
+  `checked_mul`/`checked_add`/`checked_div`; the committed
+  `AtOrAbove`/`AtOrBelow` comparison applies to the floored average.
+  Threshold units are feed-native, like the legacy `Price` variant (the
+  decimal-explicit question is #26's and stays with `ScaledPriceConfig`).
+* **Sample cap and budget.** `MAX_TWAP_SAMPLES = 32` bounds the
+  cross-contract `price` reads per resolution attempt — as a cap on
+  *reads inspected*, not samples found, so a window full of missing
+  records terminates instead of walking the grid forever. The issue asks
+  for a value "chosen from measured CPU cost" (`env.cost_estimate()`
+  against the registered wasm, recorded here). **That measurement is not
+  available and this number is reasoned, not measured**: the in-tree
+  build gate (the wasm-hash verification build script and
+  `oracledesk-types`) fails at the current tip, so no test executes; no
+  benchmark figure is claimed. 32 is instead derived from the contract's
+  own accepted ceilings — `MAX_WEIGHTED_SIGNERS = 32` /
+  `MAX_COMMITTEE = 32`, and the weighted-keys path verifies up to 32
+  ed25519 signatures in one call at a documented 23.1M instructions (see
+  "Weighted-key attestations"), a per-item cost strictly above one bounded
+  price read — so a 32-sample TWAP cannot exceed a flow the protocol
+  already ships against. A measured re-derivation is a maintainer
+  follow-up alongside the golden re-pin.
+* **Manipulation scope.** A TWAP dilutes a single print, but a sustained
+  push still moves the average; median filtering is out of scope.
+
 ## Liveness fallback
 
 A market whose spec is never revealed, whose committed feed is permanently
@@ -88,8 +218,13 @@ the single guardian key acts. `Resolver::expire_market` removes that dependency.
   proposal shortly before the deadline can let expiry void a market whose
   signers are still re-attesting; that is accepted by design.
 * **Unusable feed.** A Reflector call that traps is treated as
-  `PriceUnavailable`, so a broken oracle address cannot make expiry revert
-  forever; any other error (for example `NotInitialized`) is still surfaced.
+  `PriceUnavailable`, and the expiry and guardian paths accept
+  `PriceUnavailable`, `StalePrice` (no acceptable record on the feed's
+  resolution grid within `max_staleness`, and no earlier one within the
+  bounded lookback) and `InvalidPrice` (a non-positive published price, or a
+  feed reporting `resolution() == 0`) as "feed unusable", so a broken or dead
+  oracle address cannot make expiry revert forever. Any other error (for
+  example `NotInitialized`) is still surfaced.
 
 ## Weighted-key attestations
 

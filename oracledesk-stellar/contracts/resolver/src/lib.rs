@@ -78,6 +78,12 @@ pub const ORACLE_GRACE_SECS: u64 = 86_400;
 pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
 /// Maximum number of proposal cancellations per market allowed by the guardian.
 pub const MAX_CANCELS_PER_MARKET: u32 = 2;
+/// Maximum number of feed records a grid lookback may inspect per resolution
+/// attempt (issue #26). Bounds the cross-contract calls: a record older than
+/// `MAX_LOOKBACK_RECORDS * resolution()` is reported `StalePrice` even when
+/// `max_staleness` would still allow it, because resolution is only known at
+/// resolve time and the cap cannot be validated at registration.
+pub const MAX_LOOKBACK_RECORDS: u32 = 12;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +113,94 @@ pub enum ExpiryMode {
     Unrevealed,
     Price,
     Signers,
+}
+
+/// Maximum decimal places a [`ScaledPriceConfig`] threshold or a feed's
+/// `decimals()` may report. `i128` holds `10^38` but not `10^39`, so any
+/// larger scale factor overflows on rescale (issue #26).
+pub const MAX_THRESHOLD_DECIMALS: u32 = 38;
+
+/// Decimal-explicit price rule (issue #26, goal 2). Unlike the legacy
+/// [`PriceConfig`] — re-exported here from `oracledesk-types`, whose
+/// `threshold` is in *feed-native units* and is compared to the raw feed
+/// price with no scaling, so every committed legacy hash and meaning is
+/// unchanged (ADR 0001) — this struct records
+/// `threshold_decimals`, and resolution rescales both the threshold and the
+/// feed price to `max(feed_decimals, threshold_decimals)` with checked
+/// arithmetic before comparing. A creator who means "$0.20" commits
+/// `threshold = 20`, `threshold_decimals = 2` instead of guessing the feed's
+/// scale.
+///
+/// `PriceConfig` and `SignerConfig` deliberately do **not** appear here:
+/// PR #176 made `contracts/oracledesk-types` their canonical home and this
+/// crate re-exports them (see the `pub use` at the top of this file), so a
+/// `resolution_hash` commitment never depends on which crate declared the
+/// type. [`ScaledPriceConfig`] stays resolver-local for now for the same
+/// reason ADR 0001 can state its append-only rule so precisely — see
+/// [`scaled_spec_hash`] for the commitment preimage and
+/// `docs/adr/0001-resolution-commitment.md`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScaledPriceConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    pub threshold: i128,
+    pub threshold_decimals: u32,
+    pub direction: PriceDirection,
+    pub max_staleness: u64,
+}
+
+/// Hard cap on the grid slots a TWAP resolution attempt reads (issue #27).
+/// Bounds the cross-contract `price(asset, ts)` calls the sampling loop may
+/// make, so a TWAP market stays inside Soroban's per-transaction CPU budget
+/// even when most records in the window are missing (the cap applies to
+/// *reads inspected*, not samples found — a window of absent records
+/// terminates after this many calls instead of walking the whole grid).
+///
+/// **Reasoned, not measured.** The issue asks for a value "chosen from
+/// measured CPU cost" via `env.cost_estimate()` against the registered
+/// wasm; that measurement is not executable in the environment this change
+/// landed in (the wasm-hash build gate fails before any test can run, so no
+/// cost number is recorded — see `docs/adr/0001-resolution-commitment.md`,
+/// "TWAP variant"). 32 is instead taken from the contract's own accepted
+/// ceilings: [`MAX_WEIGHTED_SIGNERS`] and [`MAX_COMMITTEE`] are both 32, and
+/// the weighted-keys path already verifies up to 32 ed25519 signatures in
+/// one call — a cost per item strictly above one bounded cross-contract
+/// price read — so a 32-sample TWAP cannot be more expensive than flows the
+/// protocol already accepts. Registration rejects `window / resolution()`
+/// above this cap outright (`register_twap_spec`), so a compliant feed
+/// never hits the resolve-time truncation; the cap only guards against a
+/// feed changing `resolution()` after the commitment.
+pub const MAX_TWAP_SAMPLES: u32 = 32;
+
+/// Time-weighted-average price rule (issue #27). The market settles on the
+/// average of the feed's records over a window ending at `close_time`
+/// instead of a single print: a manipulated or anomalous close record can no
+/// longer decide the market on its own. Like the legacy [`PriceConfig`] (and
+/// unlike [`ScaledPriceConfig`], issue #26) the `threshold` is in
+/// feed-native units — the TWAP is a raw-price average — and the committed
+/// comparison applies to the floored average (see `twap_outcome` and ADR
+/// 0001). `min_samples`/`max_gap` encode how much of the window the feed
+/// must actually have filled: resolution is rejected (`StalePrice`) below
+/// `min_samples` present records or when any gap — window start to first
+/// sample, consecutive samples, or last sample to `close_time` — exceeds
+/// `max_gap`.
+///
+/// Same canonical-home note as [`ScaledPriceConfig`]: this is a
+/// resolver-local type committing through a domain-tagged preimage
+/// ([`twap_spec_hash`]) because PR #176 froze `oracledesk-types`'
+/// `ResolutionSpec` as the shared enum router and treasury consume; the
+/// append-into-types-crate follow-up is recorded in ADR 0001.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    pub threshold: i128,
+    pub direction: PriceDirection,
+    pub window: u64,
+    pub min_samples: u32,
+    pub max_gap: u64,
 }
 
 /// Legacy proposal shape, stored under [`DataKey::Proposal`]. Only read (as a
@@ -259,6 +353,19 @@ pub enum GuardianActionKind {
     CancelProposal,
 }
 
+// The resolution-rule enum itself is **not** declared here any more: PR #176
+// moved `ResolutionSpec` (and every config type it wraps) to
+// `contracts/oracledesk-types`, re-exported at the top of this file. Router
+// and treasury pass `resolver::ResolutionSpec` straight into
+// `ResolutionSpecV2.rule`, so re-declaring a local superset enum here would
+// break those crates — the enum's canonical home is the shared types crate,
+// full stop. The decimal-scaled mode of issue #26 and the TWAP mode of issue
+// #27 therefore commit through their own domain-tagged preimages,
+// [`scaled_spec_hash`] and [`twap_spec_hash`], instead of through seventh and
+// eighth `ResolutionSpec` variants; see ADR 0001 for the hash-space argument
+// and the maintainer follow-up of moving the variants into the types crate
+// (append-only) once that crate's toolchain gate is restored.
+
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
 /// preimage is the XDR of an `ScVal` and so starts with the bytes `00 00 00 10`
 /// (`ScValType::Vec`), never with ASCII, which keeps the two hash spaces
@@ -275,6 +382,50 @@ pub fn legacy_spec_hash(env: &Env, rule: &ResolutionSpec) -> BytesN<32> {
 pub fn spec_v2_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
     let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN.as_bytes());
     preimage.append(&spec.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Domain tag prepended to a [`ScaledPriceConfig`] before hashing (issue #26).
+/// Same disjointness argument as [`SPEC_DOMAIN`]: every legacy preimage is an
+/// `ScVal` XDR starting `00 00 00 10`, every V2 preimage starts with
+/// `oracledesk:resolution-spec`, and this tag starts `oracledesk:scaled-` —
+/// no preimage of one mode can be a preimage of another. Appending the tag
+/// to the bare struct XDR (rather than wrapping it in a `ResolutionSpec`
+/// variant) keeps `oracledesk-types` — the canonical, re-exported rule enum
+/// every sibling contract flows through — untouched, and therefore every
+/// already-committed `Price` / `Signers` / V2 `resolution_hash` byte-for-byte
+/// unchanged. See `docs/adr/0001-resolution-commitment.md`.
+pub const SCALED_SPEC_DOMAIN: &str = "oracledesk:scaled-price-spec";
+
+/// Hash a decimal-scaled price commitment is checked against:
+/// `sha256(SCALED_SPEC_DOMAIN || XDR(cfg))`. This is the preimage a market
+/// commits to in `resolution_hash` for [`ScaledPriceConfig`] rules registered
+/// through [`Resolver::register_scaled_price_spec`]; `scripts/spec-hash`
+/// delegates to this same function so the tool cannot drift from the
+/// contract.
+pub fn scaled_spec_hash(env: &Env, cfg: &ScaledPriceConfig) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, SCALED_SPEC_DOMAIN.as_bytes());
+    preimage.append(&cfg.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Domain tag prepended to a [`TwapConfig`] before hashing (issue #27).
+/// Same disjointness argument as [`SCALED_SPEC_DOMAIN`]: legacy preimages
+/// start `00 00 00 10` (ScVal), V2 preimages start `oracledesk:resolution-`,
+/// scaled preimages start `oracledesk:scaled-price-spec` and this tag starts
+/// `oracledesk:price-twap-spec` — no preimage of one mode can be a preimage
+/// of another. A TWAP market's `resolution_hash` therefore lives in its own
+/// hash space and every already-committed `Price` / `Signers` / V2 hash
+/// stays byte-for-byte valid (ADR 0001).
+pub const TWAP_SPEC_DOMAIN: &str = "oracledesk:price-twap-spec";
+
+/// Hash a TWAP commitment is checked against:
+/// `sha256(TWAP_SPEC_DOMAIN || XDR(cfg))`, the [`TwapConfig`] counterpart
+/// of [`scaled_spec_hash`]; `scripts/spec-hash` delegates to this same
+/// function so the tool cannot drift from the contract.
+pub fn twap_spec_hash(env: &Env, cfg: &TwapConfig) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, TWAP_SPEC_DOMAIN.as_bytes());
+    preimage.append(&cfg.clone().to_xdr(env));
     env.crypto().sha256(&preimage).into()
 }
 
@@ -382,6 +533,16 @@ pub enum DataKey {
     CountV2(u64, AttestedOutcome),
     ProposalV2(u64),
     Snapshot(u64),
+    /// Appended last: union discriminants are positional, so earlier keys
+    /// keep their encoding and live markets' stored data still decodes.
+    /// A new key (not `Price` under a wrapper enum) because values already
+    /// stored under `DataKey::Price` are bare `PriceConfig` XDR and must not
+    /// be reinterpreted (issue #26).
+    PriceScaled(u64),
+    /// Appended last (after `PriceScaled`, same positional-discriminant
+    /// discipline, issue #27): a revealed TWAP rule's `TwapConfig` lives
+    /// under its own key so no stored payload is ever reinterpreted.
+    PriceTwap(u64),
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -429,6 +590,39 @@ pub struct PriceResolutionV2 {
     pub price_timestamp: u64,
     pub outcome: Outcome,
     pub from_snapshot: bool,
+}
+
+/// Emitted alongside the unchanged [`PriceResolution`]/[`PriceResolutionV2`]
+/// for a [`ScaledPriceConfig`] settlement (issue #26): the raw feed price,
+/// the feed's `decimals()`, the threshold rescaled to the comparison scale,
+/// and the grid-aligned lookup timestamp. New event type, so existing
+/// indexer decoders are untouched.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceResolutionScaled {
+    #[topic]
+    pub market_id: u64,
+    pub raw_price: i128,
+    pub feed_decimals: u32,
+    pub threshold_scaled: i128,
+    pub lookup_timestamp: u64,
+    pub outcome: Outcome,
+}
+
+/// Emitted alongside the [`PriceResolution`]/[`PriceResolutionV2`] pair for
+/// a [`TwapConfig`] settlement (issue #27): the floored time-weighted
+/// average, how many grid records answered, and the oldest/newest sample
+/// timestamps. New event type, so existing indexer decoders are untouched.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapResolution {
+    #[topic]
+    pub market_id: u64,
+    pub twap: i128,
+    pub samples: u32,
+    pub first_ts: u64,
+    pub last_ts: u64,
+    pub outcome: Outcome,
 }
 
 #[contractevent]
@@ -622,9 +816,18 @@ pub struct AdminTransferred {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferCancelled {}
 
+/// SEP-40 Oracle Consumer interface, as implemented by Reflector feeds.
+/// `decimals` and `resolution` are the feed's fixed-point scale and record
+/// grid; `price` returns a record only for a timestamp exactly on one
+/// (`Option<PriceData>` for a gap or an aged-out query); `lastprice` is the
+/// newest stored observation, used by [`Resolver::preview_price`] for feed
+/// health checks only, never for resolution.
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
+    fn decimals(env: Env) -> u32;
+    fn resolution(env: Env) -> u32;
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
+    fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData>;
 }
 
 #[contract]
@@ -719,6 +922,49 @@ impl Resolver {
     pub fn register_price_spec(env: Env, market_id: u64, spec: PriceConfig) -> Result<(), Error> {
         let rule = ResolutionSpec::Price(spec);
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
+    /// Reveals a decimal-explicit price rule committed to as
+    /// `sha256(SCALED_SPEC_DOMAIN || XDR(ScaledPriceConfig))` (issue #26).
+    /// Same commit/reveal flow as [`register_price_spec`];
+    /// `threshold_decimals` above [`MAX_THRESHOLD_DECIMALS`] is
+    /// `InvalidConfig` (no `i128` scale factor exists that large). The
+    /// preimage is its own domain-tagged space rather than a
+    /// `ResolutionSpec` variant because PR #176 moved that enum to
+    /// `oracledesk-types` (edited only via maintainer follow-up; see ADR
+    /// 0001) — every existing `Price` / `Signers` / V2 commitment stays
+    /// byte-for-byte valid either way.
+    pub fn register_scaled_price_spec(
+        env: Env,
+        market_id: u64,
+        spec: ScaledPriceConfig,
+    ) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        Self::validate_scaled_rule(&spec)?;
+        Self::assert_matches_commitment(&env, market_id, &scaled_spec_hash(&env, &spec))?;
+        Self::store_scaled_rule(&env, market_id, &spec);
+        Ok(())
+    }
+
+    /// Reveals a time-weighted-average price rule committed to as
+    /// `sha256(TWAP_SPEC_DOMAIN || XDR(TwapConfig))` (issue #27). Same
+    /// commit/reveal flow as [`register_scaled_price_spec`], with two
+    /// differences. First, the static validation
+    /// ([`validate_twap_rule`]): `window > 0`, `min_samples >= 2`,
+    /// `max_gap` in `(0, window]`, `threshold >= 0`. Second, feasibility is
+    /// checked *against the live feed*: the grid period only exists
+    /// on-chain, so registration calls `resolution()` on the configured
+    /// reflector and rejects `window / resolution > MAX_TWAP_SAMPLES` or
+    /// `min_samples > window / resolution` with `InvalidConfig`. This makes
+    /// the reflector required reachable at registration (a trapping feed
+    /// gives `PriceUnavailable`) — deliberate: an unresolvable TWAP market
+    /// is caught at reveal time, not at close.
+    pub fn register_twap_spec(env: Env, market_id: u64, spec: TwapConfig) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        Self::validate_twap_rule(&env, &spec)?;
+        Self::assert_matches_commitment(&env, market_id, &twap_spec_hash(&env, &spec))?;
+        Self::store_twap_rule(&env, market_id, &spec);
+        Ok(())
     }
 
     /// See `register_price_spec` — same commit/reveal rule, signer mode.
@@ -1044,22 +1290,16 @@ impl Resolver {
                 reasons.push_back(GuardianReason::UnrevealedSpec);
             }
 
-            let price_cfg = if let Some(cfg) =
-                storage.get::<_, PriceConfig>(&DataKey::Price(market_id))
+            if (storage.has(&DataKey::Price(market_id))
+                || storage.has(&DataKey::PriceScaled(market_id))
+                || storage.has(&DataKey::PriceTwap(market_id))
+                || storage.has(&DataKey::Hybrid(market_id)))
+                && now >= market.close_time.saturating_add(ORACLE_GRACE_SECS)
             {
-                Some(cfg)
-            } else if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
-                Some(h.price)
-            } else {
-                None
-            };
-            if let Some(cfg) = price_cfg {
-                if now >= market.close_time.saturating_add(ORACLE_GRACE_SECS) {
-                    if let Err(Error::PriceUnavailable | Error::StalePrice) =
-                        Self::price_outcome(&env, market_id, &cfg, market.close_time)
-                    {
-                        reasons.push_back(GuardianReason::OracleUnavailable);
-                    }
+                if let Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) =
+                    Self::committed_price_outcome(&env, market_id, market.close_time)
+                {
+                    reasons.push_back(GuardianReason::OracleUnavailable);
                 }
             }
 
@@ -1154,22 +1394,14 @@ impl Resolver {
                 }
             }
             GuardianReason::OracleUnavailable => {
-                let storage = env.storage().persistent();
-                let config: PriceConfig = if let Some(cfg) = storage.get(&DataKey::Price(market_id))
-                {
-                    cfg
-                } else if let Some(hybrid) =
-                    storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id))
-                {
-                    hybrid.price
-                } else {
-                    return Err(Error::GuardianNotAllowed);
-                };
                 if now < market.close_time.saturating_add(ORACLE_GRACE_SECS) {
                     return Err(Error::GuardianNotAllowed);
                 }
-                match Self::price_outcome(&env, market_id, &config, market.close_time) {
-                    Err(Error::PriceUnavailable | Error::StalePrice) => {}
+                match Self::committed_price_outcome(&env, market_id, market.close_time) {
+                    // A feed that traps, has no acceptable record, or reports
+                    // a price the resolver must not settle on (`InvalidPrice`,
+                    // issue #26) is feed-unusable and permits the void.
+                    Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
                     _ => return Err(Error::GuardianNotAllowed),
                 }
             }
@@ -1214,6 +1446,22 @@ impl Resolver {
     }
 
     pub fn resolve_price(env: Env, market_id: u64) -> Result<Outcome, Error> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PriceTwap(market_id))
+        {
+            // TWAP markets resolve through the same entrypoint as scaled
+            // ones (issue #27); `resolve_twap` is the explicit alias.
+            return Self::resolve_twap(env, market_id);
+        }
+        if let Ok(scaled) = Self::load::<ScaledPriceConfig>(&env, DataKey::PriceScaled(market_id)) {
+            if Self::resolution_state(&env, market_id).is_terminal() {
+                return Err(Error::AlreadyFinalized);
+            }
+            let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+            return Self::settle_scaled(&env, &market_core, market_id, &scaled);
+        }
         let (config, is_hybrid) = if let Ok(cfg) =
             Self::load::<PriceConfig>(&env, DataKey::Price(market_id))
         {
@@ -1255,6 +1503,298 @@ impl Resolver {
             &data,
             from_snapshot,
         )?;
+        Ok(outcome)
+    }
+
+    /// Resolves a [`TwapConfig`] market (issue #27). Same lifecycle as
+    /// `resolve_price` (closed, not terminal), and markets already revealed
+    /// as TWAP also resolve through `resolve_price`, which dispatches here.
+    /// Non-TWAP markets are `WrongMode`.
+    pub fn resolve_twap(env: Env, market_id: u64) -> Result<Outcome, Error> {
+        if let Ok(config) = Self::load::<TwapConfig>(&env, DataKey::PriceTwap(market_id)) {
+            if Self::resolution_state(&env, market_id).is_terminal() {
+                return Err(Error::AlreadyFinalized);
+            }
+            let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+            return Self::settle_twap(&env, &market_core, market_id, &config);
+        }
+        Err(Error::WrongMode)
+    }
+
+    /// Samples the committed feed at every `resolution()`-aligned timestamp
+    /// in `(close_time - window, close_time]` and computes the floored,
+    /// time-weighted average with checked `i128` arithmetic. Returns
+    /// `(twap, samples, first_ts, last_ts, outcome)`.
+    ///
+    /// Sampling details (issue #27):
+    /// - Grid alignment reuses the #26 machinery: the newest queried
+    ///   timestamp is `close_time - close_time % resolution()`, walked down
+    ///   in `resolution()` steps while it stays inside the window.
+    /// - Missing records (`None`) are skipped, not fatal; a trapping feed
+    ///   or a failing `price` call is `PriceUnavailable`; `resolution()` of
+    ///   0 is a broken feed (`InvalidPrice`, it would divide by zero).
+    /// - The loop is capped at [`MAX_TWAP_SAMPLES`] *reads inspected* (not
+    ///   samples found), so a window of absent records terminates bounded
+    ///   and then fails the `min_samples`/gap checks below.
+    /// - Records are kept keyed by their returned `timestamp`, duplicates
+    ///   (a feed answering with the same record for several queries) are
+    ///   counted once, and records outside the window or newer than
+    ///   `close_time` are ignored / rejected like `validate_price` does.
+    /// - Weights: each sample is weighted by the time until the next
+    ///   sample; the newest sample is weighted `close_time - last_ts + 1`
+    ///   so the closing second is included, the convention picked in ADR
+    ///   0001 and applied consistently on both the numerator and the
+    ///   denominator.
+    /// - Any sample price `<= 0` is `InvalidPrice` (same rule as #26);
+    ///   any `checked_mul`/`checked_add` overflow is `InvalidPrice`.
+    /// - Floor division: the `AtOrAbove`/`AtOrBelow` comparison of
+    ///   `compare_price` applies to the floored average.
+    fn twap_outcome(
+        env: &Env,
+        config: &TwapConfig,
+        close_time: u64,
+    ) -> Result<(i128, u32, u64, u64, Outcome), Error> {
+        let client = ReflectorPriceClient::new(env, &config.reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
+            return Err(Error::PriceUnavailable);
+        };
+        if resolution == 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let res = resolution as u64;
+        let end = close_time - close_time % res;
+        let start = close_time.saturating_sub(config.window);
+        // Oldest-first, strictly ascending timestamps. Bounded in memory by
+        // MAX_TWAP_SAMPLES; never persisted.
+        let mut samples: Vec<(u64, i128)> = Vec::new(env);
+        let mut ts = end;
+        let mut inspected = 0u32;
+        while ts > start {
+            if inspected >= MAX_TWAP_SAMPLES {
+                // Read cap on *reads*, not found samples (issue #27
+                // budget): only reachable if the feed changed
+                // `resolution()` after registration widened the slot count
+                // past MAX_TWAP_SAMPLES. Validation below then rejects via
+                // the min_samples / gap rules rather than trusting a
+                // silently truncated window's average as complete.
+                break;
+            }
+            inspected += 1;
+            match client.try_price(&config.asset, &ts) {
+                Ok(Ok(Some(data))) => {
+                    if data.price <= 0 {
+                        return Err(Error::InvalidPrice);
+                    }
+                    if data.timestamp > close_time {
+                        return Err(Error::StalePrice);
+                    }
+                    if data.timestamp > start {
+                        // Keep the ascending invariant and count each
+                        // distinct timestamp once: samples collected so far
+                        // all have timestamp > this slot's query, so an
+                        // already-seen or newer timestamp is a duplicate of
+                        // a record the walk counted already.
+                        let duplicate = samples
+                            .get(0)
+                            .is_some_and(|(head, _)| data.timestamp >= head);
+                        if !duplicate {
+                            samples.push_front((data.timestamp, data.price));
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {}
+                _ => return Err(Error::PriceUnavailable),
+            }
+            if ts < res {
+                break;
+            }
+            ts -= res;
+        }
+
+        let count = samples.len();
+        if count < config.min_samples {
+            return Err(Error::StalePrice);
+        }
+        // Gap checks, all three kinds (issue #27 step 3): window start to
+        // first sample, every consecutive pair, last sample to close_time.
+        let (first_ts, _) = samples.get(0).unwrap();
+        let (last_ts, _) = samples.get(count - 1).unwrap();
+        if first_ts - start > config.max_gap || close_time - last_ts > config.max_gap {
+            return Err(Error::StalePrice);
+        }
+        for i in 1..count {
+            let (prev, _) = samples.get(i - 1).unwrap();
+            let (next, _) = samples.get(i).unwrap();
+            if next - prev > config.max_gap {
+                return Err(Error::StalePrice);
+            }
+        }
+
+        let mut weighted_sum: i128 = 0;
+        let mut total_weight: u64 = 0;
+        for i in 0..count {
+            let (sample_ts, sample_price) = samples.get(i).unwrap();
+            let next_ts = if i + 1 < count {
+                samples.get(i + 1).unwrap().0
+            } else {
+                close_time.saturating_add(1)
+            };
+            // dt >= 1 always: timestamps are strictly ascending and
+            // sample_ts <= close_time < close_time + 1.
+            let dt = next_ts - sample_ts;
+            total_weight = total_weight.checked_add(dt).ok_or(Error::InvalidPrice)?;
+            let term = sample_price
+                .checked_mul(dt as i128)
+                .ok_or(Error::InvalidPrice)?;
+            weighted_sum = weighted_sum.checked_add(term).ok_or(Error::InvalidPrice)?;
+        }
+        let twap = weighted_sum
+            .checked_div(total_weight as i128)
+            .ok_or(Error::InvalidPrice)?;
+        let outcome = Self::compare_price(&config.direction, twap, config.threshold);
+        Ok((twap, count, first_ts, last_ts, outcome))
+    }
+
+    /// Settles a [`TwapConfig`] market: same lifecycle preconditions as
+    /// `settle_scaled`, then the shared `settle_price` finalize with the
+    /// averaged price stamped at the newest sample, alongside the dedicated
+    /// [`TwapResolution`] event (the dual-event pattern #26 established with
+    /// [`PriceResolutionScaled`]). TWAP markets do not use `snapshot_price`:
+    /// snapshots pin a single record, which is exactly what issue #27
+    /// exists to avoid.
+    fn settle_twap(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        config: &TwapConfig,
+    ) -> Result<Outcome, Error> {
+        let market = MarketCoreClient::new(env, market_core).get_market(&market_id);
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let (twap, samples, first_ts, last_ts, outcome) =
+            Self::twap_outcome(env, config, market.close_time)?;
+        Self::settle_price(
+            env,
+            market_core,
+            market_id,
+            &outcome,
+            &PriceData {
+                price: twap,
+                timestamp: last_ts,
+            },
+            false,
+        )?;
+        TwapResolution {
+            market_id,
+            twap,
+            samples,
+            first_ts,
+            last_ts,
+            outcome: outcome.clone(),
+        }
+        .publish(env);
+        Ok(outcome)
+    }
+
+    /// The live-read outcome of a [`ScaledPriceConfig`] rule: grid-aligned
+    /// feed read, the feed's `decimals()`, and both sides rescaled to
+    /// `max(feed_decimals, threshold_decimals)`. Returns the outcome, the raw
+    /// record, the feed's decimals and the rescaled threshold (for
+    /// [`PriceResolutionScaled`]).
+    fn scaled_price_outcome(
+        env: &Env,
+        config: &ScaledPriceConfig,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, u32, i128), Error> {
+        let data = Self::read_feed_on_grid(
+            env,
+            &config.reflector,
+            &config.asset,
+            config.max_staleness,
+            close_time,
+        )?;
+        let Ok(Ok(feed_decimals)) =
+            ReflectorPriceClient::new(env, &config.reflector).try_decimals()
+        else {
+            return Err(Error::PriceUnavailable);
+        };
+        let (price_scaled, threshold_scaled) = Self::rescale(
+            data.price,
+            feed_decimals,
+            config.threshold,
+            config.threshold_decimals,
+        )?;
+        let outcome = Self::compare_price(&config.direction, price_scaled, threshold_scaled);
+        Ok((outcome, data, feed_decimals, threshold_scaled))
+    }
+
+    /// The committed price rule's outcome at `close_time`, covering all four
+    /// price shapes (legacy `Price`, the `Hybrid` price leg, `PriceScaled`
+    /// and `PriceTwap`). Guardian and availability paths use it so "feed
+    /// unusable" is one uniform check; snapshot precedence works exactly as
+    /// in `resolve_price` for the legacy shapes.
+    fn committed_price_outcome(
+        env: &Env,
+        market_id: u64,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, bool), Error> {
+        let storage = env.storage().persistent();
+        if let Some(cfg) = storage.get::<_, PriceConfig>(&DataKey::Price(market_id)) {
+            return Self::price_outcome(env, market_id, &cfg, close_time);
+        }
+        if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Self::price_outcome(env, market_id, &h.price, close_time);
+        }
+        if let Some(s) = storage.get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id)) {
+            let (outcome, data, _feed_decimals, _threshold_scaled) =
+                Self::scaled_price_outcome(env, &s, close_time)?;
+            return Ok((outcome, data, false));
+        }
+        if let Some(t) = storage.get::<_, TwapConfig>(&DataKey::PriceTwap(market_id)) {
+            let (twap, _n, _first, last, outcome) = Self::twap_outcome(env, &t, close_time)?;
+            return Ok((
+                outcome,
+                PriceData {
+                    price: twap,
+                    timestamp: last,
+                },
+                false,
+            ));
+        }
+        Err(Error::WrongMode)
+    }
+
+    /// Settles a [`ScaledPriceConfig`] market: the same grid-aligned feed
+    /// read as legacy mode, then both sides of the comparison are rescaled to
+    /// `max(feed_decimals, threshold_decimals)` before applying the
+    /// direction. Emits the unchanged [`PriceResolution`]/[`PriceResolutionV2`]
+    /// events plus [`PriceResolutionScaled`] with the decimals metadata
+    /// (issue #26). Scaled markets do not use the `snapshot_price` pin: the
+    /// snapshot type stores a raw `PriceConfig` shape (issue #37 will
+    /// revisit snapshots).
+    fn settle_scaled(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        config: &ScaledPriceConfig,
+    ) -> Result<Outcome, Error> {
+        let market = MarketCoreClient::new(env, market_core).get_market(&market_id);
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let (outcome, data, feed_decimals, threshold_scaled) =
+            Self::scaled_price_outcome(env, config, market.close_time)?;
+        Self::settle_price(env, market_core, market_id, &outcome, &data, false)?;
+        PriceResolutionScaled {
+            market_id,
+            raw_price: data.price,
+            feed_decimals,
+            threshold_scaled,
+            lookup_timestamp: data.timestamp,
+            outcome: outcome.clone(),
+        }
+        .publish(env);
         Ok(outcome)
     }
 
@@ -1316,6 +1856,22 @@ impl Resolver {
             .get(&DataKey::Snapshot(market_id))
     }
 
+    /// The feed's newest observation (`lastprice`) for the market's committed
+    /// asset: a read-only health check for keepers before calling
+    /// `resolve_price`. Resolution never consults it (issue #26): a live
+    /// `lastprice` can be fresher than `close_time`, and the historical grid
+    /// lookup is the only settlement source. A trapping feed or a feed with
+    /// no record is `PriceUnavailable`; signer-mode markets are `WrongMode`.
+    pub fn preview_price(env: Env, market_id: u64) -> Result<PriceData, Error> {
+        let config = Self::price_config(&env, market_id)?;
+        let Ok(Ok(Some(data))) =
+            ReflectorPriceClient::new(&env, &config.reflector).try_lastprice(&config.asset)
+        else {
+            return Err(Error::PriceUnavailable);
+        };
+        Ok(data)
+    }
+
     /// When `expire_market` becomes callable for `market_id`: `close_time` plus
     /// [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it
     /// is known before (and without) a spec reveal.
@@ -1352,23 +1908,47 @@ impl Resolver {
         let mode = Self::expiry_mode(&env, market_id);
         match mode {
             ExpiryMode::Price => {
-                let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
-                match Self::price_outcome(&env, market_id, &config, market.close_time) {
-                    Ok((outcome, data, from_snapshot)) => {
-                        Self::settle_price(
-                            &env,
-                            &market_core,
-                            market_id,
-                            &outcome,
-                            &data,
-                            from_snapshot,
-                        )?;
-                        return Ok(());
+                if let Ok(twap) = Self::load::<TwapConfig>(&env, DataKey::PriceTwap(market_id)) {
+                    match Self::settle_twap(&env, &market_core, market_id, &twap) {
+                        Ok(_) => return Ok(()),
+                        // Same uniform feed-unusable set as scaled/legacy
+                        // below (issue #27 mirrors #26 here).
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
                     }
-                    // Only an unusable feed lets the market expire; any other
-                    // error (e.g. NotInitialized) is a real fault.
-                    Err(Error::PriceUnavailable | Error::StalePrice) => {}
-                    Err(other) => return Err(other),
+                } else if let Ok(scaled) =
+                    Self::load::<ScaledPriceConfig>(&env, DataKey::PriceScaled(market_id))
+                {
+                    match Self::settle_scaled(&env, &market_core, market_id, &scaled) {
+                        Ok(_) => return Ok(()),
+                        // Only an unusable feed lets the market expire; any
+                        // other error (e.g. NotInitialized) is a real fault.
+                        // InvalidPrice counts as unusable since #26: a zeroed
+                        // or negative feed must not block the void forever.
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
+                    }
+                } else {
+                    let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
+                    match Self::price_outcome(&env, market_id, &config, market.close_time) {
+                        Ok((outcome, data, from_snapshot)) => {
+                            Self::settle_price(
+                                &env,
+                                &market_core,
+                                market_id,
+                                &outcome,
+                                &data,
+                                from_snapshot,
+                            )?;
+                            return Ok(());
+                        }
+                        // Only an unusable feed lets the market expire; any
+                        // other error (e.g. NotInitialized) is a real fault.
+                        // InvalidPrice counts as unusable since #26: a zeroed
+                        // or negative feed must not block the void forever.
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
+                    }
                 }
             }
             ExpiryMode::Signers if Self::has_valid_proposal(&env, market_id)? => {
@@ -1749,6 +2329,8 @@ impl Resolver {
     fn expiry_mode(env: &Env, market_id: u64) -> ExpiryMode {
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Price(market_id))
+            || storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
             || (storage.has(&DataKey::Hybrid(market_id))
                 && Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen)
         {
@@ -2090,15 +2672,16 @@ impl Resolver {
     }
 
     /// The single rule for whether a feed read may settle a market, shared by
-    /// `snapshot_price` and every resolution path so a snapshot can never pin
-    /// a price resolution would reject. The place to add further checks (for
-    /// example rejecting `price <= 0`).
-    fn validate_price(
-        config: &PriceConfig,
-        close_time: u64,
-        data: &PriceData,
-    ) -> Result<(), Error> {
-        if data.timestamp > close_time || close_time - data.timestamp > config.max_staleness {
+    /// `snapshot_price` and every resolution path (legacy and scaled) so a
+    /// snapshot can never pin a price resolution would reject. A non-positive
+    /// price is `InvalidPrice` (issue #26): a broken or zeroed feed must never
+    /// settle a "below" market YES, and SEP-40 prices are fixed-point values
+    /// whose zero or sign flip is never a valid observation.
+    fn validate_price(max_staleness: u64, close_time: u64, data: &PriceData) -> Result<(), Error> {
+        if data.price <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        if data.timestamp > close_time || close_time - data.timestamp > max_staleness {
             return Err(Error::StalePrice);
         }
         Ok(())
@@ -2106,11 +2689,15 @@ impl Resolver {
 
     /// Applies the committed comparison.
     fn outcome_for(config: &PriceConfig, price: i128) -> Outcome {
-        let hit = match config.direction {
-            PriceDirection::Above => price > config.threshold,
-            PriceDirection::AtOrAbove => price >= config.threshold,
-            PriceDirection::Below => price < config.threshold,
-            PriceDirection::AtOrBelow => price <= config.threshold,
+        Self::compare_price(&config.direction, price, config.threshold)
+    }
+
+    fn compare_price(direction: &PriceDirection, price: i128, threshold: i128) -> Outcome {
+        let hit = match direction {
+            PriceDirection::Above => price > threshold,
+            PriceDirection::AtOrAbove => price >= threshold,
+            PriceDirection::Below => price < threshold,
+            PriceDirection::AtOrBelow => price <= threshold,
         };
         if hit {
             Outcome::Yes
@@ -2119,16 +2706,93 @@ impl Resolver {
         }
     }
 
-    /// Reads the committed feed at `close_time` and validates it. A missing
-    /// record or a trapping oracle is `PriceUnavailable`, never a host error.
-    fn read_feed(env: &Env, config: &PriceConfig, close_time: u64) -> Result<PriceData, Error> {
-        let Ok(Ok(Some(data))) =
-            ReflectorPriceClient::new(env, &config.reflector).try_price(&config.asset, &close_time)
-        else {
+    /// `10^k` as `i128`, `None` past `i128::MAX` (`10^38` fits, `10^39` does
+    /// not) — the checked scale factor of [`Resolver::rescale`].
+    fn pow10_i128(k: u32) -> Option<i128> {
+        (0..k).try_fold(1i128, |acc, _| acc.checked_mul(10))
+    }
+
+    /// Brings a feed price and a [`ScaledPriceConfig`] threshold to the common
+    /// scale `max(feed_decimals, threshold_decimals)` with checked
+    /// arithmetic. Any scale factor beyond `i128` capacity is an overflow and
+    /// `InvalidPrice` at resolution (registration already rejects
+    /// `threshold_decimals > MAX_THRESHOLD_DECIMALS`; a feed claiming absurd
+    /// `decimals()` can only fail here).
+    fn rescale(
+        price: i128,
+        price_decimals: u32,
+        threshold: i128,
+        threshold_decimals: u32,
+    ) -> Result<(i128, i128), Error> {
+        let target = price_decimals.max(threshold_decimals);
+        let (Some(price_factor), Some(threshold_factor)) = (
+            Self::pow10_i128(target - price_decimals),
+            Self::pow10_i128(target - threshold_decimals),
+        ) else {
+            return Err(Error::InvalidPrice);
+        };
+        let price_scaled = price.checked_mul(price_factor).ok_or(Error::InvalidPrice)?;
+        let threshold_scaled = threshold
+            .checked_mul(threshold_factor)
+            .ok_or(Error::InvalidPrice)?;
+        Ok((price_scaled, threshold_scaled))
+    }
+
+    /// Reads the committed feed on its SEP-40 record grid and validates it.
+    /// The lookup timestamp is `close_time` floored to `resolution()`; SEP-40
+    /// feeds only store records on that grid, so querying `close_time` raw
+    /// would miss every off-boundary close (issue #26). If the aligned record
+    /// is missing the lookback walks the grid back in `resolution()` steps
+    /// while the next candidate could still satisfy `max_staleness`, capped
+    /// at [`MAX_LOOKBACK_RECORDS`] cross-contract calls. A trapping oracle or
+    /// a failing `price` call is `PriceUnavailable`, never a host error; a
+    /// grid with no acceptable record is `StalePrice`; a `resolution()` of 0
+    /// is a broken feed and `InvalidPrice` (it would divide by zero).
+    fn read_feed_on_grid(
+        env: &Env,
+        reflector: &Address,
+        asset: &OracleAsset,
+        max_staleness: u64,
+        close_time: u64,
+    ) -> Result<PriceData, Error> {
+        let client = ReflectorPriceClient::new(env, reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
             return Err(Error::PriceUnavailable);
         };
-        Self::validate_price(config, close_time, &data)?;
-        Ok(data)
+        if resolution == 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let res = resolution as u64;
+        let mut ts = close_time - close_time % res;
+        let mut inspected = 1u32;
+        loop {
+            match client.try_price(asset, &ts) {
+                Ok(Ok(Some(data))) => {
+                    Self::validate_price(max_staleness, close_time, &data)?;
+                    return Ok(data);
+                }
+                Ok(Ok(None)) => {}
+                _ => return Err(Error::PriceUnavailable),
+            }
+            if ts < res
+                || close_time - ts + res > max_staleness
+                || inspected >= MAX_LOOKBACK_RECORDS
+            {
+                return Err(Error::StalePrice);
+            }
+            ts -= res;
+            inspected += 1;
+        }
+    }
+
+    fn read_feed(env: &Env, config: &PriceConfig, close_time: u64) -> Result<PriceData, Error> {
+        Self::read_feed_on_grid(
+            env,
+            &config.reflector,
+            &config.asset,
+            config.max_staleness,
+            close_time,
+        )
     }
 
     /// The outcome the market's price rule gives, from its stored snapshot
@@ -2145,7 +2809,7 @@ impl Resolver {
         let (data, from_snapshot) = match storage.get::<_, PriceSnapshot>(&key) {
             Some(snapshot) => {
                 storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-                Self::validate_price(config, close_time, &snapshot.data)?;
+                Self::validate_price(config.max_staleness, close_time, &snapshot.data)?;
                 (snapshot.data, true)
             }
             None => (Self::read_feed(env, config, close_time)?, false),
@@ -2155,6 +2819,9 @@ impl Resolver {
 
     /// The price rule of a price or hybrid market. Signer-mode markets are
     /// `WrongMode`; markets with no revealed spec `MarketNotConfigured`.
+    /// Scaled (issue #26) and TWAP (issue #27) markets are `WrongMode` too:
+    /// `snapshot_price`/`preview_price` work on the raw `PriceConfig` shape
+    /// only (issue #37 will extend snapshots).
     fn price_config(env: &Env, market_id: u64) -> Result<PriceConfig, Error> {
         let storage = env.storage().persistent();
         if let Some(cfg) = storage.get(&DataKey::Price(market_id)) {
@@ -2162,6 +2829,11 @@ impl Resolver {
         }
         if let Some(hybrid) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(hybrid.price);
+        }
+        if storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
+        {
+            return Err(Error::WrongMode);
         }
         match Self::signer_authority(env, market_id) {
             Ok(_) => Err(Error::WrongMode),
@@ -2210,6 +2882,8 @@ impl Resolver {
         }
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Price(market_id))
+            || storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
             || storage.has(&DataKey::Signers(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::Disputable(market_id))
@@ -2306,6 +2980,82 @@ impl Resolver {
             storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
         }
         Self::set_state(env, market_id, state);
+    }
+
+    /// Issue #26 counterpart of [`validate_rule`] for the scaled mode, which
+    /// is not a `ResolutionSpec` variant (see
+    /// [`register_scaled_price_spec`]).
+    fn validate_scaled_rule(cfg: &ScaledPriceConfig) -> Result<(), Error> {
+        let valid = cfg.threshold >= 0
+            && cfg.max_staleness != 0
+            && cfg.threshold_decimals <= MAX_THRESHOLD_DECIMALS;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfig)
+        }
+    }
+
+    /// Issue #26 counterpart of [`store_rule`] for the scaled mode: same
+    /// key + TTL + evidence-policy + state bookkeeping, different payload.
+    fn store_scaled_rule(env: &Env, market_id: u64, cfg: &ScaledPriceConfig) {
+        let storage = env.storage().persistent();
+        let key = DataKey::PriceScaled(market_id);
+        storage.set(&key, cfg);
+        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        if let Some((_, policy)) = Self::evidence_config_internal(env) {
+            let p_key = DataKey::EvidencePolicy(market_id);
+            storage.set(&p_key, &policy);
+            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        Self::set_state(env, market_id, ResolutionState::Unconfigured);
+    }
+
+    /// Issue #27 counterpart of [`validate_scaled_rule`] for the TWAP mode,
+    /// plus the live feasibility check described in
+    /// [`register_twap_spec`]: the grid period is read from the feed at
+    /// registration, so an infeasible `window`/`min_samples` pair for that
+    /// grid (or an unreachable/zero-period feed) fails before any
+    /// commitment is spent. Static violations and infeasible slot counts
+    /// are `InvalidConfig`; a trapping reflector is `PriceUnavailable`.
+    fn validate_twap_rule(env: &Env, cfg: &TwapConfig) -> Result<(), Error> {
+        let static_ok = cfg.window > 0
+            && cfg.min_samples >= 2
+            && cfg.max_gap > 0
+            && cfg.max_gap <= cfg.window
+            && cfg.threshold >= 0;
+        if !static_ok {
+            return Err(Error::InvalidConfig);
+        }
+        let client = ReflectorPriceClient::new(env, &cfg.reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
+            return Err(Error::PriceUnavailable);
+        };
+        if resolution == 0 {
+            // A zero-period feed divides by zero at resolve time; the market
+            // cannot ever sample it on a grid. Reject at reveal (issue #27
+            // step 2: catch unresolvable markets early).
+            return Err(Error::InvalidConfig);
+        }
+        let slots = cfg.window / resolution as u64;
+        if slots > MAX_TWAP_SAMPLES as u64 || (cfg.min_samples as u64) > slots {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    /// Issue #27 counterpart of [`store_scaled_rule`] for the TWAP mode.
+    fn store_twap_rule(env: &Env, market_id: u64, cfg: &TwapConfig) {
+        let storage = env.storage().persistent();
+        let key = DataKey::PriceTwap(market_id);
+        storage.set(&key, cfg);
+        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        if let Some((_, policy)) = Self::evidence_config_internal(env) {
+            let p_key = DataKey::EvidencePolicy(market_id);
+            storage.set(&p_key, &policy);
+            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
 
     fn evidence_config_internal(env: &Env) -> Option<(Address, EvidencePolicy)> {
@@ -2604,18 +3354,111 @@ mod test {
     }
 
     #[contract]
-    struct MockReflector;
+    struct Sep40Mock;
+
+    const MOCK_HISTORY: u32 = 0;
+    const MOCK_DECIMALS: u32 = 1;
+    const MOCK_RESOLUTION: u32 = 2;
+    const MOCK_PANIC: u32 = 3;
+    const MOCK_NEAREST: u32 = 4;
 
     #[contractimpl]
-    impl MockReflector {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage()
-                .instance()
-                .set(&0u32, &PriceData { price, timestamp });
+    impl Sep40Mock {
+        pub fn set_config(env: Env, decimals: u32, resolution: u32) {
+            env.storage().instance().set(&MOCK_DECIMALS, &decimals);
+            env.storage().instance().set(&MOCK_RESOLUTION, &resolution);
         }
 
-        pub fn price(env: Env, _asset: OracleAsset, _timestamp: u64) -> Option<PriceData> {
-            env.storage().instance().get(&0u32)
+        pub fn set_panic(env: Env, on: bool) {
+            env.storage().instance().set(&MOCK_PANIC, &on);
+        }
+
+        /// Deviate from SEP-40 exactness: `price(asset, ts)` then answers
+        /// with the newest stored record at or before `ts` (issue #27's
+        /// "some implementations return the nearest earlier record" edge).
+        pub fn set_nearest(env: Env, on: bool) {
+            env.storage().instance().set(&MOCK_NEAREST, &on);
+        }
+
+        /// Replaces the feed's history for `asset`. Records are only findable
+        /// at their exact timestamps, so a record off the `resolution()` grid
+        /// models a corrupt feed and stays unreachable by the aligned
+        /// lookback.
+        pub fn set_history(env: Env, asset: OracleAsset, history: Vec<PriceData>) {
+            let mut all: soroban_sdk::Map<OracleAsset, Vec<PriceData>> = env
+                .storage()
+                .instance()
+                .get(&MOCK_HISTORY)
+                .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+            all.set(asset, history);
+            env.storage().instance().set(&MOCK_HISTORY, &all);
+        }
+
+        fn guard(env: &Env) {
+            let on: bool = env.storage().instance().get(&MOCK_PANIC).unwrap_or(false);
+            if on {
+                panic!("sep40 mock feed down");
+            }
+        }
+
+        fn records(env: &Env, asset: &OracleAsset) -> Vec<PriceData> {
+            let all: soroban_sdk::Map<OracleAsset, Vec<PriceData>> = env
+                .storage()
+                .instance()
+                .get(&MOCK_HISTORY)
+                .unwrap_or_else(|| soroban_sdk::Map::new(env));
+            all.get(asset.clone()).unwrap_or_else(|| Vec::new(env))
+        }
+
+        /// Defaults to Reflector's public-feed shape: 14 decimals.
+        pub fn decimals(env: Env) -> u32 {
+            Self::guard(&env);
+            env.storage().instance().get(&MOCK_DECIMALS).unwrap_or(14)
+        }
+
+        /// Default 1 s so fixtures written against the old mock keep
+        /// resolving; grid behaviour is set explicitly per test.
+        pub fn resolution(env: Env) -> u32 {
+            Self::guard(&env);
+            env.storage().instance().get(&MOCK_RESOLUTION).unwrap_or(1)
+        }
+
+        /// SEP-40 exactness: `Some` only when `timestamp` names a stored
+        /// record of this asset. Under `set_nearest(true)` the newest
+        /// record at or before `timestamp` answers instead (issue #27's
+        /// duplicate-timestamp edge).
+        pub fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
+            Self::guard(&env);
+            let nearest: bool = env.storage().instance().get(&MOCK_NEAREST).unwrap_or(false);
+            let records = Self::records(&env, &asset);
+            if nearest {
+                let mut best: Option<PriceData> = None;
+                for record in records.iter() {
+                    if record.timestamp <= timestamp
+                        && best.as_ref().is_none_or(|b| record.timestamp > b.timestamp)
+                    {
+                        best = Some(record);
+                    }
+                }
+                return best;
+            }
+            records.iter().find(|record| record.timestamp == timestamp)
+        }
+
+        pub fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData> {
+            Self::guard(&env);
+            let records = Self::records(&env, &asset);
+            let mut newest: Option<PriceData> = None;
+            for record in records.iter() {
+                let replace = match &newest {
+                    Some(current) => record.timestamp >= current.timestamp,
+                    None => true,
+                };
+                if replace {
+                    newest = Some(record);
+                }
+            }
+            newest
         }
     }
 
@@ -2646,10 +3489,28 @@ mod test {
         })
     }
 
+    /// [`fixture`] with a custom market `close_time`, for grid-alignment tests.
+    fn fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
+    ) -> Fixture {
+        fixture_close_with(close_time, spec_fn, |env, spec, _market_core| {
+            legacy_spec_hash(env, spec)
+        })
+    }
+
     /// Like [`fixture`], but `commit` chooses the `resolution_hash` the market
     /// is created with, given the rule and the market-core address, so V2
     /// envelopes can be committed to.
     fn fixture_with(
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
+        commit: impl FnOnce(&Env, &ResolutionSpec, &Address) -> BytesN<32>,
+    ) -> Fixture {
+        fixture_close_with(2_000, spec_fn, commit)
+    }
+
+    fn fixture_close_with(
+        close_time: u64,
         spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
         commit: impl FnOnce(&Env, &ResolutionSpec, &Address) -> BytesN<32>,
     ) -> Fixture {
@@ -2664,7 +3525,7 @@ mod test {
         let signer_b = Address::generate(&env);
         let treasury = Address::generate(&env);
         let resolver_id = Address::generate(&env);
-        let reflector_id = env.register(MockReflector, ());
+        let reflector_id = env.register(Sep40Mock, ());
 
         let collateral = env.register_stellar_asset_contract_v2(admin.clone());
         let token = StellarAssetClient::new(&env, &collateral.address());
@@ -2691,7 +3552,7 @@ mod test {
             &resolution_hash,
             &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
             &Category::Crypto,
-            &2_000,
+            &close_time,
             &(100 * 10_000_000_i128),
             &5000u32,
         );
@@ -2717,13 +3578,204 @@ mod test {
         }
     }
 
+    /// Issue #26 counterpart of [`fixture_close_with`]: the market's
+    /// `resolution_hash` commits to `scaled_spec_hash(cfg)` — a domain-tagged
+    /// `ScaledPriceConfig` preimage, not a `ResolutionSpec` variant (see
+    /// [`register_scaled_price_spec`]). The returned `Fixture.spec` is a
+    /// legacy `Price` placeholder that these tests never register; only the
+    /// revealed scaled config matches this market's commitment.
+    fn scaled_fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ScaledPriceConfig,
+    ) -> (Fixture, ScaledPriceConfig) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(Sep40Mock, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let scaled = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
+        let spec = ResolutionSpec::Price(price_spec(&env, &reflector_id));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                // Protocol keeps the whole fee; resolver tests do no splits.
+                10_000u32,
+            ),
+        );
+        let resolution_hash = scaled_spec_hash(&env, &scaled);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let market_id = market_core.create_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
+            &Category::Crypto,
+            &close_time,
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        (
+            Fixture {
+                env,
+                admin,
+                resolver,
+                resolver_id,
+                market_core,
+                market_id,
+                signer_a,
+                signer_b,
+                reflector_id,
+                spec,
+            },
+            scaled,
+        )
+    }
+
+    /// Issue #27 counterpart of [`scaled_fixture_at`]: the market's
+    /// `resolution_hash` commits to `twap_spec_hash(cfg)`. The returned
+    /// `Fixture.spec` is a legacy `Price` placeholder these tests never
+    /// register; only the revealed TWAP config matches the commitment.
+    fn twap_fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> TwapConfig,
+    ) -> (Fixture, TwapConfig) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(Sep40Mock, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let twap_cfg = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
+        let spec = ResolutionSpec::Price(price_spec(&env, &reflector_id));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                // Protocol keeps the whole fee; resolver tests do no splits.
+                10_000u32,
+            ),
+        );
+        let resolution_hash = twap_spec_hash(&env, &twap_cfg);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let market_id = market_core.create_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
+            &Category::Crypto,
+            &close_time,
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        (
+            Fixture {
+                env,
+                admin,
+                resolver,
+                resolver_id,
+                market_core,
+                market_id,
+                signer_a,
+                signer_b,
+                reflector_id,
+                spec,
+            },
+            twap_cfg,
+        )
+    }
+
+    /// [`twap_fixture_at`] at the default `close_time` of 2_000.
+    fn twap_fixture(
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> TwapConfig,
+    ) -> (Fixture, TwapConfig) {
+        twap_fixture_at(2_000, spec_fn)
+    }
+
+    fn twap_price_spec(
+        env: &Env,
+        reflector: &Address,
+        threshold: i128,
+        direction: PriceDirection,
+        window: u64,
+        min_samples: u32,
+        max_gap: u64,
+    ) -> TwapConfig {
+        TwapConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            threshold,
+            direction,
+            window,
+            min_samples,
+            max_gap,
+        }
+    }
+
     fn price_spec(env: &Env, reflector: &Address) -> PriceConfig {
+        price_spec_at(env, reflector, 2_000, PriceDirection::Above, 10)
+    }
+
+    fn price_spec_at(
+        env: &Env,
+        reflector: &Address,
+        threshold: i128,
+        direction: PriceDirection,
+        max_staleness: u64,
+    ) -> PriceConfig {
         PriceConfig {
             reflector: reflector.clone(),
             asset: OracleAsset::Other(Symbol::new(env, "XLM")),
-            threshold: 2_000,
-            direction: PriceDirection::Above,
-            max_staleness: 10,
+            threshold,
+            direction,
+            max_staleness,
         }
     }
 
@@ -2774,8 +3826,17 @@ mod test {
     #[test]
     fn price_mode_resolves_from_historical_reflector_price() {
         let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
-        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
-        reflector.set_price(&2_500_i128, &1_999_u64);
+        let reflector = Sep40MockClient::new(&f.env, &f.reflector_id);
+        reflector.set_history(
+            &OracleAsset::Other(Symbol::new(&f.env, "XLM")),
+            &Vec::from_array(
+                &f.env,
+                [PriceData {
+                    price: 2_500,
+                    timestamp: 1_999,
+                }],
+            ),
+        );
 
         let ResolutionSpec::Price(spec) = f.spec.clone() else {
             unreachable!()
@@ -3040,7 +4101,16 @@ mod test {
         let ResolutionSpec::Price(spec) = f.spec.clone() else {
             unreachable!()
         };
-        MockReflectorClient::new(&f.env, &f.reflector_id).set_price(&price, &price_timestamp);
+        Sep40MockClient::new(&f.env, &f.reflector_id).set_history(
+            &spec.asset,
+            &Vec::from_array(
+                &f.env,
+                [PriceData {
+                    price,
+                    timestamp: price_timestamp,
+                }],
+            ),
+        );
         f.resolver.register_price_spec(&f.market_id, &spec);
         f
     }
@@ -4516,6 +5586,8 @@ mod test {
 
     /// SEP-40 feed with bounded history: `price(ts)` returns the newest
     /// record at or before `ts`, but only among the last `retention` pushed.
+    /// Models Reflector's retention window (issue #26's snapshots work); the
+    /// record grid is 10 s.
     #[contract]
     struct RetentionReflector;
 
@@ -4533,6 +5605,29 @@ mod test {
 
         pub fn set_retention(env: Env, n: u32) {
             env.storage().instance().set(&1u32, &n);
+        }
+
+        pub fn decimals(env: Env) -> u32 {
+            let _ = env;
+            14
+        }
+
+        pub fn resolution(env: Env) -> u32 {
+            let _ = env;
+            10
+        }
+
+        pub fn lastprice(env: Env, _asset: OracleAsset) -> Option<PriceData> {
+            let history: Vec<PriceData> = env
+                .storage()
+                .instance()
+                .get(&0u32)
+                .unwrap_or(Vec::new(&env));
+            if history.is_empty() {
+                None
+            } else {
+                history.get(history.len() - 1)
+            }
         }
 
         pub fn price(env: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
@@ -4650,13 +5745,16 @@ mod test {
     }
 
     #[test]
-    fn resolve_without_snapshot_after_retention_fails_price_unavailable() {
+    fn resolve_without_snapshot_after_retention_fails_stale() {
         let (f, feed) = retention_fixture();
         feed.push(&2_500, &2_000);
         age_out(&feed);
+        // Issue #26: the aligned lookup finds no record on the grid within
+        // `max_staleness`, so exhaustion is `StalePrice` (a live-but-empty
+        // window), not `PriceUnavailable` (which now means a trapping feed).
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
-            Err(Ok(Error::PriceUnavailable))
+            Err(Ok(Error::StalePrice))
         );
     }
 
@@ -4668,7 +5766,7 @@ mod test {
         let caller = Address::generate(&f.env);
         assert_eq!(
             f.resolver.try_snapshot_price(&f.market_id, &caller),
-            Err(Ok(Error::PriceUnavailable))
+            Err(Ok(Error::StalePrice))
         );
         assert_eq!(f.resolver.snapshot(&f.market_id), None);
     }
