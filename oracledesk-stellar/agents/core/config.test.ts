@@ -4,6 +4,8 @@ import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import {
   AgentConfigError,
   describeConfig,
+  redactConfig,
+  TESTNET_PASSPHRASE,
   loadAgentConfig,
   MAINNET_OPT_IN,
   NETWORKS,
@@ -315,4 +317,11 @@ test("live startup runs both probes", async () => {
 test("parseTunables validates the same fields without a deployment", () => {
   assert.equal(parseTunables({ SLIPPAGE_BPS: "100" }).trading.slippageBps, 100);
   assert.throws(() => parseTunables({ SLIPPAGE_BPS: "1.0" }), AgentConfigError);
+});
+
+test("passphrase constants and redactConfig alias never expose secrets", async () => {
+  assert.equal(TESTNET_PASSPHRASE, NETWORKS.testnet.passphrase);
+  const cfg = await load(LIVE).run();
+  const redacted = JSON.stringify(redactConfig(cfg));
+  assert.ok(!redacted.includes(AGENT.secret()));
 });
