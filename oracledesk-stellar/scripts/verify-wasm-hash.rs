@@ -1,17 +1,19 @@
-//! Shared `build.rs` helper that pins a vendored wasm artifact to a committed
-//! sha256 (issue #58).
-//!
-//! `contractimport!` reads `market_core.wasm` / `reasoning_registry.wasm` at
-//! the *dependent* crate's compile time, so a stale copy silently compiles
-//! against an old interface. A plain `git diff --exit-code` in CI only catches
-//! that after a full rebuild, and only if the build is bit-for-bit
-//! reproducible. This makes the stale copy a **compile error**: the expected
-//! digest lives in `<name>.wasm.sha256`, and the build fails unless the bytes
-//! on disk hash to it. Refreshing a vendored wasm (a deliberate, reviewable
-//! act) requires updating both files together.
-//!
-//! Self-contained (no build-dependency) so pinning does not change
-//! `Cargo.lock`; `include!`d by each contract's `build.rs`.
+// Shared `build.rs` helper that pins a vendored wasm artifact to a committed
+// sha256 (issue #58).
+//
+// `contractimport!` reads `market_core.wasm` / `reasoning_registry.wasm` at
+// the *dependent* crate's compile time, so a stale copy silently compiles
+// against an old interface. A plain `git diff --exit-code` in CI only catches
+// that after a full rebuild, and only if the build is bit-for-bit
+// reproducible. This makes the stale copy a **compile error**: the expected
+// digest lives in `<name>.wasm.sha256`, and the build fails unless the bytes
+// on disk hash to it. Refreshing a vendored wasm (a deliberate, reviewable
+// act) requires updating both files together.
+//
+// Self-contained (no build-dependency) so pinning does not change
+// `Cargo.lock`; `include!`d by each contract's `build.rs`. Uses `//` rather
+// than `//!` because rustc (>= 1.93) rejects an inner doc comment inside an
+// `include!`ed fragment that is not the crate root.
 
 use std::fs;
 use std::path::Path;

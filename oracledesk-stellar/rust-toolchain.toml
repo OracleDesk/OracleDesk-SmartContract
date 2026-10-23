@@ -2,7 +2,13 @@
 # meaningful if two clean builds produce identical bytes, which requires a
 # fixed compiler. Bump this deliberately, in the same commit that refreshes
 # the vendored wasm and its .sha256 pins.
+#
+# 1.93.0 is the lowest compiler that satisfies both floors of this checkout:
+# `soroban-sdk 27.0.6` (Cargo.lock) requires rustc >= 1.91.0, and CI installs
+# `stellar-cli 27.1.0` (`stellar-cli.version`), which requires >= 1.93.0. The
+# previous pin (1.90.0) could not build this lockfile or that CLI, so every
+# Rust job failed before reaching a repo command.
 [toolchain]
-channel = "1.90.0"
+channel = "1.93.0"
 targets = ["wasm32v1-none"]
 components = ["rustfmt", "clippy"]

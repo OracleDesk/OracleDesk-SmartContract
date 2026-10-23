@@ -31,7 +31,8 @@ export interface TraderCandidate {
 }
 
 export interface TraderDeps {
-  adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace">;
+  adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace"> &
+    Partial<Pick<StellarAdapter, "currentFeeBps">>;
   traceStore: TraceStore;
   candidates: () => Promise<TraderCandidate[]>;
   /** This deployment's treasury contract id (creator of our own markets). */

@@ -39,6 +39,15 @@ export interface Deployments {
   };
 }
 
+/** Subset of market-core's `Market` the agents consume. i128 maps to bigint
+ * and u64 to bigint per the generated bindings (`u32` -> number). */
+export interface MarketView {
+  close_time: bigint;
+  fee_bps: number;
+  reserve_yes: bigint;
+  reserve_no: bigint;
+}
+
 export function loadDeployments(
   path = process.env.DEPLOYMENTS_PATH ?? join(REPO_ROOT, "deployments", "testnet.json"),
 ): Deployments {
@@ -297,6 +306,31 @@ export class StellarAdapter {
     const { result } = await client.quote_buy(args);
     // quote_buy returns Result<i128, Error>: unwrap it, and surface an Err.
     return BigInt(unwrapContractResult("quote_buy", result) as bigint);
+  }
+
+  /**
+   * Reads a market's trade-relevant state via market-core's `get_market` view
+   * (read-only — simulates, never signs or submits). Lets the trader seed
+   * its market state (reserves, close time) from the chain in live mode.
+   * Named apart from `getMarket`, which returns the spec-reveal metadata view.
+   */
+  async getMarketView(args: { market_id: bigint }): Promise<MarketView> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.get_market(args);
+    return result as MarketView;
+  }
+
+  /**
+   * Reads market-core's `current_fee_bps` view: the fee a trade would pay
+   * right now, including any dynamic `FeeSchedule`. That schedule is
+   * deliberately invisible in `Market.fee_bps` (the flat snapshot legacy
+   * markets charge), so quoting off the snapshot would understate the fee
+   * near close. Read-only, simulates only.
+   */
+  async currentFeeBps(args: { market_id: bigint }): Promise<number> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.current_fee_bps(args);
+    return result as number;
   }
 
   /**

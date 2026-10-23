@@ -65,15 +65,21 @@ function stateReader(rpcUrl: string, deployments: Deployments) {
   });
 }
 
-/** Chain-state market source: tradable markets the treasury can afford. */
-export function chainCandidates(t: Tunables, deployments: Deployments): () => Promise<TraderCandidate[]> {
+/** Chain-state market source: tradable markets the treasury can afford.
+ * `effectiveFeeBps` (#9) replaces each market's fee before the strategy sees
+ * it; without it the flat snapshot from `get_market` is used. */
+export function chainCandidates(
+  t: Tunables,
+  deployments: Deployments,
+  effectiveFeeBps?: (marketId: bigint) => Promise<number>,
+): () => Promise<TraderCandidate[]> {
   const reader = stateReader(t.rpcUrl, deployments);
   const cache = new SnapshotCache();
   const tradeSize = t.trading.tradeSizeStroops;
   return async () => {
     const snapshot = await cache.get(() => reader.readSnapshot([]));
     if (availableCapital(snapshot) < tradeSize) return [];
-    return tradableMarkets(snapshot).map((m) => {
+    const candidates = tradableMarkets(snapshot).map((m) => {
       const market = toMarketState(m);
       return {
         market,
@@ -84,7 +90,27 @@ export function chainCandidates(t: Tunables, deployments: Deployments): () => Pr
         ledger: snapshot.ledgers.max,
       };
     });
+    return effectiveFeeBps ? applyEffectiveFees(candidates, effectiveFeeBps) : candidates;
   };
+}
+
+/**
+ * A dynamic `FeeSchedule` (#9) is deliberately invisible in
+ * `Market.fee_bps`, so quoting off that snapshot understates the fee near
+ * close. Replace it with `current_fee_bps` — the fee the contract actually
+ * charges at the current ledger time — so every off-chain impact estimate
+ * matches on-chain reality.
+ */
+export async function applyEffectiveFees(
+  candidates: TraderCandidate[],
+  feeBps: (marketId: bigint) => Promise<number>,
+): Promise<TraderCandidate[]> {
+  return Promise.all(
+    candidates.map(async (c) => ({
+      ...c,
+      market: { ...c.market, feeBps: await feeBps(BigInt(c.market.marketId)) },
+    })),
+  );
 }
 
 export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
@@ -104,6 +130,18 @@ export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Dep
  * Trader deps. With deployments, markets come from chain state; without
  * (tests, an adapter not bound to a deployment) from the demo fixture.
  */
+/**
+ * `#9`: only a live adapter that implements the read can supply the
+ * effective fee. Dry-run and fake adapters keep the flat snapshot.
+ */
+function effectiveFeeReader(
+  adapter: TraderDeps["adapter"],
+): ((marketId: bigint) => Promise<number>) | undefined {
+  const read = adapter.currentFeeBps;
+  if (adapter.mode !== "live" || !read) return undefined;
+  return (marketId) => read.call(adapter, { market_id: marketId });
+}
+
 export function traderDeps(
   t: Tunables,
   adapter: TraderDeps["adapter"],
@@ -113,7 +151,9 @@ export function traderDeps(
   return {
     adapter,
     traceStore: new LocalTraceStore(t.traceStoreDir),
-    candidates: deployments ? chainCandidates(t, deployments) : () => fixtureCandidates(nowSecs()),
+    candidates: deployments
+      ? chainCandidates(t, deployments, effectiveFeeReader(adapter))
+      : () => fixtureCandidates(nowSecs()),
     treasury: deployments?.contracts.treasury,
     minEdgeBps: t.trading.minEdgeBps,
     tradeSizeStroops: t.trading.tradeSizeStroops,

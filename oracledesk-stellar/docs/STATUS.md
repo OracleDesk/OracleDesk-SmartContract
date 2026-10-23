@@ -99,6 +99,48 @@ The work above landed on `develop` as merge commit `581a3ec` (PR #153,
 merged 2026-10-16), so the feature-branch reference above is historical and
 `develop` is the source of truth for #8, #10, #12 and #13.
 
+## Contributor addendum: 2026-10-16 — categorical (#6), scalar (#7), dynamic fees (#9)
+
+Implemented together on `feat/categorical-scalar-dynamic-fees` (PR against
+`develop`): n-outcome categorical markets (2..=8 —
+`create_categorical_market` / `buy_cat` / `sell_cat` / `resolve_cat` /
+`redeem_cat` / `claim_pool_remainder_cat`), scalar range markets
+(`create_scalar_market` / `resolve_scalar` / `get_scalar_meta`, settled from
+a Reflector feed via `resolver.resolve_scalar_price`), and per-market
+dynamic fee schedules (`FeeSchedule` / `effective_fee_bps`,
+`create_market_with_fees`, `quote_buy_at`, `current_fee_bps`); the resolver
+also gained categorical signer resolution (`register_cat_signer_spec` /
+`attest_cat` / `finalize_cat`) and the treasury an `agent_buy_cat`
+forwarder. Design and invariants: `docs/architecture.md`; storage and
+append-only-XDR decision: [ADR 0006](adr/0006-market-kind-storage-split.md).
+
+Verified in the contributor session, re-measured after merging `develop`:
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (now **305** tests: market-core 97, resolver 107,
+treasury 95, reasoning-registry 6 — superseding the 87-test count above), the
+`scripts/spec-hash` crate (11 tests), `python3 model/fpmm_model.py`, agents (54
+tests) and x402 (5 tests), plus `make build` (vendored wasm regenerated) and
+`make bindings` with only the intended diffs. The new math is mirrored in all three
+languages against one shared fixture file (`model/fee_fixtures.json`) that
+Python, Rust and TypeScript all read. Worst-case categorical cost was
+measured, not estimated: `buy_cat` at `n = 8` takes 444,604 instructions /
+64,092 B memory / 1,640 write bytes across 5 write entries — under 60% of
+the network limits, asserted by the `cat_eight_outcomes_resource_budget`
+test.
+
+**Release note for bindings consumers:** `MarketStatus` and
+`ResolutionSpec` gained *appended* variants (`ResolvedScalar`,
+`CategoricalSigners`, `Scalar`). Values using them cannot be decoded by
+bindings generated before this change — regenerate; the committed
+`packages/bindings` in this PR are regenerated.
+
+**Not** (re)verified: no testnet redeploy — the deployed contracts and
+`deployments/testnet.json` predate these changes, so the new entrypoints
+have contract-level and off-chain tests only, not a real-ledger
+transaction. Categorical markets keep a flat fee (the dynamic schedule
+applies to binary and scalar markets) and neither new kind has a live
+testnet transaction yet.
+
 ## Contributor addendum: 2026-10-18
 
 Signer-key rotation via committee registry (#35), hybrid price feed with attested

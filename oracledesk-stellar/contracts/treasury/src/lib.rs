@@ -1873,6 +1873,40 @@ impl Treasury {
         )
     }
 
+    /// Categorical counterpart of `agent_buy`: buys `outcome_index` shares of
+    /// a categorical market using treasury capital (`ROLE_TRADE`). The binary
+    /// price band is a Yes/No concept so it does not apply here, but the
+    /// per-trade / per-market / daily caps, the reserved-capital check, the
+    /// net-exposure reserve and the nested transfer pre-authorization all do
+    /// (see `do_agent_buy`).
+    pub fn agent_buy_cat(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        outcome_index: u32,
+        collateral_in: i128,
+        min_shares_out: i128,
+    ) -> Result<i128, Error> {
+        Self::assert_not_paused(&env)?;
+        let global = Self::load_global(&env)?;
+        let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        Self::check_trade_size(&global, &policy, collateral_in)?;
+        Self::ensure_unreserved(&env, &global, collateral_in)?;
+
+        let treasury_addr = env.current_contract_address();
+        Self::authorize_token_pull(&env, &global, &treasury_addr, collateral_in);
+        let shares = MarketCoreClient::new(&env, &global.market_core).buy_cat(
+            &treasury_addr,
+            &market_id,
+            &outcome_index,
+            &collateral_in,
+            &min_shares_out,
+        );
+        Self::reserve_capacity(&env, &global, &agent, &policy, market_id, collateral_in)?;
+        Self::reserve_net(&env, &global, market_id, collateral_in)?;
+        Ok(shares)
+    }
+
     /// Sells `outcome` shares back into the pool for exactly
     /// `collateral_out` (`ROLE_TRADE`). This returns capital to the treasury
     /// (market-core pays out of its own balance), so it is not capped and
@@ -3381,6 +3415,12 @@ impl Treasury {
         match status {
             MarketStatus::Resolved(Outcome::Yes) => yes,
             MarketStatus::Resolved(Outcome::No) => no,
+            MarketStatus::ResolvedScalar(payout_long_bps) => {
+                // Mirror of market-core's `math::scalar_payout`: each leg floors
+                // independently at its fractional share of the complete set.
+                let p = *payout_long_bps as i128;
+                yes.saturating_mul(p) / BPS + no.saturating_mul(BPS - p) / BPS
+            }
             MarketStatus::Void => yes.saturating_add(no) / 2,
             MarketStatus::Open => 0,
         }
@@ -3942,7 +3982,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
-        BytesN, String,
+        BytesN, String, Vec,
     };
 
     // ---- dual registration of market-core (coverage, issue #75) ---------------
@@ -4745,6 +4785,78 @@ mod test {
             .agent_buy_v2(
                 &agent, &market_id, &outcome, &amount, &min_out, &limit, &deadline,
             );
+        assert!(shares > 0);
+    }
+
+    /// Creates a 3-outcome categorical market seeded by the fixture creator.
+    fn create_cat_market(f: &Fixture, nonce: u8) -> u64 {
+        let creator = f.market_core.get_market(&f.market_id).creator;
+        f.market_core.create_categorical_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[nonce; 32]),
+            &BytesN::from_array(&f.env, &[nonce + 100; 32]),
+            &String::from_str(&f.env, "ipfs://treasury-cat-market"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * 10_000_000_i128),
+            &Vec::from_array(&f.env, [5_000u32, 3_000, 2_000]),
+        )
+    }
+
+    #[test]
+    fn agent_buy_cat_respects_trade_and_market_caps() {
+        let f = fixture();
+        let cat_market = create_cat_market(&f, 18);
+
+        // Same single-trade cap as the binary path.
+        assert_eq!(
+            f.treasury
+                .try_agent_buy_cat(&f.agent, &cat_market, &0u32, &(21 * 10_000_000_i128), &0),
+            Err(Ok(Error::TradeCapExceeded))
+        );
+        // Two capped buys fill the per-market cap; a third — even on another
+        // outcome — is rejected.
+        f.treasury
+            .agent_buy_cat(&f.agent, &cat_market, &0u32, &(20 * 10_000_000_i128), &0);
+        f.treasury
+            .agent_buy_cat(&f.agent, &cat_market, &2u32, &(20 * 10_000_000_i128), &0);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy_cat(&f.agent, &cat_market, &1u32, &(20 * 10_000_000_i128), &0),
+            Err(Ok(Error::MarketCapExceeded))
+        );
+        assert_eq!(
+            f.treasury.try_close_trade(&f.agent, &cat_market),
+            Ok(Ok(40 * 10_000_000_i128))
+        );
+    }
+
+    /// The categorical twin of the `agent_buy` pitfall test: `buy_cat`'s
+    /// nested token transfer must be pre-authorized too (`mock_auths` for
+    /// only the agent, so a regression in `authorize_token_pull` fails here).
+    #[test]
+    fn pitfall_agent_buy_cat_forwards_nested_transfer_auth() {
+        let f = fixture();
+        let cat_market = create_cat_market(&f, 19);
+        let agent = f.treasury.get_config().agent;
+        let outcome_index = 1u32;
+        let amount = 20 * 10_000_000_i128;
+        let min_out = 0_i128;
+
+        f.env.set_auths(&[]);
+        let shares = f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &agent,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "agent_buy_cat",
+                    args: (agent.clone(), cat_market, outcome_index, amount, min_out)
+                        .into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .agent_buy_cat(&agent, &cat_market, &outcome_index, &amount, &min_out);
         assert!(shares > 0);
     }
 

@@ -24,7 +24,7 @@
 //! `contracts/resolver`'s `shared_types_are_byte_identical_to_imported` test
 //! pins that byte-for-byte.
 
-use soroban_sdk::{Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // market-core outcome surface
@@ -57,6 +57,11 @@ pub enum MarketStatus {
     Resolved(Outcome),
     /// Invalid market. Every share redeems at 0.5.
     Void,
+    /// Scalar (range) market, final: LONG shares pay `payout_long_bps /
+    /// 10_000` and SHORT shares the complement. Appended last so stored
+    /// `Resolved`/`Void` values keep their encoding; readers compiled
+    /// against older bindings fail to decode this one (see the release note).
+    ResolvedScalar(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +155,38 @@ pub struct WeightedKeyConfig {
     pub dispute_window: u64,
 }
 
+/// Categorical counterpart of [`SignerConfig`]: signers attest an outcome
+/// *index* of a categorical market instead of Yes/No. `outcome_count`
+/// binds the market's outcome set to the commitment (2..=8, mirroring
+/// market-core's cap), so a reveal cannot silently change how many outcomes
+/// signers are voting on.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatSignerConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+    pub dispute_window: u64,
+    pub outcome_count: u32,
+}
+
+/// Scalar (range) counterpart of [`PriceConfig`]. The market settles on the
+/// fractional position of `price` inside `[lower, upper]`:
+/// `payout_long_bps = (clamped_price - lower) / (upper - lower)`, and the
+/// SHORT side pays the complement. A reading below the range clamps to
+/// `lower` (LONG pays 0), above to `upper` (LONG pays 1.0); a non-positive
+/// reading is an invalid price, never a clamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarPriceConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    /// Bottom of the staked range. Validated `0 <= lower < upper`, with
+    /// `upper` capped so `upper * BPS` cannot overflow.
+    pub lower: i128,
+    pub upper: i128,
+    pub max_staleness: u64,
+}
+
 /// Binds a market to a reusable committee registry subject to rotation bounds.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +219,11 @@ pub enum ResolutionSpec {
     SignersDisputable(DisputableSignerConfig),
     Committee(CommitteeRef),
     Hybrid(HybridConfig),
+    /// Categorical counterpart of `Signers` (appended, tag 6).
+    CategoricalSigners(CatSignerConfig),
+    /// Scalar counterpart of `Price` (appended, tag 7): the binary pool
+    /// settles at a fractional LONG payout instead of a side.
+    Scalar(ScalarPriceConfig),
 }
 
 /// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
