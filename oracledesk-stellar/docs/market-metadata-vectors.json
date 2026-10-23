@@ -1,0 +1,121 @@
+[
+  {
+    "name": "basic_crypto_price_market",
+    "input": {
+      "schema": "oracledesk.market-metadata/1",
+      "question": "Will XLM close above $0.20 on 2026-12-31?",
+      "description": "End-of-year XLM/USD benchmark market.",
+      "category": "Crypto",
+      "close_time": 1798675200,
+      "resolution": {
+        "mode": "price",
+        "criteria": "Resolves YES if Reflector XLM/USD price at close_time is strictly above 2000000.",
+        "spec": {
+          "threshold": "2000000",
+          "asset": "XLM",
+          "comparison": "Gt",
+          "oracle": "CAVLP5DH2GJPZMVO7IJY4CVOD5MWEFTJFVPD2YY2FQXOQHRGHK4D6HLP"
+        },
+        "resolution_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "sources": [
+        {
+          "url": "https://reflector.network",
+          "name": "Reflector Oracle"
+        }
+      ],
+      "created_by": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "language": "en"
+    },
+    "canonical_utf8": "{\"category\":\"Crypto\",\"close_time\":1798675200,\"created_by\":\"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF\",\"description\":\"End-of-year XLM/USD benchmark market.\",\"language\":\"en\",\"question\":\"Will XLM close above $0.20 on 2026-12-31?\",\"resolution\":{\"criteria\":\"Resolves YES if Reflector XLM/USD price at close_time is strictly above 2000000.\",\"mode\":\"price\",\"resolution_hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"spec\":{\"asset\":\"XLM\",\"comparison\":\"Gt\",\"oracle\":\"CAVLP5DH2GJPZMVO7IJY4CVOD5MWEFTJFVPD2YY2FQXOQHRGHK4D6HLP\",\"threshold\":\"2000000\"}},\"schema\":\"oracledesk.market-metadata/1\",\"sources\":[{\"name\":\"Reflector Oracle\",\"url\":\"https://reflector.network\"}]}",
+    "canonical_hex": "7b2263617465676f7279223a2243727970746f222c22636c6f73655f74696d65223a313739383637353230302c22637265617465645f6279223a224741414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141574846222c226465736372697074696f6e223a22456e642d6f662d7965617220584c4d2f5553442062656e63686d61726b206d61726b65742e222c226c616e6775616765223a22656e222c227175657374696f6e223a2257696c6c20584c4d20636c6f73652061626f76652024302e3230206f6e20323032362d31322d33313f222c227265736f6c7574696f6e223a7b226372697465726961223a225265736f6c76657320594553206966205265666c6563746f7220584c4d2f55534420707269636520617420636c6f73655f74696d65206973207374726963746c792061626f766520323030303030302e222c226d6f6465223a227072696365222c227265736f6c7574696f6e5f68617368223a2230313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566222c2273706563223a7b226173736574223a22584c4d222c22636f6d70617269736f6e223a224774222c226f7261636c65223a224341564c5035444832474a505a4d564f37494a593443564f44354d574546544a46565044325959324651584f51485247484b344436484c50222c227468726573686f6c64223a2232303030303030227d7d2c22736368656d61223a226f7261636c656465736b2e6d61726b65742d6d657461646174612f31222c22736f7572636573223a5b7b226e616d65223a225265666c6563746f72204f7261636c65222c2275726c223a2268747470733a2f2f7265666c6563746f722e6e6574776f726b227d5d7d",
+    "sha256": "34a3b0271411f87feb46b8eedca6120ba9321dccc5e7f5f6607a6d3bcd541dfe"
+  },
+  {
+    "name": "nfc_combining_marks_and_case_keys",
+    "input": {
+      "schema": "oracledesk.market-metadata/1",
+      "question": "Will Café index exceed 100 before Q4?",
+      "category": "Macro",
+      "close_time": 1800000000,
+      "resolution": {
+        "mode": "signers",
+        "criteria": "Confirmed by 2-of-3 committee signers (resumé feed).",
+        "spec": {
+          " threshold": "ignored_space_key",
+          "Threshold": "2",
+          "threshold": "2",
+          "signers": [
+            "GAAA",
+            "GBBB",
+            "GCCC"
+          ]
+        },
+        "resolution_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "sources": []
+    },
+    "canonical_utf8": "{\"category\":\"Macro\",\"close_time\":1800000000,\"question\":\"Will Café index exceed 100 before Q4?\",\"resolution\":{\"criteria\":\"Confirmed by 2-of-3 committee signers (resumé feed).\",\"mode\":\"signers\",\"resolution_hash\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",\"spec\":{\" threshold\":\"ignored_space_key\",\"Threshold\":\"2\",\"signers\":[\"GAAA\",\"GBBB\",\"GCCC\"],\"threshold\":\"2\"}},\"schema\":\"oracledesk.market-metadata/1\",\"sources\":[]}",
+    "canonical_hex": "7b2263617465676f7279223a224d6163726f222c22636c6f73655f74696d65223a313830303030303030302c227175657374696f6e223a2257696c6c20436166c3a920696e6465782065786365656420313030206265666f72652051343f222c227265736f6c7574696f6e223a7b226372697465726961223a22436f6e6669726d656420627920322d6f662d3320636f6d6d6974746565207369676e6572732028726573756dc3a92066656564292e222c226d6f6465223a227369676e657273222c227265736f6c7574696f6e5f68617368223a2266656463626139383736353433323130666564636261393837363534333231306665646362613938373635343332313066656463626139383736353433323130222c2273706563223a7b22207468726573686f6c64223a2269676e6f7265645f73706163655f6b6579222c225468726573686f6c64223a2232222c227369676e657273223a5b2247414141222c2247424242222c2247434343225d2c227468726573686f6c64223a2232227d7d2c22736368656d61223a226f7261636c656465736b2e6d61726b65742d6d657461646174612f31222c22736f7572636573223a5b5d7d",
+    "sha256": "71f752ebdd3132dfa9494adbea5b3f699d91fda1b498f9a28f7a4d2cc904f511"
+  },
+  {
+    "name": "utf16_surrogate_vs_bmp_key_ordering",
+    "input": {
+      "schema": "oracledesk.market-metadata/1",
+      "question": "Will 🚀 launch happen before ﬁnal window?",
+      "category": "Culture",
+      "close_time": 1810000000,
+      "resolution": {
+        "mode": "signers",
+        "criteria": "Resolves YES if launch telemetry confirms orbit.",
+        "spec": {
+          "ﬀ": "bmp_u_fb00_sorts_after_surrogate_in_utf16",
+          "😀": "astral_u_1f600_sorts_before_u_fb00_in_utf16",
+          "a": "ascii"
+        },
+        "resolution_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "sources": [
+        {
+          "name": "Telemetry",
+          "url": "https://example.org/telemetry"
+        }
+      ]
+    },
+    "canonical_utf8": "{\"category\":\"Culture\",\"close_time\":1810000000,\"question\":\"Will 🚀 launch happen before ﬁnal window?\",\"resolution\":{\"criteria\":\"Resolves YES if launch telemetry confirms orbit.\",\"mode\":\"signers\",\"resolution_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"spec\":{\"a\":\"ascii\",\"😀\":\"astral_u_1f600_sorts_before_u_fb00_in_utf16\",\"ﬀ\":\"bmp_u_fb00_sorts_after_surrogate_in_utf16\"}},\"schema\":\"oracledesk.market-metadata/1\",\"sources\":[{\"name\":\"Telemetry\",\"url\":\"https://example.org/telemetry\"}]}",
+    "canonical_hex": "7b2263617465676f7279223a2243756c74757265222c22636c6f73655f74696d65223a313831303030303030302c227175657374696f6e223a2257696c6c20f09f9a80206c61756e63682068617070656e206265666f726520efac816e616c2077696e646f773f222c227265736f6c7574696f6e223a7b226372697465726961223a225265736f6c76657320594553206966206c61756e63682074656c656d6574727920636f6e6669726d73206f726269742e222c226d6f6465223a227369676e657273222c227265736f6c7574696f6e5f68617368223a2231313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131222c2273706563223a7b2261223a226173636969222c22f09f9880223a2261737472616c5f755f31663630305f736f7274735f6265666f72655f755f666230305f696e5f7574663136222c22efac80223a22626d705f755f666230305f736f7274735f61667465725f737572726f676174655f696e5f7574663136227d7d2c22736368656d61223a226f7261636c656465736b2e6d61726b65742d6d657461646174612f31222c22736f7572636573223a5b7b226e616d65223a2254656c656d65747279222c2275726c223a2268747470733a2f2f6578616d706c652e6f72672f74656c656d65747279227d5d7d",
+    "sha256": "f13a6fa28633d89fccaac1df27c86056f5274ac6b9402a00a441dfe132734a33"
+  },
+  {
+    "name": "control_char_escaping_and_nested_spec",
+    "input": {
+      "schema": "oracledesk.market-metadata/1",
+      "question": "Will governance proposal #42 pass?\nCheck line 2\twith tab.",
+      "category": "Geopolitics",
+      "close_time": 1820000000,
+      "resolution": {
+        "mode": "signers",
+        "criteria": "Official tally > 50%.\r\nQuorum >= 10%.",
+        "spec": {
+          "nested": {
+            "z": 10,
+            "a": 1,
+            "m": [
+              3,
+              2,
+              1
+            ]
+          },
+          "quorum_bps": 1000
+        },
+        "resolution_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "sources": [],
+      "language": "en"
+    },
+    "canonical_utf8": "{\"category\":\"Geopolitics\",\"close_time\":1820000000,\"language\":\"en\",\"question\":\"Will governance proposal #42 pass?\\nCheck line 2\\twith tab.\",\"resolution\":{\"criteria\":\"Official tally > 50%.\\r\\nQuorum >= 10%.\",\"mode\":\"signers\",\"resolution_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"spec\":{\"nested\":{\"a\":1,\"m\":[3,2,1],\"z\":10},\"quorum_bps\":1000}},\"schema\":\"oracledesk.market-metadata/1\",\"sources\":[]}",
+    "canonical_hex": "7b2263617465676f7279223a2247656f706f6c6974696373222c22636c6f73655f74696d65223a313832303030303030302c226c616e6775616765223a22656e222c227175657374696f6e223a2257696c6c20676f7665726e616e63652070726f706f73616c2023343220706173733f5c6e436865636b206c696e6520325c7477697468207461622e222c227265736f6c7574696f6e223a7b226372697465726961223a224f6666696369616c2074616c6c79203e203530252e5c725c6e51756f72756d203e3d203130252e222c226d6f6465223a227369676e657273222c227265736f6c7574696f6e5f68617368223a2232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232222c2273706563223a7b226e6573746564223a7b2261223a312c226d223a5b332c322c315d2c227a223a31307d2c2271756f72756d5f627073223a313030307d7d2c22736368656d61223a226f7261636c656465736b2e6d61726b65742d6d657461646174612f31222c22736f7572636573223a5b5d7d",
+    "sha256": "8543f863b3a1635e816f2b8ed46c3b6885f9fea4eaa86a8d5e0c1824552e13cf"
+  }
+]
