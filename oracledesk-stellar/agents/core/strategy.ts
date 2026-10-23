@@ -92,7 +92,11 @@ export function decideMarketProposal(
 export interface MarketState {
   marketId: number;
   question: string;
-  yesBps: number; // current market-implied probability
+  yesBps: number; // current market-implied probability (spot)
+  /** Time-weighted average YES price in bps, when the caller read it
+   * (market-core's `twap`). Required by `decideTrade` when `priceSource` is
+   * `"twap"`; spot reads may leave it undefined. */
+  twapBps?: number;
   closeTime: number;
   /** Pool reserves in stroops, if known. Required when the caller sets
    * `maxImpactBps` on `decideTrade`. */
@@ -160,6 +164,12 @@ function clampSizeToImpact(
  * decides whether the mispricing is worth trading. Trades toward whichever
  * side the market is *underpricing* relative to the estimate.
  *
+ * `priceSource` picks which of the market's prices is compared: `"spot"`
+ * (default) uses `MarketState.yesBps`, which a single trade can move
+ * arbitrarily within one ledger; `"twap"` uses `MarketState.twapBps`, the
+ * manipulation-resistant time-weighted average. Prefer `"twap"` for
+ * automated trading loops.
+ *
  * With `maxImpactBps` set to a positive value, the trade size is clamped
  * so the estimated price impact stays below the market's on-chain breaker
  * (the market state must then carry reserves and `feeBps`); if even the
@@ -170,13 +180,31 @@ function clampSizeToImpact(
 export function decideTrade(
   market: MarketState,
   fairValueBps: number,
-  opts: { minEdgeBps: number; tradeSizeStroops: bigint; maxImpactBps?: number },
+  opts: {
+    minEdgeBps: number;
+    tradeSizeStroops: bigint;
+    priceSource?: "spot" | "twap";
+    maxImpactBps?: number;
+  },
 ): TraderDecision {
-  const edge = fairValueBps - market.yesBps; // positive => YES underpriced
+  const priceSource = opts.priceSource ?? "spot";
+  let marketBps: number;
+  if (priceSource === "twap") {
+    if (market.twapBps === undefined) {
+      throw new Error(
+        `priceSource "twap" requires market.twapBps on market ${market.marketId} — read it with readMarket({ useTwapSecs })`,
+      );
+    }
+    marketBps = market.twapBps;
+  } else {
+    marketBps = market.yesBps;
+  }
+
+  const edge = fairValueBps - marketBps; // positive => YES underpriced
   if (Math.abs(edge) < opts.minEdgeBps) {
     return {
       action: "skip",
-      reasoning: `edge ${edge}bps on market ${market.marketId} is below the ${opts.minEdgeBps}bps threshold`,
+      reasoning: `edge ${edge}bps (${priceSource}) on market ${market.marketId} is below the ${opts.minEdgeBps}bps threshold`,
     };
   }
   const outcome = edge > 0 ? "Yes" : "No";
@@ -196,8 +224,76 @@ export function decideTrade(
   }
   return {
     action: "buy",
-    reasoning: `market ${market.marketId} prices YES at ${market.yesBps}bps vs fair value ${fairValueBps}bps (edge ${edge}bps) — buying ${outcome}${clampNote}`,
+    reasoning: `market ${market.marketId} prices YES at ${marketBps}bps (${priceSource}) vs fair value ${fairValueBps}bps (edge ${edge}bps) — buying ${outcome}${clampNote}`,
     outcome,
     collateralInStroops,
   };
+}
+
+/** One point of market-core's TWAP ring, as returned by the `Obs` entries
+ * (or the `observe` view): the cumulative YES-price-seconds at `ts`. */
+export interface PriceObservation {
+  /** unix seconds */
+  ts: number;
+  /** `price_cumulative` (bps × seconds) as of `ts` */
+  cumulative: bigint;
+}
+
+/**
+ * BigInt mirror of market-core's `observe`/`twap` math, for consumers that
+ * cannot simulate the contract (e.g. rendering historical charts from
+ * indexed observations). Linearly interpolates the cumulative between
+ * observations — exact there, because the accumulator is linear on each
+ * interval (its slope is the price that held) — evaluates the window ending
+ * at the newest observation's timestamp, and floors, exactly like the
+ * contract.
+ *
+ * The contract counterfactually extends the accumulator from the last trade
+ * to the current time (the last price holds). To reproduce that, append the
+ * live edge — `(last_ts, price_cumulative)` is what `observe(marketId, 0)`
+ * returns — as the final observation.
+ *
+ * Throws a `RangeError` when the window reaches before the first
+ * observation (the contract's `ObservationTooOld`), or when the inputs are
+ * degenerate. `observations` must be ordered by non-decreasing `ts`; exact
+ * duplicates (same ts and cumulative) are tolerated.
+ */
+export function twapFromObservations(
+  observations: readonly PriceObservation[],
+  windowSecs: number,
+): number {
+  if (observations.length === 0) {
+    throw new RangeError("twapFromObservations: no observations");
+  }
+  if (!Number.isInteger(windowSecs) || windowSecs <= 0) {
+    throw new RangeError(`twapFromObservations: window must be a positive integer, got ${windowSecs}`);
+  }
+  const now = observations[observations.length - 1].ts;
+  const t = now - windowSecs;
+  if (t < observations[0].ts) {
+    throw new RangeError("twapFromObservations: window reaches before the oldest observation (ObservationTooOld)");
+  }
+  const delta = cumulativeAt(observations, now) - cumulativeAt(observations, t);
+  return Number(delta / BigInt(windowSecs));
+}
+
+/** Newest observation with `ts <= t`, interpolated along the next chord if
+ * `t` falls strictly between two observations. */
+function cumulativeAt(observations: readonly PriceObservation[], t: number): bigint {
+  let lo = 0;
+  let hi = observations.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (observations[mid].ts <= t) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const a = observations[lo];
+  if (a.ts === t) {
+    return a.cumulative;
+  }
+  const b = observations[lo + 1];
+  return a.cumulative + ((b.cumulative - a.cumulative) * BigInt(t - a.ts)) / BigInt(b.ts - a.ts);
 }

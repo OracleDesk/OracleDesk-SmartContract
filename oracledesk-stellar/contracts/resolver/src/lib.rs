@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod ttl;
+
 #[cfg(test)]
 extern crate std;
 
@@ -69,6 +71,13 @@ pub const RESOLUTION_GRACE_SECS: u64 = 30 * 86_400;
 pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OracleAsset {
+    Stellar(Address),
+    Other(Symbol),
+}
 
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
@@ -926,9 +935,8 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
         if now < fallback_deadline {
@@ -1101,6 +1109,7 @@ impl Resolver {
         if env.ledger().timestamp() >= proposal.proposed_at.saturating_add(dispute_window) {
             return Err(Error::DisputeWindowClosed);
         }
+        let close_time = Self::market_close_time(&env, market_id)?;
         let cancel_key = DataKey::Cancels(market_id);
         let cancels: u32 = storage.get(&cancel_key).unwrap_or(0);
         if cancels >= MAX_CANCELS_PER_MARKET {
@@ -1115,6 +1124,7 @@ impl Resolver {
                 &(Self::round(&env, market_id) + 1),
             );
         }
+        Self::bump_market_entries(&env, market_id, close_time);
         GuardianAction {
             market_id,
             action: GuardianActionKind::CancelProposal,
@@ -1203,6 +1213,7 @@ impl Resolver {
         core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         GuardianAction {
             market_id,
             action: GuardianActionKind::Void,
@@ -1224,9 +1235,8 @@ impl Resolver {
             return Err(Error::WrongMode);
         };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1275,9 +1285,8 @@ impl Resolver {
         caller.require_auth();
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         if now < market.close_time {
             return Err(Error::MarketNotClosed);
@@ -1321,9 +1330,8 @@ impl Resolver {
     /// is known before (and without) a spec reveal.
     pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         Ok(Self::deadline(&market))
     }
 
@@ -1379,6 +1387,7 @@ impl Resolver {
 
         core_call(core.try_void_market(&market_id))?;
         Self::set_state(&env, market_id, ResolutionState::Expired);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         MarketExpired {
             market_id,
             close_time: market.close_time,
@@ -1451,9 +1460,8 @@ impl Resolver {
             return Err(Error::StaleRound);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1534,6 +1542,7 @@ impl Resolver {
             }
         }
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, Self::market_close_time(&env, market_id)?);
         ResolutionFinalizedV2 {
             market_id,
             outcome: proposal.outcome,
@@ -1577,7 +1586,8 @@ impl Resolver {
         }
 
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let token = core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
+        let token =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
         token::Client::new(&env, &token).transfer(
             &disputer,
             env.current_contract_address(),
@@ -1688,6 +1698,9 @@ impl Resolver {
         Ok(())
     }
 
+    /// Pure view: no TTL extensions. The instance and the market's entries
+    /// are kept alive by the mutating entrypoints above, so a view-only
+    /// simulation stays read-only.
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
     }
@@ -1698,6 +1711,7 @@ impl Resolver {
         env: &Env,
         key: DataKey,
     ) -> Result<V, Error> {
+        ttl::bump_instance(env);
         env.storage()
             .instance()
             .get(&key)
@@ -1737,9 +1751,6 @@ impl Resolver {
     fn set_state(env: &Env, market_id: u64, state: ResolutionState) {
         let key = DataKey::State(market_id);
         env.storage().persistent().set(&key, &state);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -2182,6 +2193,8 @@ impl Resolver {
                 .try_resolve(&market_id, &to_core_outcome(outcome)),
         )?;
         Self::set_state(env, market_id, ResolutionState::Finalized);
+        let close_time = Self::market_close_time(env, market_id)?;
+        Self::bump_market_entries(env, market_id, close_time);
         PriceResolution {
             market_id,
             price: data.price,
@@ -2230,8 +2243,9 @@ impl Resolver {
     ) -> Result<(), Error> {
         Self::assert_unconfigured(env, market_id)?;
         Self::validate_rule(rule)?;
-        Self::assert_matches_commitment(env, market_id, commitment)?;
+        let close_time = Self::assert_matches_commitment(env, market_id, commitment)?;
         Self::store_rule(env, market_id, rule);
+        Self::bump_market_entries(env, market_id, close_time);
         Ok(())
     }
 
@@ -2267,7 +2281,7 @@ impl Resolver {
 
     fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
         let storage = env.storage().persistent();
-        let (key, state) = match rule {
+        let (_key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
                 storage.set(&key, cfg);
@@ -2392,9 +2406,8 @@ impl Resolver {
             .unwrap_or(EvidencePolicy::Disabled);
 
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
@@ -2412,15 +2425,14 @@ impl Resolver {
             if storage.has(&DataKey::EvidenceUsed(trace_id)) {
                 return Err(Error::EvidenceAlreadyUsed);
             }
-            let trace = match registry_call(
-                RegistryClient::new(env, &registry).try_get_trace(&trace_id),
-            ) {
-                Ok(trace) => trace,
-                // A missing trace (or a registry that cannot be read) is the
-                // same caller-facing condition: the cited evidence is not
-                // available. The registry's own numeric code is never leaked.
-                Err(_) => return Err(Error::EvidenceNotFound),
-            };
+            let trace =
+                match registry_call(RegistryClient::new(env, &registry).try_get_trace(&trace_id)) {
+                    Ok(trace) => trace,
+                    // A missing trace (or a registry that cannot be read) is the
+                    // same caller-facing condition: the cited evidence is not
+                    // available. The registry's own numeric code is never leaked.
+                    Err(_) => return Err(Error::EvidenceNotFound),
+                };
             if trace.agent != signer {
                 return Err(Error::EvidenceAuthorMismatch);
             }
@@ -2460,6 +2472,13 @@ impl Resolver {
             &DataKey::AttestationV2(market_id, outcome, signer.clone()),
             &true,
         );
+        // #16: attestation entries are not enumerable, so each is extended to
+        // the market's close-time-aware target where it is written.
+        ttl::bump_persistent(
+            env,
+            &DataKey::AttestationV2(market_id, outcome, signer.clone()),
+            ttl::market_target(env, market.close_time),
+        );
         if let Some(epoch) = members_opt {
             Self::persist(
                 env,
@@ -2496,6 +2515,7 @@ impl Resolver {
         if quorum_reached && may_propose {
             Self::propose(env, market_id, outcome);
         }
+        Self::bump_market_entries(env, market_id, market.close_time);
         Ok(())
     }
 
@@ -2504,15 +2524,57 @@ impl Resolver {
         env: &Env,
         market_id: u64,
         commitment: &BytesN<32>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         if *commitment != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
-        Ok(())
+        Ok(market.close_time)
+    }
+
+    fn market_close_time(env: &Env, market_id: u64) -> Result<u64, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        Ok(MarketCoreClient::new(env, &market_core)
+            .get_market(&market_id)
+            .close_time)
+    }
+
+    /// Extends every per-market entry to the market's close-time-aware target.
+    /// Called after each mutating entrypoint so an in-progress vote or a
+    /// finalized market cannot archive mid-settlement. `Attestation` entries
+    /// are not enumerable — each is extended where it is written, plus the
+    /// configured signers' in `finalize_signers` — so they are handled
+    /// separately. Absent keys are skipped: `extend_ttl` panics on them.
+    fn bump_market_entries(env: &Env, market_id: u64, close_time: u64) {
+        let target = ttl::market_target(env, close_time);
+        let keys = [
+            DataKey::Price(market_id),
+            DataKey::Signers(market_id),
+            DataKey::WeightedKeys(market_id),
+            DataKey::Disputable(market_id),
+            DataKey::Proposal(market_id),
+            DataKey::ProposalV2(market_id),
+            DataKey::Snapshot(market_id),
+            DataKey::State(market_id),
+            DataKey::Round(market_id),
+            DataKey::Dispute(market_id),
+            DataKey::Count(market_id, Outcome::Yes),
+            DataKey::Count(market_id, Outcome::No),
+            // #16: `CountV2`/`ProposalV2` are the live tally/proposal keys after
+            // the `AttestedOutcome` migration (ADR 0003); the legacy `Count`/
+            // `Proposal` above are only read during migration, so the close-time
+            // guarantee lives on the V2 variants.
+            DataKey::CountV2(market_id, AttestedOutcome::Yes),
+            DataKey::CountV2(market_id, AttestedOutcome::No),
+            DataKey::CountV2(market_id, AttestedOutcome::Invalid),
+        ];
+        for key in keys {
+            if env.storage().persistent().has(&key) {
+                ttl::bump_persistent(env, &key, target);
+            }
+        }
     }
 }
 
@@ -2522,7 +2584,10 @@ mod test {
     use market_core::{Category, MarketStatus};
     use soroban_sdk::{
         contract, contractimpl,
-        testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke,
+        },
         token::{self, StellarAssetClient},
         BytesN, IntoVal,
     };
@@ -4167,6 +4232,123 @@ mod test {
         let _ = f.admin;
     }
 
+    // ---- close-time-aware storage TTL (issue #16) --------------------------
+    //
+    // These helpers read back a live entry's remaining TTL so the tests can
+    // prove a tally/instance survives an idle gap longer than the fixed
+    // `BUMP_TO` (60-day) default and therefore needed the write-time
+    // `ttl::market_target` extension, not just `Self::persist`'s bump. After
+    // the `AttestedOutcome` migration (ADR 0003) the live tally is `CountV2`.
+
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    #[test]
+    fn signer_vote_entries_survive_dispute_period() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+
+        // 61 days of silence — past the old 60-day cap and past any default
+        // persistent TTL. Without the write-time extension the tally would be
+        // archived here and the second attest would read `Count` == 0.
+        advance_ledgers(&f.env, 61 * ttl::DAY_SECS);
+        let count_key = DataKey::CountV2(f.market_id, AttestedOutcome::No);
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &count_key) > 0,
+            "vote tally archived during the dispute period"
+        );
+
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
+        let count: Option<u32> = f.env.as_contract(&f.resolver_id, || {
+            f.env.storage().persistent().get(&count_key)
+        });
+        assert_eq!(count, Some(2), "tally silently reset after archival");
+
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + 200);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::No)
+        );
+    }
+
+    #[test]
+    fn instance_survives_after_long_idle() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+
+        // 25 days idle drains the instance TTL below the 7-day threshold...
+        advance_ledgers(&f.env, 25 * ttl::DAY_SECS);
+        assert!(instance_ttl(&f.env, &f.resolver_id) < ttl::INSTANCE_THRESHOLD);
+
+        // ...and the next entrypoint call re-extends it.
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+    }
+
+    #[test]
+    fn bump_market_entries_skips_missing_keys() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &spec);
+
+        // Price and State exist; Signers, Proposal and both Counts do not.
+        // The sweep must skip absent keys — `extend_ttl` traps on them.
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::bump_market_entries(&f.env, f.market_id, 2_000);
+        });
+
+        let horizon_ledgers = (ttl::SETTLEMENT_HORIZON_SECS / ttl::LEDGER_SECS) as u32;
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::Price(f.market_id)) >= horizon_ledgers
+        );
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::State(f.market_id)) >= horizon_ledgers
+        );
+        assert!(!f.env.as_contract(&f.resolver_id, || f
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::Signers(f.market_id))));
+    }
+
     // ----- Invalid attestations (committee voids) -------------------------
 
     fn attest_both(f: &Fixture, outcome: AttestedOutcome) {
@@ -5294,18 +5476,30 @@ mod shared_types {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
         for (shared, imported) in [
-            (oracledesk_types::Category::Crypto, market_core::Category::Crypto),
-            (oracledesk_types::Category::Macro, market_core::Category::Macro),
+            (
+                oracledesk_types::Category::Crypto,
+                market_core::Category::Crypto,
+            ),
+            (
+                oracledesk_types::Category::Macro,
+                market_core::Category::Macro,
+            ),
             (
                 oracledesk_types::Category::Geopolitics,
                 market_core::Category::Geopolitics,
             ),
-            (oracledesk_types::Category::Sports, market_core::Category::Sports),
+            (
+                oracledesk_types::Category::Sports,
+                market_core::Category::Sports,
+            ),
             (
                 oracledesk_types::Category::Culture,
                 market_core::Category::Culture,
             ),
-            (oracledesk_types::Category::Other, market_core::Category::Other),
+            (
+                oracledesk_types::Category::Other,
+                market_core::Category::Other,
+            ),
         ] {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
@@ -5397,7 +5591,10 @@ mod golden {
         let env = Env::default();
         let declared = hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600));
         let canonical = hex_of(&env, &signers(&env, &[G3, G1, G2], 2, 3_600));
-        assert_eq!(declared, "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee");
+        assert_eq!(
+            declared,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
         assert_ne!(declared, canonical);
     }
 

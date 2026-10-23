@@ -378,6 +378,32 @@ markers in the files themselves:
   risk, not systemic market behavior. `agents/sim` now quantifies this
   (see `docs/simulation.md`, experiment B): with k identical deployments,
   capital at risk grows linearly in k while total profit does not.
+- **Unredeemed shares expire after the redemption window.** Each market
+  snapshots a redemption horizon at creation (default 365 days; the admin
+  default is bounded to 180–1825 days). Once `finalized_at + horizon_secs`
+  has passed, anyone can call `finalize_market`, which sweeps the market's
+  **entire** remaining balance — expired user claims, void rounding dust,
+  any unclaimed LP remainder and accrued fees — to the treasury and closes
+  redemption (`redeem`/`claim_pool_remainder` then revert with
+  `RedemptionClosed`). Redeeming before the deadline always pays the exact
+  `settle_value`; expired claims go to the treasury, not the LP. Markets
+  created before this `SettleState` bookkeeping (issue #14) have no deadline
+  and cannot be finalized (`NotSupported`), and stay redeemable through the
+  old paths. A market waiting on a multi-year deadline can be
+  TTL-archived before it is finalized and needs a restore (or the keeper,
+  `docs/wave-issues/14-storage-ttl-keeper.md`) first; the deadline itself is
+  on-chain state, so a late finalization is still exact.
+- **The TWAP ring keeps only the most recent 16 observations.** Each
+  observation is written per trade timestamp, so 16 distinct-timestamp trades
+  supersede the creation point: `observe`/`twap` windows that reach further
+  back than the surviving ring revert with `ObservationTooOld` rather than
+  returning a value. Windows that extend past the newest observation keep
+  averaging the last traded price (the accumulator extends
+  counterfactually), including past `close_time` until a resolver action.
+  `twap` divides with floor rounding; off-chain mirroring code must floor
+  identically. Markets created before the accumulator (issue #11) return
+  `NotSupported` from `observe`/`twap`/`price_cumulative`, and an archived
+  `Oracle`/`Obs` entry needs a restore like any other entry.
 - **Expiry cannot help an oracle the creator controls.** `expire_market`
   voids unresolvable markets 30 days after close, but a creator who commits
   to a feed they control can still decide the outcome of a *resolvable*

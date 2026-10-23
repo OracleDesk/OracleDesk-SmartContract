@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod ttl;
+
 // The test module builds over-length `action`/`ipfs_cid` strings with
 // `str::repeat`, which lives in `alloc`/`std`; the crate itself stays
 // `no_std`.
@@ -10,6 +12,11 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
     Env, String, Vec,
 };
+
+/// Rolling window for trace entries, unchanged from the pre-#16 policy:
+/// 60 days, extended at half that. Registration (`Agent`) instead uses
+/// `ttl::long_lived_target` and is refreshed by every `publish_trace`.
+const TRACE_TARGET: u32 = 60 * ttl::DAY_IN_LEDGERS;
 
 mod market_core {
     #[allow(clippy::too_many_arguments)]
@@ -405,7 +412,11 @@ impl ReasoningRegistry {
             status: AgentStatus::Active,
             registered_at: now,
         };
-        Self::put(&env, &DataKey::Agent(agent.clone()), &record);
+        let agent_key = DataKey::Agent(agent.clone());
+        Self::put(&env, &agent_key, &record);
+        // Registration is long-lived (issue #16), not the 60-day trace window
+        // `put` bumps to, and is refreshed again on every `publish_trace`.
+        ttl::bump_persistent(&env, &agent_key, ttl::long_lived_target(&env));
         AgentRegistered { agent }.publish(&env);
         Ok(())
     }
@@ -462,6 +473,8 @@ impl ReasoningRegistry {
         Self::retire_agent(env, agent)
     }
 
+    /// Read-only view: no TTL writes, so an indexer's simulation stays cheap.
+    /// The `Agent` entry is refreshed by `register_agent`/`publish_trace`.
     pub fn is_registered(env: Env, agent: Address) -> bool {
         Self::load_agent(&env, &agent).map_or(false, |r| matches!(r.status, AgentStatus::Active))
     }
@@ -478,7 +491,15 @@ impl ReasoningRegistry {
         trace_hash: BytesN<32>,
         ipfs_cid: String,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        // Refresh the registration TTL on every publish (#16): without this a
+        // long-running agent's `Agent` entry archives and later publishes fail.
+        ttl::bump_persistent(
+            &env,
+            &DataKey::Agent(agent.clone()),
+            ttl::long_lived_target(&env),
+        );
         // Once an agent keeps a chained log, unchained traces would sit outside
         // it unseen, so they're refused (#52).
         if Self::load_head(&env, &agent).seq > 0 {
@@ -502,7 +523,13 @@ impl ReasoningRegistry {
         expected_seq: u64,
         prev_trace_hash: BytesN<32>,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        ttl::bump_persistent(
+            &env,
+            &DataKey::Agent(agent.clone()),
+            ttl::long_lived_target(&env),
+        );
         let head = Self::load_head(&env, &agent);
         if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
             return Err(Error::ChainHeadMismatch);
@@ -634,6 +661,9 @@ impl ReasoningRegistry {
         Self::commitment_for(&env, &trace_hash, &salt) == commitment
     }
 
+    /// Extends `Trace` on read, as before (a write in a view: simulation
+    /// footprints are read-write, kept for compatibility and noted in
+    /// `docs/architecture.md`).
     pub fn get_trace(env: Env, trace_id: u64) -> Result<Trace, Error> {
         let key = DataKey::Trace(trace_id);
         let trace: Trace = env
@@ -641,9 +671,7 @@ impl ReasoningRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::TraceNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        ttl::bump_persistent(&env, &key, TRACE_TARGET);
         Ok(trace)
     }
 
@@ -751,7 +779,10 @@ impl ReasoningRegistry {
         Ok(Self::trace_verdict(env, trace_id, received_hash)? == TraceVerdict::Valid)
     }
 
+    /// Reads the instance's `NextId`; the bump keeps the instance (and with
+    /// it the whole contract) alive under view-only traffic.
     pub fn trace_count(env: Env) -> u64 {
+        ttl::bump_instance(&env);
         env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
 
@@ -1685,6 +1716,7 @@ impl ReasoningRegistry {
     }
 
     fn require_admin(env: &Env) -> Result<(), Error> {
+        ttl::bump_instance(env);
         let admin: Address = env
             .storage()
             .instance()
@@ -1699,7 +1731,10 @@ impl ReasoningRegistry {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Ledger as _, MockAuth, MockAuthInvoke,
+        },
         IntoVal,
     };
 
@@ -1894,6 +1929,68 @@ mod test {
             )
             .is_err());
     }
+
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    fn publish_trace_at_day(
+        client: &ReasoningRegistryClient,
+        env: &Env,
+        agent: &Address,
+        day: u64,
+    ) {
+        let trace_hash = BytesN::from_array(env, &[day as u8; 32]);
+        let cid = String::from_str(env, "ipfs://publish-refresh");
+        client.publish_trace(
+            agent,
+            &(100 + day),
+            &String::from_str(env, "trade"),
+            &trace_hash,
+            &cid,
+        );
+    }
+
+    #[test]
+    fn agent_entry_extended_on_publish() {
+        let (env, client, _, agent) = setup();
+        let max_ttl = 3_110_400u32;
+        env.ledger().set_max_entry_ttl(max_ttl);
+        env.ledger().set_min_persistent_entry_ttl(4_096);
+        let agent_key = DataKey::Agent(agent.clone());
+
+        client.register_agent(&agent);
+        assert!(persistent_ttl(&env, &client.address, &agent_key) >= max_ttl - 1);
+
+        // Day 0 and day 59 publishes; the day-100 publish only succeeds if the
+        // registration was not archived in between (it would be past the old
+        // 60-day window with no `Agent` extension on publish).
+        publish_trace_at_day(&client, &env, &agent, 0);
+        advance_ledgers(&env, 59 * ttl::DAY_SECS);
+        publish_trace_at_day(&client, &env, &agent, 59);
+
+        advance_ledgers(&env, 41 * ttl::DAY_SECS);
+        let before = persistent_ttl(&env, &client.address, &agent_key);
+        assert!(before < max_ttl / 2, "refresh was already due at day 100");
+        assert!(client.is_registered(&agent));
+
+        publish_trace_at_day(&client, &env, &agent, 100);
+        assert!(
+            persistent_ttl(&env, &client.address, &agent_key) >= max_ttl - 1,
+            "publish_trace did not refresh the Agent entry"
+        );
+        assert_eq!(instance_ttl(&env, &client.address), ttl::INSTANCE_TARGET);
 
     // ── #52 hash-chained traces ──────────────────────────────────────────
 

@@ -94,6 +94,22 @@ export type LiveResult<T> = { dryRun: false; value: T };
 
 export type AdapterResult<T> = DryRunResult | LiveResult<T>;
 
+/** Snapshot of a market's read-only state, from `readMarket`. */
+export interface MarketRead {
+  marketId: number;
+  /** IPFS CID / URI of the question metadata (the question text itself is
+   * stored off-chain; see docs/frontend-integration.md). */
+  metaUri: string;
+  closeTime: number;
+  reserveYes: bigint;
+  reserveNo: bigint;
+  /** YES spot price in bps (0..=10_000), from `get_price`. */
+  yesBps: number;
+  /** YES time-weighted average over the requested `useTwapSecs` window,
+   * from `twap`. Present only when `useTwapSecs` was passed. */
+  twapBps?: number;
+}
+
 /**
  * The call failed before a transaction was submitted (building or
  * simulating it — e.g. a treasury cap rejection), so it certainly has no
@@ -507,6 +523,51 @@ export class StellarAdapter {
       call,
       (client) => client.publish_trace_signed(call),
     );
+  }
+
+  /**
+   * Reads a market's price state. Unlike the write wrappers above, a read
+   * always queries the network — through the bindings' simulation, which
+   * never signs or submits — so it works identically in dry-run and live
+   * mode and there is no offline stand-in to return.
+   *
+   * `useTwapSecs` additionally reads `twap(market_id, useTwapSecs)`: the
+   * time-weighted average over that trailing window, which a single
+   * transaction cannot move (see market-core's accumulator, issue #11).
+   * Prefer it over spot for any automated trading loop.
+   */
+  async readMarket(
+    marketId: bigint,
+    opts: { useTwapSecs?: number } = {},
+  ): Promise<MarketRead> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const marketTx = await client.get_market({ market_id: marketId });
+    const market = marketTx.result.unwrap() as {
+      meta_uri: string;
+      close_time: bigint;
+      reserve_yes: bigint;
+      reserve_no: bigint;
+    };
+    const priceTx = await client.get_price({
+      market_id: marketId,
+      outcome: { tag: "Yes", values: undefined },
+    });
+    const read: MarketRead = {
+      marketId: Number(marketId),
+      metaUri: market.meta_uri,
+      closeTime: Number(market.close_time), // unix seconds, safe as number
+      reserveYes: market.reserve_yes,
+      reserveNo: market.reserve_no,
+      yesBps: priceTx.result.unwrap() as number,
+    };
+    if (opts.useTwapSecs !== undefined) {
+      const twapTx = await client.twap({
+        market_id: marketId,
+        window_secs: BigInt(opts.useTwapSecs),
+      });
+      read.twapBps = twapTx.result.unwrap() as number;
+    }
+    return read;
   }
 }
 
