@@ -21,6 +21,10 @@ repository, rather than opening a public issue. This applies to:
   already covered).
 - A way to make the resolution-commitment scheme (ADR 0001) or the treasury
   cross-contract auth flow (ADR 0002) behave differently from documented.
+- A way to break the market-core complete-set invariants: `split` / `merge`
+  (added in this revision) must never change `reserve_yes`, `reserve_no` or `fees_accrued`, must preserve
+  `reserve_yes + Σpos.yes` == `sets_minted` (and the NO analogue), and must not let
+  total `settle_value` payouts exceed `sets_minted`.
 - A vulnerability in the x402 payment/verification flow that would let a
   trace be served without payment, or without its hash matching the
   on-chain record.
@@ -72,3 +76,39 @@ arbitrary cancellations:
   (`MAX_CANCELS_PER_MARKET`) to prevent indefinite griefing.
 - **Mandatory reason codes and public audit trail**: Every guardian action emits
   a `GuardianAction` event recording a typed `GuardianReason` and timestamp.
+
+## Complete-set split / merge (market-core)
+
+`split` and `merge` are fee-free complete-set primitives that never touch the
+FPMM pool. The following security decisions are recorded here and in
+`docs/architecture.md`:
+
+- `split` requires an `Open` market and `now < close_time` (reuses
+  `assert_tradable`) and is gated by `assert_not_paused`. After close there is no
+  purpose to split, and allowing it would open timing games against the
+  resolution process.
+- `merge` requires an `Open` market but is **allowed after `close_time` and
+  while paused**. Merging is a pure exit: it burns one YES and one NO and
+  returns one unit of collateral at par. It cannot harm the pool, change
+  `reserve_yes` / `reserve_no` / `fees_accrued`, or move a price, so letting
+  users de-risk while the resolver is slow or the contract is paused is
+  desirable. The asymmetry with `split` is intentional.
+- Neither entrypoint changes `reserve_yes`, `reserve_no` or `fees_accrued`. They
+  preserve `sets_minted == reserve_yes + Σpos.yes` (and the NO analogue)
+  and `token.balance == sets_minted + fees_accrued`, and the total of
+  `settle_value` payouts across all holders plus the pool never exceeds
+  `sets_minted`. Tests in `contracts/market-core/src/lib.rs` assert this
+  across mixed split/buy/sell/merge sequences and under Void.
+- **MAX_SETS griefing.** `split` is bounded by the same `sets_minted` cap as
+  `buy`, so an attacker can split up to `MAX_SETS` and block further `buy`
+  calls (`ErrorMarketTooLarge`) at the cost of locking collateral, then
+  `merge` out at par risk-free. This is a deliberate trade-off: the capital
+  locked is the attacker's own, the attack is visible on-chain, and a
+  per-market split cap or excluding split sets from the buy limit would add
+  complexity that is not justified for a testnet-only, unaudited deployment.
+  The decision is documented in `docs/architecture.md`.
+- **Void dust.** Split increases the number of holders that can each lose up to
+  0.5 unit to flooring under Void. This is bounded by the number of holders
+  and the collateral locked by those holders, and is not a drain vector.
+- `sell` uses `sets_minted.checked_sub` for the same reason `split` uses
+  `checked_add`: the invariant must never underflow.

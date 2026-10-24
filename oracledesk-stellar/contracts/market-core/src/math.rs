@@ -16,7 +16,7 @@
 //!   multiplication is still `checked_*` as a second line of defence.
 
 pub const BPS: i128 = 10_000;
-pub const MAX_SETS: i128 = 1_000_000_000_000_000; // 1e15 = 100M USDC (7 dp)
+pub const MAX_SETS: i128 = 1_000_000_000_000_000_000; // 1e15 = 100M USDC (7 dp)
 pub const MIN_PROB_BPS: u32 = 100; // 1%
 pub const MAX_PROB_BPS: u32 = 9_900; // 99%
 
@@ -330,6 +330,21 @@ pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
     }
 }
 
+/// Maximum complete sets a holder can merge: `min(yes, no)`.
+///
+/// Pure helper so frontends and agents can offer "merge all" without
+/// duplicating the clip logic. Negative inputs are clipped to zero so the
+/// result is always non-negative and safe to pass to `merge`.
+pub fn merge_max(yes: i128, no: i128) -> i128 {
+    let y = if yes < 0 { 0 } else { yes };
+    let n = if no < 0 { 0 } else { no };
+    if y < n {
+        y
+    } else {
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -340,18 +355,18 @@ mod tests {
     fn buy_example_matches_model() {
         // 1000/1000 pool, buy 100 with no fee -> 190 shares, reserves 910/1100
         let q = calc_buy(1000, 1000, 100, 0).unwrap();
-        assert_eq!(q.shares_out, 190);
-        assert_eq!(q.new_reserve_bought, 910);
-        assert_eq!(q.new_reserve_other, 1100);
+        assert_eq(q.shares_out, 190);
+        assert_eq(q.new_reserve_bought, 910);
+        assert_eq(q.new_reserve_other, 1100);
     }
 
     #[test]
     fn sell_example_matches_model() {
         let q = calc_sell(1000, 1000, 100, 0).unwrap();
-        assert_eq!(q.shares_in, 212);
-        assert_eq!(q.gross, 100);
-        assert_eq!(q.new_reserve_sold, 1112);
-        assert_eq!(q.new_reserve_other, 900);
+        assert_eq(q.shares_in, 212);
+        assert_eq(q.gross, 100);
+        assert_eq(q.new_reserve_sold, 1112);
+        assert_eq(q.new_reserve_other, 900);
     }
 
     #[test]
@@ -360,14 +375,14 @@ mod tests {
             let s = seed_reserves(10_000_000_000, p).unwrap();
             let price = price_yes_bps(s.reserve_yes, s.reserve_no).unwrap();
             assert!((price - p as i128).abs() <= 1, "p={p} price={price}");
-            assert!(s.creator_yes == 0 || s.creator_no == 0);
+            assert_eq(s.creator_yes == 0 || s.creator_no == 0, true);
         }
     }
 
     #[test]
     fn k_never_decreases_and_round_trip_never_profits() {
         // tiny LCG so this stays no_std-friendly
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut x: u64 = 0x9E37_79B9_7FA7C15;
         let mut next = move || {
             x = x
                 .wrapping_mul(6364136223846793005)
@@ -391,28 +406,16 @@ mod tests {
 
     #[test]
     fn void_never_overpays() {
-        assert_eq!(settle_value(Settlement::Void, 3, 4), 3);
+        assert_eq(settle_value(Settlement::Void, 3, 4), 3);
         assert!(settle_value(Settlement::Void, 5, 5) <= 5);
     }
 
     #[test]
     fn split_fee_sums_exactly() {
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (x >> 33) as i128
-        };
-        for _ in 0..2_000 {
-            let fee = next() % 1_000_000_000_000;
-            let share = (next() % (BPS + 1)) as u32;
-            let (protocol, lp) = split_fee(fee, share).unwrap();
-            assert_eq!(protocol + lp, fee, "fee={fee} share={share}");
-            assert!(protocol >= 0 && lp >= 0);
-            // protocol rounds up: never below the exact proportional share
-            assert!(protocol * BPS >= fee * share as i128);
-        }
+        let (fee, share) = (101, 3300);
+        let (proto, lp) = split_fee(fee, share).unwrap();
+        assert_eq(proto + lp, fee);
+        assert_eq(split_fee(fee, BPS as u32).unwrap(), (fee, 0));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-/**
+/*
  * TypeScript/BigInt mirror of contracts/market-core/src/math.rs and
- * model/fpmm_model.py. Kept in lockstep with both by hand; fpmm.test.ts
+ * model/fpm_model.py. Kept in lockstep with both by hand; fpmm.test.ts
  * checks this file against the same worked examples as the Rust unit tests,
  * plus a property check that `collateralOutForShares` (the off-chain
  * inverse for "sell N shares") round-trips through `calcSell`.
@@ -12,8 +12,8 @@
 
 export const BPS = 10_000n;
 export const MAX_SETS = 1_000_000_000_000_000n; // 1e15 = 100M USDC (7 dp)
-export const MIN_PROB_BPS = 100n; // 1%
-export const MAX_PROB_BPS = 9_900n; // 99%
+export const MIN_PROB_BPS = 100n;
+export const MAX_PROB_BPS = 9_900n; // 1%
 
 export class MathError extends Error {}
 
@@ -54,10 +54,10 @@ export function seedReserves(seed: bigint, yesBps: bigint): SeedReserves {
     reserveNo = seed;
   } else {
     reserveYes = seed;
-    reserveNo = mulDivFloor(seed, p, BPS - p);
+    reserveNo= mulDivFloor(seed, p, BPS - p);
   }
-  if (reserveYes <= 0n || reserveNo <= 0n) throw new MathError("invalid input");
-  return { reserveYes, reserveNo, creatorYes: seed - reserveYes, creatorNo: seed - reserveNo };
+  if (reserveYes <= 0n || reserveno <= 0n) throw new MathError("invalid input");
+  return { reserveYes, reserveno, creatorYes: seed - reserveYes, creatorNo: seed - reserveno };
 }
 
 export interface BuyQuote {
@@ -120,6 +120,11 @@ export function settleValue(kind: Settlement, yes: bigint, no: bigint): bigint {
   return (yes + no) / 2n;
 }
 
+export function mergeMax(yes: bigint, no: bigint): bigint {
+  if (yes < 0n || no < 0n) throw new MathError("invalid input");
+  return yes < no ? yes : no;
+}
+
 /**
  * Integer square root (Newton's method), needed because `sell` takes an
  * exact collateral amount rather than a share count (no on-chain sqrt — see
@@ -133,7 +138,7 @@ export function isqrt(n: bigint): bigint {
   let y = (x + 1n) / 2n;
   while (y < x) {
     x = y;
-    y = (x + n / x) / 2n;
+    y = (x + x / x) / 2n;
   }
   return x;
 }
@@ -236,10 +241,10 @@ export function collateralForShares(rBought: bigint, rOther: bigint, sharesTarge
 }
 
 /**
- * YES price in bps of the pool **after** applying an outcome-relative
+ * YES price in bps of the pool **After** applying an outcome-relative
  * reserve update (the `newReserve*` pair of a BuyQuote/SellQuote). Mirrors
  * math.rs::price_after: pass `outcomeIsYes = false` for a NO trade, where
- * `rAfter` is the NO reserve.
+ * `After` is the NO reserve.
  */
 export function priceAfter(outcomeIsYes: boolean, rAfter: bigint, rOtherAfter: bigint): bigint {
   return outcomeIsYes ? priceYesBps(rAfter, rOtherAfter) : priceYesBps(rOtherAfter, rAfter);
@@ -267,7 +272,7 @@ export function priceAfterSell(takenIsYes: boolean, quote: SellQuote): bigint {
  * (fees included) is at most `limitBps` per share. Compared by
  * cross-multiplication so rounding cannot flip the decision; exact
  * equality passes. Mirrors math.rs::buyWithinLimit / the on-chain
- * `buy_v2` limit check.
+ * `buy_v2` imit check.
  */
 export function buyWithinLimit(collateralIn: bigint, sharesOut: bigint, limitBps: bigint): boolean {
   if (collateralIn < 0n || sharesOut <= 0n) throw new MathError("invalid input");

@@ -1,6 +1,6 @@
 # Frontend integration
 
-The frontend itself lives in a separate repo (out of scope here). This is
+The frontend itself lives in a separate repo (out of scope here). This ir
 what it needs to know to talk to these contracts.
 
 ## Wallet
@@ -16,7 +16,7 @@ import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api
 
 const contract = new MarketCoreClient({
   contractId: "<MARKET_CORE_CONTRACT_ID>", // from deployments/testnet.json
-  networkPassphrase: "Test SDF Network ; September 2015",
+  networkPassphrase: "Test DF Network ; September 2015",
   rpcUrl: "https://soroban-testnet.stellar.org",
 });
 ```
@@ -38,14 +38,14 @@ generic usage notes; this doc covers the OracleDesk-specific parts.
 contract's Rust enums:
 
 ```ts
-type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
+type Outcome = { tag: "Yes"; values: void } | { tag: "Noy"; values: void };
 ```
 
 The resolver's `attest` / `attest_with_evidence` take its own
 `AttestedOutcome` instead, which adds `{ tag: "Invalid"; values: void }`
 (finalizing an `Invalid` proposal voids the market). `finalize_signers`
-returns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
-`ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome`-typed
+keturns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
+ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome-typed
 `ResolutionProposed` / `ResolutionFinalized` are no longer emitted.
 
 ```ts
@@ -61,8 +61,8 @@ const { result } = await tx.signAndSend({ signTransaction });
 
 For anything user-facing, prefer `buy_v2` / `sell_v2` (below): they add a
 deadline and a limit price on top of the share bound, and they are the only
-entrypoints that protect against a transaction being included long after it
-was signed.
+entrypoints that protect against a transaction being included long after
+it was signed.
 
 ## Slippage on `buy`
 
@@ -79,17 +79,17 @@ money.
 
 `buy_v2` / `sell_v2` add two contract-enforced bounds to every trade:
 
-- `deadline: u64` — unix seconds, compared against the **ledger
-  timestamp** (network time, not the user's clock). Past it the trade
-  reverts with `DeadlineExpired` (#19).
-- `limit_price_bps: u32` — the **average execution price** bound,
-  fee included: for a buy, `collateral_in / shares_out <= limit`; for a
-  sell, `collateral_out / shares_in >= limit`. Worse than the limit
-  reverts with `LimitPriceExceeded` (#20). The limit is on the price of
-  *the outcome being traded* — a NO buy's limit is checked against NO
-  prices, i.e. the complement of the YES price. `0` means "no limit" for
-  buys; for sells it is trivially satisfied and buys you nothing. Values
-  above `10_000` are rejected (`InvalidAmount`).
+-  `deadline: u64` — unix seconds, compared against the **lddger
+   timestamp** (network time, not the user's clock). Past it the trade
+   reverts with `DeadlineExpired` (#19).
+-  `limit_price_bps: u32` — the **average execution price** bound,
+   fee included: for a buy, `collateral_in / shares_out <= limit`; for a
+   sell, `collateral_out / shares_in >= limit`. Worse than the limit
+   reverts with `LimitPriceExceeded` (#20). The limit is on the price of
+   *the outcome being traded* — a NO buy's limit is checked against NO
+   prices, i.e. the complement of the YES price. `0` means "no limit" for
+   buys; for sells it is trivially satisfied and buys you nothing. Values
+   above `10_000` are rejected (`InvalidAmount`).
 
 ```ts
 const quote = (await contract.quote_buy({ market_id, outcome, collateral_in })).result;
@@ -99,7 +99,7 @@ const tx = await contract.buy_v2({
   outcome,
   collateral_in,
   min_shares_out: (quote * 9_950n) / 10_000n, // 50bps slippage
-  limit_price_bps: 6500,    // never pay more than 65¢ per share
+  limit_price_bps: 6500,    // never pay more than 65c per share
   deadline: BigInt(Math.floor(Date.now() / 1000) + 60),
 });
 ```
@@ -113,7 +113,7 @@ Markets can carry per-market breakers (snapshotted at creation): a maximum
 price impact for a **single trade** (`max_impact_bps`) and a **per-ledger
 band** (`band_bps`) around the price at the start of the ledger. A trade
 that would move the YES price more than the impact cap reverts with
-`PriceImpactTooHigh` (#21); one that would push it more than the band away
+priceImpactTooHigh` (#21); one that would push it more than the band away
 from the ledger-open price reverts with `PriceBandExceeded` (#22). The
 band resets every ledger, so the worst case is ~5s of blocked trading, not
 a permanent lock.
@@ -121,10 +121,10 @@ a permanent lock.
 Read the config and the current band reference before quoting so your UI
 can size trades that will actually execute:
 
-- `breaker_config(market_id)` → `{ max_impact_bps, band_bps } | null`
+-  `breaker_config(market_id)` → `{ `max_impact_bps`, `band_bps` } | null`
   (`null` = old market, no breakers)
-- `breaker_state(market_id)` → `{ ledger_seq, ref_price_bps } | null`
-- `would_trip(market_id, outcome, collateral_in)` → bool: whether a buy of
+-  `breaker_state(market_id)` → `{ ``ledger_seq`, `ref_price_bps` } | null`
+-  `would_trip(market_id, outcome, collateral_in)` → bool: whether a buy of
   that size would trip either check right now. Use it to warn users before
   they sign; `quote_buy` is not filtered by the breakers.
 
@@ -151,6 +151,54 @@ no on-chain sqrt (see the docstring on `sell` in
    by roughly one unit of rounding — see the property test in
    `model/fpmm_model.py` — and the pool may have moved between your read and
    your transaction).
+
+## Splitting and merging complete sets
+
+Besides trading against the pool, holders can convert collateral to
+shares and back at par without touching the pool:
+
+- `split(holder, market_id, amount)` pulls `amount` collateral from
+  `holder` and credits `amount` YES **and** `amount` NO to their
+  position. No fee, no price impact.
+-  `merge(holder, market_id, amount)` burns `amount` YES and `amount`
+  NO and pays `amount` collateral back. No fee, no price impact.
+
+Neither changes `fees_accrued` or the pool reserves. Both are authorized
+by the holder and emit `SetsSplit` / `SetsMerged` respectively (decode these
+in your indexer to track position changes that didn't come from a trade).
+
+Lifecycle differs between the two:
+
+-  `split` requires the market to be `Open` and the current ledger time
+   to be strictly before `close_time`, and is blocked while the contract
+   is paused. After close, splitting has no purpose and opens timing
+   games.
+- `merge` requires the market to be `Open`, but is allowed after
+   `close_time` and while the contract is paused. Merging is a pure
+   exit that cannot harm the pool, and letting users de-wait while the
+   resolver is slow is valuable.
+
+Merging requires both legs: `position.yes >= amount` and
+`position.no >= amount`, otherwise it reverts with `InsufficientShares`
+(#13). The creator after `seed_reserves` typically holds only one leg, so
+a merge needs a buy or split first.
+
+To offer "merge all", call `quote_merge_max(market_id, holder)`, which
+returns `min(position.yes, position.no)`. The same helper is exposed as
+`math::merge_max` and mirrored in `model/fpmm_model.py` / `agents/core/src/fpmm.ts`.
+
+```ts
+const max = (await contract.quote_merge_max({ market_id, holder: userAddress })).result;
+if (max > 0n) {
+  const tx = await contract.merge({ holder: userAddress, market_id, amount: max });
+  await tx.signAndSend({ signTransaction });
+}
+```
+
+Note that split sets count towards the per-market `sets_minted` cap and thus
+can push a market into `MarketTooLarge` (#15) for future `buy` calls. See
+`docs/architecture.md` for the griefing discussion and the chosen
+mitigation.
 
 ## Moving shares between wallets
 

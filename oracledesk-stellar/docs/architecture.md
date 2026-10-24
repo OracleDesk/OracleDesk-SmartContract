@@ -17,6 +17,69 @@ natively unit-testable and mirrored line-for-line in
 [`model/fpmm_model.py`](../model/fpmm_model.py) and
 `agents/core/fpmm.ts` for property testing and off-chain quoting.
 
+**Split and merge (complete-set primitives).** Two pool-free entrypoints
+convert between collateral and complete sets, modelled on Gnosis's
+Conditional Tokens `splitPosition` / `mergePositions`:
+
+- `split(holder, market_id, amount)` pulls `amount` collateral from `holder`
+  and credits `amount` YES **and** `amount` NO to `holder`'s `Position`.
+  Requires `MarketStatus::Open` and `now < close_time` (reuses
+  `assert_tradable`) plus `assert_not_paused`; after close, splitting has no
+  purpose and would open timing games.
+- `merge(holder, market_id, amount)` debits `amount` YES and `amount` NO
+  (rejecting with `InsufficientShares` if either leg is short) and pays
+  `amount` collateral back to `holder`. Requires `MarketStatus::Open` but is
+  **allowed after `close_time` and while paused**: merging is a pure exit
+  that cannot harm the pool, and letting holders de-risk while the resolver
+  is slow is valuable. This asymmetry with `split` is deliberate.
+
+Neither touches `reserve_yes`, `reserve_no` or `fees_accrued`, and neither
+charges a fee. Both emit `SetsSplit` / `SetsMerged` (`market_id`, `holder`
+as topics, `amount` as data) so indexers can track positions. `split`
+performs its state writes before the token transfer, matching `buy`.
+`math::merge_max(yes, no) = min(yes, no)` (mirrored in the Python model and
+the TS agent core) backs the `quote_merge_max(market_id, holder)` view for
+frontends offering "merge all".
+
+The TS mirror lives in `agents/core/fpmm.ts` as `mergeMax(yes, no)` and must
+stay syntactically valid and in lockstep with `math::merge_max`; the agents
+test suite exercises known values against the Rust and Python implementations.
+
+**Invariant proof for split/merge.** Let `S = sets_minted`,
+`R_y, R_n` be the reserves and `Σpos.yes, Σpos.no` the summed holder legs.
+
+- *Split* adds `amount` to `S`, to `Σpos.yes` and to `Σpos.no`, so
+  `R_y + Σpos.yes == S` (and the NO twin) is preserved. The collateral
+  balance grows by exactly `amount`, so `balance == S + fees_accrued +
+  lp_fees` holds.
+- *Merge* subtracts `amount` from `S` and from both sums, and pays out
+  `amount` collateral; the same two equalities are preserved.
+- *Settlement.* Resolved(Yes) pays `R_y + Σpos.yes = S`. Void pays
+  `Σ floor((y_i + n_i)/2) + floor((R_y + R_n)/2) <= (Σ(y_i + n_i) + R_y +
+  R_n)/2 = S`. Split can increase the number of holders each losing up to
+  0.5 unit to flooring, but the total is bounded by `S` — the
+  `void_total_payout_never_exceeds_sets_with_split` test asserts this.
+
+**MAX_SETS griefing (split).** `split` is bounded by `math::MAX_SETS`
+(`MarketTooLarge` above it), the same cap `buy` enforces. An attacker can
+therefore split up to `MAX_SETS` and block further `buy` calls at the cost
+of locking that much capital, then merge out risk-free. Decision: keep the
+shared cap rather than add a separate per-market split cap or exclude split
+sets from the `buy` limit. A separate cap would let `sets_minted` exceed
+`MAX_SETS` (breaking the settlement bound above), and excluding split sets
+from the `buy` limit would let `sets_minted` grow unbounded. The griefing
+cost is locking the full `MAX_SETS` of collateral, which is expensive and
+recoverable only by the attacker's own merge; the alternative designs are
+worse. This is documented as a known limitation.
+
+**Pause semantics for merge.** Because `merge` works while paused, a paused
+contract can still pay out collateral. This is intentional (a pure exit
+cannot harm the pool) and is recorded in `SECURITY.md`.
+
+**`sell` accounting.** `sell` now uses `checked_sub` for `sets_minted`
+(previously an unchecked `-=`), so a bug can never drive `S` negative and
+break the settlement bound.
+
 **Solvency invariant** (holds after every state transition — see the test
 suite for the ones exercised): the contract's own SEP-41 token balance for a
 market equals `sets_minted + fees_accrued + lp_fees` (`fees_accrued` is the
@@ -108,7 +171,10 @@ with bounds) → `resolve` or `void_market` (resolver-only) → `redeem` per
 holder, `claim_pool_remainder` for the creator/LP, `sweep_fees`
 (permissionless) to the snapshotted fee recipient. Positions and LP
 ownership can change hands at any point via `transfer_position` /
-`transfer_lp`.
+`transfer_lp`. While open, `split`/`merge` convert between collateral and
+complete sets without touching the pool (`split` before `close_time`,
+`merge` any time before resolution, including while paused). After
+finality, `redeem` handles both legs; `merge` is not used post-resolution.
 
 The contract maintains a global counter and a per-market figure:
 
@@ -305,6 +371,11 @@ directly would just be trading its own separate funds, not bypassing a cap
 on the treasury's money. The `*_v2` twins forward the same caps plus
 market-core's deadline / limit-price bounds, so a revert from either layer
 leaves the caps unchanged (the whole invocation is atomic).
+
+Treasury `agent_split` / `agent_merge` forwarders are **not** implemented
+yet (a non-goal of the split/merge change); agents that need the primitives
+call `market-core` directly today. They can be added later as thin wrappers
+that reuse the existing caps.
 
 **Agents.** The treasury keeps a registry of up to `MAX_AGENTS = 16` agents,
 each with an `AgentPolicy { roles, max_trade, max_daily, active }`. Roles are
@@ -985,6 +1056,10 @@ compatibility must be declared and is checked against the chain.
   deployments (this repo's or a fork's) from trading against the same
   market-core markets; the treasury's caps bound one agent deployment's own
   risk, not systemic market behavior.
+- MAX_SETS griefing via `split`: an attacker can split up to `MAX_SETS` and
+  block further `buy` calls (`MarketTooLarge`) at the cost of locking that
+  much collateral, then merge out risk-free. See the split/merge section
+  above for why the shared cap is kept.
 
 ### x402 payment preparation, settlement and replay
 

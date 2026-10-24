@@ -143,6 +143,17 @@ def settle_value(kind: str, yes: int, no: int) -> int:
     raise ValueError(f"unknown settlement kind {kind!r}")
 
 
+def merge_max(yes: int, no: int) -> int:
+    """Largest amount of complete sets a holder can merge: the smaller of
+    their YES and NO balances. Mirrors math.rs::merge_max; split/merge never
+    touch the pool, so this is a pure min over the holder's position."""
+    if yes < 0 or no < 0:
+        raise MathError("invalid input")
+    return min(yes, no)
+
+
+
+
 def gross_for_shares(r_sold: int, r_other: int, shares_in: int, fee_bps: int) -> int:
     """Off-chain inverse of calc_sell: how many complete sets (`gross`) the
     pool must burn so that selling exactly `shares_in` shares balances the
@@ -354,6 +365,25 @@ def _check_void_never_overpays():
     assert settle_value("void", 5, 5) <= 5
 
 
+def _check_merge_max_known_values():
+    """Pins the same worked examples as math.rs's merge_max tests."""
+    assert merge_max(0, 0) == 0
+    assert merge_max(5, 0) == 0
+    assert merge_max(0, 7) == 0
+    assert merge_max(3, 3) == 3
+    assert merge_max(10, 4) == 4
+    assert merge_max(4, 10) == 4
+    assert merge_max(MAX_SETS, MAX_SETS) == MAX_SETS
+    try:
+        merge_max(-1, 5)
+    except MathError:
+        pass
+    else:
+        raise AssertionError("merge_max accepted a negative balance")
+
+
+
+
 def _check_price_after_maps_both_sides():
     """Mirrors math.rs's price_after tests: outcome_is_yes selects which of
     the two post-trade reserves is the YES reserve."""
@@ -484,6 +514,7 @@ def run_all():
     _check_k_never_decreases_and_round_trip_never_profits()
     _check_gross_for_shares_inverts_calc_sell()
     _check_void_never_overpays()
+    _check_merge_max_known_values()
     _check_price_after_maps_both_sides()
     _check_limits_boundary_and_symmetry()
     _check_collateral_for_shares_is_minimal()
