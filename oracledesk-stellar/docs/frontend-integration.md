@@ -134,23 +134,52 @@ the error codes above and the views here.
 
 ## Selling an exact share count
 
-`sell` takes an exact `collateral_out`, not a share count — market-core has
-no on-chain sqrt (see the docstring on `sell` in
-`contracts/market-core/src/lib.rs`). To sell a specific number of shares:
+Use `sell_shares` to sell an exact number of outcome shares. The
+contract does the curve inversion on-chain (including an exact integer
+square root) and rounds in the pool's favour, so you never have to invert anything off-chain or pad the share bound.
 
-1. Compute the matching `collateral_out` off-chain with the same quadratic
-   inversion the contract's math uses. `model/fpmm_model.py`'s
-   `collateral_out_for_shares(r_sold, r_other, shares_in, fee_bps)` is the
-   reference implementation; `agents/core`'s TypeScript port (BigInt-based,
-   for the browser/Node) is `grossForShares` / `collateralOutForShares` in
-   `agents/core/src/fpmm.ts`.
-2. Read the market's current `reserve_yes`/`reserve_no` and `fee_bps` via
-   `get_market(market_id)` to feed that function.
-3. Call `sell` with the computed `collateral_out` and a `max_shares_in` set
-   a little above your target share count (the off-chain estimate can be off
-   by roughly one unit of rounding — see the property test in
-   `model/fpmm_model.py` — and the pool may have moved between your read and
-   your transaction).
+```ts
+const quote = (await contract.quote_sell_shares({
+  market_id,
+  outcome,
+  shares_in: 375_000_000n, // 37.5 YES shares
+})).result;
+
+const tx = await contract.sell_shares({
+  trader: userAddress,
+  market_id,
+  outcome,
+  shares_in: 375_000_000n,
+  min_collateral_out: (quote * 9_950n) / 10_000n, // 50bps slippage
+});
+```
+
+Behaviour and errors:
+
+- Returns the exact `collateral_out` transferred to the trader.
+- `SlippageExceeded` (#12) if `collateral_out < min_collateral_out`.
+- `InsufficientShares` (#13) if the trader holds fewer than `shares_in`.
+- `InsufficientLiquidity` (#11) if the pool cannot absorb the size.
+- `InvalidInput` (#2) for non-positive `shares_in`, or when the resulting
+  `collateral_out` floors to zero (a tiny sell will revert rather than
+  silently burn shares).
+- Publishes the same `Trade` event as `sell` with `is_buy: false`, so
+  indexers need no schema change.
+
+To close a position entirely, pass `shares_in == held` (read via
+`get_position(market_id, holder)`). Selling the whole position removes the
+`Position` storage entry when the other side is also zero, so a "Sell all"
+button leaves no dust behind.
+
+`quote_sell_shares(market_id, outcome, shares_in)` returns the collateral
+a sell would pay *right now*. Like `quote_sell`, it does not check the
+market is tradable — it is a pure pricing view. Call it immediately before
+building the `sell_shares` transaction and pass a `min_collateral_out` a
+few bps below the quote.
+
+`sell` / `quote_sell` still take an exact `collateral_out` and return
+how many shares it costs, for backward compatibility. New code should prefer
+`sell_shares`.
 
 ## Moving shares between wallets
 
@@ -183,7 +212,27 @@ a verified reasoning trace in the UI:
    content without this check, since IPFS gateways are not authenticated.
 
 `x402/trace-verification.ts` has the reference hash-check implementation the
-frontend's check should match.
+frontend can port.
+
+## Off-chain math mirrors
+
+```ts
+import { calcSellShares } from "../agents/core/fpmm";
+```
+
+The exact share-to-collateral inverse is implemented in three places
+that must agree bit-for-bit:
+
+- "contracts/market-core/src/math.rs" — `isqrt` and `calc_sell_shares`
+  (the source of truth)
+- "model/fpmm_model.py" — `calc_sell_shares`
+- "agents/core/fpmm.ts" — `isqrt` and `calcSellShares`
+
+The older `collateralOutForShares` / `collateral_out_for_shares` inverses
+still exist but are deprecated: they do not apply the pool-favouring
+correction loop, so they can disagree with the contract by a few units.
+Prefer `sell_shares` / `quote_sell_shares` on-chain, or `calcSellShares` /
+`calc_sell_shares` off-chain.
 
 ### Bindings interface versions
 
