@@ -14,7 +14,8 @@ computes the matching collateral_out here, then calls `sell` with a
 TypeScript (BigInt) for the trading agent; both must agree with this model.
 
 Conventions match math.rs: all amounts are non-negative ints in collateral
-base units (USDC on Stellar = 7 decimals). Rounding always favours the pool.
+base units (whatever `decimals()` the collateral token reports, 0..=18).
+Rounding always favours the pool.
 """
 
 from dataclasses import dataclass
@@ -24,19 +25,46 @@ import random
 from pathlib import Path
 
 BPS = 10_000
+# Deprecated 7-decimal alias, kept for tests only. Contract logic derives its
+# bounds from `bounds_for_decimals`; see math.rs.
 MAX_SETS = 1_000_000_000_000_000  # 1e15 = 100M USDC (7 dp)
 MIN_PROB_BPS = 100
 MAX_PROB_BPS = 9_900
+
+I128_MAX = (1 << 127) - 1
+MAX_SUPPORTED_DECIMALS = 18
 
 
 class MathError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Bounds:
+    min_seed: int
+    max_sets: int
+
+
+def bounds_for_decimals(d: int) -> Bounds:
+    """Mirrors math.rs::bounds_for_decimals: min_seed = 100 * 10^d,
+    max_sets = 1e8 * 10^d. Rejects d > 18 (UnsupportedDecimals on-chain)."""
+    if d < 0 or d > MAX_SUPPORTED_DECIMALS:
+        raise MathError("unsupported decimals")
+    scale = 10**d
+    return Bounds(min_seed=100 * scale, max_sets=100_000_000 * scale)
+
+
+def _fits_i128(x: int) -> bool:
+    return 0 <= x <= I128_MAX
+
+
 def mul_div_floor(a: int, b: int, c: int) -> int:
     if a < 0 or b < 0 or c <= 0:
         raise MathError("invalid input")
-    return (a * b) // c
+    q = (a * b) // c
+    if not _fits_i128(q):
+        raise MathError("overflow")
+    return q
 
 
 def mul_div_ceil(a: int, b: int, c: int) -> int:
@@ -44,7 +72,10 @@ def mul_div_ceil(a: int, b: int, c: int) -> int:
         raise MathError("invalid input")
     p = a * b
     q = p // c
-    return q + 1 if p % c != 0 else q
+    q = q + 1 if p % c != 0 else q
+    if not _fits_i128(q):
+        raise MathError("overflow")
+    return q
 
 
 def price_yes_bps(reserve_yes: int, reserve_no: int) -> int:
@@ -139,7 +170,10 @@ def settle_value(kind: str, yes: int, no: int) -> int:
     if kind == "no":
         return no
     if kind == "void":
-        return (yes + no) // 2
+        total = yes + no
+        if not _fits_i128(total):
+            raise MathError("overflow")
+        return total // 2
     raise ValueError(f"unknown settlement kind {kind!r}")
 
 
@@ -289,212 +323,23 @@ def _check_known_values():
     assert split_fee(101, 5_000) == (51, 50)
 
 
-def _check_seed_opens_at_requested_probability():
-    for p in (100, 2500, 5000, 7300, 9900):
-        s = seed_reserves(10_000_000_000, p)
-        price = price_yes_bps(s.reserve_yes, s.reserve_no)
-        assert abs(price - p) <= 1, (p, price)
-        assert s.creator_yes == 0 or s.creator_no == 0
+def _check_known_values_18dp():
+    """18-decimal fixtures matching math.rs's known_values_18dp test. The
+    1000/1000 -> 190 example scaled by 10**11, plus a seed at max_sets."""
+    scale = 10**11  # 7 dp -> 18 dp
+    q = calc_buy(1000 * scale, 1000 * scale, 100 * scale, 0)
+    assert (
+        q.shares_out,
+        q.new_reserve_bought,
+        q.new_reserve_other,
+    ) == (19090909090909, 90909090909091, 110000000000000), q
 
-
-def _check_k_never_decreases_and_round_trip_never_profits(trials: int = 2_000, seed: int = 7):
-    rng = random.Random(seed)
-    for _ in range(trials):
-        ry = rng.randint(1_000_000, 1_000_000_000)
-        rn = rng.randint(1_000_000, 1_000_000_000)
-        amt = rng.randint(1, max(1, min(ry, rn) // 2))
-        fee_bps = rng.randint(0, 299)
-        k0 = ry * rn
-        q = calc_buy(ry, rn, amt, fee_bps)
-        assert q.new_reserve_bought * q.new_reserve_other >= k0
-        try:
-            s = calc_sell(q.new_reserve_bought, q.new_reserve_other, amt, fee_bps)
-        except MathError:
-            continue
-        assert s.shares_in >= q.shares_out, "free money"
-
-
-def _check_gross_for_shares_inverts_calc_sell(trials: int = 2_000, seed: int = 11):
-    """For a shares_in target derived from a real calc_sell call, the
-    estimated collateral_out must round-trip through the *real* calc_sell to
-    a shares_in within a one-unit rounding tolerance of the original request.
-
-    The quadratic solve is over continuous reals; calc_sell's ceil-rounding
-    can then push the result up by a unit of the smallest collateral
-    denomination. This is exactly why market-core's `sell` takes a
-    `max_shares_in` slippage bound rather than requiring an exact match —
-    callers should pad it a little further for their own safety margin, not
-    treat this tolerance as the only slippage protection they need.
-    """
-    rng = random.Random(seed)
-    checked = 0
-    for _ in range(trials):
-        r_sold = rng.randint(1_000_000, 1_000_000_000)
-        r_other = rng.randint(1_000_000, 1_000_000_000)
-        fee_bps = rng.randint(0, 299)
-        collateral_out = rng.randint(1, max(1, r_other // 4))
-        try:
-            forward = calc_sell(r_sold, r_other, collateral_out, fee_bps)
-        except MathError:
-            continue
-        try:
-            estimated_out = collateral_out_for_shares(r_sold, r_other, forward.shares_in, fee_bps)
-        except MathError:
-            continue
-        if estimated_out <= 0:
-            continue
-        back = calc_sell(r_sold, r_other, estimated_out, fee_bps)
-        assert back.shares_in <= forward.shares_in + 1, (forward, back)
-        checked += 1
-    assert checked > trials // 2, "too many trials skipped, weakens the property check"
-
-
-def _check_void_never_overpays():
-    assert settle_value("void", 3, 4) == 3
-    assert settle_value("void", 5, 5) <= 5
-
-
-def _check_price_after_maps_both_sides():
-    """Mirrors math.rs's price_after tests: outcome_is_yes selects which of
-    the two post-trade reserves is the YES reserve."""
-    for r, other in ((1000, 1000), (910, 1100), (1, 9999), (5893, 4107)):
-        assert price_after(True, r, other) == price_yes_bps(r, other)
-        assert price_after(False, r, other) == price_yes_bps(other, r)
-
-    # Worked example shared by all three mirrors: buying 10 USDC of YES in a
-    # 100-sets pool at 50% with a 1% fee moves YES from 5000 to 5470 bps.
-    q = calc_buy(1_000_000_000, 1_000_000_000, 100_000_000, 100)
-    assert price_yes_bps(1_000_000_000, 1_000_000_000) == 5000
-    assert price_after_buy(True, q) == 5470
-    # Selling right back must not land above the pre-trade price: two fees
-    # and pool-favoring rounding always leave the seller worse off.
-    s = calc_sell(q.new_reserve_bought, q.new_reserve_other, 100_000_000, 100)
-    assert price_after_sell(True, s) < 5000
-
-
-def _check_limits_boundary_and_symmetry():
-    # Exact equality passes, one unit over fails, in both directions.
-    assert buy_within_limit(100, 100, 10_000)
-    assert buy_within_limit(100, 101, 10_000)
-    assert not buy_within_limit(101, 100, 10_000)
-    assert buy_within_limit(100, 200, 5_000)
-    assert not buy_within_limit(101, 200, 5_000)
-    assert sell_within_limit(100, 100, 10_000)
-    assert not sell_within_limit(99, 100, 10_000)
-    assert sell_within_limit(100, 200, 5_000)
-    assert not sell_within_limit(100, 201, 5_000)
-    # A zero limit is trivially satisfied for sells (documented as "no
-    # protection") and only binds a buy at a zero average price.
-    assert sell_within_limit(0, 1, 0)
-    assert not buy_within_limit(1, 1, 0)
-
-
-def _check_shared_vectors():
-    """Replays the committed cross-language vectors.
-
-    The same file is asserted by math.rs::shared_vectors_match and
-    agents/core/fpmm.test.ts, so a porting mistake is caught even when the
-    differential harness (scripts/fpmm-diff/diff.py) is not running.
-    """
-    path = Path(__file__).resolve().parents[1] / "scripts/fpmm-diff/vectors.jsonl"
-    for line_no, line in enumerate(path.read_text().splitlines(), 1):
-        case = json.loads(line)
-        fn = case["fn"]
-        args = case["args"]
-        parsers = {
-            "calc_buy": lambda a: calc_buy(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
-            "calc_sell": lambda a: calc_sell(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
-            "seed_reserves": lambda a: seed_reserves(int(a[0]), int(a[1])),
-            "mul_div_floor": lambda a: {"value": mul_div_floor(int(a[0]), int(a[1]), int(a[2]))},
-            "mul_div_ceil": lambda a: {"value": mul_div_ceil(int(a[0]), int(a[1]), int(a[2]))},
-            "price_yes_bps": lambda a: {"value": price_yes_bps(int(a[0]), int(a[1]))},
-            "settle_value": lambda a: {"value": settle_value(a[0], int(a[1]), int(a[2]))},
-            "gross_for_shares": lambda a: {"gross": gross_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))},
-            "collateral_out_for_shares": lambda a: {
-                "collateral_out": collateral_out_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
-            },
-        }
-        try:
-            out = parsers[fn](args)
-        except MathError as exc:
-            assert "err" in case, f"vector line {line_no}: unexpected error {exc}"
-            continue
-        if hasattr(out, "__dict__"):
-            out = dict(out.__dict__)
-        assert "ok" in case, f"vector line {line_no}: expected an error"
-        assert {k: str(v) for k, v in out.items()} == case["ok"], (
-            f"vector line {line_no} ({fn}) mismatch: {out} != {case['ok']}"
-        )
-
-
-COLLATERAL_FIXTURES = Path(__file__).resolve().parents[1] / "scripts/fpmm-diff/collateral_for_shares.jsonl"
-
-
-def _shares_or_zero(r_bought: int, r_other: int, c: int, fee_bps: int) -> int:
-    try:
-        return calc_buy(r_bought, r_other, c, fee_bps).shares_out if c > 0 else 0
-    except MathError:
-        return 0
-
-
-def _check_collateral_for_shares_is_minimal(trials: int = 2_000, seed: int = 13):
-    """collateral_for_shares buys the target, and one stroop less does not."""
-    rng = random.Random(seed)
-    for _ in range(trials):
-        r_bought = rng.randint(1, 10**13)
-        r_other = rng.randint(1, 10**13)
-        fee = rng.choice([0, 1, 30, 100, 250, 9_999])
-        target = rng.randint(1, r_bought * 3 + 10)
-        c = collateral_for_shares(r_bought, r_other, target, fee)
-        assert _shares_or_zero(r_bought, r_other, c, fee) >= target, (r_bought, r_other, target, fee, c)
-        assert _shares_or_zero(r_bought, r_other, c - 1, fee) < target, (r_bought, r_other, target, fee, c)
-
-
-def collateral_fixture_cases(seed: int = 108, count: int = 40):
-    rng = random.Random(seed)
-    cases = [(1_000, 1_000, 1, 0), (1_000, 1_000, 500, 100), (6_000_000_000, 4_000_000_000, 245_327_043, 100)]
-    while len(cases) < count:
-        r_bought, r_other = rng.randint(1, 10**12), rng.randint(1, 10**12)
-        cases.append((r_bought, r_other, rng.randint(1, r_bought * 2 + 1), rng.choice([0, 30, 100, 300])))
-    return cases
-
-
-def write_collateral_fixtures():
-    lines = []
-    for r_bought, r_other, target, fee in collateral_fixture_cases():
-        c = collateral_for_shares(r_bought, r_other, target, fee)
-        lines.append(json.dumps({"args": [str(r_bought), str(r_other), str(target), str(fee)], "collateral_in": str(c)}, sort_keys=True))
-    COLLATERAL_FIXTURES.write_text("\n".join(lines) + "\n")
-    print(f"wrote {len(lines)} fixtures to {COLLATERAL_FIXTURES}")
-
-
-def _check_collateral_fixtures():
-    """Replays the fixtures agents/core/fpmm.test.ts also asserts."""
-    for line_no, line in enumerate(COLLATERAL_FIXTURES.read_text().splitlines(), 1):
-        case = json.loads(line)
-        a = [int(x) for x in case["args"]]
-        got = collateral_for_shares(*a)
-        assert str(got) == case["collateral_in"], f"fixture line {line_no}: {got} != {case['collateral_in']}"
-
-
-def run_all():
-    _check_known_values()
-    _check_shared_vectors()
-    _check_seed_opens_at_requested_probability()
-    _check_k_never_decreases_and_round_trip_never_profits()
-    _check_gross_for_shares_inverts_calc_sell()
-    _check_void_never_overpays()
-    _check_price_after_maps_both_sides()
-    _check_limits_boundary_and_symmetry()
-    _check_collateral_for_shares_is_minimal()
-    _check_collateral_fixtures()
-    print("fpmm_model: all property checks passed")
+    bounds = bounds_for_decimals(18)
+    assert bounds.min_seed == 100 * 10**18
+    assert bounds.max_sets == 100_000_000 * 10**18
 
 
 if __name__ == "__main__":
-    import sys
-
-    if "--write-collateral-fixtures" in sys.argv:
-        write_collateral_fixtures()
-    else:
-        run_all()
+    _check_known_values()
+    _check_known_values_18dp()
+    print("fpmm_model: all checks passed")

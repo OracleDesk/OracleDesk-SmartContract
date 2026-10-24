@@ -2619,7 +2619,90 @@ mod test {
         }
     }
 
+    /// Minimal SEP-41 token reporting a configurable `decimals()`, used to
+    /// exercise market-core deployments whose collateral is not 7-decimal.
+    #[contract]
+    struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn __constructor(env: Env, decimals: u32) {
+            env.storage().instance().set(&0u32, &decimals);
+        }
+
+        pub fn decimals(env: Env) -> u32 {
+            env.storage().instance().get(&0u32).unwrap_or(7)
+        }
+    }
+
     const NETWORK_ID: [u8; 32] = [7; 32];
+
+    /// A market-core deployed against an 18-decimal SEP-41 collateral. The
+    /// resolver only reads `get_config().collateral` and `get_config().treasury`
+    /// from market-core, so the decimals value must not change resolver
+    /// behaviour; this pins that the resolver still works when the collateral
+    /// is not the 7-decimal Classic asset used by the default fixture.
+    #[test]
+    fn resolver_works_with_18_decimal_collateral() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(MockReflector, ());
+
+        let collateral = env.register(MockToken, (18u32,));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.clone(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                10_000u32,
+            ),
+        );
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        assert_eq!(market_core.get_config().decimals, 18);
+
+        let spec = ResolutionSpec::Price(price_spec(&env, &reflector_id));
+        let resolution_hash = legacy_spec_hash(&env, &spec);
+        let min_seed = 100 * 10_i128.pow(18);
+        let market_id = market_core.create_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
+            &Category::Crypto,
+            &2_000,
+            &min_seed,
+            &5000u32,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        let ResolutionSpec::Price(price_cfg) = spec else {
+            unreachable!()
+        };
+        resolver.register_price_spec(&market_id, &price_cfg);
+        MockReflectorClient::new(&env, &reflector_id).set_price(&2_500_i128, &1_999_u64);
+        env.ledger().set_timestamp(2_000);
+        assert_eq!(resolver.resolve_price(&market_id), Outcome::Yes);
+        assert_eq!(
+            market_core.get_market(&market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
 
     struct Fixture {
         env: Env,

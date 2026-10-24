@@ -17,12 +17,31 @@ natively unit-testable and mirrored line-for-line in
 [`model/fpmm_model.py`](../model/fpmm_model.py) and
 `agents/core/fpmm.ts` for property testing and off-chain quoting.
 
+**Decimals.** The collateral token's `decimals()` is read once in
+`__constructor` (rejecting anything above 18 with `UnsupportedDecimals`) and
+stored in instance storage; `get_config` exposes it as `Config.decimals`.
+The market-size bounds are derived from it rather than hardcoded:
+`min_seed = 100 * 10^d` and `max_sets = 1e8 * 10^d` (`math::bounds_for_decimals`),
+so a 7-decimal USDC market keeps the old 100 USDC / 100M USDC limits while an
+18-decimal token gets 100 / 1e26 raw units. Because `max_sets` can now reach
+1e26, `mul_div_floor` / `mul_div_ceil` use 256-bit intermediates (a no_std
+`u128x2` widening multiply/divide in `math.rs`) so a result that fits in
+`i128` is always returned exactly, regardless of the product's size.
+The widening helpers live in a `no_std` `wide` module inside `math.rs` with
+no `soroban_sdk` imports, so the arithmetic stays natively testable and the
+Python/TypeScript mirrors can reproduce it bit-for-bit.
+
 **Solvency invariant** (holds after every state transition — see the test
 suite for the ones exercised): the contract's own SEP-41 token balance for a
 market equals `sets_minted + fees_accrued + lp_fees` (`fees_accrued` is the
 protocol's pending share of trading fees, `lp_fees` the creator's — see the
 fee split below), and `reserve_yes + Σ(user yes positions) == sets_minted`
 (symmetrically for `no`).
+
+**Market size bound.** A market's seed and total sets are bounded by
+`max_sets = 1e8 * 10^decimals` (100M tokens at the collateral's precision);
+`buy` reverts with `MarketTooLarge` past it. `settle_value` sums YES+NO with
+checked addition, so the bound also keeps settlement arithmetic in `i128`.
 
 **Fee split and recipient snapshot.** `create_market` snapshots a
 `FeeTerms { recipient, protocol_share_bps }` side entry per market, so
