@@ -342,3 +342,12 @@ at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
 syncing. The manifest describes functions, named/tuple types, numeric errors and
 event payloads directly from the built WASM. Hash-critical resolver types carry
 ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.
+
+## Verifying market question metadata
+
+Every market commits `question_hash` (32-byte SHA-256) and `meta_uri` (content-addressed URI pointing to an `oracledesk.market-metadata/1` JSON document; see `docs/market-metadata.md`):
+
+1. Fetch the raw bytes from `meta_uri` (strip `ipfs://` and append the CID path directly to your IPFS gateway base URL — never URL-encode the entire `ipfs://...` string).
+2. Call `verifyMetadata(rawBytes, market.question_hash)` from `agents/core/metadata.ts` (or `verify_metadata` in `model/market_metadata.py`), which hashes the received bytes first, validates schema v1, and verifies RFC 8785 JCS + Unicode NFC canonical encoding.
+3. Call `checkAgainstMarket(metadata, market)` to confirm `metadata.resolution.resolution_hash == market.resolution_hash`, `metadata.close_time == market.close_time`, and `metadata.category == market.category`.
+4. Only display the question and resolution criteria when verification succeeds; mark pre-schema legacy markets as `legacy/unverifiable`.

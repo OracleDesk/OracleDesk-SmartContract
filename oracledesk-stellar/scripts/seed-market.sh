@@ -19,10 +19,6 @@
 # unresolvable market. Pass --commit-only to keep the legacy two-step
 # behaviour (agent_create_market, then register_spec_v2 separately).
 #
-# The market-maker agent runs the same commit -> persist -> create -> reveal
-# flow itself, with crash recovery: see agents/core/maker-flow.ts and
-# docs/adr/0001-resolution-commitment.md ("Agent flow and recovery").
-#
 # Usage: scripts/seed-market.sh [--commit-only] [seed_amount_stroops] [initial_yes_bps] [close_in_seconds]
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -82,23 +78,15 @@ spec_hash() {
   cargo run --quiet --manifest-path scripts/spec-hash/Cargo.toml -- "$@"
 }
 
-# Canonical signer order (lexicographic strkey), shared with the agent
-# (agents/core/spec.ts canonicalizeSpec). Vec order is part of the XDR, so
-# hashing and the reveal must both use this order.
-canonical_signers() {
-  printf '%s\n' "$@" | LC_ALL=C sort
-}
-
 # $1 = salt. Prints the V2 flags spec-hash expects, one per line.
 v2_flags() {
   printf '%s\n' --v2 --salt "$1" --network-passphrase "$NETWORK_PASSPHRASE" --market-core "$MARKET_CORE"
 }
 
 echo "==> computing salted V2 resolution commitment (signers: [$AGENT], threshold 1)" >&2
-mapfile -t SIGNERS < <(canonical_signers "$AGENT")
 SALT=$(spec_hash gen-salt)
 mapfile -t V2_FLAGS < <(v2_flags "$SALT")
-RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}")
+RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "$AGENT")
 
 echo "==> persisting the salt to $SPECS_DIR before creating the market" >&2
 mkdir -p "$SPECS_DIR"
@@ -107,23 +95,43 @@ SPEC_FILE="$SPECS_DIR/$RESOLUTION_HASH.json"
   umask 077
   jq -n --arg question "$QUESTION_TEXT" --arg hash "$RESOLUTION_HASH" --arg salt "$SALT" \
     --arg network_id "$(sha256_hex "$NETWORK_PASSPHRASE")" --arg market_core "$MARKET_CORE" \
-    --argjson signers "$(printf '%s\n' "${SIGNERS[@]}" | jq -R . | jq -sc .)" --argjson window "$DISPUTE_WINDOW" '{
+    --arg agent "$AGENT" --argjson window "$DISPUTE_WINDOW" '{
       market_question: $question,
       resolution_hash: $hash,
       salt: $salt,
       spec: {
         version: 2, network_id: $network_id, market_core: $market_core, salt: $salt,
-        rule: { Signers: { dispute_window: $window, signers: $signers, threshold: 1 } }
+        rule: { Signers: { dispute_window: $window, signers: [$agent], threshold: 1 } }
       }
     }' >"$SPEC_FILE.tmp"
   mv "$SPEC_FILE.tmp" "$SPEC_FILE"
 )
 # Prove the stored salt reproduces the commitment before any funds move.
 mapfile -t V2_FLAGS < <(v2_flags "$(jq -r .salt "$SPEC_FILE")")
-spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}" >/dev/null
+spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "$AGENT" >/dev/null
 
-QUESTION_HASH=$(sha256_hex "$QUESTION_TEXT")
 CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))
+META_FILE="$SPECS_DIR/$RESOLUTION_HASH.metadata.json"
+jq -n --arg question "$QUESTION_TEXT" --arg rhash "$RESOLUTION_HASH" --arg agent "$AGENT" \
+  --argjson close_time "$CLOSE_TIME" --slurpfile spec "$SPEC_FILE" '{
+    schema: "oracledesk.market-metadata/1",
+    question: $question,
+    category: "Macro",
+    close_time: $close_time,
+    resolution: {
+      mode: "signers",
+      criteria: ("Resolves YES if confirmed by designated signer " + $agent),
+      spec: $spec[0].spec,
+      resolution_hash: $rhash
+    },
+    sources: [],
+    created_by: $agent,
+    language: "en"
+  }' >"$META_FILE.raw"
+python3 model/market_metadata.py canonical "$META_FILE.raw" >"$META_FILE"
+rm -f "$META_FILE.raw"
+QUESTION_HASH=$(python3 model/market_metadata.py hash "$META_FILE")
+META_URI="ipfs://b$(python3 -c 'import base64,hashlib,sys; d=hashlib.sha256(open(sys.argv[1],"rb").read()).digest(); print(base64.b32encode(bytes([0x01,0x55,0x12,0x20])+d).decode().lower().rstrip("="))' "$META_FILE")"
 
 if [ "$ATOMIC" = "true" ]; then
   echo "==> creating AND revealing market atomically (seed=$SEED_AMOUNT, close_time=$CLOSE_TIME)" >&2
@@ -132,7 +140,7 @@ if [ "$ATOMIC" = "true" ]; then
     --agent "$AGENT" \
     --resolver "$RESOLVER" \
     --question_hash "$QUESTION_HASH" \
-    --meta_uri "\"ipfs://$(echo -n "$QUESTION_TEXT" | tr ' ' '-')\"" \
+    --meta_uri "\"$META_URI\"" \
     --category Macro \
     --close_time "$CLOSE_TIME" \
     --seed_amount "$SEED_AMOUNT" \
@@ -145,7 +153,7 @@ else
     --agent "$AGENT" \
     --question_hash "$QUESTION_HASH" \
     --resolution_hash "$RESOLUTION_HASH" \
-    --meta_uri "\"ipfs://$(echo -n "$QUESTION_TEXT" | tr ' ' '-')\"" \
+    --meta_uri "\"$META_URI\"" \
     --category Macro \
     --close_time "$CLOSE_TIME" \
     --seed_amount "$SEED_AMOUNT" \
