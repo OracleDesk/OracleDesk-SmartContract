@@ -542,3 +542,9 @@ export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
     maker: { ...maker, defaultSeedStroops: maker.defaultSeedStroops.toString() },
   };
 }
+
+export const TESTNET_PASSPHRASE = NETWORKS.testnet.passphrase;
+export const FUTURENET_PASSPHRASE = NETWORKS.futurenet.passphrase;
+export const LOCAL_PASSPHRASE = NETWORKS.local.passphrase;
+export const MAINNET_PASSPHRASE = NETWORKS.mainnet.passphrase;
+export const redactConfig = describeConfig;
