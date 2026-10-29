@@ -32,7 +32,11 @@ jobs:
       # (`cargo install stellar-cli` — verified against the actual crate
       # name behind the `stellar` binary, not a guessed GitHub Action).
       - name: Install stellar CLI
-        run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}/stellar-cli-${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
+          mkdir -p "$RUNNER_TEMP/stellar-bin"
+          tar -xzf /tmp/stellar.tar.gz -C "$RUNNER_TEMP/stellar-bin" stellar
+          echo "$RUNNER_TEMP/stellar-bin" >> "$GITHUB_PATH"
 
       - name: cargo fmt --check
         run: |

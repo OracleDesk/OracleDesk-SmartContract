@@ -34,6 +34,17 @@ TRADER_KEY=${TRADER_KEY:-${IDENTITY_PREFIX}-trader}
 OUT=${OUT:-deployments/$NETWORK.json}
 WASM_DIR=target/wasm32v1-none/release
 
+# Collateral decimals. market-core reads decimals() from the token at
+# construction and derives its MIN_SEED / MAX_SETS bounds from it, so the
+# deployer must know the token's precision up front. The self-issued test
+# asset below is a Classic asset (7 decimals); set COLLATERAL_DECIMALS to
+# match if you point `collateral` at a different SEP-41 token.
+COLLATERAL_DECIMALS=${COLLATERAL_DECIMALS:-7}
+if ! [[ "$COLLATERAL_DECIMALS" =~ ^[0-9]+$ ]] || [ "$COLLATERAL_DECIMALS" -gt 18 ]; then
+  echo "error: COLLATERAL_DECIMALS=$COLLATERAL_DECIMALS must be an integer in 0..=18 (market-core's supported range)" >&2
+  exit 1
+fi
+
 # treasury's risk caps (7-decimal USDC units). Must comfortably clear
 # market-core's MIN_SEED (100 USDC) since agent_create_market's seed amount
 # is capped by max_trade. Override via env if you need different limits.
@@ -250,6 +261,9 @@ fi
 # design doc) with no dependency on guessing a real issuer's contract id.
 # <!-- TODO(maintainer): point `collateral` at Circle's real testnet USDC
 # issuer if/when this needs to interoperate with other testnet apps. -->
+# market-core's __constructor calls decimals() on this token, so it must be
+# deployed before market-core below (it is). Keep COLLATERAL_DECIMALS in
+# sync with the asset deployed here.
 USDC=$(json_get .contracts.usdc)
 if [ -z "$USDC" ]; then
   log "deploying self-issued testnet USDC (SEP-41)"
@@ -339,7 +353,9 @@ fi
 
 # --- market-core (constructor receives the real resolver/treasury) ----------
 if [ "$(json_get .contracts.market_core)" = "" ]; then
-  log "deploying market-core with real resolver/treasury in the constructor"
+  # __constructor reads collateral.decimals() and rejects anything above 18
+  # with Error::UnsupportedDecimals (#19). The token must already be live.
+  log "deploying market-core with real resolver/treasury in the constructor (collateral decimals: $COLLATERAL_DECIMALS)"
   DEPLOYED=$(stellar contract deploy \
     --wasm "$WASM_DIR/market_core.wasm" \
     --salt "$MARKET_CORE_SALT" \
@@ -356,6 +372,7 @@ if [ "$(json_get .contracts.market_core)" = "" ]; then
     echo "error: market-core landed at $DEPLOYED, expected $MARKET_CORE" >&2
     exit 1
   }
+  json_set --argjson d "$COLLATERAL_DECIMALS" '.collateral_decimals = $d'
   json_set --arg id "$MARKET_CORE" '.contracts.market_core = $id'
 else
   log "market-core already deployed: $MARKET_CORE"
@@ -463,8 +480,10 @@ propose_agent trader "$TRADER" $((ROLE_TRADE | ROLE_SETTLE)) "$TRADER_MAX_TRADE"
 # The treasury is a share vault: collateral sent to it directly would be a
 # donation to existing shareholders, so the deployer mints to itself and
 # deposits, receiving shares (docs/adr/0005-treasury-vault.md).
+# FUND_AMOUNT is in raw token units, so scale it by the collateral's
+# decimals: 1,000,000 tokens at 7 decimals is 1e13, at 18 decimals 1e24.
 TREASURY_FUNDED=$(json_get .treasury_funded_amount)
-FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-10000000000000} # 1,000,000 USDC
+FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-$((1000000 * 10 ** COLLATERAL_DECIMALS))} # 1,000,000 tokens
 if [ "$TREASURY_FUNDED" != "$FUND_AMOUNT" ]; then
   log "minting $FUND_AMOUNT stroops of test USDC and depositing it into the treasury"
   stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \

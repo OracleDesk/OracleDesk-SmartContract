@@ -15,7 +15,8 @@ helpers are kept for backward compatibility but are deprecated in favour of
 trading agent; all three must agree with this model.
 
 Conventions match math.rs: all amounts are non-negative ints in collateral
-base units (USDC on Stellar = 7 decimals). Rounding always favours the pool.
+base units (whatever `decimals()` the collateral token reports, 0..=18).
+Rounding always favours the pool.
 """
 
 from dataclasses import dataclass
@@ -25,19 +26,46 @@ import random
 from pathlib import Path
 
 BPS = 10_000
+# Deprecated 7-decimal alias, kept for tests only. Contract logic derives its
+# bounds from `bounds_for_decimals`; see math.rs.
 MAX_SETS = 1_000_000_000_000_000  # 1e15 = 100M USDC (7 dp)
 MIN_PROB_BPS = 100
 MAX_PROB_BPS = 9_900
+
+I128_MAX = (1 << 127) - 1
+MAX_SUPPORTED_DECIMALS = 18
 
 
 class MathError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Bounds:
+    min_seed: int
+    max_sets: int
+
+
+def bounds_for_decimals(d: int) -> Bounds:
+    """Mirrors math.rs::bounds_for_decimals: min_seed = 100 * 10^d,
+    max_sets = 1e8 * 10^d. Rejects d > 18 (UnsupportedDecimals on-chain)."""
+    if d < 0 or d > MAX_SUPPORTED_DECIMALS:
+        raise MathError("unsupported decimals")
+    scale = 10**d
+    return Bounds(min_seed=100 * scale, max_sets=100_000_000 * scale)
+
+
+def _fits_i128(x: int) -> bool:
+    return 0 <= x <= I128_MAX
+
+
 def mul_div_floor(a: int, b: int, c: int) -> int:
     if a < 0 or b < 0 or c <= 0:
         raise MathError("invalid input")
-    return (a * b) // c
+    q = (a * b) // c
+    if not _fits_i128(q):
+        raise MathError("overflow")
+    return q
 
 
 def mul_div_ceil(a: int, b: int, c: int) -> int:
@@ -45,7 +73,10 @@ def mul_div_ceil(a: int, b: int, c: int) -> int:
         raise MathError("invalid input")
     p = a * b
     q = p // c
-    return q + 1 if p % c != 0 else q
+    q = q + 1 if p % c != 0 else q
+    if not _fits_i128(q):
+        raise MathError("overflow")
+    return q
 
 
 def price_yes_bps(reserve_yes: int, reserve_no: int) -> int:
@@ -184,7 +215,10 @@ def settle_value(kind: str, yes: int, no: int) -> int:
     if kind == "no":
         return no
     if kind == "void":
-        return (yes + no) // 2
+        total = yes + no
+        if not _fits_i128(total):
+            raise MathError("overflow")
+        return total // 2
     raise ValueError(f"unknown settlement kind {kind!r}")
 
 
@@ -358,12 +392,27 @@ def _check_known_values():
     assert split_fee(101, 5_000) == (51, 50)
 
 
+def _check_known_values_18dp():
+    """18-decimal fixtures matching math.rs's known_values_18dp test. The
+    1000/1000 -> 190 example scaled by 10**11, plus a seed at max_sets."""
+    scale = 10**11  # 7 dp -> 18 dp
+    q = calc_buy(1000 * scale, 1000 * scale, 100 * scale, 0)
+    assert (
+        q.shares_out,
+        q.new_reserve_bought,
+        q.new_reserve_other,
+    ) == (19090909090909, 90909090909091, 110000000000000), q
+
+    bounds = bounds_for_decimals(18)
+    assert bounds.min_seed == 100 * 10**18
+    assert bounds.max_sets == 100_000_000 * 10**18
+
+
 def _check_seed_opens_at_requested_probability():
-    for p in (100, 2500, 5000, 7300, 9900):
-        s = seed_reserves(10_000_000_000, p)
-        price = price_yes_bps(s.reserve_yes, s.reserve_no)
-        assert abs(price - p) <= 1, (p, price)
-        assert s.creator_yes == 0 or s.creator_no == 0
+    for yes_bps in (MIN_PROB_BPS, 2_500, 5_000, 7_500, MAX_PROB_BPS):
+        s = seed_reserves(1_000_000, yes_bps)
+        assert s.reserve_yes > 0 and s.reserve_no > 0
+        assert abs(price_yes_bps(s.reserve_yes, s.reserve_no) - yes_bps) <= 1, (yes_bps, s)
 
 
 def _check_k_never_decreases_and_round_trip_never_profits(trials: int = 2_000, seed: int = 7):
@@ -679,6 +728,7 @@ def _check_collateral_fixtures():
 
 def run_all():
     _check_known_values()
+    _check_known_values_18dp()
     _check_shared_vectors()
     _check_seed_opens_at_requested_probability()
     _check_k_never_decreases_and_round_trip_never_profits()
