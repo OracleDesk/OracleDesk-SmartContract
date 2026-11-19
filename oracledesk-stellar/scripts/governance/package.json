@@ -21,7 +21,7 @@
     "@stellar/stellar-sdk": "^16.0.1"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.6.6",
     "tsx": "^4.22.0",
     "typescript": "^5.8.3"
   }
