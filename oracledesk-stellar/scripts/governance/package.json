@@ -18,7 +18,7 @@
     "@oracledesk/bindings-router": "file:../../packages/bindings/router",
     "@oracledesk/bindings-timelock": "file:../../packages/bindings/timelock",
     "@oracledesk/bindings-treasury": "file:../../packages/bindings/treasury",
-    "@stellar/stellar-sdk": "^16.0.1"
+    "@stellar/stellar-sdk": "^17.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

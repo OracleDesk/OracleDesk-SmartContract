@@ -16,7 +16,7 @@
     "@oracledesk/bindings-reasoning-registry": "file:../../packages/bindings/reasoning-registry",
     "@oracledesk/bindings-resolver": "file:../../packages/bindings/resolver",
     "@oracledesk/bindings-treasury": "file:../../packages/bindings/treasury",
-    "@stellar/stellar-sdk": "^16.0.1",
+    "@stellar/stellar-sdk": "^17.4.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
