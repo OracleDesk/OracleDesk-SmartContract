@@ -14,7 +14,7 @@
     "@x402/core": "2.26.0",
     "@x402/express": "2.26.0",
     "@x402/stellar": "2.26.0",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "13.2.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1"
   },
