@@ -39,6 +39,9 @@ pub const MAX_DELAY: u64 = 30 * 86_400;
 pub const EXECUTION_GRACE: u64 = 7 * 86_400;
 /// How long a pending admin proposal stays acceptable.
 pub const ADMIN_TRANSFER_TTL: u64 = 7 * 24 * 60 * 60;
+pub const MAX_EMERGENCY_TTL: u64 = 90 * 86_400;
+pub const MAX_EMERGENCY_ARGS: u32 = 4;
+pub const MAX_EMERGENCY_RULES: u32 = 16;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +50,36 @@ pub struct Roles {
     pub canceller: Address,
     pub executor: Option<Address>,
     pub emergency: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArgConstraint {
+    Any,
+    BoolEq(bool),
+    U64Any,
+    U32Eq(u32),
+    UnitVariant(Symbol),
+    AddressEq(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyRule {
+    pub target: Address,
+    pub fn_name: Symbol,
+    pub args: Vec<ArgConstraint>,
+    pub max_uses: u32,
+    pub window_secs: u64,
+    pub expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyUse {
+    pub window_start: u64,
+    pub count: u32,
+    pub total: u64,
 }
 
 /// A scheduled call. It exists in storage only while pending; `execute` and
@@ -72,6 +105,10 @@ pub enum DataKey {
     Delay(Address, Symbol),
     NextId,
     Op(u64),
+    EmergencyRule(Address, Symbol),
+    EmergencyUse(Address, Symbol),
+    EmergencyRuleCount,
+    EmergencyRuleAt(u32),
 }
 
 #[contracterror]
@@ -92,6 +129,11 @@ pub enum Error {
     AdminTransferExpired = 12,
     /// A scheduled self-call to a function the timelock cannot apply itself.
     SelfCallUnsupported = 13,
+    EmergencyRuleExpired = 14,
+    EmergencyArgsRejected = 15,
+    EmergencyRateLimited = 16,
+    InvalidEmergencyRule = 17,
+    TooManyEmergencyRules = 18,
 }
 
 #[contractevent]
@@ -123,6 +165,9 @@ pub struct OperationCancelled {
 pub struct EmergencyExecuted {
     pub target: Address,
     pub fn_name: Symbol,
+    pub args: Vec<Val>,
+    pub count: u32,
+    pub total: u64,
 }
 
 #[contractevent]
@@ -196,6 +241,7 @@ impl Timelock {
         );
         s.set(&DataKey::DefaultDelay, &default_delay);
         s.set(&DataKey::NextId, &0u64);
+        s.set(&DataKey::EmergencyRuleCount, &0u32);
     }
 
     // ----- scheduling -----------------------------------------------------
@@ -268,12 +314,27 @@ impl Timelock {
             // Soroban forbids contract re-entry, so a self-call is applied
             // in-process rather than through `invoke_contract`.
             let set_delay = Symbol::new(&env, "set_default_delay");
-            if op.fn_name != set_delay {
+            let set_rule = Symbol::new(&env, "set_emergency_rule");
+            let renew_rule = Symbol::new(&env, "renew_emergency_rule");
+            if op.fn_name == set_delay {
+                let delay = u64::try_from_val(&env, &op.args.get_unchecked(0))
+                    .map_err(|_| Error::InvalidConfig)?;
+                Self::apply_default_delay(&env, delay, true)?;
+            } else if op.fn_name == set_rule {
+                let rule = EmergencyRule::try_from_val(&env, &op.args.get_unchecked(0))
+                    .map_err(|_| Error::InvalidEmergencyRule)?;
+                Self::apply_emergency_rule(&env, rule, true)?;
+            } else if op.fn_name == renew_rule {
+                let target = Address::try_from_val(&env, &op.args.get_unchecked(0))
+                    .map_err(|_| Error::InvalidEmergencyRule)?;
+                let fn_name = Symbol::try_from_val(&env, &op.args.get_unchecked(1))
+                    .map_err(|_| Error::InvalidEmergencyRule)?;
+                let expires_at = u64::try_from_val(&env, &op.args.get_unchecked(2))
+                    .map_err(|_| Error::InvalidEmergencyRule)?;
+                Self::apply_renew_emergency_rule(&env, target, fn_name, expires_at, true)?;
+            } else {
                 return Err(Error::SelfCallUnsupported);
             }
-            let delay = u64::try_from_val(&env, &op.args.get_unchecked(0))
-                .map_err(|_| Error::InvalidConfig)?;
-            Self::apply_default_delay(&env, delay, true)?;
         } else {
             env.invoke_contract::<()>(&op.target, &op.fn_name, op.args);
         }
@@ -304,11 +365,50 @@ impl Timelock {
         let roles = Self::roles(env.clone())?;
         let emergency = roles.emergency.ok_or(Error::EmergencyNotAllowed)?;
         emergency.require_auth();
-        if !Self::is_emergency_allowed(&env, &fn_name, &args) {
-            return Err(Error::EmergencyNotAllowed);
+        let key = DataKey::EmergencyRule(target.clone(), fn_name.clone());
+        let rule: EmergencyRule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EmergencyNotAllowed)?;
+        let now = env.ledger().timestamp();
+        if now >= rule.expires_at {
+            return Err(Error::EmergencyRuleExpired);
         }
-        env.invoke_contract::<()>(&target, &fn_name, args);
-        EmergencyExecuted { target, fn_name }.publish(&env);
+        if !Self::args_match(&env, &rule.args, &args) {
+            return Err(Error::EmergencyArgsRejected);
+        }
+
+        let use_key = DataKey::EmergencyUse(target.clone(), fn_name.clone());
+        let mut emergency_use: EmergencyUse = env
+            .storage()
+            .persistent()
+            .get(&use_key)
+            .unwrap_or(EmergencyUse {
+                window_start: now,
+                count: 0,
+                total: 0,
+            });
+        if now >= emergency_use.window_start + rule.window_secs {
+            emergency_use.window_start = now;
+            emergency_use.count = 0;
+        }
+        if emergency_use.count >= rule.max_uses {
+            return Err(Error::EmergencyRateLimited);
+        }
+        emergency_use.count += 1;
+        emergency_use.total += 1;
+        env.storage().persistent().set(&use_key, &emergency_use);
+
+        env.invoke_contract::<()>(&target, &fn_name, args.clone());
+        EmergencyExecuted {
+            target,
+            fn_name,
+            args,
+            count: emergency_use.count,
+            total: emergency_use.total,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -376,6 +476,35 @@ impl Timelock {
     pub fn set_default_delay(env: Env, delay: u64) -> Result<(), Error> {
         Self::apply_default_delay(&env, delay, false)?;
         DefaultDelaySet { delay }.publish(&env);
+        Ok(())
+    }
+
+    /// Applies an emergency rule. This entrypoint is only callable by a
+    /// scheduled self-call on the timelock contract.
+    pub fn set_emergency_rule(env: Env, rule: EmergencyRule) -> Result<(), Error> {
+        Self::apply_emergency_rule(&env, rule, false)
+    }
+
+    pub fn renew_emergency_rule(
+        env: Env,
+        target: Address,
+        fn_name: Symbol,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::apply_renew_emergency_rule(&env, target, fn_name, expires_at, false)
+    }
+
+    /// Removes a rule immediately. Only the canceller or admin may narrow
+    /// emergency permissions this way.
+    pub fn remove_emergency_rule(
+        env: Env,
+        target: Address,
+        fn_name: Symbol,
+    ) -> Result<(), Error> {
+        let roles = Self::roles(env.clone())?;
+        roles.canceller.require_auth();
+        let key = DataKey::EmergencyRule(target, fn_name);
+        env.storage().persistent().remove(&key);
         Ok(())
     }
 
@@ -451,6 +580,37 @@ impl Timelock {
         env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
 
+    pub fn emergency_rule(env: Env, target: Address, fn_name: Symbol) -> Option<EmergencyRule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyRule(target, fn_name))
+    }
+
+    pub fn emergency_rules(env: Env) -> Vec<EmergencyRule> {
+        let mut rules = Vec::new(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyRuleCount)
+            .unwrap_or(0);
+        for i in 0..count {
+            if let Some(rule) = env
+                .storage()
+                .instance()
+                .get::<_, EmergencyRule>(&DataKey::EmergencyRuleAt(i))
+            {
+                rules.push_back(rule);
+            }
+        }
+        rules
+    }
+
+    pub fn emergency_use(env: Env, target: Address, fn_name: Symbol) -> Option<EmergencyUse> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyUse(target, fn_name))
+    }
+
     // ----- internals ------------------------------------------------------
 
     fn effective_delay(env: &Env, target: &Address, fn_name: &Symbol) -> u64 {
@@ -467,16 +627,137 @@ impl Timelock {
         }
     }
 
-    fn is_emergency_allowed(env: &Env, fn_name: &Symbol, args: &Vec<Val>) -> bool {
-        if fn_name == &Symbol::new(env, "set_paused") {
-            if args.len() != 1 {
+    fn args_match(env: &Env, constraints: &Vec<ArgConstraint>, args: &Vec<Val>) -> bool {
+        if constraints.len() != args.len() {
+            return false;
+        }
+        for i in 0..constraints.len() {
+            let constraint = constraints.get_unchecked(i);
+            let value = args.get_unchecked(i);
+            let matched = match constraint {
+                ArgConstraint::Any => true,
+                ArgConstraint::BoolEq(expected) => {
+                    bool::try_from_val(env, &value).ok().as_ref() == Some(expected)
+                }
+                ArgConstraint::U64Any => u64::try_from_val(env, &value).is_ok(),
+                ArgConstraint::U32Eq(expected) => {
+                    u32::try_from_val(env, &value).ok().as_ref() == Some(expected)
+                }
+                ArgConstraint::UnitVariant(expected) => {
+                    Vec::<Val>::try_from_val(env, &value)
+                        .ok()
+                        .and_then(|variant| {
+                            if variant.len() != 1 {
+                                return None;
+                            }
+                            let symbol = Symbol::try_from_val(env, &variant.get_unchecked(0)).ok()?;
+                            Some(symbol == *expected)
+                        })
+                        .unwrap_or(false)
+                }
+                ArgConstraint::AddressEq(expected) => {
+                    Address::try_from_val(env, &value).ok().as_ref() == Some(expected)
+                }
+            };
+            if !matched {
                 return false;
             }
-            let val = args.get_unchecked(0);
-            let paused = bool::try_from_val(env, &val).unwrap_or(false);
-            return paused;
         }
-        fn_name == &Symbol::new(env, "cancel_proposal")
+        true
+    }
+
+    fn validate_emergency_rule(env: &Env, rule: &EmergencyRule) -> Result<(), Error> {
+        if rule.max_uses == 0
+            || rule.window_secs < 3_600
+            || rule.window_secs > 7 * 86_400
+            || rule.args.len() > MAX_EMERGENCY_ARGS
+            || rule.target == env.current_contract_address()
+            || rule.expires_at > env.ledger().timestamp() + MAX_EMERGENCY_TTL
+        {
+            return Err(Error::InvalidEmergencyRule);
+        }
+
+        let pause = Symbol::new(env, "set_paused");
+        let cancel = Symbol::new(env, "cancel_proposal");
+        if rule.fn_name == pause {
+            if rule.args.len() != 1 {
+                return Err(Error::InvalidEmergencyRule);
+            }
+            if !matches!(rule.args.get_unchecked(0), ArgConstraint::BoolEq(true)) {
+                return Err(Error::InvalidEmergencyRule);
+            }
+        } else if rule.fn_name == cancel {
+            if rule.args.len() != 2 {
+                return Err(Error::InvalidEmergencyRule);
+            }
+            if !matches!(rule.args.get_unchecked(0), ArgConstraint::U64Any)
+                || !matches!(rule.args.get_unchecked(1), ArgConstraint::UnitVariant(ref s) if s == &Symbol::new(env, "DisputeUpheld"))
+            {
+                return Err(Error::InvalidEmergencyRule);
+            }
+        } else {
+            return Err(Error::InvalidEmergencyRule);
+        }
+        Ok(())
+    }
+
+    fn apply_emergency_rule(env: &Env, rule: EmergencyRule, scheduled: bool) -> Result<(), Error> {
+        if !scheduled {
+            return Err(Error::Unauthorized);
+        }
+        Self::validate_emergency_rule(env, &rule)?;
+
+        let key = DataKey::EmergencyRule(rule.target.clone(), rule.fn_name.clone());
+        let replacing = env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &rule);
+
+        if !replacing {
+            let count_key = DataKey::EmergencyRuleCount;
+            let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
+            if count >= MAX_EMERGENCY_RULES {
+                return Err(Error::TooManyEmergencyRules);
+            }
+            env.storage().instance().set(&DataKey::EmergencyRuleAt(count), &rule);
+            env.storage().instance().set(&count_key, &(count + 1));
+        } else {
+            let count: u32 = env.storage().instance().get(&DataKey::EmergencyRuleCount).unwrap_or(0);
+            for i in 0..count {
+                let at = DataKey::EmergencyRuleAt(i);
+                if let Some(existing) = env.storage().instance().get::<_, EmergencyRule>(&at) {
+                    if existing.target == rule.target && existing.fn_name == rule.fn_name {
+                        env.storage().instance().set(&at, &rule);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_renew_emergency_rule(
+        env: &Env,
+        target: Address,
+        fn_name: Symbol,
+        expires_at: u64,
+        scheduled: bool,
+    ) -> Result<(), Error> {
+        if !scheduled {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::EmergencyRule(target.clone(), fn_name.clone());
+        let mut rule: EmergencyRule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EmergencyNotAllowed)?;
+        if expires_at > env.ledger().timestamp() + MAX_EMERGENCY_TTL
+            || expires_at < env.ledger().timestamp()
+        {
+            return Err(Error::InvalidEmergencyRule);
+        }
+        rule.expires_at = expires_at;
+        env.storage().persistent().set(&key, &rule);
+        Ok(())
     }
 
     /// `scheduled` is true when this runs from `execute` for a timelocked

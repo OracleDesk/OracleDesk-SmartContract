@@ -234,6 +234,11 @@ export const EnvSchema = z.object({
   MARKET_CLOSE_IN_SECS: intField(3600, 1, 365 * 86_400),
   AGENT_STARTUP_PROBE_TIMEOUT_MS: intField(DEFAULT_PROBE_TIMEOUT_MS, 1, 600_000),
   AGENT_ALLOW_MAINNET: z.string().optional(),
+  AGENT_CHANNEL_SECRETS: z.string().optional(),
+  AGENT_CHANNEL_MIN_XLM: stroopsField(50_000_000n, 1n),
+  AGENT_CHANNEL_TOPUP_XLM: stroopsField(200_000_000n, 1n),
+  AGENT_AUTH_EXPIRY_LEDGERS: intField(60, 1, 720),
+  AGENT_CHANNEL_RETIRE: z.string().optional(),
   EVENTS_STATE_DIR: nonEmptyPath,
   EVENTS_TRADE_THRESHOLD: stroopsField(500_000_000n),
   EVENTS_POLL_INTERVAL_MS: intField(10_000, 100, 3_600_000),
@@ -276,6 +281,16 @@ const contractId = z.string().refine((v) => StrKey.isValidContract(v), "must be 
 
 /** A deployment record (deployments/<network>.json). Extra metadata keys are kept. */
 export const DeploymentsSchema = z.looseObject({
+  schema: z.number().int().min(1).optional(),
+  generation: z.number().int().min(1).optional(),
+  source_commit: z.string().optional(),
+  wasm_hashes: z.record(z.string(), z.string()).optional(),
+  legacy: z.array(z.looseObject({
+    generation: z.number().int().min(1).optional(),
+    source_commit: z.string().optional(),
+    contracts: z.record(z.string(), z.string()).optional(),
+    retired_at: z.string().optional(),
+  })).optional(),
   network: z.enum(NETWORK_NAMES).optional(),
   deployer: publicKey,
   agent: publicKey,
@@ -286,6 +301,7 @@ export const DeploymentsSchema = z.looseObject({
     resolver: contractId,
     treasury: contractId,
     reasoning_registry: contractId,
+    timelock: contractId.optional(),
   }),
   wired: z.boolean().optional(),
   agent_registered: z.boolean().optional(),

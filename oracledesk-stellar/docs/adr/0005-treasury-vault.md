@@ -318,6 +318,12 @@ Positions moved with `migrate_markets` are not in the successor's index and
 count as zero in its NAV until they are redeemed. The old pre-vault flow's
 admin `withdraw` no longer exists.
 
+## Epoch-priced entry and exit
+
+Deposits and withdrawal requests are queued for the first epoch boundary at least one full epoch after submission. The boundary snapshots NAV once and applies it to the entire batch. Shares minted in an epoch cannot be requested for withdrawal during the same epoch or the immediately following epoch, preventing same-ledger and same-epoch round trips.
+
+Bounded entry and exit fees (maximum 100 bps) reduce residual intra-epoch drift; fees remain in the vault and accrue to remaining holders. Pending deposits are excluded from NAV and refundable while paused. Pending redeems are released back to the owner for emergency handling. The FIFO ticket queue, virtual-share inflation guard, and queue reservation remain unchanged.
+
 ## Consequences
 
 - Outside funders can back an agent. Their claim is enforced on-chain, and

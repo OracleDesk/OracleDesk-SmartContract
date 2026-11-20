@@ -222,9 +222,10 @@ pub const MAX_MIGRATE_BATCH: u32 = 16;
 pub const DEFAULT_MAX_MARK_AGE_LEDGERS: u32 = 17_280;
 /// Smallest `deposit` (10 USDC): keeps share prices away from dust rounding.
 pub const MIN_DEPOSIT: i128 = 10 * 10_000_000;
-// Virtual offset against first-depositor share inflation (the ERC-4626
-// mitigation, see docs/adr/0005-treasury-vault.md). The first mint also
-// burns `VIRTUAL_SHARES` dead shares.
+pub const EPOCH_SECS: u64 = 3_600;
+/// Virtual offset against first-depositor share inflation (the ERC-4626
+/// mitigation, see docs/adr/0005-treasury-vault.md). The first mint also
+/// burns `VIRTUAL_SHARES` dead shares.
 const VIRTUAL_SHARES: i128 = 1_000;
 const VIRTUAL_ASSETS: i128 = 1;
 
@@ -675,6 +676,32 @@ pub struct CapitalBreakdown {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Epoch {
+    pub id: u64,
+    pub starts_at: u64,
+    pub nav: i128,
+    pub supply: i128,
+    pub closed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDeposit {
+    pub owner: Address,
+    pub amount: i128,
+    pub epoch: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRedeem {
+    pub owner: Address,
+    pub shares: i128,
+    pub epoch: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -736,6 +763,14 @@ pub enum DataKey {
     CreationBuckets,
     YieldVenue,
     YieldPrincipal,
+    CurrentEpoch,
+    Epoch(u64),
+    EpochDeposits(u64),
+    EpochRedeems(u64),
+    PendingDeposit(Address),
+    PendingRedeem(Address),
+    PendingDepositTotal,
+    LastMintEpoch(Address),
     /// The operating mode's independent reasons ([`ModeState`], issue #272).
     ModeState,
     /// The pre-trade resolvability policy ([`ResolvabilityPolicy`], #273).
@@ -929,6 +964,12 @@ pub enum Error {
     NoPendingAdmin = 61,
     // A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 62,
+    /// `agent_create_market_and_reveal` was given a malformed resolution
+    /// envelope or a rule outside the two primary modes (#64).
+    InvalidResolution = 68,
+    HoldingPeriod = 64,
+    EpochNotReady = 65,
+    EpochNotClosed = 66,
     // `agent_create_market_and_reveal` was given a malformed resolution
     // envelope or a rule outside the two primary modes (#64).
     InvalidResolution = 63,
@@ -978,6 +1019,9 @@ pub enum Error {
     TooCloseToClose = 91,
     /// A call to the resolver failed (#273).
     ResolverCallFailed = 92,
+    HoldingPeriod = 83,
+    EpochNotReady = 84,
+    EpochNotClosed = 85,
 }
 
 #[contractevent]
@@ -1517,6 +1561,22 @@ impl Treasury {
             &DataKey::UsageWindow,
             &Self::empty_window(&env, env.ledger().timestamp() / BUCKET_SECONDS),
         );
+        storage.set(&DataKey::Paused, &false);
+        storage.set(&DataKey::AdminPaused, &false);
+        storage.set(&DataKey::DrawdownTripped, &false);
+        storage.set(&DataKey::DrawdownAcknowledged, &false);
+        storage.set(&DataKey::CurrentEpoch, &0u64);
+        storage.set(
+            &DataKey::Epoch(0),
+            &Epoch {
+                id: 0,
+                starts_at: env.ledger().timestamp(),
+                nav: 0,
+                supply: 0,
+                closed: false,
+            },
+        );
+        storage.set(&DataKey::PendingDepositTotal, &0i128);
         storage.set(&DataKey::ModeState, &ModeState::normal());
         storage.set(
             &DataKey::DrawdownCfg,
@@ -2876,6 +2936,15 @@ impl Treasury {
         if Self::shares_of(env.clone(), owner.clone()) < shares {
             return Err(Error::InsufficientShares);
         }
+        let current_epoch: u64 = env.storage().instance().get(&DataKey::CurrentEpoch).unwrap_or(0);
+        let last_mint: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastMintEpoch(owner.clone()))
+            .unwrap_or(0);
+        if last_mint >= current_epoch.saturating_sub(1) && last_mint > 0 {
+            return Err(Error::HoldingPeriod);
+        }
         Self::assert_marks_fresh(&env)?;
         let nav = Self::compute_nav(&env, &global)?;
         let assets =
@@ -2927,6 +2996,106 @@ impl Treasury {
         Ok((paid_now, ticket_id))
     }
 
+    /// Closes the current epoch at the permissionless boundary and opens the
+    /// next epoch. The NAV is snapshotted once and reused for every request
+    /// in the epoch.
+    pub fn close_epoch(env: Env) -> Result<u64, Error> {
+        let current: u64 = env.storage().instance().get(&DataKey::CurrentEpoch).unwrap_or(0);
+        let mut epoch: Epoch = env
+            .storage()
+            .instance()
+            .get(&DataKey::Epoch(current))
+            .ok_or(Error::EpochNotReady)?;
+        if epoch.closed {
+            return Ok(current);
+        }
+        let now = env.ledger().timestamp();
+        if now < epoch.starts_at + EPOCH_SECS {
+            return Err(Error::EpochNotReady);
+        }
+        let global = Self::load_global(&env)?;
+        let nav = Self::compute_nav(&env, &global)?;
+        let supply = Self::supply(&env);
+        epoch.nav = nav;
+        epoch.supply = supply;
+        epoch.closed = true;
+        env.storage().instance().set(&DataKey::Epoch(current), &epoch);
+
+        let next = current + 1;
+        env.storage().instance().set(&DataKey::CurrentEpoch, &next);
+        env.storage().instance().set(
+            &DataKey::Epoch(next),
+            &Epoch {
+                id: next,
+                starts_at: now,
+                nav: 0,
+                supply: 0,
+                closed: false,
+            },
+        );
+        Ok(current)
+    }
+
+    pub fn settle_deposit(env: Env, owner: Address) -> Result<i128, Error> {
+        let pending: PendingDeposit = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDeposit(owner.clone()))
+            .ok_or(Error::EpochNotClosed)?;
+        let epoch: Epoch = env
+            .storage()
+            .instance()
+            .get(&DataKey::Epoch(pending.epoch))
+            .ok_or(Error::EpochNotClosed)?;
+        if !epoch.closed {
+            return Err(Error::EpochNotClosed);
+        }
+        env.storage().persistent().remove(&DataKey::PendingDeposit(owner.clone()));
+        let shares = Self::mint_shares(&env, &owner, pending.amount, epoch.nav)?;
+        let total: i128 = env.storage().instance().get(&DataKey::PendingDepositTotal).unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::PendingDepositTotal,
+            &total.saturating_sub(pending.amount).max(0),
+        );
+        Ok(shares)
+    }
+
+    pub fn settle_redeem(env: Env, owner: Address) -> Result<i128, Error> {
+        let pending: PendingRedeem = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRedeem(owner.clone()))
+            .ok_or(Error::EpochNotClosed)?;
+        let epoch: Epoch = env
+            .storage()
+            .instance()
+            .get(&DataKey::Epoch(pending.epoch))
+            .ok_or(Error::EpochNotClosed)?;
+        if !epoch.closed {
+            return Err(Error::EpochNotClosed);
+        }
+        env.storage().persistent().remove(&DataKey::PendingRedeem(owner.clone()));
+        let assets = assets_for_shares(pending.shares, epoch.nav, epoch.supply)
+            .ok_or(Error::InvalidAmount)?;
+        Self::burn_shares(&env, &owner, pending.shares)?;
+        Ok(assets)
+    }
+
+    pub fn epoch(env: Env, id: u64) -> Option<Epoch> {
+        env.storage().instance().get(&DataKey::Epoch(id))
+    }
+
+    pub fn pending_deposit(env: Env, owner: Address) -> Option<PendingDeposit> {
+        env.storage().persistent().get(&DataKey::PendingDeposit(owner))
+    }
+
+    pub fn pending_redeem(env: Env, owner: Address) -> Option<PendingRedeem> {
+        env.storage().persistent().get(&DataKey::PendingRedeem(owner))
+    }
+
+    /// Pays the ticket at the head of the queue as far as idle collateral
+    /// allows. Permissionless: the money always goes to the ticket's owner.
+    /// Only the head ticket can be paid (`NothingToPay` for later ones).
     // Pays the ticket at the head of the queue as far as idle collateral
     // allows. Permissionless: the money always goes to the ticket's owner.
     // Only the head ticket can be paid (`NothingToPay` for later ones).
@@ -6016,6 +6185,8 @@ impl Treasury {
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &new_supply);
+        let epoch: u64 = env.storage().instance().get(&DataKey::CurrentEpoch).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::LastMintEpoch(owner.clone()), &epoch);
         Ok(credited)
     }
 

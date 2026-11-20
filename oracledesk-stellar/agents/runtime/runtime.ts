@@ -26,7 +26,7 @@ export interface TaskContext {
    * *start* once shutdown began; once `fn` is running it is never aborted.
    * State is flushed after every submission.
    */
-  submit: <T>(fn: () => Promise<T>, intent?: string) => Promise<T>;
+  submit: <T>(fn: (lease?: import("../stellar/channels.js").ChannelLease) => Promise<T>, intent?: string) => Promise<T>;
   log: Logger;
   now: () => number;
 }
@@ -169,6 +169,7 @@ export class Runtime {
     };
   }
 
+  private async submit<T>(fn: (lease?: import("../stellar/channels.js").ChannelLease) => Promise<T>, intent: string): Promise<T> {
   private async killLocally(reason: KillReason): Promise<void> {
     if (this.o.killSwitch) await this.o.killSwitch.trip(reason);
     else await this.kill(reason);
@@ -192,7 +193,7 @@ export class Runtime {
       this.inFlight++;
       this.pending.set(id, intent);
       try {
-        return await fn();
+        return await fn(undefined);
       } finally {
         this.inFlight--;
         this.pending.delete(id);

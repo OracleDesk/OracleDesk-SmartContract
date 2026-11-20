@@ -42,6 +42,7 @@ MAKER_KEY=${MAKER_KEY:-${IDENTITY_PREFIX}-maker}
 TRADER_KEY=${TRADER_KEY:-${IDENTITY_PREFIX}-trader}
 OUT=${OUT:-deployments/$NETWORK.json}
 WASM_DIR=target/wasm32v1-none/release
+SKIP_FUNDING=${SKIP_FUNDING:-0}
 
 # treasury's risk caps (7-decimal USDC units). Must comfortably clear
 # market-core's MIN_SEED (100 USDC) since agent_create_market's seed amount
@@ -477,7 +478,9 @@ propose_agent trader "$TRADER" $((ROLE_TRADE | ROLE_SETTLE)) "$TRADER_MAX_TRADE"
 # deposits, receiving shares (docs/adr/0005-treasury-vault.md).
 TREASURY_FUNDED=$(json_get .treasury_funded_amount)
 FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-10000000000000} # 1,000,000 USDC
-if [ "$TREASURY_FUNDED" != "$FUND_AMOUNT" ]; then
+if [ "$SKIP_FUNDING" = "1" ]; then
+  log "SKIP_FUNDING=1: leaving generation-2 treasury unfunded for migration capital transfer"
+elif [ "$TREASURY_FUNDED" != "$FUND_AMOUNT" ]; then
   log "minting $FUND_AMOUNT stroops of test USDC and depositing it into the treasury"
   stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
     --network "$NETWORK" -- mint --to "$DEPLOYER" --amount "$FUND_AMOUNT"
