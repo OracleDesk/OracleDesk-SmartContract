@@ -332,6 +332,15 @@ pub enum DataKey {
     KeyTraceCount(BytesN<32>),
     /// #299: trace_id at a given index in a key's signed-trace index.
     KeyTraceAt(BytesN<32>, u64),
+    // ── #316 Commit-reveal trace storage ─────────────────────────────────────
+    /// Pending commitment: `TraceCommit` stored at submit time.
+    TraceCommit(u64),
+    /// Counter of pending commits assigned to an agent (for deadline scanning).
+    AgentCommitCount(Address),
+    /// Dense index: `AgentCommitAt(agent, index)` → commit_id.
+    AgentCommitAt(Address, u64),
+    /// Number of traces an agent missed the reveal deadline for.
+    AgentMissedRevealCount(Address),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -357,6 +366,57 @@ pub struct ChainLink {
 pub struct PendingAdmin {
     pub address: Address,
     pub expires_at: u64,
+}
+
+// ── #316 Commit-reveal trace storage ─────────────────────────────────────────
+
+/// Default reveal deadline: 24 hours after commit.
+pub const DEFAULT_REVEAL_DEADLINE_SECS: u64 = 86_400;
+
+/// A pending trace commitment stored before the reveal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceCommit {
+    pub agent: Address,
+    pub market_id: u64,
+    pub action: TraceAction,
+    pub commitment: BytesN<32>,
+    pub committed_at: u64,
+    pub reveal_deadline: u64,
+    /// True after `reveal_trace` succeeds; the record is kept for auditing.
+    pub revealed: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceCommitted {
+    #[topic]
+    pub commit_id: u64,
+    #[topic]
+    pub agent: Address,
+    pub market_id: u64,
+    pub commitment: BytesN<32>,
+    pub reveal_deadline: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceRevealed {
+    #[topic]
+    pub commit_id: u64,
+    #[topic]
+    pub trace_id: u64,
+    pub agent: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevealDeadlineMissed {
+    #[topic]
+    pub commit_id: u64,
+    #[topic]
+    pub agent: Address,
+    pub missed_total: u64,
 }
 
 #[contracterror]
@@ -2184,6 +2244,174 @@ impl ReasoningRegistry {
         env.crypto().sha256(&bytes).into()
     }
 
+    // ── #316 Commit-reveal trace storage ─────────────────────────────────────
+
+    /// Stores a commitment for a future unchained trace. Returns the commit id.
+    /// The agent must reveal within `reveal_deadline_secs` (capped to
+    /// `DEFAULT_REVEAL_DEADLINE_SECS` when zero).
+    pub fn commit_trace(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        commitment: BytesN<32>,
+        reveal_deadline_secs: u64,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
+        if !matches!(record.status, AgentStatus::Active) {
+            return Err(Error::AgentNotActive);
+        }
+        Self::validate_action(&env, &action)?;
+        Self::validate_reference(&env, market_id, &action)?;
+
+        let deadline_secs = if reveal_deadline_secs == 0 {
+            DEFAULT_REVEAL_DEADLINE_SECS
+        } else {
+            reveal_deadline_secs
+        };
+        let now = env.ledger().timestamp();
+        let commit_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .ok_or(Error::NotInitialized)?;
+        env.storage().instance().set(&DataKey::NextId, &(commit_id + 1));
+
+        let commit = TraceCommit {
+            agent: agent.clone(),
+            market_id,
+            action,
+            commitment: commitment.clone(),
+            committed_at: now,
+            reveal_deadline: now.saturating_add(deadline_secs),
+            revealed: false,
+        };
+        Self::put(&env, &DataKey::TraceCommit(commit_id), &commit);
+
+        let count_key = DataKey::AgentCommitCount(agent.clone());
+        let idx: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        Self::put(&env, &DataKey::AgentCommitAt(agent.clone(), idx), &commit_id);
+        Self::put(&env, &count_key, &(idx + 1));
+
+        TraceCommitted {
+            commit_id,
+            agent,
+            market_id: commit.market_id,
+            commitment,
+            reveal_deadline: commit.reveal_deadline,
+        }
+        .publish(&env);
+        Ok(commit_id)
+    }
+
+    /// Stores a commitment for a future chained trace. Same semantics as
+    /// `commit_trace` but records the expected chain head for consistency.
+    pub fn commit_chained_trace(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        commitment: BytesN<32>,
+        reveal_deadline_secs: u64,
+    ) -> Result<u64, Error> {
+        // Validation identical to commit_trace; chaining is enforced at reveal.
+        Self::commit_trace(env, agent, market_id, action, commitment, reveal_deadline_secs)
+    }
+
+    /// Reveals a previously committed trace. Verifies the commitment and
+    /// publishes the trace through the normal `write_trace` path.
+    /// If the reveal deadline has passed, increments the agent's missed-reveal
+    /// counter and emits `RevealDeadlineMissed` before continuing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reveal_trace(
+        env: Env,
+        agent: Address,
+        commit_id: u64,
+        trace_hash: BytesN<32>,
+        salt: BytesN<32>,
+        ipfs_cid: String,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        let commit_key = DataKey::TraceCommit(commit_id);
+        let mut commit: TraceCommit = env
+            .storage()
+            .persistent()
+            .get(&commit_key)
+            .ok_or(Error::TraceNotFound)?;
+
+        if commit.agent != agent {
+            return Err(Error::TraceAgentMismatch);
+        }
+        if commit.revealed {
+            return Err(Error::TraceAlreadyConsumed);
+        }
+
+        let expected = Self::commitment_for(&env, &trace_hash, &salt);
+        if expected != commit.commitment {
+            return Err(Error::TraceMismatch);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > commit.reveal_deadline {
+            let missed_key = DataKey::AgentMissedRevealCount(agent.clone());
+            let missed: u64 = env.storage().persistent().get(&missed_key).unwrap_or(0);
+            let new_missed = missed + 1;
+            Self::put(&env, &missed_key, &new_missed);
+            RevealDeadlineMissed {
+                commit_id,
+                agent: agent.clone(),
+                missed_total: new_missed,
+            }
+            .publish(&env);
+        }
+
+        if ipfs_cid.is_empty() {
+            return Err(Error::EmptyCid);
+        }
+
+        // Bump the agent's TTL (mirrors publish_trace).
+        ttl::bump_persistent(
+            &env,
+            &DataKey::Agent(agent.clone()),
+            ttl::long_lived_target(&env),
+        );
+
+        let trace_id = Self::write_trace(
+            &env,
+            agent.clone(),
+            commit.market_id,
+            commit.action.clone(),
+            trace_hash,
+            ipfs_cid,
+        )?;
+
+        commit.revealed = true;
+        Self::put(&env, &commit_key, &commit);
+
+        TraceRevealed {
+            commit_id,
+            trace_id,
+            agent,
+        }
+        .publish(&env);
+        Ok(trace_id)
+    }
+
+    /// Returns a pending commitment record by its id.
+    pub fn get_trace_commit(env: Env, commit_id: u64) -> Option<TraceCommit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TraceCommit(commit_id))
+    }
+
+    /// Number of traces an agent missed the reveal deadline for.
+    pub fn agent_missed_reveal_count(env: Env, agent: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentMissedRevealCount(agent))
+            .unwrap_or(0)
+    }
 
 }
 

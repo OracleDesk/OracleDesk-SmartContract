@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod bounds;
 pub mod ttl;
 
 #[cfg(test)]
@@ -2373,7 +2374,7 @@ impl Resolver {
         Self::assert_not_disputed(&env, market_id)?;
         let authority = Self::signer_authority(&env, market_id)?;
         let proposal = Self::load_proposal(&env, market_id).ok_or(Error::NoProposal)?;
-        if env.ledger().timestamp() < proposal.proposed_at + authority.dispute_window() {
+        if env.ledger().timestamp() < proposal.proposed_at.saturating_add(authority.dispute_window()) {
             return Err(Error::DisputeWindowOpen);
         }
         if !Self::has_quorum(&env, &authority, market_id, proposal.outcome) {
@@ -3286,6 +3287,7 @@ impl Resolver {
     ) -> Result<(), Error> {
         Self::assert_unconfigured(env, market_id)?;
         Self::validate_rule(env, rule)?;
+        bounds::validate_spec_bounds(env, rule)?;
         let close_time = Self::assert_matches_commitment(env, market_id, commitment)?;
         Self::store_rule(env, market_id, rule, close_time);
         Self::bump_market_entries(env, market_id, close_time);

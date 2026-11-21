@@ -17,6 +17,8 @@ path = "src/lib.rs"
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 market-core = { path = "../contracts/market-core" }
+reasoning-registry = { path = "../contracts/reasoning-registry" }
+timelock = { path = "../contracts/timelock" }
 soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
 
 [[bin]]
@@ -52,6 +54,18 @@ doc = false
 [[bin]]
 name = "fuzz_market_core_sequence"
 path = "fuzz_targets/fuzz_market_core_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_registry_sequence"
+path = "fuzz_targets/fuzz_registry_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_timelock_sequence"
+path = "fuzz_targets/fuzz_timelock_sequence.rs"
 test = false
 doc = false
 
