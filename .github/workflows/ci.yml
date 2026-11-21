@@ -17,7 +17,7 @@ jobs:
     name: Toolchain sync check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify toolchain.env matches rust-toolchain.toml, Dockerfile, and flake.nix
         run: |
           ./scripts/check-toolchain-sync.sh
@@ -31,7 +31,7 @@ jobs:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Read pinned toolchain versions
@@ -90,7 +90,7 @@ jobs:
             contracts/router/resolver.wasm \
             contracts/router/reasoning_registry.wasm
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: contract-wasm
           path: oracledesk-stellar/target/wasm32v1-none/release/*.wasm
@@ -99,10 +99,10 @@ jobs:
     name: Python FPMM model
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python3 model/fpmm_model.py
@@ -112,13 +112,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: contract-wasm
           path: oracledesk-stellar/target/wasm32v1-none/release
@@ -190,7 +190,7 @@ jobs:
     name: Shell scripts (bats, shellcheck, shfmt)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned shellcheck and shfmt
         run: |
           curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz -o /tmp/sc.tar.xz
