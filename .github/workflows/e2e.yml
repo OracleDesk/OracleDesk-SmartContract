@@ -32,15 +32,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: pinned
+        working-directory: oracledesk-stellar
+        run: |
+          echo "rust=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
           targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: oracledesk-stellar
 
-      - uses: stellar/stellar-cli@v27.1.0
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL "https://github.com/stellar/stellar-cli/releases/download/v${{ steps.pinned.outputs.stellar }}/stellar-cli-${{ steps.pinned.outputs.stellar }}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/stellar.tar.gz
+          mkdir -p "$RUNNER_TEMP/stellar-bin"
+          tar -xzf /tmp/stellar.tar.gz -C "$RUNNER_TEMP/stellar-bin" stellar
+          echo "$RUNNER_TEMP/stellar-bin" >> "$GITHUB_PATH"
 
       - uses: actions/setup-node@v4
         with:

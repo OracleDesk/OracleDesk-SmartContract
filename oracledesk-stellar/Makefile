@@ -1,5 +1,5 @@
 .PHONY: setup build test test-scripts lint fmt deploy-testnet seed-market demo bindings clean interface-check
-.PHONY: doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+.PHONY: doctor check-toolchain-sync check-lockfiles monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
 
 # Verify local or CI tool versions match `toolchain.env` (#135).
 doctor:
@@ -8,6 +8,9 @@ doctor:
 # Fail if toolchain.env drifted from rust-toolchain.toml, Dockerfile, or flake.nix.
 check-toolchain-sync:
 	./scripts/check-toolchain-sync.sh
+
+check-lockfiles:
+	./scripts/check-lockfiles.sh
 
 # Run the on-chain monitoring and alerting service (#131).
 monitor:
@@ -34,7 +37,7 @@ setup:
 # pin (see docs/adr/0002-cross-contract-calls.md — a stale copy is a compile
 # error, not a silent old interface).
 build:
-	cargo build --workspace
+	cargo build --locked --workspace
 	stellar contract build
 	./scripts/sync-vendored-wasm.sh
 	stellar contract build
@@ -66,9 +69,9 @@ check-wasm:
 		contracts/resolver/reasoning_registry.wasm.sha256
 
 test: build
-	cargo test --workspace
+	cargo test --locked --workspace
 	CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml
-	CARGO_TARGET_DIR=target cargo test --manifest-path scripts/spec-hash/Cargo.toml
+	CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/spec-hash/Cargo.toml
 	python3 model/fpmm_model.py
 	python3 model/fpmm_bounds.py --quick
 	python3 scripts/coverage-tools.py --self-test
@@ -83,13 +86,14 @@ test-scripts:
 
 lint:
 	./scripts/check-no-mock-all-auths.sh
+	./scripts/check-lockfiles.sh
 	cargo fmt --check
 	cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
 auth-matrix: build
-	cargo test -p integration-tests --test auth_matrix
+	cargo test --locked -p integration-tests --test auth_matrix
 	./scripts/check-no-mock-all-auths.sh
 
 kani:
@@ -97,7 +101,7 @@ kani:
 
 model-test:
 	python3 model/system_model.py --selftest
-	cargo test -p integration-tests --test system_model
+	cargo test --locked -p integration-tests --test system_model
 
 e2e-local:
 	./scripts/e2e-local.sh

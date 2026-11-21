@@ -166,6 +166,15 @@ against the PR base branch and also rejects stale generated manifests. GitHub
 runs the workflow at the repository root; the nested workflow is retained for
 standalone use of `oracledesk-stellar/`.
 
+## Toolchain and lockfiles
+
+- The Rust version is pinned in `rust-toolchain.toml`. CI reads it from that file, so no workflow installs `stable`.
+- The Stellar CLI version is pinned in `stellar-cli.version`. CI and `scripts/toolchain.env` read it from there.
+- There are six independent Cargo workspaces (the root `Cargo.toml`, `contracts/budget-tests`, `fuzz`, `scripts/spec-hash`, `scripts/interface-manifest` and `scripts/fpmm-diff/oracle`). Each has its own lockfile.
+- Every `cargo` command in CI and the Makefile uses `--locked`.
+- The Soroban/Stellar crates (`soroban-sdk`, `stellar-xdr` and related) must resolve to the same versions in all six lockfiles. `make check-lockfiles` (run by `make lint`) fails when they drift or when a new standalone workspace is not listed in `scripts/check-lockfiles.sh`.
+- To bump `soroban-sdk`, change the requirement in every manifest that uses it, then regenerate every lockfile in one PR. Use `cargo update -p <crate> --precise <version>` so that unrelated transitive dependencies do not move, and check the diff with `make verify-wasm`.
+
 ## Supply-chain security
 
 All PRs run automated supply-chain checks (`cargo-deny`, production `npm audit` gate, `gitleaks`, and CycloneDX SBOM generation). See [`docs/security-ci.md`](docs/security-ci.md) for policy details and exception rules.
