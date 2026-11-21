@@ -29,7 +29,14 @@ jobs:
         working-directory: oracledesk-stellar
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - id: pinned
+        working-directory: oracledesk-stellar
+        run: |
+          echo "rust=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: oracledesk-stellar

@@ -30,8 +30,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - id: pinned
+        working-directory: oracledesk-stellar
+        run: |
+          echo "rust=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
           targets: wasm32v1-none
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -42,7 +48,7 @@ jobs:
       # (`cargo install stellar-cli` — verified against the actual crate
       # name behind the `stellar` binary, not a guessed GitHub Action).
       - name: Install stellar CLI
-        run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
+        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar }}
 
       - name: cargo fmt --check
         run: |
@@ -51,11 +57,11 @@ jobs:
 
       - name: cargo clippy
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build all contracts to wasm
         run: |
@@ -113,13 +119,20 @@ jobs:
           name: contract-wasm
           path: oracledesk-stellar/target/wasm32v1-none/release
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: pinned
+        working-directory: oracledesk-stellar
+        run: |
+          echo "rust=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "oracledesk-stellar -> target"
       - name: Install Stellar CLI
         run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v${{ steps.pinned.outputs.stellar }}/stellar-cli-${{ steps.pinned.outputs.stellar }}-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
           mkdir -p "$RUNNER_TEMP/stellar-bin"
           tar -xzf /tmp/stellar.tar.gz -C "$RUNNER_TEMP/stellar-bin" stellar
           echo "$RUNNER_TEMP/stellar-bin" >> "$GITHUB_PATH"
