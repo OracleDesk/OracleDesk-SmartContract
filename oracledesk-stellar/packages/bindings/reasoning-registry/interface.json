@@ -97,12 +97,58 @@
         ]
       }
     },
+    "availability_reporter": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Whether `reporter` may raise availability flags (#325).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reporter",
+            "type_": "address"
+          }
+        ],
+        "name": "availability_reporter",
+        "outputs": [
+          {
+            "bool": null
+          }
+        ]
+      }
+    },
     "cancel_admin_transfer": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
         "inputs": [],
         "name": "cancel_admin_transfer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "clear_unavailable": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Clears only an active `unavail` flag raised by the calling reporter (#325).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reporter",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "clear_unavailable",
         "outputs": [
           {
             "result": {
@@ -502,6 +548,60 @@
         ]
       }
     },
+    "report_unavailable": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Flags a trace whose content is unavailable, as a delegated reporter (#325).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reporter",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "report_unavailable",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_availability_reporter": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin allow-list for delegated availability reporters (#325).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reporter",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "name": "set_availability_reporter",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "trace_count": {
       "kind": "function_v0",
       "spec": {
@@ -726,6 +826,33 @@
           },
           {
             "tuple_v0": {
+              "doc": "Marks a flag as reporter-owned so `clear_unavailable` cannot touch an admin flag (#325).",
+              "name": "AvailabilityFlag",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "#325: `AvailabilityReporter(addr)` \u2192 `true` while allow-listed.",
+              "name": "AvailabilityReporter",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Last availability toggle, used to rate-limit flapping gateways (#325).",
+              "name": "AvailabilityToggle",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
               "doc": "Set once a trace has backed an action (#50).",
               "name": "Consumed",
               "type_": [
@@ -887,6 +1014,21 @@
             "value": 4
           },
           {
+            "doc": "The trace has no active reporter-owned `unavail` flag (#325).",
+            "name": "NotAvailabilityFlag",
+            "value": 136
+          },
+          {
+            "doc": "Caller is not an admin-registered availability reporter (#325).",
+            "name": "NotAvailabilityReporter",
+            "value": 135
+          },
+          {
+            "doc": "The same trace was toggled again before AVAIL_MIN_TOGGLE_SECS elapsed (#325).",
+            "name": "AvailabilityToggleTooSoon",
+            "value": 137
+          },
+          {
             "doc": "`expected_seq` / `prev_trace_hash` don't extend the agent's chain head (#52).",
             "name": "ChainHeadMismatch",
             "value": 8
@@ -1020,6 +1162,32 @@
         ],
         "prefix_topics": [
           "agent_registered"
+        ]
+      }
+    },
+    "AvailabilityReporterSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AvailabilityReporterSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "reporter",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "availability_reporter_set"
         ]
       }
     },

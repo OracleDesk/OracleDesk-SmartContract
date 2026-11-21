@@ -93,6 +93,12 @@ pub const MAX_CID_LEN: u32 = 128;
 /// were unbounded, so no page size could have been proven safe.)
 pub const MAX_PAGE_SIZE: u32 = 25;
 
+/// #325: availability flags use one fixed reason, so a reporter can only ever
+/// toggle its own narrow signal and never imitate an admin's policy flag.
+pub const AVAILABILITY_REASON: &str = "unavail";
+/// Minimum interval between two availability toggles for the same trace.
+pub const AVAIL_MIN_TOGGLE_SECS: u64 = 24 * 3_600;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraceAction {
@@ -192,6 +198,15 @@ pub struct TraceUnflagged {
     #[topic]
     pub trace_id: u64,
     pub reason: Symbol,
+}
+
+/// #325: admin-managed allow-list of delegated availability reporters.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityReporterSet {
+    #[topic]
+    pub reporter: Address,
+    pub enabled: bool,
 }
 
 #[contractevent]
@@ -330,6 +345,15 @@ pub enum DataKey {
     KeyTraceCount(BytesN<32>),
     /// #299: trace_id at a given index in a key's signed-trace index.
     KeyTraceAt(BytesN<32>, u64),
+    // ── #325 delegated availability reporters (appended: stored-key order is
+    // part of the contract's XDR, so existing variants must not shift) ───────
+    /// `AvailabilityReporter(addr)` → `true` while allow-listed.
+    AvailabilityReporter(Address),
+    /// Last availability toggle, used to rate-limit flapping gateways.
+    AvailabilityToggle(u64),
+    /// Marks a flag as reporter-owned so `clear_unavailable` cannot touch an
+    /// admin flag that happens to use the same reason.
+    AvailabilityFlag(u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -423,6 +447,13 @@ pub enum Error {
     ScopingAlreadyEnabled = 134,
     /// #299: Key already revoked and `compromised_since` cannot move later.
     AlreadyRevoked = 129,
+    // ── #325 delegated availability reporters ──────────────────────────────
+    /// Caller is not an admin-registered availability reporter.
+    NotAvailabilityReporter = 135,
+    /// The trace has no active reporter-owned `unavail` flag.
+    NotAvailabilityFlag = 136,
+    /// The same trace was toggled again before AVAIL_MIN_TOGGLE_SECS elapsed.
+    AvailabilityToggleTooSoon = 137,
 }
 
 #[contractevent]
@@ -900,6 +931,75 @@ impl ReasoningRegistry {
         Ok(())
     }
 
+    // ----- #325 delegated availability reporters -------------------------
+
+    /// Admin-managed allow-list. Disabling a reporter does not rewrite any
+    /// flags it already raised; it only stops future toggles.
+    pub fn set_availability_reporter(
+        env: Env,
+        reporter: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::AvailabilityReporter(reporter.clone());
+        if enabled {
+            env.storage().instance().set(&key, &true);
+        } else {
+            env.storage().instance().remove(&key);
+        }
+        AvailabilityReporterSet { reporter, enabled }.publish(&env);
+        Ok(())
+    }
+
+    pub fn availability_reporter(env: Env, reporter: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AvailabilityReporter(reporter))
+            .unwrap_or(false)
+    }
+
+    /// Flags a trace whose bytes no gateway can serve. Only the reporter key
+    /// registered by the admin may call this, and only with reason `unavail`.
+    pub fn report_unavailable(
+        env: Env,
+        reporter: Address,
+        trace_id: u64,
+    ) -> Result<(), Error> {
+        reporter.require_auth();
+        Self::require_availability_reporter(&env, &reporter)?;
+        Self::get_trace(env.clone(), trace_id)?;
+        let reason = Symbol::new(&env, AVAILABILITY_REASON);
+        Self::set_availability_flag(&env, trace_id, &reporter, true, reason)
+    }
+
+    /// Clears only a flag this reporter previously raised. Admin flags are
+    /// never removable through this entrypoint, even with reason `unavail`.
+    pub fn clear_unavailable(
+        env: Env,
+        reporter: Address,
+        trace_id: u64,
+    ) -> Result<(), Error> {
+        reporter.require_auth();
+        Self::require_availability_reporter(&env, &reporter)?;
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AvailabilityFlag(trace_id))
+            .ok_or(Error::NotAvailabilityFlag)?;
+        if owner != reporter {
+            return Err(Error::NotAvailabilityFlag);
+        }
+        let flag: TraceFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Flag(trace_id))
+            .ok_or(Error::NotAvailabilityFlag)?;
+        if !flag.active || flag.reason != Symbol::new(&env, AVAILABILITY_REASON) {
+            return Err(Error::NotAvailabilityFlag);
+        }
+        Self::set_availability_flag(&env, trace_id, &reporter, false, flag.reason)
+    }
+
     pub fn trace_flags(
         env: Env,
         trace_id: u64,
@@ -1203,6 +1303,62 @@ impl ReasoningRegistry {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
+        Ok(())
+    }
+
+    fn require_availability_reporter(env: &Env, reporter: &Address) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AvailabilityReporter(reporter.clone()))
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(Error::NotAvailabilityReporter)
+        }
+    }
+
+    fn set_availability_flag(
+        env: &Env,
+        trace_id: u64,
+        reporter: &Address,
+        active: bool,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        let toggle_key = DataKey::AvailabilityToggle(trace_id);
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&toggle_key) {
+            if env.ledger().timestamp().saturating_sub(last) < AVAIL_MIN_TOGGLE_SECS {
+                return Err(Error::AvailabilityToggleTooSoon);
+            }
+        }
+        let count_key = DataKey::FlagHistoryCount(trace_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count >= 16 {
+            return Err(Error::FlagHistoryFull);
+        }
+        let flag = TraceFlag {
+            reason: reason.clone(),
+            flagged_at: env.ledger().timestamp(),
+            active,
+        };
+        let flag_key = DataKey::Flag(trace_id);
+        let history_key = DataKey::FlagHistory(trace_id, count);
+        let owner_key = DataKey::AvailabilityFlag(trace_id);
+        Self::put(env, &flag_key, &flag);
+        if active {
+            Self::put(env, &owner_key, reporter);
+        } else {
+            env.storage().persistent().remove(&owner_key);
+        }
+        Self::put(env, &history_key, &flag);
+        Self::put(env, &count_key, &(count + 1));
+        env.storage().persistent().set(&toggle_key, &env.ledger().timestamp());
+        if active {
+            TraceFlagged { trace_id, reason }.publish(env);
+        } else {
+            TraceUnflagged { trace_id, reason }.publish(env);
+        }
         Ok(())
     }
 
@@ -3784,6 +3940,79 @@ mod test {
         );
 
         let _ = admin;
+    }
+
+    fn publish_one_trace(env: &Env, client: &ReasoningRegistryClient<'static>, agent: &Address) -> u64 {
+        client.register_agent(agent);
+        client.publish_trace(
+            agent,
+            &1,
+            &TraceAction::Buy,
+            &BytesN::from_array(env, &[7u8; 32]),
+            &String::from_str(env, "bafkrei-availability"),
+        )
+    }
+
+    #[test]
+    fn reporter_can_flag_and_clear_unavail() {
+        let (env, client, _, agent) = setup();
+        let trace_id = publish_one_trace(&env, &client, &agent);
+        let reporter = Address::generate(&env);
+        client.set_availability_reporter(&reporter, &true);
+        assert!(client.availability_reporter(&reporter));
+
+        client.report_unavailable(&reporter, &trace_id);
+        let flag = client.get_trace_flag(&trace_id).unwrap();
+        assert!(flag.active);
+        assert_eq!(flag.reason, Symbol::new(&env, AVAILABILITY_REASON));
+        assert_eq!(
+            client.trace_verdict(&trace_id, &BytesN::from_array(&env, &[7u8; 32])),
+            TraceVerdict::Flagged(Symbol::new(&env, AVAILABILITY_REASON))
+        );
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + AVAIL_MIN_TOGGLE_SECS);
+        client.clear_unavailable(&reporter, &trace_id);
+        assert!(!client.get_trace_flag(&trace_id).unwrap().active);
+    }
+
+    #[test]
+    fn non_reporter_cannot_flag() {
+        let (env, client, _, agent) = setup();
+        let trace_id = publish_one_trace(&env, &client, &agent);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_report_unavailable(&stranger, &trace_id),
+            Err(Ok(Error::NotAvailabilityReporter))
+        );
+    }
+
+    #[test]
+    fn reporter_cannot_clear_an_admin_flag() {
+        let (env, client, _, agent) = setup();
+        let trace_id = publish_one_trace(&env, &client, &agent);
+        let reporter = Address::generate(&env);
+        client.set_availability_reporter(&reporter, &true);
+        client.flag_trace(&trace_id, &Symbol::new(&env, AVAILABILITY_REASON));
+
+        // The admin flag has no reporter-owned marker, so clear must refuse it.
+        assert_eq!(
+            client.try_clear_unavailable(&reporter, &trace_id),
+            Err(Ok(Error::NotAvailabilityFlag))
+        );
+        assert!(client.get_trace_flag(&trace_id).unwrap().active);
+    }
+
+    #[test]
+    fn availability_toggle_is_rate_limited() {
+        let (env, client, _, agent) = setup();
+        let trace_id = publish_one_trace(&env, &client, &agent);
+        let reporter = Address::generate(&env);
+        client.set_availability_reporter(&reporter, &true);
+        client.report_unavailable(&reporter, &trace_id);
+        assert_eq!(
+            client.try_clear_unavailable(&reporter, &trace_id),
+            Err(Ok(Error::AvailabilityToggleTooSoon))
+        );
     }
 }
 }

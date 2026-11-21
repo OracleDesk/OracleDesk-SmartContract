@@ -16,8 +16,14 @@ caller = "anyone (read-only)"
 [functions.agent_trace_at]
 caller = "anyone (read-only)"
 
+[functions.availability_reporter]
+caller = "anyone (read-only)"
+
 [functions.cancel_admin_transfer]
 caller = "admin (require_auth)"
+
+[functions.clear_unavailable]
+caller = "allow-listed availability reporter (require_auth)"
 
 [functions.consume_trace]
 caller = "registered consumer contract (require_auth)"
@@ -64,6 +70,12 @@ caller = "admin (require_auth)"
 [functions.register_consumer]
 caller = "admin (require_auth)"
 
+[functions.report_unavailable]
+caller = "allow-listed availability reporter (require_auth)"
+
+[functions.set_availability_reporter]
+caller = "admin (require_auth)"
+
 [functions.trace_count]
 caller = "anyone (read-only)"
 
@@ -82,6 +94,18 @@ caller = "anyone (read-only)"
 [storage.Admin]
 durability = "instance"
 ttl = "extended with contract instance TTL"
+
+[storage.AvailabilityFlag]
+durability = "persistent"
+ttl = "extended with trace entry TTL"
+
+[storage.AvailabilityReporter]
+durability = "instance"
+ttl = "extended with contract instance TTL"
+
+[storage.AvailabilityToggle]
+durability = "persistent"
+ttl = "extended with trace entry TTL"
 
 [storage.Agent]
 durability = "persistent"

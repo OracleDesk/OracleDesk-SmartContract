@@ -159,6 +159,12 @@ type TypedTreasuryClient = TreasuryBindingClient & {
 };
 type TypedReasoningRegistryClient = ReasoningRegistryBindingClient & {
   publish_decision_trace: DynamicContractMethod;
+  // #325: added after the committed bindings were generated; called through
+  // the same dynamic client path as publish_decision_trace.
+  report_unavailable: DynamicContractMethod;
+  clear_unavailable: DynamicContractMethod;
+  set_availability_reporter: DynamicContractMethod;
+  availability_reporter: DynamicContractMethod;
 };
 
 /**
@@ -1314,9 +1320,56 @@ export class StellarAdapter {
 
   /** The IPFS CID a registry trace was published with. */
   async traceCid(traceId: bigint): Promise<string> {
+    return (await this.traceMetadata(traceId)).cid;
+  }
+
+  /** CID and on-chain plaintext hash used by the availability probe (#325). */
+  async traceMetadata(traceId: bigint): Promise<{ cid: string; traceHash: string }> {
     const client = await this.client<any>("reasoning_registry", "@oracledesk/bindings-reasoning-registry");
-    const t = unwrapContractResult("get_trace", (await client.get_trace({ trace_id: traceId })).result) as { ipfs_cid: string };
-    return t.ipfs_cid;
+    const t = unwrapContractResult("get_trace", (await client.get_trace({ trace_id: traceId })).result) as {
+      ipfs_cid: string;
+      trace_hash: Uint8Array;
+    };
+    return { cid: t.ipfs_cid, traceHash: Buffer.from(t.trace_hash).toString("hex") };
+  }
+
+  /** Number of trace ids that have been allocated. Simulation-only read. */
+  async traceCount(): Promise<bigint> {
+    const client = await this.client<any>("reasoning_registry", "@oracledesk/bindings-reasoning-registry");
+    return BigInt((await client.trace_count({})).result);
+  }
+
+  /** Delegated availability flag (#325). `reporter` must be an allow-listed address. */
+  async reportUnavailable(args: { reporter: string; trace_id: bigint }): Promise<AdapterResult<void>> {
+    return this.run<TypedReasoningRegistryClient, void>(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "report_unavailable",
+      args,
+      (client, options) => client.report_unavailable(args, options),
+    );
+  }
+
+  /** Clears only an active `unavail` flag raised by an availability reporter. */
+  async clearUnavailable(args: { reporter: string; trace_id: bigint }): Promise<AdapterResult<void>> {
+    return this.run<TypedReasoningRegistryClient, void>(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "clear_unavailable",
+      args,
+      (client, options) => client.clear_unavailable(args, options),
+    );
+  }
+
+  /** Admin-only reporter allow-list management. */
+  async setAvailabilityReporter(args: { reporter: string; enabled: boolean }): Promise<AdapterResult<void>> {
+    return this.run<TypedReasoningRegistryClient, void>(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "set_availability_reporter",
+      args,
+      (client, options) => client.set_availability_reporter(args, options),
+    );
   }
 
   async publishTrace(args: {

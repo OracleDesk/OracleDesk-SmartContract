@@ -8,6 +8,7 @@ cd oracledesk-stellar/agents
 npm run agentd                         # both tasks, continuously
 npm run agentd -- --once               # each task exactly once, then exit
 npm run agentd -- --tasks trader       # a subset
+npm run agentd -- --tasks availability # opt-in trace availability service (#325)
 npm run agentd -- --config agentd.json # env-style overrides from a JSON object
 npm run market-maker                   # unchanged: the maker task, once
 npm run trader                         # unchanged: the trader task, once
@@ -151,6 +152,18 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `WATCHER_MAX_DISPUTES_PER_DAY` | 5 | disputes opened per UTC day |
 | `WATCHER_VERDICTS_FILE` | `./watcher-verdicts.json` | operator verdicts for the manual source |
 | `WATCHER_IPFS_GATEWAY` | | gateway used to fetch metadata and evidence traces (`local://` URIs need none) |
+| `TRACE_STORE` | `local` dry-run / `ipfs` live | store selected by `createTraceStore`; live refuses `local` without the override below |
+| `ALLOW_LOCAL_TRACE_STORE` | `0` | set to `1` to deliberately publish `local://` CIDs in live mode |
+| `IPFS_KUBO_API_URL` / `IPFS_KUBO_AUTH` | | raw-leaf `/api/v0/add` provider used for uploads and re-pins |
+| `IPFS_PINNING_ENDPOINT` / `IPFS_PINNING_TOKEN` / `IPFS_PINNING_ORIGINS` | | optional Pinning Service API provider; needs a serving origin |
+| `IPFS_MIN_PINS` / `IPFS_PIN_RETRIES` / `IPFS_PIN_TIMEOUT_MS` | 1 / 3 / 60000 | pin quorum and retry policy |
+| `IPFS_GATEWAY_URL` / `TRACE_ARCHIVE_DIR` | `https://ipfs.io/ipfs` / `./.trace-archive` | verification gateway and local archive of verified bytes |
+| `AVAIL_GATEWAYS` | `IPFS_GATEWAY_URL` | comma-separated gateways the availability task probes |
+| `AVAIL_REPORTER_SECRET` | | dedicated `S...` key for `report_unavailable`; required in live mode, never a trading key |
+| `AVAIL_BATCH` / `AVAIL_CONCURRENCY` | 25 / 4 | traces probed per tick and parallel probes |
+| `AVAIL_FLAG_AFTER_SECS` / `AVAIL_FLAG_AFTER_PROBES` | 21600 / 3 | time and distinct-tick thresholds before flagging |
+| `AVAIL_MIN_TOGGLE_SECS` | 86400 | minimum interval between reporter toggles (mirrors the registry) |
+| `AVAIL_INTERVAL_MS` / `AVAIL_JITTER_MS` / `AVAIL_TIMEOUT_MS` / `AVAIL_MAX_BYTES` | 900000 / 5000 / 30000 / 1048576 | task schedule and probe limits |
 | `RESTORE_MAX_FEE_STROOPS` | `100000000` | maximum restore rent charged to one action |
 | `RESTORE_DAILY_BUDGET_STROOPS` | `300000000` | maximum restore rent per task per UTC day (persisted) |
 | `RESTORE_MAX_RETRIES` | `2` | re-simulations after an entry archives between simulation and apply |
@@ -233,6 +246,54 @@ counts as success: nothing is spent and their dispute is followed.
 registered with the reasoning registry (`register_agent`), because the trace is
 published before the dispute. It never acts as an escalation member and does
 not change bond economics.
+
+## Trace availability (#325)
+
+An audit trail is only useful while its bytes can be fetched. The `availability`
+task is **off by default** and is enabled only with
+`--tasks availability` (it can be combined with the other tasks):
+
+```bash
+npm run agentd -- --tasks availability          # dry-run: logs intended flags
+AGENT_MODE=live AVAIL_REPORTER_SECRET=S... \
+  npm run agentd -- --tasks maker,trader,availability
+```
+
+Every entrypoint now builds its trace store through
+`core/trace-store-factory.ts`, so live mode publishes IPFS CIDs by default;
+`ALLOW_LOCAL_TRACE_STORE=1` is the only way to publish a `local://` CID.
+`IpfsTraceStore.put` archives the exact verified bytes under
+`TRACE_ARCHIVE_DIR` after enough providers pin them and the gateway serves
+bytes hashing to the recorded trace hash.
+
+Each tick the task:
+
+1. reads a persisted `availability/checkpoint` cursor and probes the next
+   `AVAIL_BATCH` registry trace ids (bounded parallelism `AVAIL_CONCURRENCY`);
+   the cursor is saved **only after** all results are recorded, so a crash
+   re-probes rather than skips;
+2. verifies every fetch: raw CIDv1/sha2-256 against the CID multihash, and
+   legacy dag-pb against the on-chain `trace_hash` without decrypting the
+   envelope. A gateway serving wrong bytes is reported as `mismatch`
+   immediately, with the gateway named in the log;
+3. re-pins from `TRACE_ARCHIVE_DIR` through the **same** `PinProvider`s that
+   published the trace, then re-probes to confirm recovery. Archived registry
+   entries (`get_trace` restore requirement) and `local://` CIDs are logged and
+   never flagged;
+4. raises `report_unavailable` only after a trace has failed for at least
+   `AVAIL_FLAG_AFTER_SECS` and across `AVAIL_FLAG_AFTER_PROBES` distinct ticks.
+   A later successful probe clears the flag with `clear_unavailable`. Both
+   submissions go through `ctx.submit`, and dry-run never submits.
+
+The reporter signs with `AVAIL_REPORTER_SECRET`, a dedicated key that must be
+registered on reasoning-registry by the admin
+(`set_availability_reporter(reporter, true)`). It is checked at startup against
+the deployment's `agent`, `agents.maker` and `agents.trader` addresses, so an
+operator cannot accidentally give the availability task a trading key.
+`clear_unavailable` can only deactivate an `unavail` flag raised by that same
+reporter; admin flags are untouched. x402 does **not** run a monitor: the old
+`x402/trace-availability-monitor.ts` scanner was dead code with no integrity
+check and no bytes to re-pin, and has been removed in favour of this task.
 
 ## State archival
 

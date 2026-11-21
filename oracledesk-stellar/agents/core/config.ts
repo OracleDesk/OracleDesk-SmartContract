@@ -221,6 +221,8 @@ export const EnvSchema = z.object({
   MAKER_SECRET_KEY: secretField,
   TRADER_SECRET_KEY: secretField,
   WATCHER_SECRET_KEY: secretField,
+  /** #325: separate key for registry availability flags, never a trading key. */
+  AVAIL_REPORTER_SECRET: secretField,
   DEPLOYMENTS_FILE: nonEmptyPath,
   DEPLOYMENTS_PATH: nonEmptyPath,
   TRACE_STORE_DIR: nonEmptyPath,

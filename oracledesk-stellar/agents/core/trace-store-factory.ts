@@ -67,6 +67,7 @@ export function createTraceStore(
     retries: positiveInt(env, "IPFS_PIN_RETRIES", 3),
     gatewayUrl: env.IPFS_GATEWAY_URL || DEFAULT_IPFS_GATEWAY_URL,
     acceptQueued,
+    archiveDir: env.TRACE_ARCHIVE_DIR || "./.trace-archive",
   });
   return { store, kind };
 }

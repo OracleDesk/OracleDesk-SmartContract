@@ -12,7 +12,9 @@ Generated deterministically from `packages/bindings/reasoning-registry/interface
 | [`admin`](#fn-admin) | anyone (read-only) | `Result<Address, Error>` | — |
 | [`agent_chain_head`](#fn-agent-chain-head) | anyone (read-only) | `ChainHead` | Current chain head for `agent` (genesis if it has never chained). |
 | [`agent_trace_at`](#fn-agent-trace-at) | anyone (read-only) | `Result<u64, Error>` | Trace id at position `seq` (1-based) of `agent`'s chain. |
+| [`availability_reporter`](#fn-availability-reporter) | anyone (read-only) | `{"bool":null}` | Whether `reporter` may raise availability flags (#325). |
 | [`cancel_admin_transfer`](#fn-cancel-admin-transfer) | admin (require_auth) | `Result<(), Error>` | — |
+| [`clear_unavailable`](#fn-clear-unavailable) | allow-listed availability reporter (require_auth) | `Result<(), Error>` | Clears only an active `unavail` flag raised by the calling reporter (#325). |
 | [`consume_trace`](#fn-consume-trace) | registered consumer contract (require_auth) | `Result<Trace, Error>` | Marks a trace as having backed an action, exactly once (#50). Only an allow-listed consumer contract can call it; the treasury passes its own address, which satisfies `require_auth` as the direct invoker. |
 | [`get_trace`](#fn-get-trace) | anyone (read-only) | `Result<Trace, Error>` | — |
 | [`get_trace_ledger`](#fn-get-trace-ledger) | anyone (read-only) | `Option<u32>` | Ledger sequence the trace was written in (#50). `None` for traces written before this field existed. |
@@ -28,6 +30,8 @@ Generated deterministically from `packages/bindings/reasoning-registry/interface
 | [`publish_trace`](#fn-publish-trace) | registered agent (require_auth) | `Result<u64, Error>` | — |
 | [`register_agent`](#fn-register-agent) | admin (require_auth) | `Result<(), Error>` | — |
 | [`register_consumer`](#fn-register-consumer) | admin (require_auth) | `Result<(), Error>` | Allow-lists a contract (e.g. the treasury) to call `consume_trace` (#50). |
+| [`report_unavailable`](#fn-report-unavailable) | allow-listed availability reporter (require_auth) | `Result<(), Error>` | Flags a trace whose content is unavailable, as a delegated reporter (#325). |
+| [`set_availability_reporter`](#fn-set-availability-reporter) | admin (require_auth) | `Result<(), Error>` | Admin allow-list for delegated availability reporters (#325). |
 | [`trace_count`](#fn-trace-count) | anyone (read-only) | `u64` | — |
 | [`unregister_agent`](#fn-unregister-agent) | admin (require_auth) | `Result<(), Error>` | — |
 | [`unregister_consumer`](#fn-unregister-consumer) | admin (require_auth) | `Result<(), Error>` | — |
@@ -81,6 +85,16 @@ fn agent_trace_at(agent: Address, seq: u64) -> Result<u64, Error>
 - **Caller / Auth:** anyone (read-only)
 - **Spec Doc:** Trace id at position `seq` (1-based) of `agent`'s chain.
 
+<a id="fn-availability-reporter"></a>
+### `availability_reporter`
+
+```rust
+fn availability_reporter(reporter: Address) -> {"bool":null}
+```
+
+- **Caller / Auth:** anyone (read-only)
+- **Spec Doc:** Whether `reporter` may raise availability flags (#325).
+
 <a id="fn-cancel-admin-transfer"></a>
 ### `cancel_admin_transfer`
 
@@ -89,6 +103,16 @@ fn cancel_admin_transfer() -> Result<(), Error>
 ```
 
 - **Caller / Auth:** admin (require_auth)
+
+<a id="fn-clear-unavailable"></a>
+### `clear_unavailable`
+
+```rust
+fn clear_unavailable(reporter: Address, trace_id: u64) -> Result<(), Error>
+```
+
+- **Caller / Auth:** allow-listed availability reporter (require_auth)
+- **Spec Doc:** Clears only an active `unavail` flag raised by the calling reporter (#325).
 
 <a id="fn-consume-trace"></a>
 ### `consume_trace`
@@ -234,6 +258,26 @@ fn register_consumer(consumer: Address) -> Result<(), Error>
 - **Caller / Auth:** admin (require_auth)
 - **Spec Doc:** Allow-lists a contract (e.g. the treasury) to call `consume_trace` (#50).
 
+<a id="fn-report-unavailable"></a>
+### `report_unavailable`
+
+```rust
+fn report_unavailable(reporter: Address, trace_id: u64) -> Result<(), Error>
+```
+
+- **Caller / Auth:** allow-listed availability reporter (require_auth)
+- **Spec Doc:** Flags a trace whose content is unavailable, as a delegated reporter (#325).
+
+<a id="fn-set-availability-reporter"></a>
+### `set_availability_reporter`
+
+```rust
+fn set_availability_reporter(reporter: Address, enabled: bool) -> Result<(), Error>
+```
+
+- **Caller / Auth:** admin (require_auth)
+- **Spec Doc:** Admin allow-list for delegated availability reporters (#325).
+
 <a id="fn-trace-count"></a>
 ### `trace_count`
 
@@ -337,6 +381,9 @@ A proposed admin handover (#62). Absent when no transfer is pending.
 | 10 | `TraceAlreadyConsumed` | Trace already backed an action (#50). |
 | 11 | `NoPendingAdmin` | `accept_admin`/`cancel_admin_transfer` called with nothing proposed. |
 | 12 | `PendingAdminExpired` | A proposed admin handover was not accepted within its `expires_at`. |
+| 135 | `NotAvailabilityReporter` | Caller is not an admin-registered availability reporter (#325). |
+| 136 | `NotAvailabilityFlag` | The trace has no active reporter-owned `unavail` flag (#325). |
+| 137 | `AvailabilityToggleTooSoon` | The same trace was toggled again before AVAIL_MIN_TOGGLE_SECS elapsed (#325). |
 
 ## Events
 
@@ -367,6 +414,13 @@ A proposed admin handover (#62). Absent when no transfer is pending.
 - **Topic fields:** `agent: Address`
 - **Data fields (`map`):** —
 - **Indexer filter:** `[Symbol("agent_registered"), "*"]`
+
+### `AvailabilityReporterSet`
+
+- **Prefix topics:** `"availability_reporter_set"`
+- **Topic fields:** `reporter: Address`
+- **Data fields (`map`):** `enabled: bool`
+- **Indexer filter:** `[Symbol("availability_reporter_set"), "*"]`
 
 ### `ConsumerRegistered`
 
@@ -411,6 +465,9 @@ A proposed admin handover (#62). Absent when no transfer is pending.
 | `Agent` | `(Address)` | persistent | extended on agent registration/updates |
 | `AgentHead` | `(Address)` | persistent | extended on chained trace publication; Per-agent hash-chain head (#52). |
 | `AgentTrace` | `(Address, u64)` | — | Per-agent `seq -> trace_id` (#52). |
+| `AvailabilityFlag` | `(u64)` | persistent | extended with trace entry TTL; Marks a flag as reporter-owned so `clear_unavailable` cannot touch an admin flag (#325). |
+| `AvailabilityReporter` | `(Address)` | instance | extended with contract instance TTL; #325: `AvailabilityReporter(addr)` → `true` while allow-listed. |
+| `AvailabilityToggle` | `(u64)` | persistent | extended with trace entry TTL; Last availability toggle, used to rate-limit flapping gateways (#325). |
 | `Consumed` | `(u64)` | — | Set once a trace has backed an action (#50). |
 | `Consumer` | `(Address)` | — | Contracts allowed to call `consume_trace` (#50). |
 | `MarketTrace` | `(u64, u64)` | — | — |
