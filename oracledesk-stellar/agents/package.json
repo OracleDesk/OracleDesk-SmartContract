@@ -19,7 +19,7 @@
     "@oracledesk/bindings-resolver": "file:../packages/bindings/resolver",
     "@oracledesk/bindings-treasury": "file:../packages/bindings/treasury",
     "@stellar/stellar-sdk": "^16.0.1",
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.10",
     "multiformats": "14.0.5",
     "pg": "^8.16.3",
     "zod": "4.6.5"
