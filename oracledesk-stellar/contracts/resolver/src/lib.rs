@@ -2624,6 +2624,17 @@ impl Resolver {
     fn set_state(env: &Env, market_id: u64, state: ResolutionState) {
         let key = DataKey::State(market_id);
         env.storage().persistent().set(&key, &state);
+        Self::bump_market_key(env, &key, market_id);
+    }
+
+    /// Bumps one per-market entry to the close-time-aware target
+    /// (`ttl::market_target`). Falls back to the flat bump only when the
+    /// close time cannot be read.
+    fn bump_market_key(env: &Env, key: &DataKey, market_id: u64) {
+        match Self::market_close_time(env, market_id) {
+            Ok(close_time) => ttl::bump_persistent(env, key, ttl::market_target(env, close_time)),
+            Err(_) => env.storage().persistent().extend_ttl(key, BUMP_THRESHOLD, BUMP_TO),
+        }
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -3286,11 +3297,11 @@ impl Resolver {
                 (key, ResolutionState::HybridPricePending)
             }
         };
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Self::bump_market_key(env, &key, market_id);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
             storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::bump_market_key(env, &p_key, market_id);
         }
         Self::set_state(env, market_id, state);
     }
@@ -3315,11 +3326,11 @@ impl Resolver {
         let storage = env.storage().persistent();
         let key = DataKey::PriceScaled(market_id);
         storage.set(&key, cfg);
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Self::bump_market_key(env, &key, market_id);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
             storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::bump_market_key(env, &p_key, market_id);
         }
         Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
@@ -3362,11 +3373,11 @@ impl Resolver {
         let storage = env.storage().persistent();
         let key = DataKey::PriceTwap(market_id);
         storage.set(&key, cfg);
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Self::bump_market_key(env, &key, market_id);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
             storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::bump_market_key(env, &p_key, market_id);
         }
         Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
@@ -3800,6 +3811,13 @@ impl Resolver {
             // market's other entries so they survive until finalization.
             DataKey::CommitteeSpec(market_id),
             DataKey::MarketEpoch(market_id),
+            // Mode-specific per-market keys: these were only flat-bumped (60 days).
+            DataKey::PriceScaled(market_id),
+            DataKey::PriceTwap(market_id),
+            DataKey::Hybrid(market_id),
+            DataKey::EvidencePolicy(market_id),
+            DataKey::EvidenceCount(market_id),
+            DataKey::Cancels(market_id),
         ];
         for key in keys {
             if env.storage().persistent().has(&key) {
