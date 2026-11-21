@@ -556,6 +556,12 @@ pub enum DataKey {
     Registry,
     TracePolicy,
     PendingTracePolicy,
+    DataBudget(Address),
+    PendingDataBudget(Address),
+    DataWindow(Address),
+    DataSpent(Address),
+    DataGlobalWindow,
+    DataGlobalCap,
 }
 
 #[contracttype]
@@ -715,6 +721,8 @@ pub enum Error {
     TraceTimelockActive = 74,
     StaleMarks = 75,
     MarkBatchTooLarge = 76,
+    /// A data spend would exceed the agent's or the global daily data cap (#318).
+    DataBudgetExceeded = 77,
 }
 
 #[contractevent]
@@ -1323,6 +1331,162 @@ impl Treasury {
     //
     // market-core only ever sees the treasury as the trader, so positions
     // are pooled: per-agent state is usage (caps), not ownership.
+
+    /// Sets the global daily cap on x402 data spend (#318). This can only
+    /// lower the cap. Raising it needs a new deployment.
+    pub fn set_data_global_cap(env: Env, cap: i128) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if cap <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if let Some(current) = env.storage().instance().get::<_, i128>(&DataKey::DataGlobalCap) {
+            if cap > current {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        env.storage().instance().set(&DataKey::DataGlobalCap, &cap);
+        Ok(())
+    }
+
+    /// Sets or proposes the data budget for `agent` (#318). Tightening (a
+    /// lower cap on the same account, or deactivation) applies at once. Any
+    /// other change waits `config_delay` and is applied by `execute_data_budget`.
+    pub fn set_data_budget(env: Env, agent: Address, budget: DataBudget) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if budget.max_daily <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if budget.max_daily > Self::data_global_cap(&env)? {
+            return Err(Error::InvalidConfig);
+        }
+        if budget.account == env.current_contract_address() {
+            return Err(Error::InvalidConfig);
+        }
+        let key = DataKey::DataBudget(agent.clone());
+        let current: Option<DataBudget> = env.storage().persistent().get(&key);
+        let tighten = !budget.active
+            || matches!(&current, Some(c) if c.active
+                && c.account == budget.account
+                && budget.max_daily <= c.max_daily);
+        if tighten {
+            Self::put_persistent(&env, &key, &budget);
+            return Ok(());
+        }
+        let pend_key = DataKey::PendingDataBudget(agent);
+        if env.storage().persistent().has(&pend_key) {
+            return Err(Error::ProposalPending);
+        }
+        let executable_at = Self::unlock_time(&env)?;
+        let pending = PendingDataBudget {
+            budget,
+            proposed_at: env.ledger().timestamp(),
+            executable_at,
+        };
+        Self::put_persistent(&env, &pend_key, &pending);
+        Ok(())
+    }
+
+    /// Applies a proposed data budget once its delay has passed (#318).
+    pub fn execute_data_budget(env: Env, agent: Address) -> Result<(), Error> {
+        let pend_key = DataKey::PendingDataBudget(agent.clone());
+        let pending: PendingDataBudget = env
+            .storage()
+            .persistent()
+            .get(&pend_key)
+            .ok_or(Error::InvalidConfig)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockActive);
+        }
+        Self::put_persistent(&env, &DataKey::DataBudget(agent), &pending.budget);
+        env.storage().persistent().remove(&pend_key);
+        Ok(())
+    }
+
+    /// Cancels a proposed data budget (#318).
+    pub fn cancel_data_budget(env: Env, agent: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::PendingDataBudget(agent);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::InvalidConfig);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Transfers `amount` of collateral from the treasury to the agent's data
+    /// account, to pay for an x402 purchase (#318). It is a trading outflow:
+    /// it respects pause, reserved withdrawal capital and liquidity, and it is
+    /// booked as a loss in the drawdown window.
+    pub fn fund_data_spend(
+        env: Env,
+        agent: Address,
+        amount: i128,
+        purpose_hash: BytesN<32>,
+    ) -> Result<i128, Error> {
+        Self::assert_not_paused(&env)?;
+        let global = Self::load_global(&env)?;
+        Self::require_agent(&env, &agent, ROLE_TRADE)?;
+        let budget: DataBudget = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DataBudget(agent.clone()))
+            .ok_or(Error::Unauthorized)?;
+        if !budget.active {
+            return Err(Error::Unauthorized);
+        }
+        if amount <= 0 || amount > budget.max_daily {
+            return Err(Error::InvalidAmount);
+        }
+        let global_cap = Self::data_global_cap(&env)?;
+        let now = env.ledger().timestamp();
+        let mut agent_window = Self::load_data_window(&env, &agent);
+        let mut global_window = Self::load_data_global_window(&env);
+        Self::consume_window(&mut agent_window, now, amount, budget.max_daily)
+            .map_err(|_| Error::DataBudgetExceeded)?;
+        Self::consume_window(&mut global_window, now, amount, global_cap)
+            .map_err(|_| Error::DataBudgetExceeded)?;
+        Self::ensure_unreserved(&env, &global, amount)?;
+        Self::ensure_liquid(&env, &global, amount)?;
+        Self::put_persistent(&env, &DataKey::DataWindow(agent.clone()), &agent_window);
+        Self::put_persistent(&env, &DataKey::DataGlobalWindow, &global_window);
+        token::TokenClient::new(&env, &global.collateral).transfer(
+            &env.current_contract_address(),
+            &budget.account,
+            &amount,
+        );
+        let spent = Self::data_spent_total(env.clone(), agent.clone())
+            .checked_add(amount)
+            .ok_or(Error::InvalidAmount)?;
+        Self::put_persistent(&env, &DataKey::DataSpent(agent.clone()), &spent);
+        Self::add_daily_pnl(&env, -amount)?;
+        DataSpendFunded {
+            agent,
+            account: budget.account,
+            amount,
+            purpose_hash,
+        }
+        .publish(&env);
+        Ok(amount)
+    }
+
+    /// The agent's data budget, if one is set (#318).
+    pub fn data_budget(env: Env, agent: Address) -> Option<DataBudget> {
+        env.storage().persistent().get(&DataKey::DataBudget(agent))
+    }
+
+    /// Total collateral spent on data by `agent` since deployment (#318).
+    pub fn data_spent_total(env: Env, agent: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DataSpent(agent))
+            .unwrap_or(0)
+    }
+
+    /// Data spend by `agent` inside the sliding window (#318).
+    pub fn data_usage(env: Env, agent: Address) -> i128 {
+        let window = Self::load_data_window(&env, &agent);
+        Self::window_sum(&window).unwrap_or(0)
+    }
 
     /// Adds or updates `agent`. Validation: `roles` non-empty and known,
     /// `0 < max_trade <= max_daily`, both within the global caps, `active`.
@@ -3061,6 +3225,27 @@ impl Treasury {
 }
 
 impl Treasury {
+    fn data_global_cap(env: &Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DataGlobalCap)
+            .ok_or(Error::DataBudgetExceeded)
+    }
+
+    fn load_data_window(env: &Env, agent: &Address) -> UsageWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DataWindow(agent.clone()))
+            .unwrap_or_else(|| Self::empty_window(env, env.ledger().timestamp() / BUCKET_SECONDS))
+    }
+
+    fn load_data_global_window(env: &Env) -> UsageWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DataGlobalWindow)
+            .unwrap_or_else(|| Self::empty_window(env, env.ledger().timestamp() / BUCKET_SECONDS))
+    }
+
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -9415,4 +9600,31 @@ mod test {
             assert_eq!(before, after);
         }
     }
+}
+
+/// Per-agent budget for x402 data purchases, paid into `account` (#318).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataBudget {
+    pub max_daily: i128,
+    pub account: Address,
+    pub active: bool,
+}
+
+/// A loosening of an agent's data budget, applied after `executable_at` (#318).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDataBudget {
+    pub budget: DataBudget,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataSpendFunded {
+    pub agent: Address,
+    pub account: Address,
+    pub amount: i128,
+    pub purpose_hash: BytesN<32>,
 }

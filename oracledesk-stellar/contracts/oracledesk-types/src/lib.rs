@@ -169,6 +169,27 @@ pub struct HybridConfig {
     pub fallback_after: u64,
 }
 
+/// Fallback authority for a [`HybridConfigV2`] market: any signer model except
+/// a hybrid itself. Nesting is rejected at registration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FallbackAuthority {
+    Signers(SignerConfig),
+    SignersDisputable(DisputableSignerConfig),
+    WeightedKeys(WeightedKeyConfig),
+    Committee(CommitteeRef),
+}
+
+/// Dual-path resolution with a choice of fallback authority (issue #314).
+/// Appended as a new variant so the XDR of existing `Hybrid` rules is unchanged.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HybridConfigV2 {
+    pub price: PriceConfig,
+    pub fallback: FallbackAuthority,
+    pub fallback_after: u64,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
@@ -182,6 +203,7 @@ pub enum ResolutionSpec {
     SignersDisputable(DisputableSignerConfig),
     Committee(CommitteeRef),
     Hybrid(HybridConfig),
+    HybridV2(HybridConfigV2),
 }
 
 /// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the

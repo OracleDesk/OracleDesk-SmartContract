@@ -97,7 +97,7 @@ fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
 // them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
 // keep working.
 pub use oracledesk_types::{
-    CommitteeRef, DisputableSignerConfig, Escalation, HybridConfig, OracleAsset, Outcome,
+    CommitteeRef, DisputableSignerConfig, Escalation, FallbackAuthority, HybridConfig, HybridConfigV2, OracleAsset, Outcome,
     PriceConfig, PriceData, PriceDirection, ResolutionSpec, ResolutionSpecV2, SignerConfig,
     WeightedKey, WeightedKeyConfig,
 };
@@ -686,6 +686,9 @@ pub enum DataKey {
     /// Absent until pinned, so pre-attestation views compute the would-be pin
     /// without writing.
     MarketEpoch(u64),
+    /// Hybrid rule with a choice of fallback authority (#314). Appended so the
+    /// keys of every earlier variant keep their encoding.
+    HybridV2(u64),
 }
 
 /// #297: A committee member set snapshotted at a specific epoch. Loaded from
@@ -1032,7 +1035,7 @@ impl Resolver {
             Some(RuleKind::SignersDisputable)
         } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
             Some(RuleKind::Committee)
-        } else if storage.has(&DataKey::Hybrid(market_id)) {
+        } else if Self::is_hybrid_in(&storage, market_id) {
             Some(RuleKind::Hybrid)
         } else if storage.has(&DataKey::PriceScaled(market_id)) {
             Some(RuleKind::ScaledPrice)
@@ -1423,7 +1426,8 @@ impl Resolver {
 
     /// Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.
     pub fn open_fallback(env: Env, market_id: u64) -> Result<(), Error> {
-        let config: HybridConfig = Self::load(&env, DataKey::Hybrid(market_id))?;
+        let (price, fallback_after) =
+            Self::hybrid_price_leg(&env, market_id).ok_or(Error::MarketNotConfigured)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
@@ -1431,12 +1435,12 @@ impl Resolver {
         let market =
             core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
-        let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
+        let fallback_deadline = market.close_time.saturating_add(fallback_after);
         if now < fallback_deadline {
             return Err(Error::DeadlineNotReached);
         }
         // If the price feed recovered and returns a valid price, resolve by price instead of opening fallback.
-        match Self::price_outcome(&env, market_id, &config.price, market.close_time) {
+        match Self::price_outcome(&env, market_id, &price, market.close_time) {
             Ok((outcome, data, from_snapshot)) => {
                 Self::settle_price(
                     &env,
@@ -1548,7 +1552,7 @@ impl Resolver {
             if (storage.has(&DataKey::Price(market_id))
                 || storage.has(&DataKey::PriceScaled(market_id))
                 || storage.has(&DataKey::PriceTwap(market_id))
-                || storage.has(&DataKey::Hybrid(market_id)))
+                || Self::is_hybrid_in(&storage, market_id))
                 && now >= market.close_time.saturating_add(ORACLE_GRACE_SECS)
             {
                 if let Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) =
@@ -1562,7 +1566,7 @@ impl Resolver {
                 || storage.has(&DataKey::Disputable(market_id))
                 || storage.has(&DataKey::WeightedKeys(market_id))
                 || storage.has(&DataKey::CommitteeSpec(market_id))
-                || (storage.has(&DataKey::Hybrid(market_id))
+                || (Self::is_hybrid_in(&storage, market_id)
                     && Self::resolution_state(&env, market_id)
                         == ResolutionState::HybridFallbackOpen);
             if is_signer_mode
@@ -1665,7 +1669,7 @@ impl Resolver {
                     || storage.has(&DataKey::Disputable(market_id))
                     || storage.has(&DataKey::WeightedKeys(market_id))
                     || storage.has(&DataKey::CommitteeSpec(market_id))
-                    || (storage.has(&DataKey::Hybrid(market_id))
+                    || (Self::is_hybrid_in(&storage, market_id)
                         && Self::resolution_state(&env, market_id)
                             == ResolutionState::HybridFallbackOpen);
                 if !is_signer_mode || Self::has_proposal(&env, market_id) {
@@ -1721,8 +1725,8 @@ impl Resolver {
             Self::load::<PriceConfig>(&env, DataKey::Price(market_id))
         {
             (cfg, false)
-        } else if let Ok(hybrid) = Self::load::<HybridConfig>(&env, DataKey::Hybrid(market_id)) {
-            (hybrid.price, true)
+        } else if let Some((price, _)) = Self::hybrid_price_leg(&env, market_id) {
+            (price, true)
         } else {
             return Err(Error::WrongMode);
         };
@@ -1997,8 +2001,8 @@ impl Resolver {
         if let Some(cfg) = storage.get::<_, PriceConfig>(&DataKey::Price(market_id)) {
             return Self::price_outcome(env, market_id, &cfg, close_time);
         }
-        if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
-            return Self::price_outcome(env, market_id, &h.price, close_time);
+        if let Some((price, _)) = Self::hybrid_price_leg(env, market_id) {
+            return Self::price_outcome(env, market_id, &price, close_time);
         }
         if let Some(s) = storage.get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id)) {
             let (outcome, data, _feed_decimals, _threshold_scaled) =
@@ -2273,7 +2277,7 @@ impl Resolver {
         round: u32,
         sigs: Vec<(BytesN<32>, BytesN<64>)>,
     ) -> Result<(), Error> {
-        let config: WeightedKeyConfig = Self::load(&env, DataKey::WeightedKeys(market_id))?;
+        let config: WeightedKeyConfig = Self::weighted_fallback_config(&env, market_id)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
@@ -2392,7 +2396,7 @@ impl Resolver {
         alternative: Option<Outcome>,
     ) -> Result<(), Error> {
         disputer.require_auth();
-        let config: DisputableSignerConfig = Self::load(&env, DataKey::Disputable(market_id))?;
+        let config: DisputableSignerConfig = Self::disputable_fallback_config(&env, market_id)?;
         Self::assert_not_disputed(&env, market_id)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
@@ -2441,7 +2445,7 @@ impl Resolver {
 
     /// Guardian escalation: the admin rules on an open dispute.
     pub fn settle_dispute(env: Env, market_id: u64, verdict: Verdict) -> Result<(), Error> {
-        let config: DisputableSignerConfig = Self::load(&env, DataKey::Disputable(market_id))?;
+        let config: DisputableSignerConfig = Self::disputable_fallback_config(&env, market_id)?;
         if config.escalation != Escalation::Guardian {
             return Err(Error::WrongMode);
         }
@@ -2458,7 +2462,7 @@ impl Resolver {
         verdict: Verdict,
     ) -> Result<(), Error> {
         member.require_auth();
-        let config: DisputableSignerConfig = Self::load(&env, DataKey::Disputable(market_id))?;
+        let config: DisputableSignerConfig = Self::disputable_fallback_config(&env, market_id)?;
         let Escalation::Committee(members, k) = config.escalation else {
             return Err(Error::WrongMode);
         };
@@ -2484,7 +2488,7 @@ impl Resolver {
     /// `escalation_timeout` after the dispute opened, the bond is refunded and
     /// the market is voided, so neither side wins by default.
     pub fn expire_dispute(env: Env, market_id: u64) -> Result<(), Error> {
-        let config: DisputableSignerConfig = Self::load(&env, DataKey::Disputable(market_id))?;
+        let config: DisputableSignerConfig = Self::disputable_fallback_config(&env, market_id)?;
         let dispute = Self::open_dispute(&env, market_id)?;
         if env.ledger().timestamp() < dispute.opened_at.saturating_add(config.escalation_timeout) {
             return Err(Error::DeadlineNotReached);
@@ -2550,7 +2554,7 @@ impl Resolver {
             SpecKind::WeightedKeys
         } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
             SpecKind::Committee
-        } else if storage.has(&DataKey::Hybrid(market_id)) {
+        } else if Self::is_hybrid_in(&storage, market_id) {
             SpecKind::Hybrid
         } else {
             SpecKind::None
@@ -2601,6 +2605,105 @@ impl Resolver {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
+    /// Whether the market carries a hybrid rule of either version (#314).
+    fn is_hybrid_in(storage: &soroban_sdk::storage::Persistent, market_id: u64) -> bool {
+        storage.has(&DataKey::Hybrid(market_id)) || storage.has(&DataKey::HybridV2(market_id))
+    }
+
+    /// The price leg and fallback window of a hybrid rule, for either version (#314).
+    fn hybrid_price_leg(env: &Env, market_id: u64) -> Option<(PriceConfig, u64)> {
+        let storage = env.storage().persistent();
+        if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Some((h.price, h.fallback_after));
+        }
+        storage
+            .get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id))
+            .map(|h| (h.price, h.fallback_after))
+    }
+
+    /// A `HybridV2` market refuses fallback-only operations until its fallback
+    /// is open. Other markets are unaffected (#314).
+    fn require_fallback_open(env: &Env, market_id: u64) -> Result<(), Error> {
+        if env.storage().persistent().has(&DataKey::HybridV2(market_id))
+            && Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen
+        {
+            return Err(Error::WrongMode);
+        }
+        Ok(())
+    }
+
+    /// The disputable signer config, reached directly or as a `HybridV2`
+    /// fallback that is open (#314).
+    fn disputable_fallback_config(
+        env: &Env,
+        market_id: u64,
+    ) -> Result<DisputableSignerConfig, Error> {
+        Self::require_fallback_open(env, market_id)?;
+        if let Some(cfg) = env.storage().persistent().get(&DataKey::Disputable(market_id)) {
+            return Ok(cfg);
+        }
+        match env
+            .storage()
+            .persistent()
+            .get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id))
+        {
+            Some(HybridConfigV2 {
+                fallback: FallbackAuthority::SignersDisputable(cfg),
+                ..
+            }) => Ok(cfg),
+            _ => Err(Error::MarketNotConfigured),
+        }
+    }
+
+    /// The weighted-key config, reached directly or as a `HybridV2` fallback
+    /// that is open (#314).
+    fn weighted_fallback_config(env: &Env, market_id: u64) -> Result<WeightedKeyConfig, Error> {
+        Self::require_fallback_open(env, market_id)?;
+        if let Some(cfg) = env.storage().persistent().get(&DataKey::WeightedKeys(market_id)) {
+            return Ok(cfg);
+        }
+        match env
+            .storage()
+            .persistent()
+            .get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id))
+        {
+            Some(HybridConfigV2 {
+                fallback: FallbackAuthority::WeightedKeys(cfg),
+                ..
+            }) => Ok(cfg),
+            _ => Err(Error::MarketNotConfigured),
+        }
+    }
+
+    /// Validates a `HybridV2` rule: the price leg as for `Hybrid`, the fallback
+    /// with its own validator, and window arithmetic that lets the fallback
+    /// finish before the resolution deadline (#314).
+    fn hybrid_v2_is_valid(env: &Env, cfg: &HybridConfigV2) -> Result<bool, Error> {
+        let price_ok = cfg.price.threshold >= 0 && cfg.price.max_staleness != 0;
+        let window_ok = cfg.fallback_after > 0 && cfg.fallback_after >= cfg.price.max_staleness;
+        let (fallback_ok, window) = match &cfg.fallback {
+            FallbackAuthority::Signers(s) => (
+                !s.signers.is_empty()
+                    && s.threshold != 0
+                    && s.threshold <= s.signers.len()
+                    && s.dispute_window != 0,
+                s.dispute_window,
+            ),
+            FallbackAuthority::SignersDisputable(d) => {
+                (Self::disputable_config_is_valid(d), d.dispute_window)
+            }
+            FallbackAuthority::WeightedKeys(w) => {
+                (Self::weighted_config_is_valid(w), w.dispute_window)
+            }
+            FallbackAuthority::Committee(c) => {
+                Self::validate_committee_ref(env, c)?;
+                (c.dispute_window != 0, c.dispute_window)
+            }
+        };
+        let fits_deadline = cfg.fallback_after.saturating_add(window) <= RESOLUTION_GRACE_SECS;
+        Ok(price_ok && window_ok && fallback_ok && fits_deadline)
+    }
+
     fn load<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
         env: &Env,
         key: DataKey,
@@ -2646,7 +2749,7 @@ impl Resolver {
         if storage.has(&DataKey::Price(market_id))
             || storage.has(&DataKey::PriceScaled(market_id))
             || storage.has(&DataKey::PriceTwap(market_id))
-            || (storage.has(&DataKey::Hybrid(market_id))
+            || (Self::is_hybrid_in(&storage, market_id)
                 && Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen)
         {
             ExpiryMode::Price
@@ -2654,7 +2757,7 @@ impl Resolver {
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::CommitteeSpec(market_id))
-            || (storage.has(&DataKey::Hybrid(market_id))
+            || (Self::is_hybrid_in(&storage, market_id)
                 && Self::resolution_state(env, market_id) == ResolutionState::HybridFallbackOpen)
         {
             ExpiryMode::Signers
@@ -2830,6 +2933,21 @@ impl Resolver {
         }
         if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(SignerAuthority::Hybrid(cfg));
+        }
+        if let Some(h) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            // The fallback signs only once the price leg has failed and the
+            // fallback is open. Before that, every signer path refuses.
+            Self::require_fallback_open(env, market_id)?;
+            return match h.fallback {
+                FallbackAuthority::Signers(cfg) => Ok(SignerAuthority::Signers(cfg)),
+                FallbackAuthority::SignersDisputable(cfg) => Ok(SignerAuthority::Disputable(cfg)),
+                FallbackAuthority::WeightedKeys(cfg) => Ok(SignerAuthority::Weighted(cfg)),
+                FallbackAuthority::Committee(ref_spec) => {
+                    let close_time = Self::market_close_time(env, market_id)?;
+                    let snapshot = Self::committee_snapshot(env, market_id, &ref_spec, close_time)?;
+                    Ok(SignerAuthority::Committee(ref_spec, snapshot))
+                }
+            };
         }
         Err(Error::MarketNotConfigured)
     }
@@ -3142,8 +3260,8 @@ impl Resolver {
         if let Some(cfg) = storage.get(&DataKey::Price(market_id)) {
             return Ok(cfg);
         }
-        if let Some(hybrid) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
-            return Ok(hybrid.price);
+        if let Some((price, _)) = Self::hybrid_price_leg(env, market_id) {
+            return Ok(price);
         }
         if storage.has(&DataKey::PriceScaled(market_id))
             || storage.has(&DataKey::PriceTwap(market_id))
@@ -3205,7 +3323,7 @@ impl Resolver {
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::CommitteeSpec(market_id))
-            || storage.has(&DataKey::Hybrid(market_id))
+            || Self::is_hybrid_in(&storage, market_id)
         {
             return Err(Error::MarketAlreadyConfigured);
         }
@@ -3255,6 +3373,7 @@ impl Resolver {
                     && cfg.fallback_after > 0
                     && cfg.fallback_after >= cfg.price.max_staleness
             }
+            ResolutionSpec::HybridV2(cfg) => Self::hybrid_v2_is_valid(env, cfg)?,
         };
         if valid {
             Ok(())
@@ -3293,6 +3412,11 @@ impl Resolver {
             }
             ResolutionSpec::Hybrid(cfg) => {
                 let key = DataKey::Hybrid(market_id);
+                storage.set(&key, cfg);
+                (key, ResolutionState::HybridPricePending)
+            }
+            ResolutionSpec::HybridV2(cfg) => {
+                let key = DataKey::HybridV2(market_id);
                 storage.set(&key, cfg);
                 (key, ResolutionState::HybridPricePending)
             }
@@ -3815,6 +3939,7 @@ impl Resolver {
             DataKey::PriceScaled(market_id),
             DataKey::PriceTwap(market_id),
             DataKey::Hybrid(market_id),
+            DataKey::HybridV2(market_id),
             DataKey::EvidencePolicy(market_id),
             DataKey::EvidenceCount(market_id),
             DataKey::Cancels(market_id),
