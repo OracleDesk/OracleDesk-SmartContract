@@ -31,6 +31,17 @@ export interface ModelTrace {
   cid: string;
 }
 
+export type ArchiveKey = "position" | "market" | "agent-window";
+
+/** Canonical names of the persistent entries the archival faults can expire. */
+export function archiveKeyFor(part: string): ArchiveKey | undefined {
+  const value = part.toLowerCase();
+  if (value.includes("position")) return "position";
+  if (value.includes("agentwindow") || value.includes("agent-window")) return "agent-window";
+  if (value.includes("market")) return "market";
+  return undefined;
+}
+
 export interface ModelState {
   markets: ModelMarket[];
   /** Agents the treasury lets trade and create markets. */
@@ -41,6 +52,8 @@ export interface ModelState {
   /** Agents registered with the reasoning registry. */
   registryAgents: string[];
   traces: ModelTrace[];
+  /** Ledger sequence each modelled persistent entry lives until (#323). */
+  entryTtls: Record<ArchiveKey, number>;
 }
 
 export interface ModelEvent {
@@ -75,7 +88,17 @@ export function initialState(opts: { agents: string[]; balance?: bigint; maxTrad
     positions: {},
     registryAgents: [...opts.agents],
     traces: [],
+    entryTtls: { position: Number.MAX_SAFE_INTEGER, market: Number.MAX_SAFE_INTEGER, "agent-window": Number.MAX_SAFE_INTEGER },
   };
+}
+
+/** Marks a modelled persistent entry archived from `ledger` onwards. */
+export function archive(state: ModelState, key: ArchiveKey, ledger: number): void {
+  state.entryTtls[key] = ledger - 1;
+}
+
+export function isArchived(state: ModelState, key: ArchiveKey, ledger: number): boolean {
+  return (state.entryTtls[key] ?? Number.MAX_SAFE_INTEGER) < ledger;
 }
 
 /** Opens a market directly in the model, as a deploy/seed script would. */

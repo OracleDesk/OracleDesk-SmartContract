@@ -8,12 +8,22 @@ description = "Cross-contract and bounded-exhaustive tests; ships no contract."
 [lib]
 doctest = false
 
-[dev-dependencies]
+[dependencies]
+# `src/world.rs` is part of the library (integration tests link it as an
+# external crate), so these cannot be dev-dependencies: `cargo build
+# --workspace` must be able to compile the library without any test target.
 soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
 treasury = { path = "../treasury" }
 market-core = { path = "../market-core" }
 resolver-contract = { package = "resolver", path = "../resolver" }
 reasoning-registry = { path = "../reasoning-registry" }
+# Router/timelock have no vendored wasm in this crate yet; their native
+# contract types are registered directly in World. The row table still uses
+# their generated interface.json so every exported function is classified.
+router = { path = "../router" }
+timelock = { path = "../timelock" }
+
+[dev-dependencies]
 wasmparser = "0.116"
 stellar-xdr = { version = "27.0.0", features = ["std"] }
 proptest = { version = "1", features = ["std"] }

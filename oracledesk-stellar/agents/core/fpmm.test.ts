@@ -10,6 +10,8 @@ import {
   calcSellShares,
   collateralOutForShares,
   grossForShares,
+  isqrt,
+  mergeMax,
   mulDivCeil,
   mulDivFloor,
   priceAfter,
@@ -18,7 +20,9 @@ import {
   priceYesBps,
   seedReserves,
   sellWithinLimit,
+  settleUpper,
   settleValue,
+  splitFee,
   collateralForShares,
   MathError,
 } from "./fpmm.js";
@@ -144,11 +148,19 @@ test("committed cross-language vectors match", () => {
   const vectorsPath = fileURLToPath(new URL("../../scripts/fpmm-diff/vectors.jsonl", import.meta.url));
   const lines = readFileSync(vectorsPath, "utf8").trim().split("\n");
   for (const [i, line] of lines.entries()) {
-    const c = JSON.parse(line) as { fn: string; args: string[]; ok: Record<string, string> };
-    // settle_value's first arg is an outcome name, not a number.
-    const a = c.args.map((x) => (/^-?\d+$/.test(x) ? BigInt(x) : 0n));
-    let actual: Record<string, string>;
-    switch (c.fn) {
+    const c = JSON.parse(line) as {
+      fn: string;
+      args: Array<string | boolean>;
+      ok?: Record<string, string>;
+      err?: string;
+    };
+    // Outcome names and JSON booleans are handled explicitly in the switch;
+    // every numeric arg is a decimal string.
+    const a = c.args.map((x) => (typeof x === "string" && /^-?\d+$/.test(x) ? BigInt(x) : 0n));
+    let actual: Record<string, string> | undefined;
+    let error: string | undefined;
+    try {
+      switch (c.fn) {
       case "calc_buy": {
         const q = calcBuy(a[0], a[1], a[2], a[3]);
         actual = {
@@ -164,6 +176,17 @@ test("committed cross-language vectors match", () => {
         const q = calcSell(a[0], a[1], a[2], a[3]);
         actual = {
           shares_in: q.sharesIn.toString(),
+          fee: q.fee.toString(),
+          gross: q.gross.toString(),
+          new_reserve_sold: q.newReserveSold.toString(),
+          new_reserve_other: q.newReserveOther.toString(),
+        };
+        break;
+      }
+      case "calc_sell_shares": {
+        const q = calcSellShares(a[0], a[1], a[2], a[3]);
+        actual = {
+          collateral_out: q.collateralOut.toString(),
           fee: q.fee.toString(),
           gross: q.gross.toString(),
           new_reserve_sold: q.newReserveSold.toString(),
@@ -190,19 +213,48 @@ test("committed cross-language vectors match", () => {
       case "price_yes_bps":
         actual = { value: priceYesBps(a[0], a[1]).toString() };
         break;
+      case "price_after": {
+        const yes = c.args[0] === true || c.args[0] === "true" || c.args[0] === "yes";
+        actual = { value: priceAfter(yes, a[1], a[2]).toString() };
+        break;
+      }
+      case "buy_within_limit":
+        actual = { value: buyWithinLimit(a[0], a[1], a[2]) ? "true" : "false" };
+        break;
+      case "sell_within_limit":
+        actual = { value: sellWithinLimit(a[0], a[1], a[2]) ? "true" : "false" };
+        break;
       case "settle_value":
-        actual = { value: settleValue(c.args[0] as "yes" | "no" | "void", a[1], a[2]).toString() };
+        actual = {
+          value: settleValue(String(c.args[0]) as "yes" | "no" | "void", a[1], a[2]).toString(),
+        };
         break;
-      case "gross_for_shares":
-        actual = { gross: grossForShares(a[0], a[1], a[2], a[3]).toString() };
+      case "settle_upper":
+        actual = {
+          value: settleUpper(String(c.args[0]) as "yes" | "no" | "void", a[1], a[2]).toString(),
+        };
         break;
-      case "collateral_out_for_shares":
-        actual = { collateral_out: collateralOutForShares(a[0], a[1], a[2], a[3]).toString() };
+      case "merge_max":
+        actual = { value: mergeMax(a[0], a[1]).toString() };
+        break;
+      case "split_fee": {
+        const q = splitFee(a[0], a[1]);
+        actual = { protocol: q.protocol.toString(), lp: q.lp.toString() };
+        break;
+      }
+      case "isqrt":
+        actual = { value: isqrt(a[0]).toString() };
         break;
       default:
         throw new Error(`line ${i + 1}: unknown fn ${c.fn}`);
+      }
+    } catch (e) {
+      if (!(e instanceof MathError)) throw e;
+      error = e.message === "insufficient liquidity" ? "InsufficientLiquidity" : "InvalidInput";
     }
-    assert.deepEqual(actual, c.ok, `shared vector line ${i + 1} (${c.fn})`);
+    const expected = c.ok ? { ok: c.ok } : { err: c.err };
+    const got = error ? { err: error } : { ok: actual };
+    assert.deepEqual(got, expected, `shared vector line ${i + 1} (${c.fn})`);
   }
 });
 
@@ -235,8 +287,11 @@ const SELL_SHARES_FIXTURES: ReadonlyArray<
   [1000n, 1000n, 212n, 0n, 100n, 0n, 100n, 1112n, 900n],
   // Same pool, 1% fee: fee rounds up, collateral_out floors.
   [1000n, 1000n, 212n, 100n, 99n, 1n, 100n, 1112n, 900n],
-  // Asymmetric reserves.
-  [1_000_000n, 2_000_000n, 500_000n, 0n, 400_000n, 0n, 400_000n, 1_100_000n, 1_600_000n],
+  // Asymmetric reserves: the pool-favouring correction lands one unit below
+  // the continuous root (gross 313859, not 400000).
+  [1_000_000n, 2_000_000n, 500_000n, 0n, 313_859n, 0n, 313_859n, 1_186_141n, 1_686_141n],
+  // A target derived from a real forward sell of 400000 gross.
+  [1_000_000n, 2_000_000n, 650_000n, 0n, 400_000n, 0n, 400_000n, 1_250_000n, 1_600_000n],
 ];
 
 test("calcSellShares matches Rust/Python known values", () => {

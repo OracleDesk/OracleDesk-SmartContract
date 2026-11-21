@@ -8,8 +8,9 @@
  *   npm run agentd -- rearm --operator alice
  *
  * --once     run each enabled task exactly once and exit (the old CLIs)
- * --tasks    comma-separated subset of: maker, trader, guard, watcher (default maker,trader,guard;
- *            the watcher also needs WATCHER_ENABLED=1 and its own WATCHER_SECRET_KEY)
+ * --tasks    comma-separated subset of: maker, trader, guard, watcher, availability
+ *            (default maker,trader,guard; the watcher needs WATCHER_ENABLED=1 and
+ *            WATCHER_SECRET_KEY, the availability task needs its own AVAIL_REPORTER_SECRET)
  * --config   JSON object of env-style overrides, e.g. {"TRADER_INTERVAL_MS": "30000"}
  * kill       write the persistent kill marker and signal the daemon's PID
  * rearm      remove the marker after operator approval
@@ -23,6 +24,7 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { redactString } from "../core/redact.js";
+import type { TraceStore } from "../core/trace.js";
 import { ConfigError, EXIT_CONFIG, EXIT_KILLED, EXIT_TEMPFAIL, intEnv, parseAgentMode } from "../runtime/config.js";
 import {
   KILL_CODES,
@@ -38,13 +40,26 @@ import { LeaseHeldError, type Lease } from "../runtime/lease.js";
 import { jsonLogger, type Logger } from "../runtime/log.js";
 import { Runtime, type Task } from "../runtime/runtime.js";
 import type { StateStore } from "../runtime/state.js";
+import { availabilityTask } from "../runtime/tasks/availability.js";
 import { guardTask } from "../runtime/tasks/guard.js";
 import { makerTask } from "../runtime/tasks/maker.js";
 import { traderTask } from "../runtime/tasks/trader.js";
 import type { StellarAdapter } from "../stellar/adapter.js";
 import { watcherTask } from "../runtime/tasks/watcher.js";
 import { loadAgentConfig } from "../core/config.js";
-import { buildAdapter, createLease, createStateStore, makerDeps, runtimeOptions, traderDeps, traderRiskCheck, watcherDeps } from "../runtime/wiring.js";
+import {
+  availabilityDeps,
+  buildAdapter,
+  buildReporterAdapter,
+  createLease,
+  createStateStore,
+  makerDeps,
+  runtimeOptions,
+  sharedTraceStore,
+  traderDeps,
+  traderRiskCheck,
+  watcherDeps,
+} from "../runtime/wiring.js";
 
 export interface AgentdArgs {
   once: boolean;
@@ -107,16 +122,19 @@ type TaskFactory = (env: NodeJS.ProcessEnv) => Task | Promise<Task>;
 type SendGuard = { check?: () => void | Promise<void> };
 
 function defaultFactories(
-  scope: { treasury?: string; adapter?: StellarAdapter },
+  scope: { treasury?: string; adapter?: StellarAdapter; traceStore?: TraceStore },
   sendGuard: SendGuard,
 ): Record<string, TaskFactory> {
+  /** One store for the whole process: every published CID is one this task can re-pin. */
+  const storeFor = (cfg: Awaited<ReturnType<typeof loadAgentConfig>>): TraceStore =>
+    (scope.traceStore ??= sharedTraceStore(cfg, undefined));
   return {
     maker: async (env) => {
       const cfg = await loadAgentConfig({ role: "maker", env, argv: [] });
       scope.treasury = cfg.deployments.contracts.treasury;
       const adapter = buildAdapter(cfg, sendGuard);
       scope.adapter ??= adapter;
-      return makerTask(makerDeps(cfg, adapter, cfg.deployments), {
+      return makerTask(makerDeps(cfg, adapter, cfg.deployments, storeFor(cfg)), {
         intervalMs: intEnv(env, "MAKER_INTERVAL_MS", 5 * 60_000),
         jitterMs: intEnv(env, "MAKER_JITTER_MS", 15_000),
       });
@@ -126,7 +144,7 @@ function defaultFactories(
       scope.treasury = cfg.deployments.contracts.treasury;
       const adapter = buildAdapter(cfg, sendGuard);
       scope.adapter ??= adapter;
-      return traderTask(traderDeps(cfg, adapter, cfg.deployments, () => Math.floor(Date.now() / 1000), undefined, traderRiskCheck(adapter)), {
+      return traderTask(traderDeps(cfg, adapter, cfg.deployments, () => Math.floor(Date.now() / 1000), undefined, traderRiskCheck(adapter), storeFor(cfg)), {
         intervalMs: intEnv(env, "TRADER_INTERVAL_MS", 60_000),
         jitterMs: intEnv(env, "TRADER_JITTER_MS", 5_000),
       });
@@ -136,7 +154,18 @@ function defaultFactories(
       const cfg = await loadAgentConfig({ role: "watcher", env, argv: [] });
       if (!cfg.watcher.enabled) throw new ConfigError("the watcher task needs WATCHER_ENABLED=1");
       scope.treasury ??= cfg.deployments.contracts.treasury;
-      return watcherTask(watcherDeps(cfg, buildAdapter(cfg)), { intervalMs: cfg.watcher.intervalMs, jitterMs: 1_000 });
+      return watcherTask(watcherDeps(cfg, buildAdapter(cfg), storeFor(cfg)), { intervalMs: cfg.watcher.intervalMs, jitterMs: 1_000 });
+    },
+    // Trace availability (#325): off unless explicitly named in --tasks.
+    availability: async (env) => {
+      const cfg = await loadAgentConfig({ role: "trader", env, argv: [] });
+      scope.treasury ??= cfg.deployments.contracts.treasury;
+      const adapter = buildReporterAdapter(cfg, env, sendGuard);
+      const store = storeFor(cfg);
+      return availabilityTask(availabilityDeps(adapter, store, env), {
+        intervalMs: intEnv(env, "AVAIL_INTERVAL_MS", 15 * 60_000, 1),
+        jitterMs: intEnv(env, "AVAIL_JITTER_MS", 5_000),
+      });
     },
     guard: async (env) => {
       const cfg = await loadAgentConfig({ role: "trader", env, argv: [] });
@@ -185,7 +214,7 @@ export async function runAgentd(argv: string[], baseEnv: NodeJS.ProcessEnv, o: A
       return 0;
     }
 
-    const real: { treasury?: string; adapter?: StellarAdapter } = {};
+    const real: { treasury?: string; adapter?: StellarAdapter; traceStore?: TraceStore } = {};
     const sendGuard: SendGuard = {};
     const factories = o.taskFactories ?? defaultFactories(real, sendGuard);
     const autoGuard = !o.taskFactories && !args.tasksExplicit && args.tasks.includes("maker") && args.tasks.includes("trader");

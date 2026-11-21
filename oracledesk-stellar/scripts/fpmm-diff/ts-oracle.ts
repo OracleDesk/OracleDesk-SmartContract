@@ -13,17 +13,21 @@ import {
   buyWithinLimit,
   calcBuy,
   calcSell,
+  calcSellShares,
   collateralOutForShares,
   grossForShares,
   isqrt,
   MathError,
+  mergeMax,
   mulDivCeil,
   mulDivFloor,
   priceAfter,
   priceYesBps,
   seedReserves,
   sellWithinLimit,
+  settleUpper,
   settleValue,
+  splitFee,
   type Settlement,
 } from "../../agents/core/fpmm.js";
 
@@ -90,6 +94,26 @@ function run(req: Req): { ok: Out } | { err: string } {
         return { ok: { value: buyWithinLimit(bi(a[0]), bi(a[1]), bi(a[2])).toString() } };
       case "sell_within_limit":
         return { ok: { value: sellWithinLimit(bi(a[0]), bi(a[1]), bi(a[2])).toString() } };
+      case "calc_sell_shares": {
+        const q = calcSellShares(bi(a[0]), bi(a[1]), bi(a[2]), bi(a[3]));
+        return {
+          ok: {
+            collateral_out: q.collateralOut.toString(),
+            fee: q.fee.toString(),
+            gross: q.gross.toString(),
+            new_reserve_sold: q.newReserveSold.toString(),
+            new_reserve_other: q.newReserveOther.toString(),
+          },
+        };
+      }
+      case "split_fee": {
+        const q = splitFee(bi(a[0]), bi(a[1]));
+        return { ok: { protocol: q.protocol.toString(), lp: q.lp.toString() } };
+      }
+      case "settle_upper":
+        return { ok: { value: settleUpper(String(a[0]) as Settlement, bi(a[1]), bi(a[2])).toString() } };
+      case "merge_max":
+        return { ok: { value: mergeMax(bi(a[0]), bi(a[1])).toString() } };
       case "gross_for_shares":
         return { ok: { gross: grossForShares(bi(a[0]), bi(a[1]), bi(a[2]), bi(a[3])).toString() } };
       case "collateral_out_for_shares":

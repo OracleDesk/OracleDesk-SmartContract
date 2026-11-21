@@ -177,13 +177,14 @@ fn mc_sell_full_position_removal() -> Metrics {
     // entry is removed (exact when granularity allows).
     let shares = buy(&fx, market_id, UNIT);
     let m = fx.client.get_market(&market_id);
-    let start = market_core::math::collateral_out_for_shares(
+    let start = market_core::math::calc_sell_shares(
         m.reserve_yes,
         m.reserve_no,
         shares,
         m.fee_bps,
     )
-    .unwrap();
+    .unwrap()
+    .collateral_out;
     let mut lo = 0i128;
     let mut hi = start.saturating_mul(3);
     let mut best = 0i128;

@@ -1,10 +1,11 @@
 //! One deployed world used by every auth-matrix test.
 //!
-//! All four production contracts are registered from their wasm (the same
-//! artifacts `make build` produces) and wired exactly as the deploy scripts
-//! wire them: market-core knows the resolver and treasury addresses, the
-//! resolver knows market-core, and the treasury knows both. The Stellar Asset
-//! Contract is the collateral.
+//! The four wasm-backed contracts are registered from their wasm (the same
+//! artifacts `make build` produces); router and timelock use their native
+//! contract types because their wasm is not vendored here yet. They are wired
+//! exactly as the deploy scripts wire them: market-core knows the resolver and
+//! treasury addresses, the resolver knows market-core, and the treasury knows
+//! both. The Stellar Asset Contract is the collateral.
 //!
 //! Setup uses *targeted* `mock_auths`; this crate never calls
 //! `mock_all_auths`. The grep guard in `scripts/check-no-mock-all-auths.sh`
@@ -12,7 +13,7 @@
 
 #![allow(dead_code)]
 
-use crate::{market_core, reasoning_registry, resolver, treasury};
+use crate::{market_core, reasoning_registry, resolver, router, timelock, treasury};
 use resolver_contract as resolver_native;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -86,6 +87,11 @@ pub struct World {
     pub signer_a: Address,
     pub signer_b: Address,
     pub random: Address,
+    /// Distinct timelock roles; kept on the world so target mocks are exact.
+    pub proposer: Address,
+    pub canceller: Address,
+    pub executor: Address,
+    pub emergency: Address,
 
     pub core_id: Address,
     pub core: market_core::Client<'static>,
@@ -95,6 +101,10 @@ pub struct World {
     pub treasury: treasury::Client<'static>,
     pub registry_id: Address,
     pub registry: reasoning_registry::Client<'static>,
+    pub router_id: Address,
+    pub router: router::Client<'static>,
+    pub timelock_id: Address,
+    pub timelock: timelock::Client<'static>,
     pub collateral: Address,
     pub token: TokenClient<'static>,
     pub oracle_id: Address,
@@ -119,6 +129,10 @@ impl World {
         let signer_a = Address::generate(&env);
         let signer_b = Address::generate(&env);
         let random = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        let canceller = Address::generate(&env);
+        let executor = Address::generate(&env);
+        let emergency = Address::generate(&env);
 
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
         let collateral = sac.address();
@@ -174,11 +188,34 @@ impl World {
             ),
         );
         let registry_id = env.register(reasoning_registry::WASM, (admin.clone(),));
+        // The router is stateless after construction; the native type is used
+        // because this crate does not ship a router.wasm yet.
+        let router_id = env.register(
+            router::Router,
+            (
+                core_id.clone(),
+                resolver_id.clone(),
+                Some(registry_id.clone()),
+            ),
+        );
+        let timelock_id = env.register(
+            timelock::Timelock,
+            (
+                admin.clone(),
+                proposer.clone(),
+                canceller.clone(),
+                Some(executor.clone()),
+                Some(emergency.clone()),
+                timelock::MIN_DELAY,
+            ),
+        );
 
         let core = market_core::Client::new(&env, &core_id);
         let resolver = resolver::Client::new(&env, &resolver_id);
         let treasury = treasury::Client::new(&env, &treasury_id);
         let registry = reasoning_registry::Client::new(&env, &registry_id);
+        let router = router::Client::new(&env, &router_id);
+        let timelock = timelock::Client::new(&env, &timelock_id);
 
         // Seed vault shares through the real deposit path. Minting straight to
         // the treasury would leave supply at zero and make NAV per share
@@ -248,6 +285,10 @@ impl World {
             signer_a,
             signer_b,
             random,
+            proposer,
+            canceller,
+            executor,
+            emergency,
             core_id,
             core,
             resolver_id,
@@ -256,6 +297,10 @@ impl World {
             treasury,
             registry_id,
             registry,
+            router_id,
+            router,
+            timelock_id,
+            timelock,
             collateral,
             token,
             oracle_id,

@@ -31,7 +31,7 @@ import {
 import { resourceFeeOf, type FeeDistribution, type FeeStatsResponse } from "../../stellar/fees.js";
 import type { ContractArtifact, ContractName } from "./artifacts.js";
 import { FaultPlan, type Fault, type RpcMethod } from "./faults.js";
-import { invoke, isWrite, type ModelEvent, type ModelState } from "./model.js";
+import { archive, archiveKeyFor, invoke, isArchived, isWrite, type ArchiveKey, type ModelEvent, type ModelState } from "./model.js";
 
 export interface LedgerClock {
   sequence: number;
@@ -87,6 +87,8 @@ export interface FakeRpcOptions {
 }
 
 const RESOURCE_FEE = 50_000;
+const RESTORE_RENT = 2_000_000;
+const RESTORED_TTL_LEDGERS = 1_000_000;
 const BASE_FEE = 100;
 
 export class FakeSorobanRpc {
@@ -103,6 +105,8 @@ export class FakeSorobanRpc {
   private readonly sequences: Map<string, bigint>;
   private readonly ids: Map<string, ContractArtifact>;
   private surge?: { minInclusion: bigint; untilLedger: number };
+  /** Entries archived after simulation; they invalidate the next apply. */
+  private readonly pendingArchive = new Set<ArchiveKey>();
   private server?: Server;
 
   constructor(private readonly o: FakeRpcOptions) {
@@ -209,6 +213,11 @@ export class FakeSorobanRpc {
         if (f.kind === "surge") this.setSurge(f.minInclusion, f.ledgers);
       }
     }
+    for (const f of faults) {
+      if (f.kind !== "archive") continue;
+      if (f.at === "before-sim") archive(this.state, f.key, this.clock.sequence);
+      else this.pendingArchive.add(f.key);
+    }
     const fatal = faults.find((f) => f.kind === "timeout" || f.kind === "http" || f.kind === "rpc-error");
     if (fatal?.kind === "timeout") {
       await sleep(fatal.ms);
@@ -280,7 +289,7 @@ export class FakeSorobanRpc {
         key: raw,
         xdr: data.toXDR("base64"),
         lastModifiedLedgerSeq: 1,
-        liveUntilLedgerSeq: this.clock.sequence + 1_000_000,
+        liveUntilLedgerSeq: this.liveUntil(key),
       });
     }
     return { entries, latestLedger: this.clock.sequence };
@@ -384,6 +393,35 @@ export class FakeSorobanRpc {
     }
   }
 
+  /** Which modelled persistent entry a call needs restored (#323). */
+  private touchedKind(fn: string, _args: Record<string, unknown>): ArchiveKey {
+    if (/position|redeem|buy|sell|trade/i.test(fn)) return "position";
+    if (/agent.window/i.test(fn)) return "agent-window";
+    return "market";
+  }
+
+  private entryKind(key: xdr.LedgerKey): ArchiveKey | undefined {
+    if (key.switch().value !== xdr.LedgerEntryType.contractData().value) return undefined;
+    return archiveKeyFor(key.contractData().key().toString());
+  }
+
+  private liveUntil(key: xdr.LedgerKey): number {
+    const kind = this.entryKind(key);
+    if (!kind) return this.clock.sequence + RESTORED_TTL_LEDGERS;
+    return this.state.entryTtls[kind] ?? this.clock.sequence + RESTORED_TTL_LEDGERS;
+  }
+
+  private restoreKey(kind: ArchiveKey, contract: xdr.ScAddress): xdr.LedgerKey {
+    const symbol = kind === "position" ? "Position" : kind === "agent-window" ? "AgentWindow" : "Market";
+    return xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract,
+        key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(symbol), xdr.ScVal.scvU64(xdr.Uint64.fromString(String(this.clock.sequence)))]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+  }
+
   private run(state: ModelState, artifact: ContractArtifact, fn: string, args: Record<string, unknown>, closeTime: number) {
     return invoke(state, artifact.name, fn, args, { closeTime: BigInt(closeTime), treasuryAddress: this.o.treasuryAddress });
   }
@@ -416,9 +454,13 @@ export class FakeSorobanRpc {
     const instance = xdr.LedgerKey.contractData(
       new xdr.LedgerKeyContractData({ contract: call.contractAddress(), key: xdr.ScVal.scvLedgerKeyContractInstance(), durability: xdr.ContractDataDurability.persistent() }),
     );
+    const touched = this.touchedKind(fn, args);
+    const archivedKind = isArchived(this.state, touched, this.clock.sequence) ? touched : undefined;
+    const wantsPreamble = archivedKind !== undefined && faults.some((f) => f.kind === "restore-preamble");
+    const resourceFee = archivedKind === undefined ? RESOURCE_FEE : RESOURCE_FEE + RESTORE_RENT;
     const data = new SorobanDataBuilder()
       .setResources(1_000_000, 10_000, write ? 1_000 : 0)
-      .setResourceFee(RESOURCE_FEE)
+      .setResourceFee(resourceFee)
       .setReadOnly(write ? [] : [instance])
       .setReadWrite(write ? [instance] : [])
       .build();
@@ -436,7 +478,14 @@ export class FakeSorobanRpc {
     return {
       ...base,
       transactionData: data.toXDR("base64"),
-      minResourceFee: String(RESOURCE_FEE),
+      minResourceFee: String(resourceFee),
+      // Fake-RPC transport for the Protocol 23 restore list. Real nodes carry
+      // these keys inside transactionData's extension; the adapter accepts
+      // both shapes so chaos tests can drive the same plan detection.
+      ...(archivedKind && !wantsPreamble && { restoreList: [this.restoreKey(archivedKind, call.contractAddress()).toXDR("base64")] }),
+      ...(wantsPreamble && {
+        restorePreamble: { transactionData: data.toXDR("base64"), minResourceFee: String(RESTORE_RENT) },
+      }),
       results: [{ auth, xdr: this.returnScVal(artifact, fn, outcome.value).toXDR("base64") }],
     };
   }
@@ -513,12 +562,52 @@ export class FakeSorobanRpc {
     this.sequences.set(tx.source, current + 1n);
     this.queued.delete(innerHash);
     this.advance();
+
+    // A journaled RestoreFootprint consumes a sequence number but has no
+    // contract invocation. It makes every modelled entry live again.
+    const firstOp = tx.operations[0];
+    if (firstOp?.type === "restoreFootprint") {
+      for (const kind of Object.keys(this.state.entryTtls) as ArchiveKey[]) {
+        this.state.entryTtls[kind] = this.clock.sequence + RESTORED_TTL_LEDGERS;
+      }
+      this.pendingArchive.clear();
+      const artifact = [...this.ids.values()][0]!;
+      const restoreSubmission: Submission = {
+        hash: innerHash,
+        contract: artifact.name,
+        fn: "restore_footprint",
+        args: {},
+        status: "SUCCESS",
+        ledger: this.clock.sequence,
+      };
+      const restoreFee = this.feeCharged(parsed).toString();
+      this.submissions.push(restoreSubmission);
+      const restoreRecord: TxRecord = {
+        submission: restoreSubmission,
+        envelopeXdr: tx.toXDR(),
+        resultXdr: this.txResult("txSUCCESS", restoreFee).toXDR("base64"),
+        resultMetaXdr: this.meta(xdr.ScVal.scvVoid()).toXDR("base64"),
+        closeTime: this.clock.closeTime,
+        hiddenPolls: 0,
+        feeCharged: restoreFee,
+        feeBump: parsed.feeBump !== undefined,
+      };
+      this.txs.set(innerHash, restoreRecord);
+      if (hash !== innerHash) this.txs.set(hash, { ...restoreRecord, envelopeXdr: envelope });
+      return { status: "PENDING", ...meta };
+    }
+
     const { artifact, contractId, fn, args } = this.callOf(tx);
     const divergence = faults.find((f) => f.kind === "apply-failure");
     const work = structuredClone(this.state);
-    const outcome = divergence?.kind === "apply-failure"
-      ? ({ ok: false, error: divergence.error } as const)
-      : this.run(work, artifact, fn, args, this.clock.closeTime);
+    const raceKind = this.touchedKind(fn, args);
+    const archivedAtApply = this.pendingArchive.has(raceKind);
+    this.pendingArchive.clear();
+    const outcome = archivedAtApply
+      ? ({ ok: false, error: "EntryArchived" } as const)
+      : divergence?.kind === "apply-failure"
+        ? ({ ok: false, error: divergence.error } as const)
+        : this.run(work, artifact, fn, args, this.clock.closeTime);
     const submission: Submission = {
       hash: innerHash,
       contract: artifact.name,
@@ -585,6 +674,7 @@ export class FakeSorobanRpc {
       applicationOrder: 1,
       feeBump: tx.feeBump,
       feeCharged: tx.feeCharged,
+      ...(tx.submission.error && { error: tx.submission.error }),
       envelopeXdr: tx.envelopeXdr,
       resultXdr: tx.resultXdr,
       resultMetaXdr: tx.resultMetaXdr,

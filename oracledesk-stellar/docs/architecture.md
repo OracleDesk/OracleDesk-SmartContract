@@ -887,6 +887,7 @@ The reasoning registry models an explicit lifecycle for agents and traces:
   - `Retired(at)`: Agent gracefully retired by admin (`retire_agent`) or the agent itself (`retire_self`). Retired agents cannot publish new traces, but their existing traces remain valid. Admin may call `reactivate_agent` to return a retired agent to `Active`.
   - `Revoked(effective_from, reason)`: Agent revoked by admin (`revoke_agent`) due to compromise or malfeasance. Revocations cannot be reversed or reactivated, preventing history laundering.
 - **Trace flagging**: The admin can annotate suspect traces via `flag_trace(trace_id, reason)` and `unflag_trace(trace_id, reason)`. Flags are annotations appended to a bounded history (max 16 entries) and never modify or erase the underlying trace data.
+- **Delegated availability flags (#325)**: Admin-registered reporters may call `report_unavailable(reporter, trace_id)` / `clear_unavailable(reporter, trace_id)` to raise or clear the fixed reason `unavail`. The reporter owns the flag via a separate `AvailabilityFlag` marker, so `clear_unavailable` can never remove an admin flag that happens to share the reason. One `AvailabilityToggle` timestamp per trace enforces `AVAIL_MIN_TOGGLE_SECS` (one day), protecting the 16-entry history from a flapping gateway. Reporter allow-list changes emit `AvailabilityReporterSet`; flags emit the same `TraceFlagged` / `TraceUnflagged` events as admin flags.
 - **Trace verdict**: `trace_verdict(trace_id, received_hash)` evaluates validity in strict precedence:
   1. Not found -> `Err(TraceNotFound)`
   2. Hash differs -> `TraceVerdict::HashMismatch`
@@ -1124,6 +1125,21 @@ With `multiformats`:
 `Buffer.from(CID.parse(cid).multihash.digest).toString("hex") === trace_hash`.
 After fetching, `sha256(body) === trace_hash`, as `x402/trace-verification.ts`
 checks, proves the bytes are the ones the agent committed to.
+
+**Availability as an operated service (#325).** `runtime/wiring.ts` creates one
+`createTraceStore(env, mode)` store per process and passes it to the maker,
+trader, watcher and availability tasks, so live mode can no longer publish a
+`local://` CID by accident. The opt-in `availability` task walks the registry's
+trace ids from a persisted cursor, verifies every response against the CID
+multihash (or the trace hash for legacy dag-pb), and re-pins from an atomic
+local archive of verified bytes through the same `PinProvider`s before
+re-probing. A wrong-body response is a `mismatch` even if another gateway
+serves the right body, and the gateway is recorded. After configured time and
+distinct-tick thresholds it submits `report_unavailable` with a dedicated
+reporter key; recovery clears only that reporter's own flag. x402 runs no
+availability monitor — the former scanner was dead code that probed one id in
+a hundred, never hashed its responses and POSTed CIDs with no bytes to re-pin —
+so it was removed. See `docs/agent-runtime.md`, "Trace availability".
 
 ### Event triggers (agents) vs. the event indexer
 

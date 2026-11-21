@@ -6,13 +6,16 @@
  * all three behave the same.
  */
 import { dirname, join } from "node:path";
+import { Keypair } from "@stellar/stellar-sdk";
 import { Server } from "@stellar/stellar-sdk/rpc";
+import { IpfsTraceStore } from "../core/ipfs-store.js";
 import { SnapshotCache } from "../core/state/state_cache.js";
 import { ChainStateReader } from "../core/state/reader.js";
 import { existingQuestionHashes, tradableMarkets } from "../core/state/select.js";
 import { toMarketState } from "../core/state/types.js";
 import type { MarketSignal, SignalSource } from "../core/strategy.js";
-import { LocalTraceStore } from "../core/trace.js";
+import type { TraceStore } from "../core/trace.js";
+import { DEFAULT_IPFS_GATEWAY_URL, createTraceStore } from "../core/trace-store-factory.js";
 import type { AgentConfig, Tunables } from "../core/config.js";
 import { evaluateAgentRisk, type AgentRiskState, type AgentRiskEvaluation } from "../core/risk.js";
 import type { CapsView, SizingParams } from "../core/sizing.js";
@@ -20,11 +23,12 @@ import { StellarAdapter, type Deployments } from "../stellar/adapter.js";
 import { BondBudget } from "../core/bond-budget.js";
 import { DEFAULT_POLICY } from "../core/dispute-policy.js";
 import { EvidenceTraceSource, ManualSource, PriceRuleSource, parsePriceQuestion, type OutcomeSource } from "../core/outcomes/index.js";
-import { assertNever, intEnv, type AgentMode } from "./config.js";
+import { ConfigError, assertNever, intEnv, parseAgentMode, type AgentMode } from "./config.js";
 import { FileLease, NoLease, type Lease } from "./lease.js";
 import { PostgresLease } from "./lease-pg.js";
 import type { RuntimeOptions } from "./runtime.js";
 import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
+import type { AvailabilityDeps } from "./tasks/availability.js";
 import type { MakerDeps } from "./tasks/maker.js";
 import type { WatcherTaskDeps } from "./tasks/watcher.js";
 import { fixtureCandidates, type TraderCandidate, type TraderDeps, type TraderRiskCheck } from "./tasks/trader.js";
@@ -66,6 +70,41 @@ export function buildAdapter(
     default:
       return assertNever(cfg.mode, "mode");
   }
+}
+
+/**
+ * One trace store per process/config. Every entrypoint now goes through
+ * createTraceStore, so live mode can no longer publish `local://` CIDs unless
+ * ALLOW_LOCAL_TRACE_STORE=1 was set deliberately (#325).
+ */
+export function sharedTraceStore(t: Tunables, store?: TraceStore): TraceStore {
+  return store ?? createTraceStore(t.env ?? {}, parseAgentMode(t.env ?? {})).store;
+}
+
+/**
+ * The availability reporter signs with its own key, never the trading agent's.
+ * The reporter address is derived from that key so `reporter.require_auth()`
+ * names the right address on-chain.
+ */
+export function buildReporterAdapter(
+  cfg: AgentConfig,
+  env: NodeJS.ProcessEnv,
+  sendGuard?: { check?: () => void | Promise<void> },
+): StellarAdapter {
+  if (cfg.mode !== "live") return buildAdapter(cfg, sendGuard);
+  const secret = env.AVAIL_REPORTER_SECRET;
+  if (!secret) throw new ConfigError("the availability task needs AVAIL_REPORTER_SECRET=S... in live mode");
+  let reporter: string;
+  try {
+    reporter = Keypair.fromSecret(secret).publicKey();
+  } catch {
+    throw new ConfigError("AVAIL_REPORTER_SECRET is not a valid S... secret key");
+  }
+  const { agent, maker, trader } = { agent: cfg.agentAddress, maker: cfg.deployments.agents?.maker, trader: cfg.deployments.agents?.trader };
+  if ([agent, maker, trader].includes(reporter)) {
+    throw new ConfigError("AVAIL_REPORTER_SECRET must be distinct from the treasury agent keys");
+  }
+  return buildAdapter({ ...cfg, mode: "live", agentSecret: secret, agentAddress: reporter }, sendGuard);
 }
 
 function stateReader(rpcUrl: string, deployments: Deployments) {
@@ -187,11 +226,11 @@ export function traderRiskCheck(
   };
 }
 
-export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
+export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments, store?: TraceStore): MakerDeps {
   const reader = stateReader(t.rpcUrl, deployments);
   return {
     adapter,
-    traceStore: new LocalTraceStore(t.traceStoreDir),
+    traceStore: sharedTraceStore(t, store),
     signals: demoSignalSource,
     knownQuestionHashes: async () => existingQuestionHashes(await reader.readSnapshot([])),
     confidenceThresholdBps: t.maker.confidenceThresholdBps,
@@ -211,10 +250,11 @@ export function traderDeps(
   nowSecs: () => number,
   dueDiligence?: TraderDeps["dueDiligence"],
   riskCheck?: TraderDeps["riskCheck"],
+  store?: TraceStore,
 ): TraderDeps {
   return {
     adapter,
-    traceStore: new LocalTraceStore(t.traceStoreDir),
+    traceStore: sharedTraceStore(t, store),
     candidates: deployments ? chainCandidates(t, deployments, adapter) : () => fixtureCandidates(nowSecs()),
     treasury: deployments?.contracts.treasury,
     minEdgeBps: t.trading.minEdgeBps,
@@ -303,7 +343,7 @@ export function uriFetcher(env: NodeJS.ProcessEnv): (uri: string, signal: AbortS
  * `candidates` scans markets the treasury holds, so a lost proposal event is
  * rediscovered from resolver state.
  */
-export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter): WatcherTaskDeps {
+export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter, store?: TraceStore): WatcherTaskDeps {
   const fetchUri = uriFetcher(cfg.env);
   const sources: OutcomeSource[] = [
     new PriceRuleSource({
@@ -328,7 +368,7 @@ export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter): WatcherT
     cfg,
     adapter,
     sources,
-    traceStore: new LocalTraceStore(cfg.traceStoreDir),
+    traceStore: sharedTraceStore(cfg, store),
     budget: (state) =>
       new BondBudget(state, {
         maxBondStroops: cfg.watcher.maxBondStroops,
@@ -346,5 +386,31 @@ export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter): WatcherT
         .filter(([id, p]) => p.yes + p.no > 0n && snapshot.markets.get(id)?.status === "open")
         .map(([id]) => id);
     },
+  };
+}
+
+/** Real availability-task dependencies built from the same store the agents use. */
+export function availabilityDeps(
+  adapter: StellarAdapter,
+  store: TraceStore,
+  env: NodeJS.ProcessEnv,
+): AvailabilityDeps {
+  const ipfs = store instanceof IpfsTraceStore ? store : undefined;
+  const gateways = (env.AVAIL_GATEWAYS ?? env.IPFS_GATEWAY_URL ?? DEFAULT_IPFS_GATEWAY_URL)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return {
+    adapter,
+    gateways,
+    providers: ipfs?.pinProviders ?? [],
+    archive: ipfs,
+    batchSize: intEnv(env, "AVAIL_BATCH", 25, 1),
+    concurrency: intEnv(env, "AVAIL_CONCURRENCY", 4, 1),
+    timeoutMs: intEnv(env, "AVAIL_TIMEOUT_MS", 30_000, 1),
+    maxBytes: intEnv(env, "AVAIL_MAX_BYTES", 1024 * 1024, 1),
+    flagAfterSecs: intEnv(env, "AVAIL_FLAG_AFTER_SECS", 6 * 3600, 0),
+    flagAfterProbes: intEnv(env, "AVAIL_FLAG_AFTER_PROBES", 3, 1),
+    minToggleSecs: intEnv(env, "AVAIL_MIN_TOGGLE_SECS", 24 * 3600, 0),
   };
 }

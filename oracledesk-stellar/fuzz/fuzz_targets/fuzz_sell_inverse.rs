@@ -22,11 +22,25 @@ fuzz_target!(|data: &[u8]| {
         assert!(gross > 0 && gross < r_other);
     }
 
-    // 2. A real forward sell can be inverted back within one share of
-    //    rounding. This is the property the Python/TS mirrors assert.
+    // 2. The on-chain exact-share quote must never pay more than the forward
+    //    sell charged for the same share count, and must not reduce k.
     let Ok(fwd) = math::calc_sell(r_sold, r_other, collateral_out, fee_bps) else {
         return;
     };
+    if let Ok(exact) = math::calc_sell_shares(r_sold, r_other, fwd.shares_in, fee_bps) {
+        assert!(
+            exact.collateral_out <= collateral_out,
+            "exact-share quote overpays: {exact:?} > {collateral_out}"
+        );
+        assert!(
+            exact.new_reserve_sold * exact.new_reserve_other >= r_sold * r_other,
+            "exact-share quote decreased k"
+        );
+    }
+
+    // 3. A real forward sell can be inverted back within one share of
+    //    rounding. This is the property the deprecated Python/TS inverse
+    //    mirrors assert.
     let Ok(est) = inverse::collateral_out_for_shares(r_sold, r_other, fwd.shares_in, fee_bps)
     else {
         return;

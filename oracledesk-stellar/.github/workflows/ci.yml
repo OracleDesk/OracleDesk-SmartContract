@@ -42,6 +42,9 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: Auth matrix uses targeted mocks only
+        run: ./scripts/check-no-mock-all-auths.sh
+
       - name: Build all contracts to wasm
         run: |
           stellar contract build

@@ -49,6 +49,10 @@ export const MAX_STROOPS = (1n << 127n) - 1n;
 export const MIN_SEED_STROOPS = 1_000_000_000n;
 const BPS_MAX = 10_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+/** Maximum restore rent charged to one action, and per task/day (#323). */
+export const DEFAULT_RESTORE_MAX_FEE = 100_000_000n;
+export const DEFAULT_RESTORE_DAILY_BUDGET = 300_000_000n;
+export const DEFAULT_RESTORE_MAX_RETRIES = 2;
 
 /** Documented contract id overrides, applied after the deployment record is validated. */
 export const CONTRACT_OVERRIDES = {
@@ -219,6 +223,8 @@ export const EnvSchema = z.object({
   MAKER_SECRET_KEY: secretField,
   TRADER_SECRET_KEY: secretField,
   WATCHER_SECRET_KEY: secretField,
+  /** #325: separate key for registry availability flags, never a trading key. */
+  AVAIL_REPORTER_SECRET: secretField,
   DEPLOYMENTS_FILE: nonEmptyPath,
   DEPLOYMENTS_PATH: nonEmptyPath,
   TRACE_STORE_DIR: nonEmptyPath,
@@ -264,6 +270,9 @@ export const EnvSchema = z.object({
   ARB_MAX_UNWIND_RETRIES: intField(3, 1, 20),
   FEE_POLICY_FILE: nonEmptyPath,
   AGENT_FEE_PAYER_SECRET: secretField,
+  RESTORE_MAX_FEE_STROOPS: stroopsField(DEFAULT_RESTORE_MAX_FEE, 0n),
+  RESTORE_DAILY_BUDGET_STROOPS: stroopsField(DEFAULT_RESTORE_DAILY_BUDGET, 0n),
+  RESTORE_MAX_RETRIES: intField(DEFAULT_RESTORE_MAX_RETRIES, 0, 10),
   ...FEE_ENV_FIELDS,
   USDC_CONTRACT_ID: contractIdField,
   MARKET_CORE_CONTRACT_ID: contractIdField,
@@ -473,6 +482,14 @@ export interface WatcherConfig {
   verdictsFile: string;
 }
 
+/** Archival restore budget (#323). Daily spend is persisted under the
+ * `restore.spend` StateStore namespace, keyed by task and UTC day. */
+export interface RestoreConfig {
+  maxFeeStroops: bigint;
+  dailyBudgetStroops: bigint;
+  maxRetries: number;
+}
+
 /** Cross-market arbitrage (#108); off unless ARB_ENABLED. */
 export interface ArbConfig {
   enabled: boolean;
@@ -504,6 +521,7 @@ export interface Tunables {
   events: EventsConfig;
   watcher: WatcherConfig;
   arb: ArbConfig;
+  restore: RestoreConfig;
   /** Runtime knobs (lease, state file, backoff, trace store selection) still
    * read by runtime/wiring.ts. Never printed: it may hold secrets. */
   env: NodeJS.ProcessEnv;
@@ -599,6 +617,11 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       maxLegLoss: e.ARB_MAX_LEG_LOSS,
       maxOpenLegs: e.ARB_MAX_OPEN_LEGS!,
       maxUnwindRetries: e.ARB_MAX_UNWIND_RETRIES!,
+    },
+    restore: {
+      maxFeeStroops: e.RESTORE_MAX_FEE_STROOPS,
+      dailyBudgetStroops: e.RESTORE_DAILY_BUDGET_STROOPS,
+      maxRetries: e.RESTORE_MAX_RETRIES!,
     },
     env,
   };
@@ -765,7 +788,7 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, fee, trading, maker, events, watcher, arb, ...rest } = cfg;
+  const { env: _env, agentSecret, fee, trading, maker, events, watcher, arb, restore, ...rest } = cfg;
   const { feePayerSecret, ...feeRest } = fee;
   const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
   const printableFee = {
@@ -782,6 +805,11 @@ export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
     arb: strings(arb),
     watcher: strings(watcher),
     events: { ...events, tradeThresholdStroops: events.tradeThresholdStroops.toString() },
+    restore: {
+      maxFeeStroops: restore.maxFeeStroops.toString(),
+      dailyBudgetStroops: restore.dailyBudgetStroops.toString(),
+      maxRetries: restore.maxRetries,
+    },
     agentSecret: agentSecret ? { publicKey: Keypair.fromSecret(agentSecret).publicKey(), redacted: true } : null,
     trading: {
       ...trading,

@@ -60,6 +60,15 @@ the reachable pool states are the same.
 so `r_bought'·r_other' ≥ r_bought·r_other`. Sell: `r_other' = r_other − gross`
 and `r_sold' = ⌈r_sold·r_other / r_other'⌉`, same inequality. ∎
 
+**Canonical sell-by-shares.** `math.rs::calc_sell_shares` is the single
+definition of "sell exactly N shares": it solves the constant-product quadratic
+and then applies a pool-favouring correction until `r_sold'·r_other' ≥ k` holds
+with integer arithmetic. `gross_for_shares` and `collateral_out_for_shares`,
+in the Python model and the TypeScript agent, are **off-chain-only** estimates
+kept for backward compatibility; they may differ from the on-chain quote by a
+unit and are never used to price a contract call. All three implementations
+plus the committed golden vectors are kept in sync by `scripts/fpmm-diff`.
+
 By induction, every reachable state has **`y·n ≥ k0 = y0·n0`**, and `y, n ≥ 1`
 (a buy keeps `r_bought' ≥ 1` because the ceiling of a positive number is at
 least 1; a sell requires `gross < r_other`). So all bounds below are *infima*:

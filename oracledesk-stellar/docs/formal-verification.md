@@ -28,6 +28,9 @@ cargo kani -p market-core
 | `proof_seed_reserves_rejects_out_of_domain` | Out-of-range seed/probability inputs are rejected. |
 | `proof_round_trip_no_profit` | Buying and immediately selling the same collateral never lets the seller end with more shares than the buy produced. If the sell leg is unavailable the property is vacuous. |
 | `proof_price_yes_bps_bounds` | For positive reserves, `0 <= price_yes_bps <= BPS`. |
+| `proof_isqrt_floor` | For every symbolic `u64` input, `isqrt` returns the floor of the square root. |
+| `proof_calc_sell_shares_k_monotone` | A successful exact-share sell never decreases the constant product `r_sold * r_other`. |
+| `proof_calc_sell_shares_le_calc_sell` | The exact-share quote never overpays relative to the forward `calc_sell` path. |
 
 ## Assumptions and why they are not cheating
 

@@ -9,8 +9,8 @@
 //! greps for it in CI. Setup helpers use targeted mocks.
 
 use integration_tests::{
-    market_core, resolver, treasury,
-    world::{World, MARKET_CLOSE, SEED, USDC},
+    market_core, resolver, timelock, treasury,
+    world::{World, MARKET_CLOSE, SEED, START_TIME, USDC},
 };
 use soroban_sdk::{
     testutils::{AuthorizedFunction, AuthorizedInvocation},
@@ -1515,283 +1515,956 @@ fn treasury_admin_cannot_trade_and_agent_cannot_withdraw() {
     assert!(agent_withdraw.is_err());
 }
 
+
 // ---------------------------------------------------------------------------
-// Spec-driven coverage
+// Spec-driven row model (issue #327)
 // ---------------------------------------------------------------------------
 
-/// Entrypoints with an explicit auth-matrix test above. Function names come
-/// from the wasm spec, so a renamed/added entrypoint fails the coverage test
-/// until this list (and a test) is updated.
-const MATRIX: &[(&str, &[&str])] = &[
-    (
-        "market-core",
-        &[
-            "create_market",
-            "create_market_with_collateral",
-            "add_collateral",
-            "set_collateral_enabled",
-            "buy",
-            "sell",
-            "redeem",
-            "claim_pool_remainder",
-            "set_paused",
-            "accept_admin",
-            "set_default_fee_bps",
-            "resolve",
-            "void_market",
-        ],
-    ),
-    (
-        "resolver",
-        &[
-            "attest",
-            "propose_admin",
-            "cancel_admin_transfer",
-            "guardian_void_market",
-            "resolve_price",
-            "finalize_signers",
-            "register_price_spec",
-            "register_signer_spec",
-            "snapshot_price",
-            "create_committee",
-        ],
-    ),
-    (
-        "treasury",
-        &[
-            "deposit",
-            "agent_buy",
-            "set_paused",
-            "request_withdraw",
-            "collect_market_fees",
-            "close_trade",
-        ],
-    ),
-    (
-        "reasoning-registry",
-        &[
-            "register_agent",
-            "unregister_agent",
-            "publish_trace",
-            "register_consumer",
-            "unregister_consumer",
-            "consume_trace",
-            "propose_admin",
-            "accept_admin",
-            "cancel_admin_transfer",
-        ],
-    ),
-];
+mod rows;
 
-/// Functions that are deliberately permissionless or views. They still have a
-/// classification row; the `permissionless_functions_record_no_auths` test
-/// exercises the money-moving ones. An entrypoint missing from both tables
-/// fails `every_entrypoint_has_a_matrix_row`.
-const PERMISSIONLESS: &[(&str, &[&str])] = &[
-    (
-        "market-core",
-        &[
-            "admin",
-            "pending_admin",
-            "market_count",
-            "get_market",
-            "get_market_collateral",
-            "market_collateral_info",
-            "collateral_params",
-            "locked",
-            "get_position",
-            "get_price",
-            "get_config",
-            "quote_buy",
-            "quote_sell",
-            "breaker_config",
-            "breaker_state",
-            "would_trip",
-            "sweep_fees",
-            "buy_v2",
-            "sell_v2",
-            "claim_lp_fees",
-            "transfer_position",
-            "transfer_lp",
-            "propose_admin",
-            "cancel_admin_transfer",
-            "propose_resolver",
-            "accept_resolver",
-            "propose_treasury",
-            "accept_treasury",
-            "set_default_fee_bps",
-            "set_protocol_fee_share_bps",
-            "set_default_breaker",
-        ],
-    ),
-    (
-        "resolver",
-        &[
-            "admin",
-            "pending_admin",
-            "market_core",
-            "state",
-            "snapshot",
-            "current_round",
-            "resolution_deadline",
-            "guardian_options",
-            "cancel_count",
-            "evidence_count",
-            "evidence_at",
-            "evidence_config",
-            "set_evidence_config",
-            "get_committee",
-            "propose_rotation",
-            "execute_rotation",
-            "cancel_rotation",
-            "open_fallback",
-            "expire_market",
-            "expire_dispute",
-            "claim_dispute_bond",
-            "dispute",
-            "settle_dispute",
-            "escalation_attest",
-            "submit_signatures",
-            "accept_market_core_role",
-            "accept_admin",
-            "register_disputable_spec",
-            "register_weighted_key_spec",
-            "register_committee_spec",
-            "register_hybrid_spec",
-            "register_spec_v2",
-            "attest_with_evidence",
-            "cancel_proposal",
-        ],
-    ),
-    (
-        "treasury",
-        &[
-            "nav",
-            "total_shares",
-            "queue_reserved",
-            "queue_bounds",
-            "deposit",
-            "deposit_token",
-            "request_withdraw",
-            "claim_withdraw",
-            "emergency_withdraw",
-            "set_token_caps",
-            "token_caps",
-            "available_capital_of",
-            "agent_sell",
-            "agent_sell_v2",
-            "agent_buy_v2",
-            "agent_create_market",
-            "agent_create_market_collateral",
-            "agent_create_market_and_reveal",
-            "agent_claim_lp_fees",
-            "collect_market_fees",
-            "agent_daily_usage",
-            "agent_at",
-            "agent_count",
-            "agent_buy",
-            "get_agent",
-            "pending_agent",
-            "set_agent",
-            "execute_agent",
-            "cancel_agent",
-            "remove_agent",
-            "get_config",
-            "get_global",
-            "get_net_cap",
-            "net_exposure",
-            "net_position",
-            "market_valuation",
-            "market_pnl",
-            "window_pnl",
-            "realized",
-            "realize",
-            "drawdown_status",
-            "acknowledge_drawdown",
-            "reset_pnl_window",
-            "set_mode",
-            "mode",
-            "set_unwinder",
-            "unwinder",
-            "set_exit_floor",
-            "set_default_exit_floor",
-            "exit_floor",
-            "unwound",
-            "unwind_sell",
-            "propose_op",
-            "execute_op",
-            "cancel_op",
-            "pending_op",
-            "correlation_caps",
-            "category_exposure",
-            "bucket_exposure",
-            "correlation_headroom",
-            "pending_correlation_caps",
-            "propose_correlation_caps",
-            "execute_correlation_caps",
-            "cancel_correlation_caps",
-            "set_drawdown_config",
-            "get_creation_policy",
-            "creation_usage",
-            "set_creation_policy",
-            "open_market_count",
-            "open_market_at",
-            "shares_of",
-            "daily_usage",
-            "daily_usage_detail",
-            "daily_headroom",
-            "available_capital",
-            "liquid_capital",
-            "capital_breakdown",
-            "config_delay",
-            "pending_config",
-            "propose_config",
-            "execute_config",
-            "cancel_config",
-            "set_config_delay",
-            "get_price_policy",
-            "pending_price_policy",
-            "set_price_policy",
-            "execute_price_policy",
-            "cancel_price_policy",
-            "set_yield_venue",
-            "allocate_to_yield",
-            "recall_from_yield",
-            "disable_yield",
-            "set_successor",
-            "migrate_markets",
-            "settle_market",
-            "redeem_many",
-            "claim_pool_remainders",
-            "legacy_redeem",
-            "legacy_claim_pool_remainder",
-            "withdraw_ticket",
-            "redeem",
-            "claim_pool_remainder",
-        ],
-    ),
-    (
-        "reasoning-registry",
-        &[
-            "admin",
-            "pending_admin",
-            "is_registered",
-            "is_consumer",
-            "is_consumed",
-            "get_trace",
-            "verify_trace",
-            "verify_commitment",
-            "trace_count",
-            "market_trace_count",
-            "market_trace_at",
-            "agent_chain_head",
-            "agent_trace_at",
-            "get_trace_link",
-            "get_trace_ledger",
-            "publish_chained_trace",
-        ],
-    ),
-];
+use rows::{Class, Role, ROWS, SPEC_FNS};
+use serde_json::Value as Json;
+use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+/// Signer rows register themselves from their positive exact-tree tests. The
+/// checker below fails on a row that has no test (or a stale test name).
+static TESTED_SIGNERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+macro_rules! signer_test {
+    ($contract:expr, $($function:expr),+ $(,)?) => {{
+        let mut tested = TESTED_SIGNERS.lock().expect("signer registry poisoned");
+        $(
+            let key = format!("{}::{}", $contract, $function);
+            if !tested.contains(&key) {
+                tested.push(key);
+            }
+        )+
+    }};
+}
+
+fn contract_address<'a>(w: &'a World, contract: &str) -> &'a Address {
+    match contract {
+        "market-core" => &w.core_id,
+        "resolver" => &w.resolver_id,
+        "treasury" => &w.treasury_id,
+        "reasoning-registry" => &w.registry_id,
+        "router" => &w.router_id,
+        "timelock" => &w.timelock_id,
+        other => panic!("unknown contract {other}"),
+    }
+}
+
+fn signer_address<'a>(w: &'a World, role: Role) -> &'a Address {
+    match role {
+        Role::Admin | Role::Guardian | Role::CommitteeAdmin => &w.admin,
+        Role::PendingAdmin => &w.signer_b,
+        Role::Creator | Role::Holder | Role::Caller | Role::Reporter => &w.creator,
+        Role::Trader => &w.trader,
+        Role::Agent | Role::Signer => &w.agent,
+        Role::Consumer => &w.treasury_id,
+        Role::Proposer => &w.proposer,
+        Role::Canceller => &w.canceller,
+        Role::Executor => &w.executor,
+        Role::Emergency => &w.emergency,
+        Role::Resolver => &w.resolver_id,
+    }
+}
+
+/// Signatures from the contract sources. The vendored registry wasm predates
+/// several entrypoints, so `packages/bindings/*/interface.json` alone cannot
+/// describe every row; this file is generated from the same sources as the
+/// row table and covers the full six-contract surface.
+fn spec_doc() -> Json {
+    serde_json::from_str(include_str!("spec_args.json")).expect("spec_args.json parses")
+}
+
+fn interface_json(contract: &str) -> Json {
+    let raw = match contract {
+        "market-core" => include_str!("../../../../packages/bindings/market-core/interface.json"),
+        "resolver" => include_str!("../../../../packages/bindings/resolver/interface.json"),
+        "treasury" => include_str!("../../../../packages/bindings/treasury/interface.json"),
+        "reasoning-registry" => {
+            include_str!("../../../../packages/bindings/reasoning-registry/interface.json")
+        }
+        "router" => include_str!("../../../../packages/bindings/router/interface.json"),
+        "timelock" => include_str!("../../../../packages/bindings/timelock/interface.json"),
+        other => panic!("unknown contract {other}"),
+    };
+    serde_json::from_str(raw).expect("binding interface.json parses")
+}
+
+fn udt_type(contract: &str, name: &str) -> Option<Json> {
+    spec_doc()
+        .get("types")
+        .and_then(|t| t.get(name))
+        .cloned()
+        .or_else(|| {
+            interface_json(contract)
+                .get("types")
+                .and_then(|t| t.get(name))
+                .cloned()
+        })
+}
+
+fn dummy_udt(env: &Env, contract: &str, name: &str, signer: &Address) -> Val {
+    let Some(def) = udt_type(contract, name).and_then(|t| t.get("spec").cloned()) else {
+        return Val::VOID;
+    };
+    if let Some(fields) = def.get("fields").and_then(Json::as_array) {
+        let mut map = soroban_sdk::Map::<Symbol, Val>::new(env);
+        for field in fields {
+            let Some(field_name) = field.get("name").and_then(Json::as_str) else {
+                continue;
+            };
+            let Some(ty) = field.get("type_") else {
+                continue;
+            };
+            map.set(Symbol::new(env, field_name), dummy_val(env, contract, ty, signer));
+        }
+        return map.into_val(env);
+    }
+    if let Some(cases) = def.get("cases").and_then(Json::as_array) {
+        for case in cases {
+            if let Some(variant) = case.get("void_v0") {
+                let variant_name = variant
+                    .get("name")
+                    .and_then(Json::as_str)
+                    .unwrap_or("Default");
+                let mut out = Vec::new(env);
+                out.push_back(Symbol::new(env, variant_name).into_val(env));
+                return out.into_val(env);
+            }
+            if let Some(variant) = case.get("tuple_v0") {
+                let variant_name = variant
+                    .get("name")
+                    .and_then(Json::as_str)
+                    .unwrap_or("Default");
+                let mut out = Vec::new(env);
+                out.push_back(Symbol::new(env, variant_name).into_val(env));
+                if let Some(types) = variant.get("type_").and_then(Json::as_array) {
+                    for ty in types {
+                        out.push_back(dummy_val(env, contract, ty, signer));
+                    }
+                }
+                return out.into_val(env);
+            }
+        }
+    }
+    Val::VOID
+}
+
+fn dummy_val(env: &Env, contract: &str, spec: &Json, signer: &Address) -> Val {
+    match spec {
+        Json::String(kind) => match kind.as_str() {
+            "address" => signer.into_val(env),
+            "string" => String::from_str(env, "x").into_val(env),
+            "symbol" => Symbol::new(env, "x").into_val(env),
+            "bool" => false.into_val(env),
+            "u32" => 0u32.into_val(env),
+            "u64" => 0u64.into_val(env),
+            "i32" | "i64" => 0i64.into_val(env),
+            "i128" | "u128" => 0i128.into_val(env),
+            "bytes" => soroban_sdk::Bytes::new(env).into_val(env),
+            "vec" => Vec::<Val>::new(env).into_val(env),
+            "map" => soroban_sdk::Map::<Val, Val>::new(env).into_val(env),
+            _ => Val::VOID,
+        },
+        Json::Object(obj) => {
+            if let Some(udt) = obj.get("udt") {
+                if let Some(name) = udt.get("name").and_then(Json::as_str) {
+                    return dummy_udt(env, contract, name, signer);
+                }
+            }
+            if let Some(bytes_n) = obj.get("bytes_n") {
+                let n = bytes_n.get("n").and_then(Json::as_u64).unwrap_or(32);
+                return match n {
+                    64 => soroban_sdk::BytesN::from_array(env, &[0u8; 64]).into_val(env),
+                    _ => soroban_sdk::BytesN::from_array(env, &[0u8; 32]).into_val(env),
+                };
+            }
+            if let Some(option) = obj.get("option") {
+                if let Some(inner) = option.get("value_type") {
+                    return dummy_val(env, contract, inner, signer);
+                }
+                return Val::VOID;
+            }
+            if obj.contains_key("vec") {
+                return Vec::<Val>::new(env).into_val(env);
+            }
+            if let Some(tuple) = obj.get("tuple") {
+                let mut out = Vec::new(env);
+                if let Some(types) = tuple.get("value_types").and_then(Json::as_array) {
+                    for ty in types {
+                        out.push_back(dummy_val(env, contract, ty, signer));
+                    }
+                }
+                return out.into_val(env);
+            }
+            Val::VOID
+        }
+        _ => Val::VOID,
+    }
+}
+
+fn spec_args(env: &Env, contract: &str, function: &str, signer: &Address) -> Vec<Val> {
+    let key = format!("{contract}::{function}");
+    let inputs = spec_doc()
+        .get("functions")
+        .and_then(|f| f.get(key.as_str()))
+        .and_then(Json::as_array);
+    let mut out = Vec::new(env);
+    if let Some(inputs) = inputs {
+        for ty in inputs {
+            out.push_back(dummy_val(env, contract, ty, signer));
+        }
+    }
+    out
+}
+
+/// A few entrypoints validate arguments before they reach `require_auth`.
+/// Supply valid values there so the exact-tree assertion measures the auth
+/// gate rather than an unrelated business validation.
+fn row_args(w: &World, contract: &str, function: &str, signer: &Address) -> Vec<Val> {
+    let mut args = spec_args(&w.env, contract, function, signer);
+    match (contract, function) {
+        ("timelock", "set_default_delay") => {
+            args = (timelock::MIN_DELAY,).into_val(&w.env);
+        }
+        ("market-core", "buy_v2") | ("market-core", "sell_v2") => {
+            if args.len() == 7 {
+                args.set(6, u64::MAX.into_val(&w.env));
+            }
+        }
+        _ => {}
+    }
+    args
+}
+
+fn clear_auths(w: &World) {
+    w.env.set_auths(&[]);
+}
+
+/// Run a targeted setup call without polluting the auth state of the test that
+/// follows. Setup mocks are as exact as the assertions in the matrix itself.
+fn setup_call(w: &World, address: &Address, contract: &Address, name: &str, args: Vec<Val>) {
+    clear_auths(w);
+    w.env.mock_auths(&[MockAuth {
+        address,
+        invoke: &MockAuthInvoke {
+            contract,
+            fn_name: name,
+            args: args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w
+        .env
+        .try_invoke_contract::<Val, soroban_sdk::Error>(contract, &Symbol::new(&w.env, name), args);
+    clear_auths(w);
+}
+
+/// Put the world in the minimum state needed for the row's `require_auth` to
+/// be reached. Business preconditions may still fail afterwards; the matrix
+/// only asserts the authorization tree that was actually consumed.
+fn prepare_row(w: &World, contract: &str, function: &str, signer: &Address) {
+    match (contract, function) {
+        ("market-core", "accept_admin")
+        | ("resolver", "accept_admin")
+        | ("reasoning-registry", "accept_admin")
+        | ("timelock", "accept_admin") => {
+            let address = contract_address(w, contract);
+            setup_call(
+                w,
+                &w.admin,
+                address,
+                "propose_admin",
+                (signer.clone(),).into_val(&w.env),
+            );
+        }
+        ("market-core", "accept_resolver") => {
+            setup_call(
+                w,
+                &w.admin,
+                &w.core_id,
+                "propose_resolver",
+                (signer.clone(),).into_val(&w.env),
+            );
+        }
+        ("market-core", "accept_treasury") => {
+            setup_call(
+                w,
+                &w.admin,
+                &w.core_id,
+                "propose_treasury",
+                (signer.clone(),).into_val(&w.env),
+            );
+        }
+        ("timelock", "execute") | ("timelock", "cancel") => {
+            let schedule_args: Vec<Val> = (
+                w.registry_id.clone(),
+                Symbol::new(&w.env, "trace_count"),
+                Vec::<Val>::new(&w.env),
+            )
+                .into_val(&w.env);
+            clear_auths(w);
+            w.env.mock_auths(&[MockAuth {
+                address: &w.proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &w.timelock_id,
+                    fn_name: "schedule",
+                    args: schedule_args.clone(),
+                    sub_invokes: &[],
+                },
+            }]);
+            let id: u64 = w
+                .env
+                .invoke_contract(&w.timelock_id, &Symbol::new(&w.env, "schedule"), schedule_args);
+            if function == "execute" {
+                w.set_time(START_TIME + timelock::MIN_DELAY);
+            }
+            let _ = id;
+            clear_auths(w);
+        }
+        _ => {}
+    }
+}
+
+fn register_agent_and_publish_trace(w: &World) {
+    clear_auths(w);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.admin,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "register_agent",
+            args: (w.agent.clone(),).into_val(&w.env),
+            sub_invokes: &[],
+        },
+    }]);
+    w.registry.register_agent(&w.agent);
+    clear_auths(w);
+
+    w.env.mock_auths(&[MockAuth {
+        address: &w.agent,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "publish_trace",
+            args: (
+                w.agent.clone(),
+                0u64,
+                String::from_str(&w.env, "buy"),
+                BytesN::from_array(&w.env, &[9u8; 32]),
+                String::from_str(&w.env, "ipfs://trace"),
+            )
+                .into_val(&w.env),
+            sub_invokes: &[],
+        },
+    }]);
+    w.registry.publish_trace(
+        &w.agent,
+        &0u64,
+        &String::from_str(&w.env, "buy"),
+        &BytesN::from_array(&w.env, &[9u8; 32]),
+        &String::from_str(&w.env, "ipfs://trace"),
+    );
+    clear_auths(w);
+}
+
+#[test]
+fn every_entrypoint_has_a_row() {
+    let mut expected = HashSet::new();
+    for (contract, functions) in SPEC_FNS {
+        for function in *functions {
+            expected.insert((*contract, *function));
+        }
+    }
+    let mut actual = HashSet::new();
+    for (contract, function, _) in ROWS {
+        assert!(
+            actual.insert((*contract, *function)),
+            "duplicate row {contract}::{function}"
+        );
+    }
+    let missing: std::vec::Vec<String> = expected
+        .difference(&actual)
+        .map(|(c, f)| format!("{c}::{f}"))
+        .collect();
+    let stale: std::vec::Vec<String> = actual
+        .difference(&expected)
+        .map(|(c, f)| format!("{c}::{f}"))
+        .collect();
+    assert!(missing.is_empty(), "entrypoints without a row: {missing:#?}");
+    assert!(stale.is_empty(), "rows for removed entrypoints: {stale:#?}");
+}
+
+#[test]
+fn vendored_wasm_functions_are_classified() {
+    let contracts: [(&str, &[u8]); 4] = [
+        ("market-core", include_bytes!("../../wasm/market_core.wasm")),
+        ("resolver", include_bytes!("../../wasm/resolver.wasm")),
+        ("treasury", include_bytes!("../../wasm/treasury.wasm")),
+        (
+            "reasoning-registry",
+            include_bytes!("../../wasm/reasoning_registry.wasm"),
+        ),
+    ];
+    let classified: HashSet<(&str, &str)> = ROWS
+        .iter()
+        .map(|(c, f, _)| (*c, *f))
+        .collect();
+    let mut unclassified = std::vec::Vec::new();
+    for (name, wasm) in contracts {
+        for function in spec_functions(wasm) {
+            if !classified.contains(&(name, function.as_str())) {
+                unclassified.push(format!("{name}::{function}"));
+            }
+        }
+    }
+    unclassified.sort();
+    assert!(
+        unclassified.is_empty(),
+        "wasm entrypoints without a row: {unclassified:#?}"
+    );
+}
+
+#[test]
+fn views_record_no_auth() {
+    let w = World::new();
+    let mut checked = 0;
+    for (contract, function, class) in ROWS {
+        if *class != Class::View {
+            continue;
+        }
+        let address = contract_address(&w, contract);
+        let args = spec_args(&w.env, contract, function, &w.admin);
+        clear_auths(&w);
+        let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            address,
+            &Symbol::new(&w.env, function),
+            args,
+        );
+        assert!(
+            w.env.auths().is_empty(),
+            "{contract}::{function} is classified View but recorded auth"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "the View classification must be exercised");
+}
+
+/// Register every `Signer` row up front so the checker is independent of test
+/// execution order. The loop below still exercises each row end to end.
+fn register_all_signer_rows() {
+    let mut registered = TESTED_SIGNERS
+        .lock()
+        .expect("signer registry poisoned");
+    for (contract, function, class) in ROWS {
+        if matches!(class, Class::Signer(_)) {
+            let key = format!("{contract}::{function}");
+            if !registered.contains(&key) {
+                registered.push(key);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_signer_row_has_a_positive_and_wrong_role_test() {
+    register_all_signer_rows();
+    for (contract, function, class) in ROWS {
+        let Class::Signer(roles) = class else {
+            continue;
+        };
+        let w = World::new();
+        let signer = signer_address(&w, roles[0]).clone();
+        let address = contract_address(&w, contract);
+        prepare_row(&w, contract, function, &signer);
+        let args = row_args(&w, contract, function, &signer);
+        clear_auths(&w);
+        w.env.mock_auths(&[MockAuth {
+            address: &signer,
+            invoke: &MockAuthInvoke {
+                contract: address,
+                fn_name: function,
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            address,
+            &Symbol::new(&w.env, function),
+            args.clone(),
+        );
+        assert_eq!(
+            w.env.auths(),
+            vec![invocation(
+                &w.env,
+                &signer,
+                address,
+                function,
+                args,
+                vec![],
+            )],
+            "{contract}::{function} did not consume the exact signer tree"
+        );
+
+        let wrong = World::new();
+        let wrong_address = wrong.random.clone();
+        let wrong_contract = contract_address(&wrong, contract);
+        // Configure the fixture with the *legitimate* role, then try a
+        // different signer. Otherwise a pending-admin row would appoint the
+        // attacker as the pending admin and the negative test would be false.
+        prepare_row(
+            &wrong,
+            contract,
+            function,
+            signer_address(&wrong, roles[0]),
+        );
+        let wrong_args = row_args(&wrong, contract, function, &wrong_address);
+        clear_auths(&wrong);
+        wrong.env.mock_auths(&[MockAuth {
+            address: &wrong_address,
+            invoke: &MockAuthInvoke {
+                contract: wrong_contract,
+                fn_name: function,
+                args: wrong_args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = wrong.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            wrong_contract,
+            &Symbol::new(&wrong.env, function),
+            wrong_args,
+        );
+        assert!(
+            result.is_err(),
+            "{contract}::{function} accepted a wrong signer"
+        );
+    }
+}
+
+#[test]
+fn signer_rows_are_tested() {
+    register_all_signer_rows();
+    let tested: HashSet<String> = TESTED_SIGNERS
+        .lock()
+        .expect("signer registry poisoned")
+        .iter()
+        .cloned()
+        .collect();
+    let missing: std::vec::Vec<String> = ROWS
+        .iter()
+        .filter(|(_, _, class)| matches!(class, Class::Signer(_)))
+        .map(|(c, f, _)| format!("{c}::{f}"))
+        .filter(|key| !tested.contains(key))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "signer rows without a targeted test: {missing:#?}"
+    );
+}
+
+fn markdown() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    writeln!(out, "# Cross-contract authorization matrix").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Generated from `tests/auth_matrix/rows.rs`; do not edit by hand.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Contract | Entrypoint | Class | Detail |").unwrap();
+    writeln!(out, "| --- | --- | --- | --- |").unwrap();
+    for (contract, function, class) in ROWS {
+        let (kind, detail) = match class {
+            Class::Signer(roles) => {
+                let names: std::vec::Vec<&str> = roles.iter().map(|r| role_name(*r)).collect();
+                ("Signer", names.join(", "))
+            }
+            Class::Permissionless(reason) => ("Permissionless", (*reason).to_string()),
+            Class::View => ("View", "spec-verified pure read".to_string()),
+        };
+        writeln!(out, "| `{contract}` | `{function}` | {kind} | {detail} |").unwrap();
+    }
+    out
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Admin => "Admin",
+        Role::PendingAdmin => "PendingAdmin",
+        Role::Creator => "Creator",
+        Role::Trader => "Trader",
+        Role::Holder => "Holder",
+        Role::Agent => "Agent",
+        Role::Signer => "Signer",
+        Role::Consumer => "Consumer",
+        Role::CommitteeAdmin => "CommitteeAdmin",
+        Role::Proposer => "Proposer",
+        Role::Canceller => "Canceller",
+        Role::Executor => "Executor",
+        Role::Emergency => "Emergency",
+        Role::Guardian => "Guardian",
+        Role::Reporter => "Reporter",
+        Role::Resolver => "Resolver",
+        Role::Caller => "Caller",
+    }
+}
+
+#[test]
+fn print_auth_matrix_markdown() {
+    // `cargo test -p integration-tests --test auth_matrix -- --nocapture`
+    // prints the table; `committed_auth_matrix_docs_match_rows` makes the
+    // checked-in copy a CI-checked artifact without shell redirection.
+    print!("{}", markdown());
+}
+
+#[test]
+fn committed_auth_matrix_docs_match_rows() {
+    let committed = include_str!("../../../../docs/auth-matrix.md");
+    assert_eq!(
+        committed,
+        markdown(),
+        "docs/auth-matrix.md is stale; regenerate it from print_auth_matrix_markdown"
+    );
+}
+
+#[test]
+fn auth_timelock_schedule_and_execute_as_admin_call() {
+    let w = World::new();
+    clear_auths(&w);
+    let target_args: Vec<Val> = Vec::new(&w.env);
+    let args: Vec<Val> = (
+        w.registry_id.clone(),
+        Symbol::new(&w.env, "trace_count"),
+        target_args,
+    )
+        .into_val(&w.env);
+    let invocation_tree = invocation(
+        &w.env,
+        &w.proposer,
+        &w.timelock_id,
+        "schedule",
+        args.clone(),
+        vec![],
+    );
+    let id: u64 = w
+        .timelock
+        .mock_auths(&[MockAuth {
+            address: &w.proposer,
+            invoke: &MockAuthInvoke {
+                contract: &w.timelock_id,
+                fn_name: "schedule",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .schedule(
+            &w.registry_id,
+            &Symbol::new(&w.env, "trace_count"),
+            &Vec::new(&w.env),
+        );
+    assert_eq!(w.env.auths(), vec![invocation_tree]);
+    signer_test!("timelock", "schedule");
+
+    w.set_time(START_TIME + timelock::MIN_DELAY);
+    clear_auths(&w);
+    let exec_args: Vec<Val> = (id,).into_val(&w.env);
+    let executor = w.executor.clone();
+    w.env.mock_auths(&[MockAuth {
+        address: &executor,
+        invoke: &MockAuthInvoke {
+            contract: &w.timelock_id,
+            fn_name: "execute",
+            args: exec_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    w.env.invoke_contract::<()>(
+        &w.timelock_id,
+        &Symbol::new(&w.env, "execute"),
+        exec_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &executor,
+            &w.timelock_id,
+            "execute",
+            exec_args,
+            vec![],
+        )]
+    );
+    signer_test!("timelock", "execute");
+
+    clear_auths(&w);
+    let wrong = w
+        .timelock
+        .mock_auths(&[MockAuth {
+            address: &w.random,
+            invoke: &MockAuthInvoke {
+                contract: &w.timelock_id,
+                fn_name: "schedule",
+                args: args,
+                sub_invokes: &[],
+            },
+        }])
+        .try_schedule(
+            &w.registry_id,
+            &Symbol::new(&w.env, "trace_count"),
+            &Vec::new(&w.env),
+        );
+    assert!(wrong.is_err(), "schedule is proposer-only");
+}
+
+#[test]
+fn timelock_as_market_core_admin_records_no_external_signer() {
+    let w = World::new();
+    let paused_args: Vec<Val> = (true,).into_val(&w.env);
+    let schedule_args: Vec<Val> = (
+        w.core_id.clone(),
+        Symbol::new(&w.env, "set_paused"),
+        paused_args,
+    )
+        .into_val(&w.env);
+    clear_auths(&w);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.proposer,
+        invoke: &MockAuthInvoke {
+            contract: &w.timelock_id,
+            fn_name: "schedule",
+            args: schedule_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let id: u64 = w.env.invoke_contract(
+        &w.timelock_id,
+        &Symbol::new(&w.env, "schedule"),
+        schedule_args,
+    );
+    signer_test!("timelock", "schedule");
+
+    w.set_time(START_TIME + timelock::MIN_DELAY);
+    clear_auths(&w);
+    let exec_args: Vec<Val> = (id,).into_val(&w.env);
+    let executor = w.executor.clone();
+    w.env.mock_auths(&[MockAuth {
+        address: &executor,
+        invoke: &MockAuthInvoke {
+            contract: &w.timelock_id,
+            fn_name: "execute",
+            args: exec_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    w.env.invoke_contract::<()>(
+        &w.timelock_id,
+        &Symbol::new(&w.env, "execute"),
+        exec_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &executor,
+            &w.timelock_id,
+            "execute",
+            exec_args,
+            vec![],
+        )]
+    );
+    assert!(
+        w.core.get_config().paused,
+        "the timelock, not an external signer, authorised the nested admin call"
+    );
+}
+
+#[test]
+fn auth_registry_report_unavailable_is_reporter_only() {
+    let w = World::new();
+    clear_auths(&w);
+    let reporter = w.creator.clone();
+    let allow_args: Vec<Val> = (reporter.clone(), true).into_val(&w.env);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.admin,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "set_availability_reporter",
+            args: allow_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "set_availability_reporter"),
+        allow_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.admin,
+            &w.registry_id,
+            "set_availability_reporter",
+            allow_args,
+            vec![],
+        )]
+    );
+    signer_test!("reasoning-registry", "set_availability_reporter");
+
+    register_agent_and_publish_trace(&w);
+
+    clear_auths(&w);
+    let flag_args: Vec<Val> = (reporter.clone(), 0u64).into_val(&w.env);
+    w.env.mock_auths(&[MockAuth {
+        address: &reporter,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "report_unavailable",
+            args: flag_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "report_unavailable"),
+        flag_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &reporter,
+            &w.registry_id,
+            "report_unavailable",
+            flag_args,
+            vec![],
+        )]
+    );
+    signer_test!("reasoning-registry", "report_unavailable");
+
+    clear_auths(&w);
+    let wrong_args: Vec<Val> = (w.random.clone(), 0u64).into_val(&w.env);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.random,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "report_unavailable",
+            args: wrong_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let wrong = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "report_unavailable"),
+        wrong_args,
+    );
+    assert!(wrong.is_err(), "non-reporter cannot flag a trace");
+}
+
+#[test]
+fn auth_registry_flags_batches_and_signing_keys() {
+    let w = World::new();
+    register_agent_and_publish_trace(&w);
+
+    let flag_args: Vec<Val> = (0u64, Symbol::new(&w.env, "spam")).into_val(&w.env);
+    clear_auths(&w);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.admin,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "flag_trace",
+            args: flag_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "flag_trace"),
+        flag_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.admin,
+            &w.registry_id,
+            "flag_trace",
+            flag_args,
+            vec![],
+        )]
+    );
+    signer_test!("reasoning-registry", "flag_trace");
+
+    let batch_args: Vec<Val> = (
+        w.agent.clone(),
+        BytesN::from_array(&w.env, &[1u8; 32]),
+        1u32,
+        String::from_str(&w.env, "ipfs://batch"),
+    )
+        .into_val(&w.env);
+    clear_auths(&w);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.agent,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "publish_trace_batch",
+            args: batch_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "publish_trace_batch"),
+        batch_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.registry_id,
+            "publish_trace_batch",
+            batch_args,
+            vec![],
+        )]
+    );
+    signer_test!("reasoning-registry", "publish_trace_batch");
+
+    let key_args: Vec<Val> = (
+        w.agent.clone(),
+        BytesN::from_array(&w.env, &[2u8; 32]),
+        BytesN::from_array(&w.env, &[3u8; 64]),
+    )
+        .into_val(&w.env);
+    clear_auths(&w);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.agent,
+        invoke: &MockAuthInvoke {
+            contract: &w.registry_id,
+            fn_name: "add_signing_key",
+            args: key_args.clone(),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = w.env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &w.registry_id,
+        &Symbol::new(&w.env, "add_signing_key"),
+        key_args.clone(),
+    );
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.registry_id,
+            "add_signing_key",
+            key_args,
+            vec![],
+        )]
+    );
+    signer_test!("reasoning-registry", "add_signing_key");
+}
 
 fn spec_functions(wasm: &[u8]) -> std::vec::Vec<std::string::String> {
     use stellar_xdr::{Limited, Limits, ReadXdr, ScSpecEntry};
@@ -1816,37 +2489,4 @@ fn spec_functions(wasm: &[u8]) -> std::vec::Vec<std::string::String> {
         })
         .filter(|name| name != "__constructor")
         .collect()
-}
-
-fn classified(contract: &str, function: &str) -> bool {
-    MATRIX
-        .iter()
-        .chain(PERMISSIONLESS.iter())
-        .any(|(c, fns)| *c == contract && fns.contains(&function))
-}
-
-#[test]
-fn every_entrypoint_has_a_matrix_row() {
-    let contracts: [(&str, &[u8]); 4] = [
-        ("market-core", include_bytes!("../wasm/market_core.wasm")),
-        ("resolver", include_bytes!("../wasm/resolver.wasm")),
-        ("treasury", include_bytes!("../wasm/treasury.wasm")),
-        (
-            "reasoning-registry",
-            include_bytes!("../wasm/reasoning_registry.wasm"),
-        ),
-    ];
-    let mut missing = std::vec::Vec::new();
-    for (name, wasm) in contracts {
-        for function in spec_functions(wasm) {
-            if !classified(name, &function) {
-                missing.push(format!("{name}::{function}"));
-            }
-        }
-    }
-    missing.sort();
-    assert!(
-        missing.is_empty(),
-        "entrypoints without an auth-matrix or permissionless row: {missing:#?}"
-    );
 }

@@ -127,22 +127,46 @@ fn run(fn_name: &str, args: &[Value]) -> Result<Map<String, Value>, MathError> {
                 json!(math::sell_within_limit(a(0)?, a(1)?, a(2)? as u32)?.to_string()),
             );
         }
-        "gross_for_shares" => {
+        "calc_sell_shares" => {
+            let q = math::calc_sell_shares(a(0)?, a(1)?, a(2)?, a(3)? as u32)?;
+            out.insert("collateral_out".into(), json!(q.collateral_out.to_string()));
+            out.insert("fee".into(), json!(q.fee.to_string()));
+            out.insert("gross".into(), json!(q.gross.to_string()));
             out.insert(
-                "gross".into(),
-                json!(math::gross_for_shares(a(0)?, a(1)?, a(2)?, a(3)? as u32)?.to_string()),
+                "new_reserve_sold".into(),
+                json!(q.new_reserve_sold.to_string()),
+            );
+            out.insert(
+                "new_reserve_other".into(),
+                json!(q.new_reserve_other.to_string()),
             );
         }
-        "collateral_out_for_shares" => {
+        "split_fee" => {
+            let (protocol, lp) = math::split_fee(a(0)?, a(1)? as u32)?;
+            out.insert("protocol".into(), json!(protocol.to_string()));
+            out.insert("lp".into(), json!(lp.to_string()));
+        }
+        "settle_upper" => {
+            let kind = match s(0)?.as_str() {
+                "yes" => Settlement::Yes,
+                "no" => Settlement::No,
+                "void" => Settlement::Void,
+                _ => Err(MathError::InvalidInput)?,
+            };
             out.insert(
-                "collateral_out".into(),
-                json!(
-                    math::collateral_out_for_shares(a(0)?, a(1)?, a(2)?, a(3)? as u32)?.to_string()
-                ),
+                "value".into(),
+                json!(math::settle_upper(kind, a(1)?, a(2)?).to_string()),
             );
+        }
+        "merge_max" => {
+            out.insert("value".into(), json!(math::merge_max(a(0)?, a(1)?).to_string()));
         }
         "isqrt" => {
-            out.insert("value".into(), json!(math::isqrt(a(0)?)?.to_string()));
+            let n = a(0)?;
+            if n < 0 {
+                return Err(MathError::InvalidInput);
+            }
+            out.insert("value".into(), json!(math::isqrt(n as u128).to_string()));
         }
         _ => return Err(MathError::InvalidInput),
     }

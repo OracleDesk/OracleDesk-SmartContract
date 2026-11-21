@@ -1,6 +1,11 @@
 #![no_std]
 
-mod math;
+/// Host-side arithmetic API for the differential oracle, fuzz targets and
+/// Kani proofs. This is not a contract interface: only `#[contractimpl]`
+/// methods become wasm exports, so exposing the module does not change the
+/// spec or the wasm ABI, and LTO strips unused functions from the binary.
+#[doc(hidden)]
+pub mod math;
 #[cfg(kani)]
 mod math_proofs;
 pub mod ttl;

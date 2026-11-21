@@ -11,7 +11,9 @@
  * AND a gateway served bytes hashing to `trace_hash`. See
  * docs/architecture.md, "IPFS trace storage".
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { CID } from "multiformats/cid";
 import * as raw from "multiformats/codecs/raw";
 import { sha256 } from "multiformats/hashes/sha2";
@@ -211,7 +213,7 @@ function errorText(err: unknown): string {
 }
 
 /** Reads at most `cap` bytes of a response body; throws past the cap. */
-async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+export async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
   const declared = Number(res.headers.get("content-length") ?? NaN);
   if (declared > cap) throw new TraceGatewayError(`gateway body ${declared} bytes exceeds cap ${cap}`);
   if (!res.body) return new Uint8Array();
@@ -231,6 +233,11 @@ async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
   return Buffer.concat(chunks);
 }
 
+/** Canonical, filesystem-safe name for an archived block. */
+function archivePath(dir: string, cid: string): string {
+  return join(dir, `${CID.parse(cid).toString()}.bin`);
+}
+
 export interface IpfsTraceStoreOptions {
   providers: PinProvider[];
   /** Confirmed pins required (default 1). */
@@ -247,6 +254,11 @@ export interface IpfsTraceStoreOptions {
   gatewayMaxBytes?: number;
   /** Count queued (accepted, unconfirmed) pinning-service pins toward minPins. */
   acceptQueued?: boolean;
+  /**
+   * Optional local archive of the exact verified bytes written by `put`.
+   * The availability task uses it to re-pin a trace if every gateway loses it.
+   */
+  archiveDir?: string;
 }
 
 export class IpfsTraceStore implements TraceStore {
@@ -254,6 +266,11 @@ export class IpfsTraceStore implements TraceStore {
   private readonly retries: number;
   private readonly pinTimeoutMs: number;
   private readonly backoffBaseMs: number;
+
+  /** Providers available for re-pinning an archived trace (#325). */
+  get pinProviders(): readonly PinProvider[] {
+    return this.o.providers;
+  }
 
   constructor(private readonly o: IpfsTraceStoreOptions) {
     this.minPins = o.minPins ?? 1;
@@ -287,7 +304,53 @@ export class IpfsTraceStore implements TraceStore {
     }
 
     await this.verifyGateway(cid, digestHex);
+    await this.archiveVerified(cid, bytes);
     return { cid };
+  }
+
+  /**
+   * Reads a previously archived block only when it still hashes to `cid`.
+   * A silently corrupted archive is treated as absent, never as re-pin source.
+   */
+  async readArchived(cid: string): Promise<Uint8Array | undefined> {
+    if (!this.o.archiveDir) return undefined;
+    let path: string;
+    try {
+      path = archivePath(this.o.archiveDir, cid);
+    } catch {
+      return undefined;
+    }
+    try {
+      const info = await stat(path);
+      if (!info.isFile() || info.size > MAX_TRACE_BYTES) return undefined;
+      const bytes = await readFile(path);
+      const got = await rawCidForBytes(bytes);
+      return sameCid(got.cid, cid) ? bytes : undefined;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw err;
+    }
+  }
+
+  private async archiveVerified(cid: string, bytes: Uint8Array): Promise<void> {
+    const dir = this.o.archiveDir;
+    if (!dir) return;
+    await mkdir(dir, { recursive: true });
+    const target = archivePath(dir, cid);
+    const tmp = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    const fh = await open(tmp, "wx", 0o600);
+    try {
+      await fh.writeFile(bytes);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    try {
+      await rename(tmp, target);
+    } catch (err) {
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
   }
 
   private async pinWithRetry(
