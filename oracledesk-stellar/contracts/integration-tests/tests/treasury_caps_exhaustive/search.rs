@@ -1,4 +1,9 @@
 //! Breadth-first exploration with memoization on `Sim::key`.
+//!
+//! Allow-listed by `scripts/check-no-mock-all-auths.sh`: this bounded search
+//! explores treasury cap invariants over state, not authorization. Auth is
+//! proved by `tests/auth_matrix/` and `tests/system_model.rs`, where blanket
+//! mocks are forbidden.
 
 use crate::sim::{Cfg, McImpl, Op, Sim, U};
 use soroban_sdk::{Address, Env};

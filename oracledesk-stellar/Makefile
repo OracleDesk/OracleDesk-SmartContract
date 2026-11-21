@@ -29,6 +29,7 @@ build:
 	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/router.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/timelock.wasm contracts/integration-tests/wasm/
 
 # Proves the contract build is bit-for-bit reproducible and that the vendored

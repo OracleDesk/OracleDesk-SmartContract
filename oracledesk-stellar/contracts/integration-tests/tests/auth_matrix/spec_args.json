@@ -1,0 +1,7934 @@
+{
+  "functions": {
+    "market-core::__constructor": [
+      "address",
+      "address",
+      "address",
+      "address",
+      "u32",
+      "u32"
+    ],
+    "market-core::accept_admin": [],
+    "market-core::accept_resolver": [],
+    "market-core::accept_treasury": [],
+    "market-core::add_collateral": [
+      "address",
+      {
+        "udt": {
+          "name": "CollateralParams"
+        }
+      }
+    ],
+    "market-core::admin": [],
+    "market-core::breaker_config": [
+      "u64"
+    ],
+    "market-core::breaker_state": [
+      "u64"
+    ],
+    "market-core::buy": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128"
+    ],
+    "market-core::buy_v2": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64"
+    ],
+    "market-core::cancel_admin_transfer": [],
+    "market-core::claim_lp_fees": [
+      "u64"
+    ],
+    "market-core::claim_pool_remainder": [
+      "u64"
+    ],
+    "market-core::claim_pool_remainders": [
+      "address",
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "market-core::collateral_params": [
+      "address"
+    ],
+    "market-core::create_market": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32"
+    ],
+    "market-core::create_market_with_collateral": [
+      "address",
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32"
+    ],
+    "market-core::finalize_market": [
+      "u64"
+    ],
+    "market-core::get_config": [],
+    "market-core::get_market": [
+      "u64"
+    ],
+    "market-core::get_market_collateral": [
+      "u64"
+    ],
+    "market-core::get_position": [
+      "u64",
+      "address"
+    ],
+    "market-core::get_price": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      }
+    ],
+    "market-core::locked": [
+      "address"
+    ],
+    "market-core::market_collateral_info": [
+      "u64"
+    ],
+    "market-core::market_count": [],
+    "market-core::max_batch": [],
+    "market-core::observe": [
+      "u64",
+      "u64"
+    ],
+    "market-core::pending_admin": [],
+    "market-core::price_cumulative": [
+      "u64"
+    ],
+    "market-core::propose_admin": [
+      "address"
+    ],
+    "market-core::propose_resolver": [
+      "address"
+    ],
+    "market-core::propose_treasury": [
+      "address"
+    ],
+    "market-core::quote_buy": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128"
+    ],
+    "market-core::quote_sell": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128"
+    ],
+    "market-core::redeem": [
+      "address",
+      "u64"
+    ],
+    "market-core::redeem_deadline": [
+      "u64"
+    ],
+    "market-core::redeem_many": [
+      "address",
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "market-core::resolve": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      }
+    ],
+    "market-core::sell": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128"
+    ],
+    "market-core::sell_v2": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64"
+    ],
+    "market-core::set_collateral_enabled": [
+      "address",
+      "bool"
+    ],
+    "market-core::set_default_breaker": [
+      {
+        "udt": {
+          "name": "BreakerConfig"
+        }
+      }
+    ],
+    "market-core::set_default_fee_bps": [
+      "u32"
+    ],
+    "market-core::set_default_redeem_horizon": [
+      "u64"
+    ],
+    "market-core::set_paused": [
+      "bool"
+    ],
+    "market-core::set_protocol_fee_share_bps": [
+      "u32"
+    ],
+    "market-core::settle_state": [
+      "u64"
+    ],
+    "market-core::sweep_fees": [
+      "u64"
+    ],
+    "market-core::transfer_lp": [
+      "u64",
+      "address"
+    ],
+    "market-core::transfer_position": [
+      "address",
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128"
+    ],
+    "market-core::twap": [
+      "u64",
+      "u64"
+    ],
+    "market-core::void_market": [
+      "u64"
+    ],
+    "market-core::would_trip": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128"
+    ],
+    "reasoning-registry::__constructor": [
+      "address",
+      "address"
+    ],
+    "reasoning-registry::accept_admin": [],
+    "reasoning-registry::add_signing_key": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 64
+        }
+      }
+    ],
+    "reasoning-registry::admin": [],
+    "reasoning-registry::affected_traces": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u64",
+      "u64",
+      "u32"
+    ],
+    "reasoning-registry::agent_batch_at": [
+      "address",
+      "u64"
+    ],
+    "reasoning-registry::agent_batch_count": [
+      "address"
+    ],
+    "reasoning-registry::agent_chain_head": [
+      "address"
+    ],
+    "reasoning-registry::agent_trace_at": [
+      "address",
+      "u64"
+    ],
+    "reasoning-registry::agent_trace_count": [
+      "address"
+    ],
+    "reasoning-registry::availability_reporter": [
+      "address"
+    ],
+    "reasoning-registry::batch_count": [],
+    "reasoning-registry::cancel_admin_transfer": [],
+    "reasoning-registry::clear_unavailable": [
+      "address",
+      "u64"
+    ],
+    "reasoning-registry::compute_merkle_root": [
+      "u32",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u32",
+      {
+        "vec": {
+          "element_type": {
+            "bytes_n": {
+              "n": 32
+            }
+          }
+        }
+      }
+    ],
+    "reasoning-registry::consume_trace": [
+      "address",
+      "u64"
+    ],
+    "reasoning-registry::flag_trace": [
+      "u64",
+      "symbol"
+    ],
+    "reasoning-registry::get_agent": [
+      "address"
+    ],
+    "reasoning-registry::get_batch": [
+      "u64"
+    ],
+    "reasoning-registry::get_key_agent": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::get_signing_keys": [
+      "address"
+    ],
+    "reasoning-registry::get_trace": [
+      "u64"
+    ],
+    "reasoning-registry::get_trace_flag": [
+      "u64"
+    ],
+    "reasoning-registry::get_trace_ledger": [
+      "u64"
+    ],
+    "reasoning-registry::get_trace_link": [
+      "u64"
+    ],
+    "reasoning-registry::get_trace_signature": [
+      "u64"
+    ],
+    "reasoning-registry::is_consumed": [
+      "u64"
+    ],
+    "reasoning-registry::is_consumer": [
+      "address"
+    ],
+    "reasoning-registry::is_registered": [
+      "address"
+    ],
+    "reasoning-registry::key_affected_from": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u64"
+    ],
+    "reasoning-registry::key_bind_message": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::key_trace_count": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::key_traces": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u64",
+      "u32"
+    ],
+    "reasoning-registry::market_action_trace_at": [
+      "u64",
+      "string",
+      "u64"
+    ],
+    "reasoning-registry::market_action_trace_count": [
+      "u64",
+      "string"
+    ],
+    "reasoning-registry::market_trace_at": [
+      "u64",
+      "u64"
+    ],
+    "reasoning-registry::market_trace_count": [
+      "u64"
+    ],
+    "reasoning-registry::pending_admin": [],
+    "reasoning-registry::propose_admin": [
+      "address"
+    ],
+    "reasoning-registry::publish_chained_trace": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "TraceAction"
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      "u64",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::publish_chained_trace_signed": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "TraceAction"
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      "u64",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 64
+        }
+      }
+    ],
+    "reasoning-registry::publish_trace": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "TraceAction"
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string"
+    ],
+    "reasoning-registry::publish_trace_batch": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u32",
+      "string"
+    ],
+    "reasoning-registry::publish_trace_signed": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "TraceAction"
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 64
+        }
+      }
+    ],
+    "reasoning-registry::reactivate_agent": [
+      "address"
+    ],
+    "reasoning-registry::register_agent": [
+      "address"
+    ],
+    "reasoning-registry::register_consumer": [
+      "address"
+    ],
+    "reasoning-registry::report_unavailable": [
+      "address",
+      "u64"
+    ],
+    "reasoning-registry::retire_agent": [
+      "address"
+    ],
+    "reasoning-registry::retire_self": [
+      "address"
+    ],
+    "reasoning-registry::retire_signing_key": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::revoke_agent": [
+      "address",
+      "u64",
+      "symbol"
+    ],
+    "reasoning-registry::revoke_signing_key": [
+      "address",
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u64",
+      "symbol"
+    ],
+    "reasoning-registry::set_availability_reporter": [
+      "address",
+      "bool"
+    ],
+    "reasoning-registry::signature_verdict": [
+      "u64"
+    ],
+    "reasoning-registry::signing_key_history": [
+      "address",
+      "u32",
+      "u32"
+    ],
+    "reasoning-registry::signing_key_history_count": [
+      "address"
+    ],
+    "reasoning-registry::trace_attestation_message": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "TraceAction"
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::trace_count": [],
+    "reasoning-registry::trace_flags": [
+      "u64",
+      "u32",
+      "u32"
+    ],
+    "reasoning-registry::trace_verdict": [
+      "u64",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::traces_by_agent": [
+      "address",
+      "u64",
+      "u32"
+    ],
+    "reasoning-registry::traces_by_market": [
+      "u64",
+      "u64",
+      "u32"
+    ],
+    "reasoning-registry::traces_by_market_action": [
+      "u64",
+      "string",
+      "u64",
+      "u32"
+    ],
+    "reasoning-registry::unflag_trace": [
+      "u64",
+      "symbol"
+    ],
+    "reasoning-registry::unregister_agent": [
+      "address"
+    ],
+    "reasoning-registry::unregister_consumer": [
+      "address"
+    ],
+    "reasoning-registry::verify_commitment": [
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::verify_trace": [
+      "u64",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      }
+    ],
+    "reasoning-registry::verify_trace_inclusion": [
+      "u64",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "u32",
+      {
+        "vec": {
+          "element_type": {
+            "bytes_n": {
+              "n": 32
+            }
+          }
+        }
+      }
+    ],
+    "reasoning-registry::verify_trace_signature": [
+      "u64"
+    ],
+    "resolver::__constructor": [
+      "address",
+      "address"
+    ],
+    "resolver::accept_admin": [],
+    "resolver::accept_market_core_role": [],
+    "resolver::admin": [],
+    "resolver::attest": [
+      "u64",
+      "address",
+      {
+        "udt": {
+          "name": "AttestedOutcome"
+        }
+      }
+    ],
+    "resolver::attest_with_evidence": [
+      "u64",
+      "address",
+      {
+        "udt": {
+          "name": "AttestedOutcome"
+        }
+      },
+      "u64"
+    ],
+    "resolver::cancel_admin_transfer": [],
+    "resolver::cancel_count": [
+      "u64"
+    ],
+    "resolver::cancel_proposal": [
+      "u64",
+      {
+        "udt": {
+          "name": "GuardianReason"
+        }
+      }
+    ],
+    "resolver::cancel_rotation": [
+      "u64"
+    ],
+    "resolver::claim_dispute_bond": [
+      "u64"
+    ],
+    "resolver::committee_members_at": [
+      "u64",
+      "u32"
+    ],
+    "resolver::create_committee": [
+      "address",
+      {
+        "vec": {
+          "element_type": "address"
+        }
+      },
+      "u32",
+      "u64"
+    ],
+    "resolver::current_round": [
+      "u64"
+    ],
+    "resolver::dispute": [
+      "u64",
+      "address",
+      {
+        "option": {
+          "value_type": {
+            "udt": {
+              "name": "Outcome"
+            }
+          }
+        }
+      }
+    ],
+    "resolver::escalation_attest": [
+      "u64",
+      "address",
+      {
+        "udt": {
+          "name": "Verdict"
+        }
+      }
+    ],
+    "resolver::evidence_at": [
+      "u64",
+      "u32"
+    ],
+    "resolver::evidence_config": [],
+    "resolver::evidence_count": [
+      "u64"
+    ],
+    "resolver::execute_rotation": [
+      "u64"
+    ],
+    "resolver::expire_dispute": [
+      "u64"
+    ],
+    "resolver::expire_market": [
+      "u64"
+    ],
+    "resolver::finalize_signers": [
+      "u64"
+    ],
+    "resolver::get_committee": [
+      "u64"
+    ],
+    "resolver::guardian_options": [
+      "u64"
+    ],
+    "resolver::guardian_void_market": [
+      "u64",
+      {
+        "udt": {
+          "name": "GuardianReason"
+        }
+      }
+    ],
+    "resolver::market_committee_epoch": [
+      "u64"
+    ],
+    "resolver::market_core": [],
+    "resolver::open_fallback": [
+      "u64"
+    ],
+    "resolver::pending_admin": [],
+    "resolver::pin_committee_epoch": [
+      "u64"
+    ],
+    "resolver::preview_price": [
+      "u64"
+    ],
+    "resolver::propose_admin": [
+      "address"
+    ],
+    "resolver::propose_rotation": [
+      "u64",
+      {
+        "vec": {
+          "element_type": "address"
+        }
+      },
+      "u32"
+    ],
+    "resolver::register_committee_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "CommitteeRef"
+        }
+      }
+    ],
+    "resolver::register_disputable_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "DisputableSignerConfig"
+        }
+      }
+    ],
+    "resolver::register_hybrid_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "HybridConfig"
+        }
+      }
+    ],
+    "resolver::register_price_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "PriceConfig"
+        }
+      }
+    ],
+    "resolver::register_scaled_price_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "ScaledPriceConfig"
+        }
+      }
+    ],
+    "resolver::register_signer_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "SignerConfig"
+        }
+      }
+    ],
+    "resolver::register_spec_v2": [
+      "u64",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "resolver::register_twap_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "TwapConfig"
+        }
+      }
+    ],
+    "resolver::register_weighted_key_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "WeightedKeyConfig"
+        }
+      }
+    ],
+    "resolver::resolution_deadline": [
+      "u64"
+    ],
+    "resolver::resolve_price": [
+      "u64"
+    ],
+    "resolver::resolve_twap": [
+      "u64"
+    ],
+    "resolver::rule_kind": [
+      "u64"
+    ],
+    "resolver::set_evidence_config": [
+      "address",
+      {
+        "udt": {
+          "name": "EvidencePolicy"
+        }
+      }
+    ],
+    "resolver::settle_dispute": [
+      "u64",
+      {
+        "udt": {
+          "name": "Verdict"
+        }
+      }
+    ],
+    "resolver::snapshot": [
+      "u64"
+    ],
+    "resolver::snapshot_price": [
+      "u64",
+      "address"
+    ],
+    "resolver::spec_kind": [
+      "u64"
+    ],
+    "resolver::state": [
+      "u64"
+    ],
+    "resolver::submit_signatures": [
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "u32",
+      {
+        "vec": {
+          "element_type": {
+            "tuple": {
+              "value_types": [
+                {
+                  "bytes_n": {
+                    "n": 32
+                  }
+                },
+                {
+                  "bytes_n": {
+                    "n": 64
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "resolver::trade_status": [
+      "u64"
+    ],
+    "router::__constructor": [
+      "address",
+      "address",
+      {
+        "option": {
+          "value_type": "address"
+        }
+      }
+    ],
+    "router::agent_create_and_reveal": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "router::agent_trade_and_publish_trace": [
+      "address",
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      {
+        "udt": {
+          "name": "Side"
+        }
+      },
+      {
+        "udt": {
+          "name": "TradeBounds"
+        }
+      },
+      {
+        "udt": {
+          "name": "TraceArgs"
+        }
+      }
+    ],
+    "router::buy_and_publish_trace": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string"
+    ],
+    "router::config": [],
+    "router::create_and_reveal": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "router::create_and_reveal_price": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "router::create_and_reveal_signers": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "router::reveal_spec": [
+      "u64",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "router::trade_and_publish_trace": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      {
+        "udt": {
+          "name": "Side"
+        }
+      },
+      {
+        "udt": {
+          "name": "TradeBounds"
+        }
+      },
+      {
+        "udt": {
+          "name": "TraceArgs"
+        }
+      }
+    ],
+    "timelock::__constructor": [
+      "address",
+      "address",
+      "address",
+      {
+        "option": {
+          "value_type": "address"
+        }
+      },
+      {
+        "option": {
+          "value_type": "address"
+        }
+      },
+      "u64"
+    ],
+    "timelock::accept_admin": [],
+    "timelock::admin": [],
+    "timelock::cancel": [
+      "u64"
+    ],
+    "timelock::cancel_admin_transfer": [],
+    "timelock::default_delay": [],
+    "timelock::delay_for": [
+      "address",
+      "symbol"
+    ],
+    "timelock::emergency": [
+      "address",
+      "symbol",
+      {
+        "vec": {
+          "element_type": "val"
+        }
+      }
+    ],
+    "timelock::execute": [
+      "u64"
+    ],
+    "timelock::operation": [
+      "u64"
+    ],
+    "timelock::operation_count": [],
+    "timelock::pending_admin": [],
+    "timelock::propose_admin": [
+      "address"
+    ],
+    "timelock::roles": [],
+    "timelock::schedule": [
+      "address",
+      "symbol",
+      {
+        "vec": {
+          "element_type": "val"
+        }
+      }
+    ],
+    "timelock::set_default_delay": [
+      "u64"
+    ],
+    "timelock::set_delay": [
+      "address",
+      "symbol",
+      {
+        "option": {
+          "value_type": "u64"
+        }
+      }
+    ],
+    "timelock::set_roles": [
+      "address",
+      "address",
+      {
+        "option": {
+          "value_type": "address"
+        }
+      },
+      {
+        "option": {
+          "value_type": "address"
+        }
+      }
+    ],
+    "treasury::__constructor": [
+      "address",
+      "address",
+      "address",
+      "address",
+      "i128",
+      "i128",
+      "i128",
+      "i128",
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "CreationPolicy"
+        }
+      }
+    ],
+    "treasury::acknowledge_drawdown": [],
+    "treasury::agent_at": [
+      "u32"
+    ],
+    "treasury::agent_buy": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128"
+    ],
+    "treasury::agent_buy_traced": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64",
+      "u64"
+    ],
+    "treasury::agent_buy_v2": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64"
+    ],
+    "treasury::agent_claim_lp_fees": [
+      "address",
+      "u64"
+    ],
+    "treasury::agent_count": [],
+    "treasury::agent_create_market": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32"
+    ],
+    "treasury::agent_create_market_and_reveal": [
+      "address",
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "treasury::agent_create_market_collateral": [
+      "address",
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32"
+    ],
+    "treasury::agent_create_market_reveal_v2": [
+      "address",
+      {
+        "bytes_n": {
+          "n": 32
+        }
+      },
+      "string",
+      {
+        "udt": {
+          "name": "Category"
+        }
+      },
+      "u64",
+      "i128",
+      "u32",
+      {
+        "udt": {
+          "name": "ResolutionSpecV2"
+        }
+      }
+    ],
+    "treasury::agent_daily_usage": [
+      "address"
+    ],
+    "treasury::agent_halt": [
+      "address",
+      "u32"
+    ],
+    "treasury::agent_sell": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128"
+    ],
+    "treasury::agent_sell_traced": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64",
+      "u64"
+    ],
+    "treasury::agent_sell_v2": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128",
+      "u32",
+      "u64"
+    ],
+    "treasury::allocate_to_yield": [
+      "i128"
+    ],
+    "treasury::allowed": [
+      {
+        "udt": {
+          "name": "Op"
+        }
+      }
+    ],
+    "treasury::audit_mark": [
+      "address",
+      "u64"
+    ],
+    "treasury::available_capital": [],
+    "treasury::available_capital_of": [
+      "address"
+    ],
+    "treasury::bucket_exposure": [
+      "address",
+      "u64"
+    ],
+    "treasury::cancel_agent": [
+      "address"
+    ],
+    "treasury::cancel_config": [],
+    "treasury::cancel_correlation_caps": [],
+    "treasury::cancel_max_mark_age": [],
+    "treasury::cancel_op": [
+      "u32"
+    ],
+    "treasury::cancel_price_policy": [],
+    "treasury::cancel_resolvability_policy": [],
+    "treasury::cancel_trace_policy": [],
+    "treasury::capital_breakdown": [],
+    "treasury::category_exposure": [
+      "address",
+      "u32"
+    ],
+    "treasury::claim_pool_remainder": [
+      "address",
+      "u64"
+    ],
+    "treasury::claim_pool_remainders": [
+      "address",
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "treasury::claim_withdraw": [
+      "u64"
+    ],
+    "treasury::close_trade": [
+      "address",
+      "u64"
+    ],
+    "treasury::collect_market_fees": [
+      "u64"
+    ],
+    "treasury::config_delay": [],
+    "treasury::correlation_caps": [],
+    "treasury::correlation_headroom": [
+      "u64"
+    ],
+    "treasury::creation_usage": [],
+    "treasury::daily_headroom": [],
+    "treasury::daily_usage": [],
+    "treasury::daily_usage_detail": [],
+    "treasury::declare_emergency": [
+      "symbol"
+    ],
+    "treasury::deposit": [
+      "address",
+      "i128"
+    ],
+    "treasury::deposit_token": [
+      "address",
+      "address",
+      "i128"
+    ],
+    "treasury::disable_yield": [],
+    "treasury::drawdown_status": [],
+    "treasury::emergency_withdraw": [
+      "address",
+      "i128"
+    ],
+    "treasury::end_emergency": [],
+    "treasury::execute_agent": [
+      "address"
+    ],
+    "treasury::execute_config": [],
+    "treasury::execute_correlation_caps": [],
+    "treasury::execute_max_mark_age": [],
+    "treasury::execute_op": [
+      "u32"
+    ],
+    "treasury::execute_price_policy": [],
+    "treasury::execute_resolvability_policy": [],
+    "treasury::execute_trace_policy": [],
+    "treasury::exit_floor": [
+      "u64"
+    ],
+    "treasury::get_agent": [
+      "address"
+    ],
+    "treasury::get_config": [],
+    "treasury::get_creation_policy": [],
+    "treasury::get_global": [],
+    "treasury::get_net_cap": [],
+    "treasury::get_price_policy": [],
+    "treasury::get_resolvability_policy": [],
+    "treasury::legacy_claim_pool_remainder": [
+      "address",
+      "address",
+      "u64"
+    ],
+    "treasury::legacy_redeem": [
+      "address",
+      "address",
+      "u64"
+    ],
+    "treasury::liquid_capital": [],
+    "treasury::market_pnl": [
+      "u64"
+    ],
+    "treasury::market_valuation": [
+      "u64"
+    ],
+    "treasury::max_mark_age_ledgers": [],
+    "treasury::migrate_markets": [
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "treasury::migrate_marks": [
+      "u32",
+      "u32"
+    ],
+    "treasury::mode": [],
+    "treasury::mode_state": [],
+    "treasury::mul_div_ceil": [
+      "i128",
+      "i128",
+      "i128"
+    ],
+    "treasury::mul_div_floor": [
+      "i128",
+      "i128",
+      "i128"
+    ],
+    "treasury::nav": [],
+    "treasury::nav_detail": [],
+    "treasury::net_exposure": [],
+    "treasury::net_position": [
+      "u64"
+    ],
+    "treasury::open_market_at": [
+      "u32"
+    ],
+    "treasury::open_market_count": [],
+    "treasury::pause": [
+      "symbol"
+    ],
+    "treasury::pending_agent": [
+      "address"
+    ],
+    "treasury::pending_config": [],
+    "treasury::pending_correlation_caps": [],
+    "treasury::pending_max_mark_age": [],
+    "treasury::pending_op": [
+      "u32"
+    ],
+    "treasury::pending_price_policy": [],
+    "treasury::pending_resolvability_policy": [],
+    "treasury::propose_config": [
+      {
+        "udt": {
+          "name": "GlobalConfig"
+        }
+      }
+    ],
+    "treasury::propose_correlation_caps": [
+      {
+        "udt": {
+          "name": "CorrelationCaps"
+        }
+      }
+    ],
+    "treasury::propose_op": [
+      {
+        "udt": {
+          "name": "AdminOp"
+        }
+      }
+    ],
+    "treasury::propose_trace_policy": [
+      {
+        "udt": {
+          "name": "TracePolicy"
+        }
+      },
+      "u32",
+      {
+        "option": {
+          "value_type": "address"
+        }
+      }
+    ],
+    "treasury::queue_bounds": [],
+    "treasury::queue_reserved": [],
+    "treasury::realize": [
+      "u64"
+    ],
+    "treasury::realized": [
+      "u64"
+    ],
+    "treasury::recall_from_yield": [
+      "i128"
+    ],
+    "treasury::redeem": [
+      "address",
+      "u64"
+    ],
+    "treasury::redeem_many": [
+      "address",
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "treasury::refresh_mark": [
+      {
+        "vec": {
+          "element_type": "u64"
+        }
+      }
+    ],
+    "treasury::remove_agent": [
+      "address"
+    ],
+    "treasury::request_withdraw": [
+      "address",
+      "i128"
+    ],
+    "treasury::reset_pnl_window": [],
+    "treasury::resume_agents": [],
+    "treasury::set_agent": [
+      "address",
+      {
+        "udt": {
+          "name": "AgentPolicy"
+        }
+      }
+    ],
+    "treasury::set_config_delay": [
+      "u64"
+    ],
+    "treasury::set_creation_policy": [
+      {
+        "udt": {
+          "name": "CreationPolicy"
+        }
+      }
+    ],
+    "treasury::set_default_exit_floor": [
+      "u32"
+    ],
+    "treasury::set_drawdown_config": [
+      "i128",
+      "u32"
+    ],
+    "treasury::set_exit_floor": [
+      "u64",
+      "u32"
+    ],
+    "treasury::set_max_mark_age": [
+      "u32"
+    ],
+    "treasury::set_mode": [
+      {
+        "udt": {
+          "name": "Mode"
+        }
+      }
+    ],
+    "treasury::set_paused": [
+      "bool"
+    ],
+    "treasury::set_price_policy": [
+      {
+        "udt": {
+          "name": "PricePolicy"
+        }
+      }
+    ],
+    "treasury::set_resolvability_policy": [
+      {
+        "udt": {
+          "name": "ResolvabilityPolicy"
+        }
+      }
+    ],
+    "treasury::set_successor": [
+      "address"
+    ],
+    "treasury::set_token_caps": [
+      "address",
+      {
+        "udt": {
+          "name": "TokenCaps"
+        }
+      }
+    ],
+    "treasury::set_unwinder": [
+      {
+        "option": {
+          "value_type": "address"
+        }
+      }
+    ],
+    "treasury::set_yield_venue": [
+      "address",
+      "i128"
+    ],
+    "treasury::settle_market": [
+      "address",
+      "u64"
+    ],
+    "treasury::shares_of": [
+      "address"
+    ],
+    "treasury::token_caps": [
+      "address"
+    ],
+    "treasury::total_shares": [],
+    "treasury::trace_policy": [],
+    "treasury::unpause": [],
+    "treasury::unwind_sell": [
+      "address",
+      "u64",
+      {
+        "udt": {
+          "name": "Outcome"
+        }
+      },
+      "i128",
+      "i128"
+    ],
+    "treasury::unwinder": [],
+    "treasury::unwound": [
+      "u64"
+    ],
+    "treasury::window_pnl": [],
+    "treasury::withdraw_ticket": [
+      "u64"
+    ]
+  },
+  "types": {
+    "AdminOp": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetYieldVenue",
+              "type_": [
+                "address",
+                "i128"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "AllocateToYield",
+              "type_": [
+                "i128"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetSuccessor",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "MigrateMarkets",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "u64"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetDrawdownConfig",
+              "type_": [
+                "i128",
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ResetPnlWindow"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetCreationPolicy",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CreationPolicy"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetCorrelationCaps",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CorrelationCaps"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "name": "AdminOp"
+      }
+    },
+    "AdminOpCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "kind",
+            "type_": "u32"
+          }
+        ],
+        "name": "AdminOpCancelled"
+      }
+    },
+    "AdminOpExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "kind",
+            "type_": "u32"
+          },
+          {
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          }
+        ],
+        "name": "AdminOpExecuted"
+      }
+    },
+    "AdminOpProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "kind",
+            "type_": "u32"
+          },
+          {
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "AdminOpProposed"
+      }
+    },
+    "AdminTransferCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [],
+        "name": "AdminTransferCancelled"
+      }
+    },
+    "AdminTransferProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "name": "AdminTransferProposed"
+      }
+    },
+    "AdminTransferred": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "name": "AdminTransferred"
+      }
+    },
+    "AgentHalted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "reason",
+            "type_": "u32"
+          },
+          {
+            "name": "roles_after",
+            "type_": "u32"
+          }
+        ],
+        "name": "AgentHalted"
+      }
+    },
+    "AgentMarketRevealed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "spec_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "AgentMarketRevealed"
+      }
+    },
+    "AgentPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "roles",
+            "type_": "u32"
+          },
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "name": "active",
+            "type_": "bool"
+          }
+        ],
+        "name": "AgentPolicy"
+      }
+    },
+    "AgentPolicyCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "AgentPolicyCancelled"
+      }
+    },
+    "AgentPolicyProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "roles",
+            "type_": "u32"
+          },
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "AgentPolicyProposed"
+      }
+    },
+    "AgentPolicySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "roles",
+            "type_": "u32"
+          },
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          }
+        ],
+        "name": "AgentPolicySet"
+      }
+    },
+    "AgentReactivated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "AgentReactivated"
+      }
+    },
+    "AgentRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "AgentStatus"
+              }
+            }
+          },
+          {
+            "name": "registered_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "AgentRecord"
+      }
+    },
+    "AgentRegistered": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "AgentRegistered"
+      }
+    },
+    "AgentRemoved": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "AgentRemoved"
+      }
+    },
+    "AgentRetired": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "name": "AgentRetired"
+      }
+    },
+    "AgentRevoked": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "effective_from",
+            "type_": "u64"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "AgentRevoked"
+      }
+    },
+    "AgentSigningKeyAdded": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "AgentSigningKeyAdded"
+      }
+    },
+    "AgentSigningKeyRetired": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "AgentSigningKeyRetired"
+      }
+    },
+    "AgentStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Active"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Retired",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Revoked",
+              "type_": [
+                "u64",
+                "symbol"
+              ]
+            }
+          }
+        ],
+        "name": "AgentStatus"
+      }
+    },
+    "AttestationEvidence": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "attested_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "AttestationEvidence"
+      }
+    },
+    "Attested": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "name": "trace_id",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "name": "count",
+            "type_": "u32"
+          }
+        ],
+        "name": "Attested"
+      }
+    },
+    "AttestedOutcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Invalid"
+            }
+          }
+        ],
+        "name": "AttestedOutcome"
+      }
+    },
+    "AvailabilityReporterSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "reporter",
+            "type_": "address"
+          },
+          {
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "name": "AvailabilityReporterSet"
+      }
+    },
+    "BandState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "ledger_seq",
+            "type_": "u32"
+          },
+          {
+            "name": "ref_price_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "BandState"
+      }
+    },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "name": "BatchItem"
+      }
+    },
+    "BatchPublished": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "batch_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "root",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "name": "manifest_cid",
+            "type_": "string"
+          },
+          {
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "BatchPublished"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "total",
+            "type_": "i128"
+          },
+          {
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "name": "BatchStatus"
+      }
+    },
+    "BlendPositions": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "supply_shares",
+            "type_": "i128"
+          },
+          {
+            "name": "liabilities",
+            "type_": "i128"
+          }
+        ],
+        "name": "BlendPositions"
+      }
+    },
+    "BlendRequest": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "request_type",
+            "type_": "u32"
+          },
+          {
+            "name": "address",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "BlendRequest"
+      }
+    },
+    "BreakerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_impact_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "band_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "BreakerConfig"
+      }
+    },
+    "CapitalBreakdown": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "liquid",
+            "type_": "i128"
+          },
+          {
+            "name": "yield_principal",
+            "type_": "i128"
+          },
+          {
+            "name": "yield_value",
+            "type_": "i128"
+          }
+        ],
+        "name": "CapitalBreakdown"
+      }
+    },
+    "Category": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Crypto"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Macro"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Geopolitics"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sports"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Culture"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Other"
+            }
+          }
+        ],
+        "name": "Category"
+      }
+    },
+    "ChainHead": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "seq",
+            "type_": "u64"
+          },
+          {
+            "name": "head_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "head_trace_id",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "ChainHead"
+      }
+    },
+    "ChainLink": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "seq",
+            "type_": "u64"
+          },
+          {
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "ChainLink"
+      }
+    },
+    "CollateralAdded": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "name": "decimals",
+            "type_": "u32"
+          },
+          {
+            "name": "min_seed",
+            "type_": "i128"
+          },
+          {
+            "name": "max_sets",
+            "type_": "i128"
+          }
+        ],
+        "name": "CollateralAdded"
+      }
+    },
+    "CollateralEnabledSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "name": "CollateralEnabledSet"
+      }
+    },
+    "CollateralParams": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "decimals",
+            "type_": "u32"
+          },
+          {
+            "name": "min_seed",
+            "type_": "i128"
+          },
+          {
+            "name": "max_sets",
+            "type_": "i128"
+          },
+          {
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "name": "CollateralParams"
+      }
+    },
+    "Committee": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "epoch",
+            "type_": "u32"
+          },
+          {
+            "name": "rotation_delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "Committee"
+      }
+    },
+    "CommitteeCreated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "CommitteeCreated"
+      }
+    },
+    "CommitteeEpochPinned": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "name": "epoch",
+            "type_": "u32"
+          }
+        ],
+        "name": "CommitteeEpochPinned"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "name": "min_epoch",
+            "type_": "u32"
+          },
+          {
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "name": "dispute_window",
+            "type_": "u64"
+          }
+        ],
+        "name": "CommitteeRef"
+      }
+    },
+    "CommitteeSnapshot": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "epoch",
+            "type_": "u32"
+          },
+          {
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "name": "CommitteeSnapshot"
+      }
+    },
+    "CommitteeVoided": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "finalized_at",
+            "type_": "u64"
+          },
+          {
+            "name": "invalid_count",
+            "type_": "u32"
+          }
+        ],
+        "name": "CommitteeVoided"
+      }
+    },
+    "Config": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "name": "treasury",
+            "type_": "address"
+          },
+          {
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "name": "default_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "protocol_fee_share_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "name": "Config"
+      }
+    },
+    "ConfigCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          }
+        ],
+        "name": "ConfigCancelled"
+      }
+    },
+    "ConfigDelaySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": "u64"
+          },
+          {
+            "name": "new",
+            "type_": "u64"
+          }
+        ],
+        "name": "ConfigDelaySet"
+      }
+    },
+    "ConfigExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "name": "ConfigExecuted"
+      }
+    },
+    "ConfigProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ConfigProposed"
+      }
+    },
+    "ConsumerRegistered": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "ConsumerRegistered"
+      }
+    },
+    "ConsumerUnregistered": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "ConsumerUnregistered"
+      }
+    },
+    "CorrelatedExposureUpdated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "name": "category",
+            "type_": "u32"
+          },
+          {
+            "name": "bucket",
+            "type_": "u64"
+          },
+          {
+            "name": "category_total",
+            "type_": "i128"
+          },
+          {
+            "name": "bucket_total",
+            "type_": "i128"
+          }
+        ],
+        "name": "CorrelatedExposureUpdated"
+      }
+    },
+    "CorrelationCaps": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_per_category",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          },
+          {
+            "name": "max_per_bucket",
+            "type_": "i128"
+          },
+          {
+            "name": "bucket_secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "CorrelationCaps"
+      }
+    },
+    "CorrelationCapsCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [],
+        "name": "CorrelationCapsCancelled"
+      }
+    },
+    "CorrelationCapsExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "name": "CorrelationCapsExecuted"
+      }
+    },
+    "CorrelationCapsProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "CorrelationCapsProposed"
+      }
+    },
+    "CreationBucket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "bucket_start",
+            "type_": "u64"
+          },
+          {
+            "name": "count",
+            "type_": "u32"
+          }
+        ],
+        "name": "CreationBucket"
+      }
+    },
+    "CreationPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_seed",
+            "type_": "i128"
+          },
+          {
+            "name": "max_markets_per_window",
+            "type_": "u32"
+          },
+          {
+            "name": "creation_window_secs",
+            "type_": "u64"
+          },
+          {
+            "name": "min_close_horizon",
+            "type_": "u64"
+          },
+          {
+            "name": "max_close_horizon",
+            "type_": "u64"
+          },
+          {
+            "name": "allowed_categories",
+            "type_": "u32"
+          }
+        ],
+        "name": "CreationPolicy"
+      }
+    },
+    "CreationPolicyUpdated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "CreationPolicy"
+              }
+            }
+          }
+        ],
+        "name": "CreationPolicyUpdated"
+      }
+    },
+    "DailyUsage": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "day_start",
+            "type_": "u64"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "DailyUsage"
+      }
+    },
+    "DataKey": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Admin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdmin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdminAt"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Roles"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultDelay"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Delay",
+              "type_": [
+                "address",
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NextId"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Op",
+              "type_": [
+                "u64"
+              ]
+            }
+          }
+        ],
+        "name": "DataKey"
+      }
+    },
+    "DefaultDelaySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "DefaultDelaySet"
+      }
+    },
+    "DefaultFeeSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "name": "old_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "new_fee_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "DefaultFeeSet"
+      }
+    },
+    "DelaySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "name": "delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "DelaySet"
+      }
+    },
+    "Deposited": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "nav",
+            "type_": "i128"
+          }
+        ],
+        "name": "Deposited"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "name": "escalation_timeout",
+            "type_": "u64"
+          }
+        ],
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "Dispute": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "disputer",
+            "type_": "address"
+          },
+          {
+            "name": "bond",
+            "type_": "i128"
+          },
+          {
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "name": "opened_at",
+            "type_": "u64"
+          },
+          {
+            "name": "payee",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "Dispute"
+      }
+    },
+    "DisputeSettled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "verdict",
+            "type_": {
+              "udt": {
+                "name": "Verdict"
+              }
+            }
+          },
+          {
+            "name": "disputer_won",
+            "type_": "bool"
+          },
+          {
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "name": "DisputeSettled"
+      }
+    },
+    "Disputed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "disputer",
+            "type_": "address"
+          },
+          {
+            "name": "bond",
+            "type_": "i128"
+          },
+          {
+            "name": "alternative",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "Disputed"
+      }
+    },
+    "DrawdownConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "name": "window_days",
+            "type_": "u32"
+          }
+        ],
+        "name": "DrawdownConfig"
+      }
+    },
+    "DrawdownConfigSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old_max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "name": "new_max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "name": "old_window_days",
+            "type_": "u32"
+          },
+          {
+            "name": "new_window_days",
+            "type_": "u32"
+          },
+          {
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "name": "DrawdownConfigSet"
+      }
+    },
+    "DrawdownPause": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "realized_loss",
+            "type_": "i128"
+          },
+          {
+            "name": "window_start_day",
+            "type_": "u64"
+          },
+          {
+            "name": "triggered_by_market",
+            "type_": "u64"
+          }
+        ],
+        "name": "DrawdownPause"
+      }
+    },
+    "DrawdownStatus": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "tripped",
+            "type_": "bool"
+          },
+          {
+            "name": "window_pnl",
+            "type_": "i128"
+          },
+          {
+            "name": "max_drawdown",
+            "type_": "i128"
+          }
+        ],
+        "name": "DrawdownStatus"
+      }
+    },
+    "EmergencyExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "name": "fn_name",
+            "type_": "symbol"
+          }
+        ],
+        "name": "EmergencyExecuted"
+      }
+    },
+    "EmergencyWithdrawn": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "EmergencyWithdrawn"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Guardian"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          }
+        ],
+        "name": "Escalation"
+      }
+    },
+    "EvidencePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Disabled"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "name": "EvidencePolicy"
+      }
+    },
+    "ExitFloorSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "price_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "is_default",
+            "type_": "bool"
+          }
+        ],
+        "name": "ExitFloorSet"
+      }
+    },
+    "ExpiryMode": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Unrevealed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          }
+        ],
+        "name": "ExpiryMode"
+      }
+    },
+    "FallbackOpened": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "opened_at",
+            "type_": "u64"
+          },
+          {
+            "name": "last_error",
+            "type_": "u32"
+          }
+        ],
+        "name": "FallbackOpened"
+      }
+    },
+    "FallbackSuperseded": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "proposal_outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          }
+        ],
+        "name": "FallbackSuperseded"
+      }
+    },
+    "FeeTerms": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "recipient",
+            "type_": "address"
+          },
+          {
+            "name": "protocol_share_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "FeeTerms"
+      }
+    },
+    "FeesCollected": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "FeesCollected"
+      }
+    },
+    "FeesSwept": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "FeesSwept"
+      }
+    },
+    "FeesSweptTo": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "recipient",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "FeesSweptTo"
+      }
+    },
+    "GlobalConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "name": "max_net_exposure",
+            "type_": "i128"
+          }
+        ],
+        "name": "GlobalConfig"
+      }
+    },
+    "GuardianAction": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "GuardianActionKind"
+              }
+            }
+          },
+          {
+            "name": "reason",
+            "type_": {
+              "udt": {
+                "name": "GuardianReason"
+              }
+            }
+          },
+          {
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "name": "GuardianAction"
+      }
+    },
+    "GuardianActionKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Void"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CancelProposal"
+            }
+          }
+        ],
+        "name": "GuardianActionKind"
+      }
+    },
+    "GuardianReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "UnrevealedSpec"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "OracleUnavailable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SignersStalled"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DisputeUpheld"
+            }
+          }
+        ],
+        "name": "GuardianReason"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          },
+          {
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "name": "fallback_after",
+            "type_": "u64"
+          }
+        ],
+        "name": "HybridConfig"
+      }
+    },
+    "KeyRevocation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "compromised_since",
+            "type_": "u64"
+          },
+          {
+            "name": "revoked_at",
+            "type_": "u64"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "name": "by_admin",
+            "type_": "bool"
+          }
+        ],
+        "name": "KeyRevocation"
+      }
+    },
+    "Leg": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "kind",
+            "type_": {
+              "udt": {
+                "name": "LegKind"
+              }
+            }
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "bound",
+            "type_": "i128"
+          },
+          {
+            "name": "limit_price_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "Leg"
+      }
+    },
+    "LegKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "BuyExactIn"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SellExactOut"
+            }
+          }
+        ],
+        "name": "LegKind"
+      }
+    },
+    "LegResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "name": "LegResult"
+      }
+    },
+    "LpFeesClaimed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "LpFeesClaimed"
+      }
+    },
+    "LpTransferred": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "name": "to",
+            "type_": "address"
+          }
+        ],
+        "name": "LpTransferred"
+      }
+    },
+    "MarkRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "pos_yes",
+            "type_": "i128"
+          },
+          {
+            "name": "pos_no",
+            "type_": "i128"
+          },
+          {
+            "name": "lp",
+            "type_": "bool"
+          },
+          {
+            "name": "lp_floor",
+            "type_": "i128"
+          },
+          {
+            "name": "status_final",
+            "type_": "bool"
+          },
+          {
+            "name": "contribution",
+            "type_": "i128"
+          },
+          {
+            "name": "refreshed_ledger",
+            "type_": "u32"
+          },
+          {
+            "name": "close_time",
+            "type_": "u64"
+          }
+        ],
+        "name": "MarkRecord"
+      }
+    },
+    "Market": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "name": "fee_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "MarketStatus"
+              }
+            }
+          },
+          {
+            "name": "reserve_yes",
+            "type_": "i128"
+          },
+          {
+            "name": "reserve_no",
+            "type_": "i128"
+          },
+          {
+            "name": "sets_minted",
+            "type_": "i128"
+          },
+          {
+            "name": "fees_accrued",
+            "type_": "i128"
+          },
+          {
+            "name": "lp_claimed",
+            "type_": "bool"
+          }
+        ],
+        "name": "Market"
+      }
+    },
+    "MarketCollateralInfo": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "name": "max_sets",
+            "type_": "i128"
+          }
+        ],
+        "name": "MarketCollateralInfo"
+      }
+    },
+    "MarketCollateralSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "collateral",
+            "type_": "address"
+          }
+        ],
+        "name": "MarketCollateralSet"
+      }
+    },
+    "MarketCreated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "MarketCreated"
+      }
+    },
+    "MarketCreatedAndRevealed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "spec_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "MarketCreatedAndRevealed"
+      }
+    },
+    "MarketExpired": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "name": "mode",
+            "type_": {
+              "udt": {
+                "name": "ExpiryMode"
+              }
+            }
+          }
+        ],
+        "name": "MarketExpired"
+      }
+    },
+    "MarketExposure": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "open",
+            "type_": "bool"
+          }
+        ],
+        "name": "MarketExposure"
+      }
+    },
+    "MarketFinalized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "swept",
+            "type_": "i128"
+          },
+          {
+            "name": "unclaimed_user",
+            "type_": "i128"
+          },
+          {
+            "name": "dust",
+            "type_": "i128"
+          }
+        ],
+        "name": "MarketFinalized"
+      }
+    },
+    "MarketMeta": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "category_idx",
+            "type_": "u32"
+          },
+          {
+            "name": "bucket",
+            "type_": "u64"
+          }
+        ],
+        "name": "MarketMeta"
+      }
+    },
+    "MarketMigrated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "successor",
+            "type_": "address"
+          },
+          {
+            "name": "yes",
+            "type_": "i128"
+          },
+          {
+            "name": "no",
+            "type_": "i128"
+          },
+          {
+            "name": "lp",
+            "type_": "bool"
+          }
+        ],
+        "name": "MarketMigrated"
+      }
+    },
+    "MarketPnl": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "cost",
+            "type_": "i128"
+          },
+          {
+            "name": "proceeds",
+            "type_": "i128"
+          },
+          {
+            "name": "realized",
+            "type_": "bool"
+          }
+        ],
+        "name": "MarketPnl"
+      }
+    },
+    "MarketResolved": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "MarketResolved"
+      }
+    },
+    "MarketSettled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "redeemed",
+            "type_": "i128"
+          },
+          {
+            "name": "lp_claimed",
+            "type_": "i128"
+          },
+          {
+            "name": "settled_by",
+            "type_": "address"
+          }
+        ],
+        "name": "MarketSettled"
+      }
+    },
+    "MarketStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Open"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Resolved",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Void"
+            }
+          }
+        ],
+        "name": "MarketStatus"
+      }
+    },
+    "ModeChanged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "from",
+            "type_": {
+              "udt": {
+                "name": "Mode"
+              }
+            }
+          },
+          {
+            "name": "to",
+            "type_": {
+              "udt": {
+                "name": "Mode"
+              }
+            }
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ModeChanged"
+      }
+    },
+    "NavDetail": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "holdings",
+            "type_": "i128"
+          },
+          {
+            "name": "stale_lp_markets",
+            "type_": "u32"
+          },
+          {
+            "name": "oldest_refresh",
+            "type_": "u32"
+          }
+        ],
+        "name": "NavDetail"
+      }
+    },
+    "NetExposureUpdated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "net_market",
+            "type_": "i128"
+          },
+          {
+            "name": "net_total",
+            "type_": "i128"
+          }
+        ],
+        "name": "NetExposureUpdated"
+      }
+    },
+    "NetPosition": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "name": "collateral_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "NetPosition"
+      }
+    },
+    "Observation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "ts",
+            "type_": "u64"
+          },
+          {
+            "name": "cumulative",
+            "type_": "i128"
+          }
+        ],
+        "name": "Observation"
+      }
+    },
+    "OpenMarket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "OpenMarket"
+      }
+    },
+    "Operation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "name": "args",
+            "type_": {
+              "vec": {
+                "element_type": "val"
+              }
+            }
+          },
+          {
+            "name": "eta",
+            "type_": "u64"
+          },
+          {
+            "name": "expires",
+            "type_": "u64"
+          }
+        ],
+        "name": "Operation"
+      }
+    },
+    "OperationCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "name": "OperationCancelled"
+      }
+    },
+    "OperationExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "name": "OperationExecuted"
+      }
+    },
+    "OperationScheduled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "id",
+            "type_": "u64"
+          },
+          {
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "name": "eta",
+            "type_": "u64"
+          }
+        ],
+        "name": "OperationScheduled"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          }
+        ],
+        "name": "OracleAsset"
+      }
+    },
+    "OracleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "price_cumulative",
+            "type_": "i128"
+          },
+          {
+            "name": "last_ts",
+            "type_": "u64"
+          },
+          {
+            "name": "last_price_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "obs_index",
+            "type_": "u32"
+          },
+          {
+            "name": "obs_count",
+            "type_": "u32"
+          }
+        ],
+        "name": "OracleState"
+      }
+    },
+    "Outcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          }
+        ],
+        "name": "Outcome"
+      }
+    },
+    "PausedSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "name": "PausedSet"
+      }
+    },
+    "PendingAdmin": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "address",
+            "type_": "address"
+          },
+          {
+            "name": "expires_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingAdmin"
+      }
+    },
+    "PendingAdminOp": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "name": "expires_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingAdminOp"
+      }
+    },
+    "PendingAgent": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "AgentPolicy"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingAgent"
+      }
+    },
+    "PendingConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "GlobalConfig"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingConfig"
+      }
+    },
+    "PendingCorrelation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingCorrelation"
+      }
+    },
+    "PendingMarkAge": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "ledgers",
+            "type_": "u32"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingMarkAge"
+      }
+    },
+    "PendingPricePolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingPricePolicy"
+      }
+    },
+    "PendingResolvability": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingResolvability"
+      }
+    },
+    "PendingRotation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "members",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingRotation"
+      }
+    },
+    "PendingTracePolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "config",
+            "type_": {
+              "udt": {
+                "name": "TracePolicyConfig"
+              }
+            }
+          },
+          {
+            "name": "registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PendingTracePolicy"
+      }
+    },
+    "PnlDays": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "head_day",
+            "type_": "u64"
+          },
+          {
+            "name": "amounts",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          },
+          {
+            "name": "head_idx",
+            "type_": "u32"
+          }
+        ],
+        "name": "PnlDays"
+      }
+    },
+    "PnlRealized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "cost",
+            "type_": "i128"
+          },
+          {
+            "name": "proceeds",
+            "type_": "i128"
+          },
+          {
+            "name": "pnl",
+            "type_": "i128"
+          }
+        ],
+        "name": "PnlRealized"
+      }
+    },
+    "PnlWindowReset": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "admin",
+            "type_": "address"
+          }
+        ],
+        "name": "PnlWindowReset"
+      }
+    },
+    "PoolRemainderClaimed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "name": "PoolRemainderClaimed"
+      }
+    },
+    "PoolRemainderClaimedV1": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "name": "PoolRemainderClaimedV1"
+      }
+    },
+    "Position": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "yes",
+            "type_": "i128"
+          },
+          {
+            "name": "no",
+            "type_": "i128"
+          }
+        ],
+        "name": "Position"
+      }
+    },
+    "PositionClosed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "PositionClosed"
+      }
+    },
+    "PositionTransferred": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "PositionTransferred"
+      }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "i128"
+          },
+          {
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "name": "max_staleness",
+            "type_": "u64"
+          }
+        ],
+        "name": "PriceConfig"
+      }
+    },
+    "PriceData": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "name": "PriceData"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          }
+        ],
+        "name": "PriceDirection"
+      }
+    },
+    "PricePolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_buy_price_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "min_sell_price_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "max_impact_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "max_slippage_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "PricePolicy"
+      }
+    },
+    "PricePolicyCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          }
+        ],
+        "name": "PricePolicyCancelled"
+      }
+    },
+    "PricePolicyProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "PricePolicyProposed"
+      }
+    },
+    "PricePolicySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "PricePolicy"
+              }
+            }
+          },
+          {
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "name": "PricePolicySet"
+      }
+    },
+    "PriceResolution": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "name": "PriceResolution"
+      }
+    },
+    "PriceResolutionScaled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "raw_price",
+            "type_": "i128"
+          },
+          {
+            "name": "feed_decimals",
+            "type_": "u32"
+          },
+          {
+            "name": "threshold_scaled",
+            "type_": "i128"
+          },
+          {
+            "name": "lookup_timestamp",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "name": "PriceResolutionScaled"
+      }
+    },
+    "PriceResolutionV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "from_snapshot",
+            "type_": "bool"
+          }
+        ],
+        "name": "PriceResolutionV2"
+      }
+    },
+    "PriceSnapshot": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "data",
+            "type_": {
+              "udt": {
+                "name": "PriceData"
+              }
+            }
+          },
+          {
+            "name": "taken_at",
+            "type_": "u64"
+          },
+          {
+            "name": "taken_by",
+            "type_": "address"
+          }
+        ],
+        "name": "PriceSnapshot"
+      }
+    },
+    "PriceSnapshotted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "name": "taken_by",
+            "type_": "address"
+          }
+        ],
+        "name": "PriceSnapshotted"
+      }
+    },
+    "ProtocolFeeShareChanged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": "u32"
+          },
+          {
+            "name": "new",
+            "type_": "u32"
+          }
+        ],
+        "name": "ProtocolFeeShareChanged"
+      }
+    },
+    "Realized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "position_proceeds",
+            "type_": "i128"
+          },
+          {
+            "name": "lp_proceeds",
+            "type_": "i128"
+          },
+          {
+            "name": "settled",
+            "type_": "bool"
+          }
+        ],
+        "name": "Realized"
+      }
+    },
+    "Redeemed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "name": "Redeemed"
+      }
+    },
+    "ResolutionFinalized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "finalized_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ResolutionFinalized"
+      }
+    },
+    "ResolutionFinalizedV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "name": "finalized_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ResolutionFinalizedV2"
+      }
+    },
+    "ResolutionProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ResolutionProposed"
+      }
+    },
+    "ResolutionProposedV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ResolutionProposedV2"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          }
+        ],
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "ResolutionSpecV3": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "name": "invalid_threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "invalid_allow_displacement",
+            "type_": "bool"
+          }
+        ],
+        "name": "ResolutionSpecV3"
+      }
+    },
+    "ResolutionState": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Unconfigured"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SignersPending"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Finalized"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Expired"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Disputed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HybridPricePending"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HybridFallbackOpen"
+            }
+          }
+        ],
+        "name": "ResolutionState"
+      }
+    },
+    "ResolvabilityPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "require_revealed",
+            "type_": "bool"
+          },
+          {
+            "name": "block_when_disputed",
+            "type_": "bool"
+          },
+          {
+            "name": "block_with_open_proposal",
+            "type_": "bool"
+          },
+          {
+            "name": "min_secs_to_close",
+            "type_": "u64"
+          },
+          {
+            "name": "allowed_specs",
+            "type_": "u32"
+          }
+        ],
+        "name": "ResolvabilityPolicy"
+      }
+    },
+    "ResolvabilityPolicyCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          }
+        ],
+        "name": "ResolvabilityPolicyCancelled"
+      }
+    },
+    "ResolvabilityPolicyProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "ResolvabilityPolicyProposed"
+      }
+    },
+    "ResolvabilityPolicySet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "name": "ResolvabilityPolicySet"
+      }
+    },
+    "ResolverChanged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "name": "ResolverChanged"
+      }
+    },
+    "ResolverProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "resolver",
+            "type_": "address"
+          }
+        ],
+        "name": "ResolverProposed"
+      }
+    },
+    "RiskConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          }
+        ],
+        "name": "RiskConfig"
+      }
+    },
+    "Roles": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "Roles"
+      }
+    },
+    "RolesSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "RolesSet"
+      }
+    },
+    "RotationCancelled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "RotationCancelled"
+      }
+    },
+    "RotationExecuted": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "name": "epoch",
+            "type_": "u32"
+          }
+        ],
+        "name": "RotationExecuted"
+      }
+    },
+    "RotationProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "RotationProposed"
+      }
+    },
+    "RouterConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "name": "reasoning_registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "RouterConfig"
+      }
+    },
+    "RuleKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WeightedKeys"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SignersDisputable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Committee"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Hybrid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ScaledPrice"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Twap"
+            }
+          }
+        ],
+        "name": "RuleKind"
+      }
+    },
+    "ScaledPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "i128"
+          },
+          {
+            "name": "threshold_decimals",
+            "type_": "u32"
+          },
+          {
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "name": "max_staleness",
+            "type_": "u64"
+          }
+        ],
+        "name": "ScaledPriceConfig"
+      }
+    },
+    "SettleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "outstanding_yes",
+            "type_": "i128"
+          },
+          {
+            "name": "outstanding_no",
+            "type_": "i128"
+          },
+          {
+            "name": "finalized_at",
+            "type_": "u64"
+          },
+          {
+            "name": "horizon_secs",
+            "type_": "u64"
+          },
+          {
+            "name": "paid_out",
+            "type_": "i128"
+          },
+          {
+            "name": "closed",
+            "type_": "bool"
+          }
+        ],
+        "name": "SettleState"
+      }
+    },
+    "SettlementReport": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "redeemed",
+            "type_": "i128"
+          },
+          {
+            "name": "lp_claimed",
+            "type_": "i128"
+          },
+          {
+            "name": "already_settled",
+            "type_": "bool"
+          }
+        ],
+        "name": "SettlementReport"
+      }
+    },
+    "Side": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          }
+        ],
+        "name": "Side"
+      }
+    },
+    "SignatureVerdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotSigned"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WrongAgent"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Valid"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "KeyCompromised",
+              "type_": [
+                "u64"
+              ]
+            }
+          }
+        ],
+        "name": "SignatureVerdict"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "dispute_window",
+            "type_": "u64"
+          }
+        ],
+        "name": "SignerConfig"
+      }
+    },
+    "SignerProposal": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "SignerProposal"
+      }
+    },
+    "SignerProposalV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "AttestedOutcome"
+              }
+            }
+          },
+          {
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "SignerProposalV2"
+      }
+    },
+    "SigningKeyRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "added_at",
+            "type_": "u64"
+          },
+          {
+            "name": "retired_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "SigningKeyRecord"
+      }
+    },
+    "SigningKeyRevoked": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "compromised_since",
+            "type_": "u64"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "name": "by_admin",
+            "type_": "bool"
+          }
+        ],
+        "name": "SigningKeyRevoked"
+      }
+    },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          }
+        ],
+        "name": "SkipReason"
+      }
+    },
+    "SpecKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "None"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ScaledPrice"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Twap"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Disputable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WeightedKeys"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Committee"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Hybrid"
+            }
+          }
+        ],
+        "name": "SpecKind"
+      }
+    },
+    "SuccessorSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "name": "SuccessorSet"
+      }
+    },
+    "TokenCaps": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "max_trade",
+            "type_": "i128"
+          },
+          {
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "name": "max_daily",
+            "type_": "i128"
+          }
+        ],
+        "name": "TokenCaps"
+      }
+    },
+    "TokenDeposited": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "TokenDeposited"
+      }
+    },
+    "Trace": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "Trace"
+      }
+    },
+    "TraceAction": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CreateMarket"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ProposeMarket"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Skip"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Redeem"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ClaimRemainder"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolve"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          }
+        ],
+        "name": "TraceAction"
+      }
+    },
+    "TraceArgs": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "name": "chained",
+            "type_": "bool"
+          },
+          {
+            "name": "chain_expected_seq",
+            "type_": "u64"
+          },
+          {
+            "name": "chain_prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "signed",
+            "type_": "bool"
+          },
+          {
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          }
+        ],
+        "name": "TraceArgs"
+      }
+    },
+    "TraceBatch": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "root",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "name": "manifest_cid",
+            "type_": "string"
+          },
+          {
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "TraceBatch"
+      }
+    },
+    "TraceChained": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "seq",
+            "type_": "u64"
+          },
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "TraceChained"
+      }
+    },
+    "TraceConsumeInfo": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "decision",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "bytes_n": {
+                    "n": 32
+                  }
+                }
+              }
+            }
+          },
+          {
+            "name": "ledger",
+            "type_": "u32"
+          }
+        ],
+        "name": "TraceConsumeInfo"
+      }
+    },
+    "TraceConsumed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "consumer",
+            "type_": "address"
+          }
+        ],
+        "name": "TraceConsumed"
+      }
+    },
+    "TraceFlag": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "name": "flagged_at",
+            "type_": "u64"
+          },
+          {
+            "name": "active",
+            "type_": "bool"
+          }
+        ],
+        "name": "TraceFlag"
+      }
+    },
+    "TraceFlagged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "TraceFlagged"
+      }
+    },
+    "TracePage": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "entries",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "TracePageEntry"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "name": "next",
+            "type_": "u64"
+          },
+          {
+            "name": "total",
+            "type_": "u64"
+          }
+        ],
+        "name": "TracePage"
+      }
+    },
+    "TracePageEntry": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "trace",
+            "type_": {
+              "udt": {
+                "name": "Trace"
+              }
+            }
+          }
+        ],
+        "name": "TracePageEntry"
+      }
+    },
+    "TracePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Off"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "name": "TracePolicy"
+      }
+    },
+    "TracePolicyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          },
+          {
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          }
+        ],
+        "name": "TracePolicyConfig"
+      }
+    },
+    "TracePublished": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "TracePublished"
+      }
+    },
+    "TraceSigned": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "TraceSigned"
+      }
+    },
+    "TraceUnflagged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "TraceUnflagged"
+      }
+    },
+    "TraceVerdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Valid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HashMismatch"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Flagged",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "AgentRevokedAfter",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "KeyCompromised",
+              "type_": [
+                "u64"
+              ]
+            }
+          }
+        ],
+        "name": "TraceVerdict"
+      }
+    },
+    "Trade": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "is_buy",
+            "type_": "bool"
+          },
+          {
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "fee",
+            "type_": "i128"
+          },
+          {
+            "name": "reserve_yes",
+            "type_": "i128"
+          },
+          {
+            "name": "reserve_no",
+            "type_": "i128"
+          }
+        ],
+        "name": "Trade"
+      }
+    },
+    "TradeAuthorized": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "market_total",
+            "type_": "i128"
+          },
+          {
+            "name": "daily_total",
+            "type_": "i128"
+          }
+        ],
+        "name": "TradeAuthorized"
+      }
+    },
+    "TradeBounds": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "limit_shares",
+            "type_": "i128"
+          },
+          {
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "name": "deadline",
+            "type_": "u64"
+          }
+        ],
+        "name": "TradeBounds"
+      }
+    },
+    "TradeStatus": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "SpecKind"
+              }
+            }
+          },
+          {
+            "name": "state",
+            "type_": {
+              "udt": {
+                "name": "ResolutionState"
+              }
+            }
+          },
+          {
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "name": "open_proposal",
+            "type_": "bool"
+          }
+        ],
+        "name": "TradeStatus"
+      }
+    },
+    "TradeTraceResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "chain_seq",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "TradeTraceResult"
+      }
+    },
+    "TradeTraced": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "name": "side",
+            "type_": {
+              "udt": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "name": "chain_seq",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "TradeTraced"
+      }
+    },
+    "TreasuryChanged": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "name": "TreasuryChanged"
+      }
+    },
+    "TreasuryProposed": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "treasury",
+            "type_": "address"
+          }
+        ],
+        "name": "TreasuryProposed"
+      }
+    },
+    "TwapConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "name": "threshold",
+            "type_": "i128"
+          },
+          {
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "name": "window",
+            "type_": "u64"
+          },
+          {
+            "name": "min_samples",
+            "type_": "u32"
+          },
+          {
+            "name": "max_gap",
+            "type_": "u64"
+          }
+        ],
+        "name": "TwapConfig"
+      }
+    },
+    "TwapResolution": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "twap",
+            "type_": "i128"
+          },
+          {
+            "name": "samples",
+            "type_": "u32"
+          },
+          {
+            "name": "first_ts",
+            "type_": "u64"
+          },
+          {
+            "name": "last_ts",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "name": "TwapResolution"
+      }
+    },
+    "UnwindSell": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "name": "shares_in",
+            "type_": "i128"
+          },
+          {
+            "name": "price_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "UnwindSell"
+      }
+    },
+    "UsageWindow": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "head_hour",
+            "type_": "u64"
+          },
+          {
+            "name": "amounts",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          },
+          {
+            "name": "head_idx",
+            "type_": "u32"
+          }
+        ],
+        "name": "UsageWindow"
+      }
+    },
+    "Valuation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "cost_basis",
+            "type_": "i128"
+          },
+          {
+            "name": "floor_value",
+            "type_": "i128"
+          },
+          {
+            "name": "spot_value",
+            "type_": "i128"
+          },
+          {
+            "name": "at_risk",
+            "type_": "i128"
+          }
+        ],
+        "name": "Valuation"
+      }
+    },
+    "Verdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Invalid"
+            }
+          }
+        ],
+        "name": "Verdict"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "name": "weight_threshold",
+            "type_": "u32"
+          },
+          {
+            "name": "dispute_window",
+            "type_": "u64"
+          }
+        ],
+        "name": "WeightedKeyConfig"
+      }
+    },
+    "WeightedSig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          }
+        ],
+        "name": "WeightedSig"
+      }
+    },
+    "WithdrawPaid": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "ticket_id",
+            "type_": "u64"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "WithdrawPaid"
+      }
+    },
+    "WithdrawRequested": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "name": "assets",
+            "type_": "i128"
+          },
+          {
+            "name": "paid_now",
+            "type_": "i128"
+          },
+          {
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "WithdrawRequested"
+      }
+    },
+    "WithdrawTicket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "name": "remaining",
+            "type_": "i128"
+          },
+          {
+            "name": "created_at",
+            "type_": "u64"
+          }
+        ],
+        "name": "WithdrawTicket"
+      }
+    },
+    "YieldAllocated": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "principal",
+            "type_": "i128"
+          }
+        ],
+        "name": "YieldAllocated"
+      }
+    },
+    "YieldRecalled": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "name": "principal",
+            "type_": "i128"
+          },
+          {
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "YieldRecalled"
+      }
+    },
+    "YieldVenue": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "name": "max_allocation",
+            "type_": "i128"
+          },
+          {
+            "name": "enabled",
+            "type_": "bool"
+          }
+        ],
+        "name": "YieldVenue"
+      }
+    },
+    "YieldVenueSet": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "fields": [
+          {
+            "name": "pool",
+            "type_": "address"
+          },
+          {
+            "name": "max_allocation",
+            "type_": "i128"
+          }
+        ],
+        "name": "YieldVenueSet"
+      }
+    }
+  }
+}
