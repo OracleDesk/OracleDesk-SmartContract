@@ -25,6 +25,7 @@ import { DEFAULT_POLICY } from "../core/dispute-policy.js";
 import { EvidenceTraceSource, ManualSource, PriceRuleSource, parsePriceQuestion, type OutcomeSource } from "../core/outcomes/index.js";
 import { ConfigError, assertNever, intEnv, parseAgentMode, type AgentMode } from "./config.js";
 import { FileLease, NoLease, type Lease } from "./lease.js";
+import { PostgresLease } from "./lease-pg.js";
 import type { RuntimeOptions } from "./runtime.js";
 import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
 import type { AvailabilityDeps } from "./tasks/availability.js";
@@ -290,6 +291,17 @@ export async function createStateStore(mode: AgentMode, env: NodeJS.ProcessEnv, 
 /** `AGENT_LEASE=none` disables the lease (only when exclusivity is guaranteed elsewhere). */
 export function createLease(env: NodeJS.ProcessEnv): Lease {
   if (env.AGENT_LEASE === "none") return new NoLease();
+  if (env.AGENT_LEASE === "pg") {
+    if (!env.AGENT_LEASE_PG_URL) throw new Error("AGENT_LEASE_PG_URL is required when AGENT_LEASE=pg");
+    return new PostgresLease({
+      connectionString: env.AGENT_LEASE_PG_URL,
+      ttlMs: intEnv(env, "LEASE_TTL_MS", 60_000, 1),
+      heartbeatMs: intEnv(env, "LEASE_HEARTBEAT_MS", 10_000, 1),
+    });
+  }
+  if (env.AGENT_LEASE !== undefined && env.AGENT_LEASE !== "file") {
+    throw new Error(`AGENT_LEASE must be one of none, file, pg; got ${env.AGENT_LEASE}`);
+  }
   return new FileLease(env.AGENT_LEASE_PATH || join(dirname(statePath(env)), "agent.lock"), {
     ttlMs: intEnv(env, "LEASE_TTL_MS", 60_000, 1),
     heartbeatMs: intEnv(env, "LEASE_HEARTBEAT_MS", 10_000, 1),

@@ -30,6 +30,26 @@ export interface LeaseRecord {
   heartbeatAt: number;
   /** Random per-acquisition token, so a reused PID is never mistaken for us. */
   token: string;
+  /** Monotonic local fencing epoch. */
+  epoch?: string;
+}
+
+export interface Fence {
+  name: string;
+  epoch: bigint;
+}
+
+export interface FencedLease extends Lease {
+  current(): Fence | undefined;
+  assertHeld(f: Fence): Promise<void>;
+  noteInflight(f: Fence, hash: string | null): Promise<void>;
+}
+
+export class FenceLostError extends Error {
+  constructor(readonly fence: Fence, readonly holder?: Fence) {
+    super(`fencing lease lost: ${fence.name} epoch ${fence.epoch}`);
+    this.name = "FenceLostError";
+  }
 }
 
 export class LeaseHeldError extends Error {
@@ -61,7 +81,7 @@ function processAlive(pid: number): boolean {
   }
 }
 
-export class FileLease implements Lease {
+export class FileLease implements FencedLease {
   onLost?: (reason: string) => void;
   private record: LeaseRecord | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -118,7 +138,8 @@ export class FileLease implements Lease {
 
   async acquire(): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
-    const mine = this.fresh();
+    const previous = await this.read();
+    const mine = { ...this.fresh(), epoch: ((BigInt(previous?.epoch ?? "0") + 1n).toString()) };
     try {
       const fh = await open(this.path, "wx", 0o600);
       try {
@@ -127,6 +148,21 @@ export class FileLease implements Lease {
       } finally {
         await fh.close();
       }
+
+      current(): Fence | undefined {
+        return this.record
+          ? { name: this.path, epoch: BigInt(this.record.epoch ?? "1") }
+          : undefined;
+      }
+
+      async assertHeld(f: Fence): Promise<void> {
+        const current = await this.read();
+        if (!this.record || current?.token !== this.record.token || BigInt(current.epoch ?? "1") !== f.epoch) {
+          throw new FenceLostError(f, current ? { name: f.name, epoch: BigInt(current.epoch ?? "1") } : undefined);
+        }
+      }
+
+      async noteInflight(_f: Fence, _hash: string | null): Promise<void> {}
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       const holder = await this.read();
@@ -173,7 +209,12 @@ export class FileLease implements Lease {
 }
 
 /** No-op lease, for tests and embedding where the caller guarantees exclusivity. */
-export class NoLease implements Lease {
+export class NoLease implements FencedLease {
   async acquire(): Promise<void> {}
   async release(): Promise<void> {}
+  current(): Fence { return { name: "none", epoch: 0n }; }
+  async assertHeld(f: Fence): Promise<void> {
+    if (f.epoch !== 0n) throw new FenceLostError(f);
+  }
+  async noteInflight(_f: Fence, _hash: string | null): Promise<void> {}
 }

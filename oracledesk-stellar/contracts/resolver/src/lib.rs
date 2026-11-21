@@ -1057,6 +1057,20 @@ impl Resolver {
         MarketCoreWiringClient::new(&env, &core).accept_resolver();
     }
 
+    /// Consent to migrate one market from this resolver to a newly wired resolver.
+    /// The market-core migration only succeeds while this resolver's address
+    /// authorizes the market-core call, so this entrypoint provides governance
+    /// acknowledgement from the resolver admin.
+    pub fn consent_market_resolver_migration(
+        env: Env,
+        _market_id: u64,
+        _new_resolver: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.current_contract_address().require_auth();
+        Ok(())
+    }
+
     // ----- admin ----------------------------------------------------------
 
     /// Starts a two-step handover of the admin role. The new admin must call

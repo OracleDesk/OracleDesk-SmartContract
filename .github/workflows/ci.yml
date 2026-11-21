@@ -16,6 +16,16 @@ permissions:
   contents: read
 
 jobs:
+  toolchain-sync:
+    name: Toolchain sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify toolchain.env matches rust-toolchain.toml, Dockerfile, and flake.nix
+        run: |
+          ./scripts/check-toolchain-sync.sh
+          node --test scripts/toolchain.test.mjs
+
   rust:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest

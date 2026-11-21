@@ -1,0 +1,67 @@
+# Declarative rule parameters for the OracleDesk on-chain monitor (#131).
+# Predicates are statically registered in `src/rules.ts` by `type`; no code is
+# evaluated from YAML.
+
+version: 1
+
+rules:
+  - id: market-core-config-changed
+    type: market_core_config_changed
+    severity: critical
+    cooldownSeconds: 300
+    description: Detect silent market-core admin config drift (resolver, treasury, collateral, paused, default_fee_bps).
+
+  - id: market-voided
+    type: market_voided
+    severity: high
+    cooldownSeconds: 60
+    description: Alert on MarketResolved with outcome=None (void), highlighting voids prior to close_time.
+
+  - id: treasury-unexpected-transfer
+    type: treasury_unexpected_transfer
+    severity: warning
+    criticalThresholdStroops: "1000000000" # 100 USDC escalates to critical
+    cooldownSeconds: 60
+    description: Alert on outgoing SAC collateral transfers from treasury to any recipient other than market-core.
+
+  - id: treasury-config-or-pause-changed
+    type: treasury_config_or_pause_changed
+    severity: critical
+    cooldownSeconds: 300
+    description: Detect treasury pause toggle or unexpected RiskConfig drift.
+
+  - id: market-stuck-unresolved
+    type: market_stuck_unresolved
+    severity: warning
+    escalateSeverity: high
+    graceAfterCloseSeconds: 7200       # 2 hours past close + dispute_window
+    escalateAfterSeconds: 21600        # 6 hours past close + dispute_window
+    cooldownSeconds: 1800
+    description: Alert when a market remains Open or unresolved past close_time + dispute_window + grace.
+
+  - id: treasury-utilization-threshold
+    type: treasury_utilization_threshold
+    severity: warning
+    dailyUsageWarnPct: 80
+    cooldownSeconds: 900
+    description: Alert when treasury daily usage exceeds 80% of max_daily or a single TradeAuthorized hits max_trade.
+
+  - id: market-core-solvency-deficit
+    type: market_core_solvency_deficit
+    severity: critical
+    toleranceStroops: "10"             # small rounding tolerance; never alerts on positive surplus / void dust
+    cooldownSeconds: 300
+    description: Verify market-core token balance covers sum of pre- and post-settlement market obligations.
+
+  - id: registry-agent-anomaly
+    type: registry_agent_anomaly
+    severity: high
+    cooldownSeconds: 300
+    description: Detect silent unregister_agent or unexpected AgentRegistered events on reasoning-registry.
+
+  - id: ledger-entry-near-archival
+    type: ledger_entry_near_archival
+    severity: warning
+    archivalMarginLedgers: 17280       # ~24 hours at ~5s/ledger
+    cooldownSeconds: 3600
+    description: Alert when any critical contract instance entry is within margin of liveUntilLedgerSeq archival.

@@ -346,6 +346,21 @@ transaction journal records both hashes plus the offered and charged fees;
 `txFEE_BUMP_INNER_FAILED` and `ResourceLimitExceeded` are classified as
 retriable fee errors, while `txBAD_AUTH` and `txBAD_SEQ` remain terminal.
 
+## Multi-host deployment
+
+For multiple hosts, set `AGENT_LEASE=pg` and configure `AGENT_LEASE_PG_URL`.
+The Postgres lease table is the authority for lease epochs; heartbeat expiry is
+computed by the database clock, not by host clocks. `LEASE_TTL_MS` must exceed
+the worst-case fence check to RPC `sendTransaction` gap.
+
+Every newly acquired epoch first bumps the agent account sequence by
+`LEASE_SEQ_WINDOW` (default 64) and waits for that transaction to confirm.
+Old holders with envelopes signed in the consumed sequence range can no longer
+apply. A stopped or paused holder is fenced again if it resumes after takeover.
+
+Channel accounts are not covered by this issue: each channel account must also
+be bumped or re-keyed per epoch.
+
 ## Extending
 
 A task is `{name, intervalMs, jitterMs?, mode?, run(ctx)}`. Its `ctx`

@@ -1,5 +1,5 @@
 const SENSITIVE_KEY =
-  /(?:secret|private.?key|seed|password|passphrase|token|authorization|credential|api.?key|access.?key)/i;
+  /(?:secret|private.?key|seed|password|passphrase|token|authorization|credential|api.?key|access.?key|pg.?url|database.?url|connection.?string)/i;
 const STELLAR_SECRET = /\bS[A-Z2-7]{55}\b/g;
 const PEM_PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;

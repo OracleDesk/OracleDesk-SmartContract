@@ -6,7 +6,7 @@
  * See docs/agent-runtime.md.
  */
 import { AsyncMutex, MarketLocks } from "./locks.js";
-import type { Lease } from "./lease.js";
+import { FenceLostError, type Fence, type FencedLease, type Lease } from "./lease.js";
 import { jsonLogger, type Logger } from "./log.js";
 import type { StateStore } from "./state.js";
 import { EXIT_KILLED } from "./config.js";
@@ -29,6 +29,7 @@ export interface TaskContext {
   submit: <T>(fn: () => Promise<T>, intent?: string) => Promise<T>;
   log: Logger;
   now: () => number;
+  fence?: Fence;
 }
 
 export interface Task {
@@ -97,6 +98,7 @@ export class Runtime {
   exitCode = 0;
   private readonly controller = new AbortController();
   private readonly killController = new AbortController();
+  private readonly leaseController = new AbortController();
   private readonly signal: AbortSignal;
   private readonly mutex = new AsyncMutex();
   private readonly locks: MarketLocks;
@@ -116,7 +118,10 @@ export class Runtime {
   private readonly finished = new Promise<void>((r) => (this.done = r));
 
   constructor(private readonly o: RuntimeOptions) {
-    this.signal = composeSignal(this.controller.signal, this.killController.signal);
+    this.signal = composeSignal(
+      composeSignal(this.controller.signal, this.killController.signal),
+      this.leaseController.signal,
+    );
     const modes = new Set(o.tasks.map((t) => t.mode).filter(Boolean));
     if (modes.size > 1) throw new Error(`mixed task modes ${[...modes].join("/")} in one runtime`);
     const names = new Set<string>();
@@ -132,6 +137,7 @@ export class Runtime {
     o.lease.onLost = (reason) => {
       this.log.error("LEASE_LOST", { reason });
       this.exitCode = 1;
+      this.leaseController.abort(reason);
       void this.stop("lease lost");
     };
   }
@@ -154,18 +160,21 @@ export class Runtime {
   }
 
   private context(task: Task): TaskContext {
+    const fenced = this.o.lease as FencedLease;
+    const fence = fenced.current?.();
     return {
       signal: this.signal,
       kill: (reason) => this.killLocally(reason),
       state: this.o.state,
       locks: this.locks,
-      submit: (fn, intent) => this.submit(fn, intent ?? task.name),
+      submit: (fn, intent) => this.submit(fn, intent ?? task.name, fence),
       log: {
         info: (e, f) => this.log.info(e, { task: task.name, ...f }),
         warn: (e, f) => this.log.warn(e, { task: task.name, ...f }),
         error: (e, f) => this.log.error(e, { task: task.name, ...f }),
       },
       now: this.now,
+      fence,
     };
   }
 
@@ -181,13 +190,21 @@ export class Runtime {
       if (reason) throw new KilledError(reason);
     }
     if (this.controller.signal.aborted) throw new AbortedError();
+    if (this.leaseController.signal.aborted) throw new FenceLostError(
+      { name: "lease", epoch: 0n },
+    );
   }
 
-  private async submit<T>(fn: () => Promise<T>, intent: string): Promise<T> {
+  private async submit<T>(fn: () => Promise<T>, intent: string, fence?: Fence): Promise<T> {
     await this.assertAlive();
     return this.mutex.run(async () => {
       // Queued behind another submission when shutdown began: not yet sent, so drop it.
       await this.assertAlive();
+      if (fence) {
+        const fenced = this.o.lease as FencedLease;
+        if (fenced.assertHeld) await fenced.assertHeld(fence);
+        this.o.state.setFenceEpoch?.(fence.epoch);
+      }
       const id = this.nextIntent++;
       this.inFlight++;
       this.pending.set(id, intent);

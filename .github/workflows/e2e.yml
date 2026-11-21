@@ -11,6 +11,8 @@ on:
       - "oracledesk-stellar/**"
       - ".github/workflows/e2e.yml"
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
@@ -68,6 +70,12 @@ jobs:
           QUICKSTART_IMAGE: stellar/quickstart:testing
         run: ./scripts/e2e-local.sh
 
+      - name: Run nightly heavy E2E stages
+        if: github.event_name == 'schedule'
+        env:
+          QUICKSTART_IMAGE: stellar/quickstart:testing
+        run: ./scripts/e2e-local.sh --stages core,vault,settle,batch,finalize,timelock,router,signers-disputable
+
       - name: Upload deployment + trace artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -76,4 +84,6 @@ jobs:
           path: |
             oracledesk-stellar/deployments/local.json
             oracledesk-stellar/deployments/traces-local/
+            oracledesk-stellar/deployments/e2e-report.json
+            oracledesk-stellar/deployments/e2e-artifacts/
           if-no-files-found: ignore

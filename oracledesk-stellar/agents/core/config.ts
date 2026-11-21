@@ -218,6 +218,8 @@ export const EnvSchema = z.object({
   STELLAR_NETWORK_PASSPHRASE: z.string().min(1, "must not be empty").optional(),
   STELLAR_RPC_URL: z.url({ protocol: /^https?$/, error: "must be an http(s) URL" }).optional(),
   AGENT_SECRET_KEY: secretField,
+  AGENT_LEASE: z.enum(["none", "file", "pg"]).default("file"),
+  AGENT_LEASE_PG_URL: z.string().url().optional(),
   MAKER_SECRET_KEY: secretField,
   TRADER_SECRET_KEY: secretField,
   WATCHER_SECRET_KEY: secretField,
@@ -657,6 +659,9 @@ export async function loadAgentConfig(o: LoadAgentConfigOptions): Promise<AgentC
   }
   if (offline && mode === "live") issues.push("--offline is only allowed in dry-run: live mode must verify the network first");
   if ((e.ARB_ENABLED === "1" || e.ARB_ENABLED === "true") && !e.ARB_RELATIONS_FILE) issues.push("ARB_ENABLED needs ARB_RELATIONS_FILE");
+  if (e.AGENT_LEASE === "pg" && !e.AGENT_LEASE_PG_URL) {
+    issues.push("AGENT_LEASE=pg needs AGENT_LEASE_PG_URL");
+  }
 
   // Deployment record.
   if (e.DEPLOYMENTS_FILE && e.DEPLOYMENTS_PATH && e.DEPLOYMENTS_FILE !== e.DEPLOYMENTS_PATH) {

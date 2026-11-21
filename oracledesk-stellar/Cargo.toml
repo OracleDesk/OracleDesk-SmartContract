@@ -8,6 +8,7 @@ members = [
     "contracts/signer-stake",
     "contracts/timelock",
     "contracts/router",
+    "contracts/test-oracle",
     "contracts/integration-tests",
 ]
 resolver = "2"

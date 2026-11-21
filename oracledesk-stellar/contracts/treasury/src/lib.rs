@@ -207,7 +207,13 @@ pub enum RuleKind {
 /// Bounds registry enumeration and admin mistakes.
 pub const MAX_AGENTS: u32 = 16;
 // Floor for `config_delay` (one day).
+#[cfg(not(feature = "local-short-windows"))]
 pub const MIN_CONFIG_DELAY: u64 = 86_400;
+#[cfg(feature = "local-short-windows")]
+pub const MIN_CONFIG_DELAY: u64 = 30;
+
+#[cfg(feature = "local-short-windows")]
+soroban_sdk::contractmeta!(key = "oracledesk_build", val = "local-short-windows");
 
 // How long a pending admin proposal stays acceptable.
 pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
@@ -1485,6 +1491,14 @@ impl Treasury {
         window_days: u32,
         creation_policy: CreationPolicy,
     ) {
+        #[cfg(feature = "local-short-windows")]
+        {
+            let standalone =
+                env.crypto().sha256(&Bytes::from_slice(&env, b"Standalone Network ; February 2017"));
+            if env.ledger().network_id() != standalone.to_bytes() {
+                panic_with_error!(&env, Error::InvalidConfig);
+            }
+        }
         let global = GlobalConfig {
             collateral,
             market_core,

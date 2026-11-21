@@ -13,7 +13,7 @@ pub mod ttl;
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, BytesN, Env, String, Vec,
+    Address, Bytes, BytesN, Env, String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,8 +30,14 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// waitable-forever (5-year ceiling). The 365-day default is snapshotted
 /// into each market at creation, so an admin change never moves an
 /// existing deadline.
+#[cfg(not(feature = "local-short-windows"))]
 const DEFAULT_REDEEM_HORIZON_SECS: u64 = 365 * ttl::DAY_SECS;
+#[cfg(feature = "local-short-windows")]
+const DEFAULT_REDEEM_HORIZON_SECS: u64 = 30;
+#[cfg(not(feature = "local-short-windows"))]
 const MIN_REDEEM_HORIZON_SECS: u64 = 180 * ttl::DAY_SECS;
+#[cfg(feature = "local-short-windows")]
+const MIN_REDEEM_HORIZON_SECS: u64 = 30;
 const MAX_REDEEM_HORIZON_SECS: u64 = 1_825 * ttl::DAY_SECS;
 
 /// Observations kept per market for the TWAP ring buffer (issue #11). One
@@ -89,6 +95,18 @@ const MAX_BATCH: u32 = 46;
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
+/// Delay before a proposed resolver migration may be accepted.
+const MARKET_RESOLVER_DELAY_SECS: u64 = 2 * 86_400;
+const MARKET_RESOLVER_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
+/// A market is considered stalled after 45 days. This is strictly longer
+/// than the resolver's 30-day resolution grace plus 7-day signer grace.
+pub const RESOLVER_STALL_SECS: u64 = 45 * 86_400;
+const _: () = assert!(RESOLVER_STALL_SECS > 30 * 86_400 + 7 * 86_400);
+
+#[cfg(feature = "local-short-windows")]
+soroban_sdk::contractmeta!(key = "oracledesk_build", val = "local-short-windows");
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -134,6 +152,14 @@ pub struct Market {
 pub struct Position {
     pub yes: i128,
     pub no: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingMarketResolver {
+    pub new_resolver: Address,
+    pub eta: u64,
+    pub expires_at: u64,
 }
 
 /// Per-market settlement bookkeeping (issue #14). Lives in its own entry so
@@ -347,6 +373,8 @@ pub enum DataKey {
     Treasury,
     Resolver,
     PendingResolver,
+    ResolverSnapshotFrom,
+    PendingMarketResolver(u64),
     PendingTreasury,
     DefaultFeeBps,
     ProtocolFeeShareBps,
@@ -363,6 +391,7 @@ pub enum DataKey {
     FeeTerms(u64),
     LpFees(u64),
     Breaker(u64),
+    MarketResolver(u64),
     // per-token collateral allow-list and solvency accounting (#151)
     CollateralParams(Address),
     MarketCollateral(u64),
@@ -431,6 +460,11 @@ pub enum Error {
     CollateralNotAllowed = 32,
     /// Allow-list parameters failed validation (decimals, seed bounds).
     InvalidCollateralParams = 33,
+    ResolverMismatch = 34,
+    NoPendingMarketResolver = 35,
+    MarketResolverNotReady = 36,
+    MarketResolverExpired = 37,
+    OldResolverConsentRequired = 38,
 }
 
 impl From<MathError> for Error {
@@ -555,6 +589,21 @@ pub struct ResolverProposed {
 }
 #[contractevent]
 pub struct ResolverChanged {
+    pub old: Address,
+    pub new: Address,
+}
+#[contractevent]
+pub struct MarketResolverProposed {
+    #[topic]
+    pub market_id: u64,
+    pub old: Address,
+    pub new: Address,
+    pub eta: u64,
+}
+#[contractevent]
+pub struct MarketResolverChanged {
+    #[topic]
+    pub market_id: u64,
     pub old: Address,
     pub new: Address,
 }
@@ -686,6 +735,14 @@ impl MarketCore {
         default_fee_bps: u32,
         protocol_fee_share_bps: u32,
     ) {
+        #[cfg(feature = "local-short-windows")]
+        {
+            let standalone =
+                env.crypto().sha256(&Bytes::from_slice(&env, b"Standalone Network ; February 2017"));
+            if env.ledger().network_id() != standalone.to_bytes() {
+                panic_with_error!(&env, Error::InvalidCollateralParams);
+            }
+        }
         if default_fee_bps > MAX_FEE_BPS {
             panic_with_error!(&env, Error::InvalidFee);
         }
@@ -697,6 +754,7 @@ impl MarketCore {
         s.set(&DataKey::Collateral, &collateral);
         s.set(&DataKey::Treasury, &treasury);
         s.set(&DataKey::Resolver, &resolver);
+        s.set(&DataKey::ResolverSnapshotFrom, &0u64);
         s.set(&DataKey::DefaultFeeBps, &default_fee_bps);
         s.set(&DataKey::ProtocolFeeShareBps, &protocol_fee_share_bps);
         s.set(&DataKey::Paused, &false);
@@ -904,6 +962,113 @@ impl MarketCore {
         Ok(())
     }
 
+    pub fn market_resolver(env: Env, market_id: u64) -> Result<Address, Error> {
+        Self::market_resolver_of(&env, market_id)
+    }
+
+    pub fn snapshot_legacy_resolver(env: Env, market_id: u64) -> Result<Address, Error> {
+        let market = Self::load_market(&env, market_id)?;
+        if market.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        let resolver: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Resolver)
+            .ok_or(Error::NotInitialized)?;
+        Self::save_market_resolver(&env, market_id, &resolver);
+        Ok(resolver)
+    }
+
+    pub fn propose_market_resolver(
+        env: Env,
+        market_id: u64,
+        new_resolver: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let market = Self::load_market(&env, market_id)?;
+        if market.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if WiringPeerClient::new(&env, &new_resolver).market_core()
+            != env.current_contract_address()
+        {
+            return Err(Error::InvalidWiring);
+        }
+        let old = Self::market_resolver_of(&env, market_id)?;
+        let now = env.ledger().timestamp();
+        let eta = now.saturating_add(MARKET_RESOLVER_DELAY_SECS);
+        let expires_at = eta.saturating_add(MARKET_RESOLVER_PROPOSAL_TTL_SECS);
+        env.storage().persistent().set(
+            &DataKey::PendingMarketResolver(market_id),
+            &PendingMarketResolver {
+                new_resolver: new_resolver.clone(),
+                eta,
+                expires_at,
+            },
+        );
+        ttl::bump_persistent(
+            &env,
+            &DataKey::PendingMarketResolver(market_id),
+            ttl::long_lived_target(&env),
+        );
+        MarketResolverProposed {
+            market_id,
+            old,
+            new: new_resolver,
+            eta,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_market_resolver(env: Env, market_id: u64) -> Result<(), Error> {
+        let key = DataKey::PendingMarketResolver(market_id);
+        let pending: PendingMarketResolver = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoPendingMarketResolver)?;
+        let now = env.ledger().timestamp();
+        if now < pending.eta {
+            return Err(Error::MarketResolverNotReady);
+        }
+        if now > pending.expires_at {
+            return Err(Error::MarketResolverExpired);
+        }
+        pending.new_resolver.require_auth();
+
+        let market = Self::load_market(&env, market_id)?;
+        if market.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        let old = Self::market_resolver_of(&env, market_id)?;
+        let stall_deadline = market.close_time.saturating_add(RESOLVER_STALL_SECS);
+        if now < stall_deadline {
+            old.require_auth();
+        }
+
+        Self::save_market_resolver(&env, market_id, &pending.new_resolver);
+        env.storage().persistent().remove(&key);
+        MarketResolverChanged {
+            market_id,
+            old,
+            new: pending.new_resolver,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_market_resolver(env: Env, market_id: u64) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::PendingMarketResolver(market_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NoPendingMarketResolver);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
     /// Affects markets created after the call and the legacy fallback in
     /// `sweep_fees`. Markets with a snapshotted `FeeTerms` keep paying their
     /// original recipient.
@@ -1092,6 +1257,7 @@ impl MarketCore {
             .get(&DataKey::ProtocolFeeShareBps)
             .ok_or(Error::NotInitialized)?;
         let treasury: Address = s.get(&DataKey::Treasury).ok_or(Error::NotInitialized)?;
+        let resolver: Address = s.get(&DataKey::Resolver).ok_or(Error::NotInitialized)?;
         let breaker: Option<BreakerConfig> = s.get(&DataKey::DefaultBreaker);
 
         let market = Market {
@@ -1131,6 +1297,7 @@ impl MarketCore {
                 protocol_share_bps,
             },
         );
+        Self::save_market_resolver(&env, id, &resolver);
         if let Some(b) = breaker {
             Self::save_breaker(&env, id, &b);
         }
@@ -1553,7 +1720,7 @@ impl MarketCore {
     // contract is the direct caller, `require_auth` on its address passes.
 
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
-        Self::require_resolver(&env)?;
+        Self::require_market_resolver(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -1574,7 +1741,7 @@ impl MarketCore {
 
     /// Invalid or unresolvable market. Allowed any time before finality.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
-        Self::require_resolver(&env)?;
+        Self::require_market_resolver(&env, market_id)?;
         let mut m = Self::load_market(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -2414,10 +2581,28 @@ impl MarketCore {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
-    fn require_resolver(env: &Env) -> Result<(), Error> {
-        let resolver: Address = Self::instance_get(env, &DataKey::Resolver)?;
+    fn require_market_resolver(env: &Env, market_id: u64) -> Result<(), Error> {
+        let resolver = Self::market_resolver_of(env, market_id)?;
         resolver.require_auth();
         Ok(())
+    }
+
+    fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
+        let key = DataKey::MarketResolver(market_id);
+        if let Some(resolver) = env.storage().persistent().get(&key) {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+            return Ok(resolver);
+        }
+        env.storage()
+            .instance()
+            .get(&DataKey::Resolver)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn save_market_resolver(env: &Env, market_id: u64, resolver: &Address) {
+        let key = DataKey::MarketResolver(market_id);
+        env.storage().persistent().set(&key, resolver);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
     }
 
     fn assert_not_paused(env: &Env) -> Result<(), Error> {

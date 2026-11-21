@@ -47,6 +47,15 @@ for wasm in market_core resolver treasury reasoning_registry; do
   fi
 done
 
+# Default builds must never carry the local-only short-window meta entry.
+for wasm in market_core treasury timelock; do
+  wasm_path="$work/a/wasm32v1-none/release/$wasm.wasm"
+  if stellar contract info meta --wasm "$wasm_path" 2>/dev/null | grep -q 'local-short-windows'; then
+    echo "LOCAL BUILD META IN DEFAULT WASM: $wasm.wasm" >&2
+    status=1
+  fi
+done
+
 check_pin() {
   local vendored="$1" built="$2" pin="$3"
   local expected actual

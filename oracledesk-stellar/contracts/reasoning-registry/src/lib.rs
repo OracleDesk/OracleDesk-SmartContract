@@ -13,7 +13,6 @@ use soroban_sdk::{
     Env, String, Symbol, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{};
 
 /// Rolling window for trace entries, unchanged from the pre-#16 policy:
 /// 60 days, extended at half that. Registration (`Agent`) instead uses
@@ -34,6 +33,9 @@ pub const MAX_LEAVES: u32 = 4096;
 pub const MAX_PROOF_LEN: u32 = 12;
 pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
 pub const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+/// Registry error codes occupy 3001..=3999 per ADR 0006.
+pub const REGISTRY_ERROR_BASE: u32 = 3000;
 
 /// Signing key constants for Ed25519 attestations (#53).
 pub const MAX_AGENT_SIGNING_KEYS: u32 = 4;
@@ -308,8 +310,8 @@ pub enum DataKey {
     TraceLink(u64),
     AgentTraceCount(Address),
     AgentTraceAt(Address, u64),
-    MarketActionTraceCount(u64, String),
-    MarketActionTraceAt(u64, String, u64),
+    MarketActionTraceCount(u64, TraceAction),
+    MarketActionTraceAt(u64, TraceAction, u64),
     FlagHistoryCount(u64),
     FlagHistory(u64, u32),
     MarketCore,
@@ -397,63 +399,56 @@ pub enum Error {
     /// Agent already has a chain, so unchained `publish_trace` is refused (#52).
     ChainedAgentMustChain = 3009,
     /// Trace already backed an action (#50).
-    TraceAlreadyConsumed = 10,
+    TraceAlreadyConsumed = 3010,
     /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
-    NoPendingAdmin = 11,
+    NoPendingAdmin = 3011,
     /// A proposed admin handover was not accepted within its `expires_at`.
-    PendingAdminExpired = 12,
-    CannotReactivateRevoked = 100,
-    FlagHistoryFull = 101,
-    InvalidEffectiveTime = 102,
-    UnknownMarket = 103,
-    MarketRequired = 104,
-    ProposalMustUseNoMarket = 105,
-    UseCanonicalAction = 106,
-    BatchNotFound = 107,
-    InvalidBatch = 108,
-    InvalidProof = 109,
-    TooManyKeys = 110,
-    KeyAlreadyBound = 111,
-    InvalidKey = 112,
-    InvalidSignature = 113,
-    TraceNotSigned = 114,
-    AgentNotActive = 115,
-    ActionTooLong = 116,
-    CidTooLong = 117,
-    PageTooLarge = 118,
-    TraceFlagged = 119,
-    TraceTooOld = 120,
-    TraceDecisionMissing = 121,
-    TraceAgentMismatch = 122,
-    TraceMismatch = 123,
-    AlreadyRetired = 124,
-    NotRetired = 125,
-    SigningKeyNotFound = 126,
-    TooManySigningKeys = 127,
-    SigningKeyAlreadyBound = 128,
+    PendingAdminExpired = 3012,
+    CannotReactivateRevoked = 3013,
+    FlagHistoryFull = 3014,
+    InvalidEffectiveTime = 3015,
+    UnknownMarket = 3016,
+    MarketRequired = 3017,
+    ProposalMustUseNoMarket = 3018,
+    UseCanonicalAction = 3019,
+    BatchNotFound = 3020,
+    InvalidBatch = 3021,
+    InvalidProof = 3022,
+    TooManyKeys = 3023,
+    KeyAlreadyBound = 3024,
+    InvalidKey = 3025,
+    InvalidSignature = 3026,
+    TraceNotSigned = 3027,
+    AgentNotActive = 3028,
+    ActionTooLong = 3029,
+    CidTooLong = 3030,
+    PageTooLarge = 3031,
+    TraceFlagged = 3032,
+    TraceTooOld = 3033,
+    TraceDecisionMissing = 3034,
+    TraceAgentMismatch = 3035,
+    TraceMismatch = 3036,
+    AlreadyRetired = 3037,
+    NotRetired = 3038,
+    SigningKeyNotFound = 3039,
+    TooManySigningKeys = 3040,
+    SigningKeyAlreadyBound = 3041,
     // ── #307 Per-agent consumer scoping ──────────────────────────────────
     /// `authorize_consumer` called after agent has reached MAX_AGENT_CONSUMERS.
-    TooManyConsumers = 129,
+    TooManyConsumers = 3042,
     /// `consume_trace` called by a consumer the publishing agent never granted.
-    ConsumerNotAuthorized = 130,
+    ConsumerNotAuthorized = 3043,
     /// `consume_trace` called by a consumer other than the one the trace is bound to.
-    TraceBoundElsewhere = 131,
+    TraceBoundElsewhere = 3044,
     /// `set_default_consumer` or `bind_trace_consumer` called with a consumer the
     /// agent has not yet authorised.
-    ConsumerGrantRequired = 132,
+    ConsumerGrantRequired = 3045,
     /// `bind_trace_consumer` called on a trace that already has a binding.
-    TraceAlreadyBound = 133,
+    TraceAlreadyBound = 3046,
     /// `grant_consumer_legacy` called after scoping has been enabled.
-    ScopingAlreadyEnabled = 134,
+    ScopingAlreadyEnabled = 3047,
     /// #299: Key already revoked and `compromised_since` cannot move later.
-    AlreadyRevoked = 129,
-    // ── #325 delegated availability reporters ──────────────────────────────
-    /// Caller is not an admin-registered availability reporter.
-    NotAvailabilityReporter = 135,
-    /// The trace has no active reporter-owned `unavail` flag.
-    NotAvailabilityFlag = 136,
-    /// The same trace was toggled again before AVAIL_MIN_TOGGLE_SECS elapsed.
-    AvailabilityToggleTooSoon = 137,
+    AlreadyRevoked = 3048,
 }
 
 #[contractevent]
@@ -795,7 +790,7 @@ impl ReasoningRegistry {
     }
 
     /// Trace id at position `seq` (1-based) of `agent`'s chain.
-    pub fn agent_trace_at(env: Env, agent: Address, seq: u64) -> Result<u64, Error> {
+    pub fn agent_chain_trace_at(env: Env, agent: Address, seq: u64) -> Result<u64, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::AgentTrace(agent, seq))
@@ -1111,10 +1106,15 @@ impl ReasoningRegistry {
     }
 
     /// The `index`-th (0-based, publish order) trace id for `agent` (#57).
-
+    pub fn agent_trace_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentTraceAt(agent, index))
+            .ok_or(Error::TraceNotFound)
+    }
 
     /// Number of traces for the `(market_id, action)` pair (#57).
-    pub fn market_action_trace_count(env: Env, market_id: u64, action: String) -> u64 {
+    pub fn market_action_trace_count(env: Env, market_id: u64, action: TraceAction) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::MarketActionTraceCount(market_id, action))
@@ -1126,7 +1126,7 @@ impl ReasoningRegistry {
     pub fn market_action_trace_at(
         env: Env,
         market_id: u64,
-        action: String,
+        action: TraceAction,
         index: u64,
     ) -> Result<u64, Error> {
         env.storage()
@@ -1174,7 +1174,7 @@ impl ReasoningRegistry {
     pub fn traces_by_market_action(
         env: Env,
         market_id: u64,
-        action: String,
+        action: TraceAction,
         start: u64,
         limit: u32,
     ) -> Result<TracePage, Error> {
@@ -2268,6 +2268,25 @@ impl ReasoningRegistry {
         Self::put(env, &DataKey::MarketTrace(market_id, index), &id);
         Self::put(env, &count_key, &(index + 1));
 
+        let agent_count_key = DataKey::AgentTraceCount(agent.clone());
+        let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
+        Self::put(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id);
+        Self::put(env, &agent_count_key, &(agent_index + 1));
+
+        let action_count_key =
+            DataKey::MarketActionTraceCount(market_id, action.clone());
+        let action_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&action_count_key)
+            .unwrap_or(0);
+        Self::put(
+            env,
+            &DataKey::MarketActionTraceAt(market_id, action.clone(), action_index),
+            &id,
+        );
+        Self::put(env, &action_count_key, &(action_index + 1));
+
         TracePublished {
             trace_id: id,
             market_id,
@@ -2348,6 +2367,21 @@ mod test {
         },
         IntoVal,
     };
+
+    #[test]
+    fn registry_errors_stay_in_reserved_range_and_unique() {
+        let codes = [
+            Error::NotInitialized as u32,
+            Error::Unauthorized as u32,
+            Error::TraceAlreadyConsumed as u32,
+            Error::NoPendingAdmin as u32,
+            Error::PendingAdminExpired as u32,
+            Error::AlreadyRevoked as u32,
+        ];
+        for code in codes {
+            assert!(code > REGISTRY_ERROR_BASE && code <= 3999);
+        }
+    }
 
     fn register_market_core(env: &Env, admin: &Address) -> (Address, market_core::Client<'static>) {
         let treasury = Address::generate(env);

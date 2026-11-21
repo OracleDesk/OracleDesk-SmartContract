@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+local-short-windows = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 doctest = false

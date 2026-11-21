@@ -1,7 +1,7 @@
 import { open, readFile, mkdir, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled";
+export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled" | "fenced";
 
 export interface TransactionJournalRecord {
   version: 1 | 2;
@@ -16,12 +16,7 @@ export interface TransactionJournalRecord {
   outerHash?: string;
   feeOffered?: string;
   feeCharged?: string;
-  /** Journal id of the transaction this one depends on (a restore before an
-   * action, or a re-simulation after an archival race). */
-  dependsOn?: string;
-  /** Restores are journaled under `${actionId}:restore`; actions use the
-   * caller's id. Absent means an action, so old records stay valid. */
-  kind?: "action" | "restore";
+  fence?: { name: string; epoch: string };
 }
 
 export interface TransactionJournalOptions {
@@ -38,6 +33,7 @@ const stages = new Set<JournalStage>([
   "failed",
   "uncertain",
   "cancelled",
+  "fenced",
 ]);
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 
@@ -64,7 +60,11 @@ function isJournalRecord(value: unknown): value is TransactionJournalRecord {
     (record.dependsOn === undefined || (typeof record.dependsOn === "string" && record.dependsOn.length > 0)) &&
     (record.kind === undefined || record.kind === "action" || record.kind === "restore") &&
     optionalDecimal(record.feeOffered) &&
-    optionalDecimal(record.feeCharged)
+    optionalDecimal(record.feeCharged) &&
+    (record.fence === undefined ||
+      (typeof record.fence === "object" &&
+        typeof record.fence.name === "string" &&
+        typeof record.fence.epoch === "string"))
   );
 }
 

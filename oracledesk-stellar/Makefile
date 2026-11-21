@@ -1,4 +1,16 @@
-.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+.PHONY: doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+
+# Verify local or CI tool versions match `toolchain.env` (#135).
+doctor:
+	./scripts/doctor.sh
+
+# Fail if toolchain.env drifted from rust-toolchain.toml, Dockerfile, or flake.nix.
+check-toolchain-sync:
+	./scripts/check-toolchain-sync.sh
+
+# Run the on-chain monitoring and alerting service (#131).
+monitor:
+	cd monitor && npm start
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -31,6 +43,12 @@ build:
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/router.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/timelock.wasm contracts/integration-tests/wasm/
+
+.PHONY: build-local-short
+build-local-short:
+	stellar contract build --package market-core --features local-short-windows --out-dir target/local-short
+	stellar contract build --package treasury --features local-short-windows --out-dir target/local-short
+	stellar contract build --package timelock --features local-short-windows --out-dir target/local-short
 
 # Proves the contract build is bit-for-bit reproducible and that the vendored
 # wasm matches a clean build (issue #58). Slow: it compiles the workspace
