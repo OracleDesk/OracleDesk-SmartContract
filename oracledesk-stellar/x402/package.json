@@ -25,7 +25,7 @@
     "@types/supertest": "^7.2.1",
     "supertest": "^7.3.1",
     "tsx": "^4.22.0",
-    "typescript": "^5.8.3"
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=22"
