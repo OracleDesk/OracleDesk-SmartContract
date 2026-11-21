@@ -8,8 +8,10 @@ Compares, over JSON lines:
 * TS     -- agents/core/fpmm.ts, through `ts-oracle.ts`
 
 The generator is boundary-aware (fee/BPS edges, MAX_SETS +/- 1, divisibility
-classes, negative inputs, inverse round-trips), results and errors are
+classes, negative inputs, exact-share round-trips), results and errors are
 normalised, and the first mismatch is greedily shrunk before it is reported.
+The deprecated inverse functions are compared Python-vs-TS only; Rust exposes
+the canonical `calc_sell_shares` instead.
 
 Usage:
     cargo build --manifest-path scripts/fpmm-diff/oracle/Cargo.toml --release
@@ -74,6 +76,16 @@ PY_FUNCS: dict[str, Callable[[list[Any]], Any]] = {
     "sell_within_limit": lambda a: {
         "value": model.sell_within_limit(int(a[0]), int(a[1]), int(a[2]))
     },
+    "calc_sell_shares": lambda a: _sell_shares_dict(
+        model.calc_sell_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+    ),
+    "split_fee": lambda a: dict(
+        zip(("protocol", "lp"), model.split_fee(int(a[0]), int(a[1])))
+    ),
+    "settle_upper": lambda a: {"value": model.settle_upper(str(a[0]), int(a[1]), int(a[2]))},
+    "merge_max": lambda a: {"value": model.merge_max(int(a[0]), int(a[1]))},
+    "isqrt": lambda a: {"value": model.isqrt(int(a[0]))},
+    # Deprecated off-chain inverse: compared Python-vs-TS only (INVERSE_FNS).
     "gross_for_shares": lambda a: {
         "gross": model.gross_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
     },
@@ -82,7 +94,6 @@ PY_FUNCS: dict[str, Callable[[list[Any]], Any]] = {
             int(a[0]), int(a[1]), int(a[2]), int(a[3])
         )
     },
-    "isqrt": lambda a: {"value": model.isqrt(int(a[0]))},
 }
 
 INVERSE_FNS = {"gross_for_shares", "collateral_out_for_shares"}
@@ -107,6 +118,16 @@ def _buy_dict(q: Any) -> dict[str, int]:
 def _sell_dict(q: Any) -> dict[str, int]:
     return {
         "shares_in": q.shares_in,
+        "fee": q.fee,
+        "gross": q.gross,
+        "new_reserve_sold": q.new_reserve_sold,
+        "new_reserve_other": q.new_reserve_other,
+    }
+
+
+def _sell_shares_dict(q: Any) -> dict[str, int]:
+    return {
+        "collateral_out": q.collateral_out,
         "fee": q.fee,
         "gross": q.gross,
         "new_reserve_sold": q.new_reserve_sold,
@@ -232,29 +253,35 @@ def expected_rust_error(fn: str, a: list[Any]) -> str | None:
             if shares <= 0:
                 return "InvalidInput"
             return None
-        if fn == "gross_for_shares":
+        if fn == "calc_sell_shares":
             rs, ro, sh, fee = map(int, a)
             if sh <= 0 or rs <= 0 or ro <= 0 or fee >= BPS:
                 return "InvalidInput"
-            aa = _add(sh, rs)
-            b = _add(aa, ro)
-            b_sq = _mul(b, b)
-            four = _mul(4, _mul(ro, sh))
-            disc = b_sq - four
+            b = _add(_add(rs, sh), ro)
+            disc = _mul(b, b) - _mul(4, _mul(ro, sh))
             if disc < 0:
                 return "InsufficientLiquidity"
-            root = model.isqrt(disc)
-            gross = (b - root) // 2
-            if gross <= 0 or gross >= ro:
+            x = (b - model.isqrt(disc)) // 2
+            while x > 0 and (rs + sh - x) * (ro - x) < rs * ro:
+                x -= 1
+            if x == 0 or x >= ro:
                 return "InsufficientLiquidity"
+            if model.mul_div_floor(x, BPS - fee, BPS) <= 0:
+                return "InvalidInput"
             return None
-        if fn == "collateral_out_for_shares":
-            err = expected_rust_error("gross_for_shares", a)
-            if err:
-                return err
-            g = model.gross_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
-            _mul(g, BPS - int(a[3]))
+        if fn == "split_fee":
+            fee, share = map(int, a)
+            if fee < 0 or share > BPS:
+                return "InvalidInput"
+            _mul(fee, share)
             return None
+        if fn in ("settle_value", "settle_upper"):
+            if str(a[0]) not in ("yes", "no", "void"):
+                return "InvalidInput"
+            _add(int(a[1]), int(a[2]))
+            return None
+        if fn == "merge_max":
+            return "InvalidInput" if int(a[0]) < 0 or int(a[1]) < 0 else None
         if fn == "isqrt":
             return "InvalidInput" if int(a[0]) < 0 else None
         if fn in ("buy_within_limit", "sell_within_limit"):
@@ -378,37 +405,57 @@ class Harness:
         for i, ((fn, args), r, t) in enumerate(zip(cases, rust, ts)):
             p = python_result(fn, args)
             msgs: list[str] = []
-            expected_err = expected_rust_error(fn, args)
             if p != t:
                 msgs.append(f"python={p} ts={t}")
-            if expected_err:
-                if r != {"err": expected_err}:
-                    msgs.append(f"expected Rust {expected_err}, got {r}")
-            elif r != p:
-                msgs.append(f"rust={r} python={p}")
-            if not expected_err and r != t:
-                msgs.append(f"rust={r} ts={t}")
-            if fn in INVERSE_FNS and "ok" in p and "ok" in r:
-                # Cross-check the inverse against the *forward* Rust calc_sell.
-                target = int(args[2])
-                fee = int(args[3])
-                if fn == "gross_for_shares":
-                    gross = int(p["ok"]["gross"])
-                    coll = model.mul_div_floor(gross, BPS - fee, BPS)
+            if fn in INVERSE_FNS:
+                # The deprecated inverse has no Rust counterpart any more.
+                # Compare Python/TS exactly, then cross-check the Python result
+                # against the real on-chain calc_sell with the existing
+                # one-share rounding tolerance.
+                msgs.extend(self._cross_check_sell(fn, args, p))
+            else:
+                expected_err = expected_rust_error(fn, args)
+                if expected_err:
+                    if r != {"err": expected_err}:
+                        msgs.append(f"expected Rust {expected_err}, got {r}")
                 else:
-                    coll = int(p["ok"]["collateral_out"])
-                if coll > 0:
-                    back = self.rust_results([("calc_sell", [args[0], args[1], str(coll), fee])])[0]
-                    if "ok" in back and int(back["ok"]["shares_in"]) > target + 1:
-                        msgs.append(
-                            f"inverse cross-check: calc_sell({args[0]},{args[1]},{coll},{fee})"
-                            f" used {back['ok']['shares_in']} shares > target {target}+1"
-                        )
-                    if "err" in back:
-                        msgs.append(f"inverse cross-check: Rust calc_sell={back}")
+                    if r != p:
+                        msgs.append(f"rust={r} python={p}")
+                    if r != t:
+                        msgs.append(f"rust={r} ts={t}")
+                if fn == "calc_sell_shares":
+                    msgs.extend(self._cross_check_sell(fn, args, p))
+                    if "ok" in p and "ok" in r:
+                        k0 = int(args[0]) * int(args[1])
+                        k1 = int(r["ok"]["new_reserve_sold"]) * int(r["ok"]["new_reserve_other"])
+                        if k1 < k0:
+                            msgs.append(f"calc_sell_shares decreased k: {k1} < {k0}")
             if msgs:
                 problems.append((i, msgs))
         return problems
+
+    def _cross_check_sell(self, fn: str, args: list[Any], p: dict[str, Any]) -> list[str]:
+        """Check a share-quote against the forward on-chain `calc_sell`."""
+        if "ok" not in p:
+            return []
+        target = int(args[2])
+        fee = int(args[3])
+        if fn == "gross_for_shares":
+            coll = model.mul_div_floor(int(p["ok"]["gross"]), BPS - fee, BPS)
+        else:
+            coll = int(p["ok"]["collateral_out"])
+        if coll <= 0:
+            return []
+        back = self.rust_results([("calc_sell", [args[0], args[1], str(coll), fee])])[0]
+        msgs: list[str] = []
+        if "ok" in back and int(back["ok"]["shares_in"]) > target + 1:
+            msgs.append(
+                f"sell cross-check: calc_sell({args[0]},{args[1]},{coll},{fee})"
+                f" used {back['ok']['shares_in']} shares > target {target}+1"
+            )
+        if "err" in back:
+            msgs.append(f"sell cross-check: Rust calc_sell={back}")
+        return msgs
 
     def check_one(self, case: tuple[str, list[Any]]) -> list[str]:
         problems = self.check_batch([case])
@@ -446,7 +493,11 @@ def gen_case(rng: random.Random, klass: str | None = None) -> tuple[str, list[An
         "seed",
         "calc_buy",
         "calc_sell",
+        "sell_shares",
+        "split_fee",
         "settle",
+        "settle_upper",
+        "merge_max",
         "inverse",
         "limit",
     ]
@@ -492,6 +543,48 @@ def gen_case(rng: random.Random, klass: str | None = None) -> tuple[str, list[An
     if klass == "settle":
         kind = rng.choice(["yes", "no", "void"])
         return "settle_value", [kind, str(log_uniform(rng, 0, 15)), str(log_uniform(rng, 0, 15))], klass
+    if klass == "sell_shares":
+        rs = pick(rng, BOUNDARIES) or 1
+        ro = pick(rng, BOUNDARIES) or 1
+        fee = rng.choice(FEES[:7])
+        # Tiny share counts exercise the collateral-floors-to-zero branch;
+        # targets derived from a forward sell exercise the real round trip.
+        if rng.random() < 0.2:
+            sh = rng.choice([1, 2, 3, 5, 10])
+        else:
+            sh = None
+            if fee < BPS:
+                for _ in range(20):
+                    try:
+                        out = rng.randint(1, max(1, ro // 4))
+                        sh = model.calc_sell(rs, ro, out, fee).shares_in
+                        break
+                    except model.MathError:
+                        rs = pick(rng, BOUNDARIES) or 1
+                        ro = pick(rng, BOUNDARIES) or 1
+            if sh is None:
+                sh = log_uniform(rng, 0, 15) or 1
+        # Occasionally probe the MAX_SETS boundary headroom.
+        if rng.random() < 0.05:
+            rs = ro = MAX_SETS
+            sh = MAX_SETS // 2 if rng.random() < 0.5 else sh
+        return "calc_sell_shares", maybe_huge(
+            rng, [str(rs), str(ro), str(sh), str(fee)], [0, 1, 2]
+        ), klass
+    if klass == "split_fee":
+        fee = log_uniform(rng, 0, 15)
+        share = rng.choice([0, 1, 3333, 5000, 9999, BPS, BPS + 1])
+        if rng.random() < 0.05:
+            fee = -fee
+        return "split_fee", [str(fee), str(share)], klass
+    if klass == "settle_upper":
+        kind = rng.choice(["yes", "no", "void"])
+        return "settle_upper", [kind, str(log_uniform(rng, 0, 15)), str(log_uniform(rng, 0, 15))], klass
+    if klass == "merge_max":
+        a, b = log_uniform(rng), log_uniform(rng)
+        if rng.random() < 0.1:
+            a = -a
+        return "merge_max", [str(a), str(b)], klass
     if klass == "inverse":
         fn = rng.choice(["gross_for_shares", "collateral_out_for_shares"])
         rs = pick(rng, BOUNDARIES) or 1

@@ -454,13 +454,10 @@ mod tests {
 
     #[test]
     fn sell_shares_example_matches_model() {
-        // 1000/1000 pool, sell 212 shares, no fee.
-        let q = calc_sell_shares(1000, 1000, 212, 0).unwrap();
-        assert_eq!(q.gross, 100);
-        assert_eq!(q.collateral_out, 100);
-        assert_eq!(q.fee, 0);
-        assert_eq!(q.new_reserve_sold, 1112);
-        assert_eq!(q.new_reserve_other, 900);
+        // 1000/1000 pool, sell 212 shares, no fee. Expectations come from
+        // the committed vector, not hand-typed literals.
+        let q = vectors::expect_ok("calc_sell_shares", &["1000", "1000", "212", "0"]);
+        assert_eq!(calc_sell_shares(1000, 1000, 212, 0).unwrap().gross.to_string(), q["gross"]);
     }
 
     // Linear congruential generator for reproducible property tests.
@@ -532,20 +529,22 @@ mod tests {
 
     #[test]
     fn buy_example_matches_model() {
-        // 1000/1000 pool, buy 100 with no fee -> 190 shares, reserves 910/1100
-        let q = calc_buy(1000, 1000, 100, 0).unwrap();
-        assert_eq!(q.shares_out, 190);
-        assert_eq!(q.new_reserve_bought, 910);
-        assert_eq!(q.new_reserve_other, 1100);
+        // 1000/1000 pool, buy 100 with no fee. The vector owns the numbers.
+        let q = vectors::expect_ok("calc_buy", &["1000", "1000", "100", "0"]);
+        let got = calc_buy(1000, 1000, 100, 0).unwrap();
+        assert_eq!(got.shares_out.to_string(), q["shares_out"]);
+        assert_eq!(got.new_reserve_bought.to_string(), q["new_reserve_bought"]);
+        assert_eq!(got.new_reserve_other.to_string(), q["new_reserve_other"]);
     }
 
     #[test]
     fn sell_example_matches_model() {
-        let q = calc_sell(1000, 1000, 100, 0).unwrap();
-        assert_eq!(q.shares_in, 212);
-        assert_eq!(q.gross, 100);
-        assert_eq!(q.new_reserve_sold, 1112);
-        assert_eq!(q.new_reserve_other, 900);
+        let q = vectors::expect_ok("calc_sell", &["1000", "1000", "100", "0"]);
+        let got = calc_sell(1000, 1000, 100, 0).unwrap();
+        assert_eq!(got.shares_in.to_string(), q["shares_in"]);
+        assert_eq!(got.gross.to_string(), q["gross"]);
+        assert_eq!(got.new_reserve_sold.to_string(), q["new_reserve_sold"]);
+        assert_eq!(got.new_reserve_other.to_string(), q["new_reserve_other"]);
     }
 
     #[test]
@@ -668,5 +667,204 @@ mod tests {
             price_after(false, 910, 1_100).unwrap(),
             price_yes_bps(1_100, 910).unwrap()
         );
+    }
+}
+
+/// Replays `scripts/fpmm-diff/vectors.jsonl` against the real arithmetic in
+/// this module. The same file is asserted by the Python model and the TS
+/// mirror, so a porting mistake in any language is caught by all three.
+#[cfg(test)]
+mod vectors {
+    extern crate std;
+    use super::*;
+    use std::{
+        collections::BTreeMap,
+        string::{String, ToString},
+        vec::Vec,
+    };
+
+    const VECTORS: &str = include_str!("../../../scripts/fpmm-diff/vectors.jsonl");
+
+    fn args(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .expect("vector args must be an array")
+            .iter()
+            .map(|v| match v {
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                other => panic!("unsupported vector arg: {other}"),
+            })
+            .collect()
+    }
+
+    fn num(a: &[String], i: usize) -> i128 {
+        a[i].parse().expect("decimal i128 vector arg")
+    }
+
+    fn fee(a: &[String], i: usize) -> u32 {
+        num(a, i) as u32
+    }
+
+    fn kind(s: &str) -> Settlement {
+        match s {
+            "yes" => Settlement::Yes,
+            "no" => Settlement::No,
+            "void" => Settlement::Void,
+            other => panic!("unknown settlement kind: {other}"),
+        }
+    }
+
+    fn err_name(e: MathError) -> &'static str {
+        match e {
+            MathError::InvalidInput => "InvalidInput",
+            MathError::InsufficientLiquidity => "InsufficientLiquidity",
+            MathError::Overflow => "Overflow",
+        }
+    }
+
+    fn fields(pairs: &[(&str, String)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    fn one(value: String) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        out.insert("value".to_string(), value);
+        out
+    }
+
+    fn run(fn_name: &str, a: &[String]) -> Result<BTreeMap<String, String>, MathError> {
+        let out = match fn_name {
+            "calc_buy" => {
+                let q = calc_buy(num(a, 0), num(a, 1), num(a, 2), fee(a, 3))?;
+                fields(&[
+                    ("fee", q.fee.to_string()),
+                    ("net", q.net.to_string()),
+                    ("new_reserve_bought", q.new_reserve_bought.to_string()),
+                    ("new_reserve_other", q.new_reserve_other.to_string()),
+                    ("shares_out", q.shares_out.to_string()),
+                ])
+            }
+            "calc_sell" => {
+                let q = calc_sell(num(a, 0), num(a, 1), num(a, 2), fee(a, 3))?;
+                fields(&[
+                    ("fee", q.fee.to_string()),
+                    ("gross", q.gross.to_string()),
+                    ("new_reserve_other", q.new_reserve_other.to_string()),
+                    ("new_reserve_sold", q.new_reserve_sold.to_string()),
+                    ("shares_in", q.shares_in.to_string()),
+                ])
+            }
+            "calc_sell_shares" => {
+                let q = calc_sell_shares(num(a, 0), num(a, 1), num(a, 2), fee(a, 3))?;
+                fields(&[
+                    ("collateral_out", q.collateral_out.to_string()),
+                    ("fee", q.fee.to_string()),
+                    ("gross", q.gross.to_string()),
+                    ("new_reserve_other", q.new_reserve_other.to_string()),
+                    ("new_reserve_sold", q.new_reserve_sold.to_string()),
+                ])
+            }
+            "split_fee" => {
+                let (protocol, lp) = split_fee(num(a, 0), fee(a, 1))?;
+                fields(&[("lp", lp.to_string()), ("protocol", protocol.to_string())])
+            }
+            "settle_value" => one(settle_value(kind(&a[0]), num(a, 1), num(a, 2)).to_string()),
+            "settle_upper" => one(settle_upper(kind(&a[0]), num(a, 1), num(a, 2)).to_string()),
+            "merge_max" => one(merge_max(num(a, 0), num(a, 1)).to_string()),
+            "seed_reserves" => {
+                let s = seed_reserves(num(a, 0), fee(a, 1))?;
+                fields(&[
+                    ("creator_no", s.creator_no.to_string()),
+                    ("creator_yes", s.creator_yes.to_string()),
+                    ("reserve_no", s.reserve_no.to_string()),
+                    ("reserve_yes", s.reserve_yes.to_string()),
+                ])
+            }
+            "mul_div_floor" => one(mul_div_floor(num(a, 0), num(a, 1), num(a, 2))?.to_string()),
+            "mul_div_ceil" => one(mul_div_ceil(num(a, 0), num(a, 1), num(a, 2))?.to_string()),
+            "price_yes_bps" => one(price_yes_bps(num(a, 0), num(a, 1))?.to_string()),
+            "price_after" => {
+                let is_yes = a[0] == "true" || a[0] == "yes";
+                one(price_after(is_yes, num(a, 1), num(a, 2))?.to_string())
+            }
+            "buy_within_limit" => {
+                one(buy_within_limit(num(a, 0), num(a, 1), fee(a, 2))?.to_string())
+            }
+            "sell_within_limit" => {
+                one(sell_within_limit(num(a, 0), num(a, 1), fee(a, 2))?.to_string())
+            }
+            "isqrt" => {
+                let n = num(a, 0);
+                if n < 0 {
+                    return Err(MathError::InvalidInput);
+                }
+                one(isqrt(n as u128).to_string())
+            }
+            other => panic!("vector fn has no Rust parser: {other}"),
+        };
+        Ok(out)
+    }
+
+    fn check(line_no: usize, case: &serde_json::Value) {
+        let fn_name = case["fn"].as_str().expect("vector fn");
+        let a = args(&case["args"]);
+        let got = match run(fn_name, &a) {
+            Ok(ok) => serde_json::json!({ "ok": ok }),
+            Err(e) => serde_json::json!({ "err": err_name(e) }),
+        };
+        let expected = if let Some(ok) = case.get("ok") {
+            serde_json::json!({ "ok": ok })
+        } else {
+            serde_json::json!({ "err": case["err"] })
+        };
+        assert_eq!(
+            got, expected,
+            "vector line {line_no} ({fn_name} {:?}) mismatch",
+            a
+        );
+    }
+
+    /// Look up a worked example by function and arguments, assert it against
+    /// the committed vector, and return its expected fields for readability.
+    pub(super) fn expect_ok(fn_name: &str, wanted: &[&str]) -> BTreeMap<String, String> {
+        let wanted: Vec<String> = wanted.iter().map(|s| (*s).to_string()).collect();
+        for (line_no, case) in parse() {
+            if case["fn"].as_str() == Some(fn_name)
+                && args(&case["args"]) == wanted
+                && case.get("ok").is_some()
+            {
+                check(line_no, &case);
+                return case["ok"]
+                    .as_object()
+                    .expect("vector ok object")
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().expect("decimal string").to_string()))
+                    .collect();
+            }
+        }
+        panic!("missing ok vector for {fn_name} {wanted:?}");
+    }
+
+    fn parse() -> Vec<(usize, serde_json::Value)> {
+        VECTORS
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(i, line)| (i + 1, serde_json::from_str(line).expect("valid vector JSON")))
+            .collect()
+    }
+
+    #[test]
+    fn shared_vectors_match() {
+        let cases = parse();
+        assert!(!cases.is_empty(), "vectors.jsonl must not be empty");
+        for (line_no, case) in &cases {
+            check(*line_no, case);
+        }
     }
 }

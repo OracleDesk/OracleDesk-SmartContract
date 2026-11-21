@@ -1,9 +1,9 @@
 /*
  * TypeScript/BigInt mirror of contracts/market-core/src/math.rs and
- * model/fpm_model.py. Kept in lockstep with both by hand; fpmm.test.ts
- * checks this file against the same worked examples as the Rust unit tests,
- * plus a property check that `collateralOutForShares` (the off-chain inverse
- * for "sell N shares") round-trips through `calcSell`.
+ * model/fpmm_model.py. Kept in lockstep with both by the committed
+ * vectors.jsonl; fpmm.test.ts also checks the worked examples and the
+ * property that the deprecated off-chain inverse round-trips through
+ * `calcSell`. `calcSellShares` is the canonical exact-share quote.
  *
  * All amounts are non-negative bigints in collateral base units (USDC on
  * Stellar = 7 decimals). Rounding always favours the pool, matching the
@@ -120,6 +120,26 @@ export function settleValue(kind: Settlement, yes: bigint, no: bigint): bigint {
   return (yes + no) / 2n;
 }
 
+/**
+ * Mirror of math.rs::split_fee: the protocol share rounds up so the two
+ * portions always sum back to `fee` with no rounding leakage.
+ */
+export function splitFee(fee: bigint, protocolShareBps: bigint): { protocol: bigint; lp: bigint } {
+  if (fee < 0n || protocolShareBps < 0n || protocolShareBps > BPS) {
+    throw new MathError("invalid input");
+  }
+  const protocol = mulDivCeil(fee, protocolShareBps, BPS);
+  return { protocol, lp: fee - protocol };
+}
+
+/**
+ * Mirror of math.rs::settle_upper: the aggregate payout bound used by
+ * finalize_market. It matches settleValue for every in-domain claim pair.
+ */
+export function settleUpper(kind: Settlement, yes: bigint, no: bigint): bigint {
+  return settleValue(kind, yes, no);
+}
+
 export function mergeMax(yes: bigint, no: bigint): bigint {
   if (yes < 0n || no < 0n) throw new MathError("invalid input");
   return yes < no ? yes : no;
@@ -132,7 +152,7 @@ export function mergeMax(yes: bigint, no: bigint): bigint {
  * function is also used by the deprecated off-chain inverse below.
  */
 export function isqrt(n: bigint): bigint {
-  if (n < 0n) throw new MathError("isqrt of negative");
+  if (n < 0n) throw new MathError("invalid input");
   if (n < 2n) return n;
   // Seed at or above the root via bit length, like the Rust version.
   const bits = n.toString(2).length;

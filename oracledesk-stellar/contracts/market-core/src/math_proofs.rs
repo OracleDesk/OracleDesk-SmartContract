@@ -14,8 +14,8 @@
 //! and known gaps.
 
 use crate::math::{
-    calc_buy, calc_sell, mul_div_ceil, mul_div_floor, price_yes_bps, seed_reserves, BPS,
-    MAX_PROB_BPS, MAX_SETS, MIN_PROB_BPS,
+    calc_buy, calc_sell, calc_sell_shares, isqrt, mul_div_ceil, mul_div_floor, price_yes_bps,
+    seed_reserves, BPS, MAX_PROB_BPS, MAX_SETS, MIN_PROB_BPS,
 };
 use kani::assume;
 
@@ -267,4 +267,69 @@ fn proof_price_yes_bps_bounds() {
     assume_reserve(r_no);
     let price = price_yes_bps(r_yes, r_no).expect("sum is positive");
     assert!((0..=BPS).contains(&price));
+}
+
+/// `isqrt` is the floor of the square root: it never overshoots, and the next
+/// integer always does. Inputs are symbolic u64 widened to u128, which covers
+/// every discriminant reachable from in-domain reserves and share counts.
+#[kani::proof]
+#[kani::unwind(8)]
+fn proof_isqrt_floor() {
+    let n: u64 = kani::any();
+    let n = n as u128;
+    let r = isqrt(n);
+    assert!(r * r <= n);
+    if let Some(next) = r.checked_add(1) {
+        assert!(n < next * next);
+    }
+}
+
+/// The exact-share sell path must not reduce the constant product. The
+/// pool-favouring correction loop exists precisely to enforce this.
+#[kani::proof]
+#[kani::unwind(3)]
+fn proof_calc_sell_shares_k_monotone() {
+    let r_sold: i128 = kani::any();
+    let r_other: i128 = kani::any();
+    let shares_in: i128 = kani::any();
+    let fee_bps: u32 = kani::any();
+    assume_reserve(r_sold);
+    assume_reserve(r_other);
+    assume!(shares_in > 0 && shares_in <= MAX_SETS);
+    assume_contract_fee(fee_bps);
+
+    if let Ok(q) = calc_sell_shares(r_sold, r_other, shares_in, fee_bps) {
+        let k_before = r_sold * r_other;
+        let k_after = q.new_reserve_sold * q.new_reserve_other;
+        assert!(k_after >= k_before, "sell_shares must never decrease k");
+    }
+}
+
+/// The exact-share quote never pays out more collateral than the forward
+/// `calc_sell` would charge for the same share count. Feeding the quoted
+/// payout back through `calc_sell` must therefore never require more shares
+/// than the seller supplied (one unit of rounding tolerance is enough).
+#[kani::proof]
+#[kani::unwind(3)]
+fn proof_calc_sell_shares_le_calc_sell() {
+    let r_sold: i128 = kani::any();
+    let r_other: i128 = kani::any();
+    let shares_in: i128 = kani::any();
+    let fee_bps: u32 = kani::any();
+    assume_reserve(r_sold);
+    assume_reserve(r_other);
+    assume!(shares_in > 0 && shares_in <= MAX_SETS);
+    assume_contract_fee(fee_bps);
+
+    if let Ok(q) = calc_sell_shares(r_sold, r_other, shares_in, fee_bps) {
+        assert!(q.collateral_out <= shares_in);
+        assert!(q.new_reserve_sold > r_sold);
+        assert!(q.new_reserve_other < r_other);
+        if let Ok(back) = calc_sell(r_sold, r_other, q.collateral_out, fee_bps) {
+            assert!(
+                back.shares_in <= shares_in + 1,
+                "exact-share quote must not overpay"
+            );
+        }
+    }
 }
