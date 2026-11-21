@@ -430,7 +430,7 @@ pub enum Error {
     BatchTooLarge = 31,
     /// Inbound collateral transfer delivered fewer (or different) units than
     /// expected, e.g. a fee-on-transfer or under-delivering token (#137).
-    CollateralShortfall = 32,
+    CollateralShortfall = 39,
     /// `create_market` used a token missing from, or disabled in, the
     /// admin collateral allow-list (#151).
     CollateralNotAllowed = 32,
@@ -2248,6 +2248,8 @@ impl MarketCore {
             return Err(Error::CollateralShortfall);
         }
         Ok(())
+    }
+
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {
