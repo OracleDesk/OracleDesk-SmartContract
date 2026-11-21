@@ -9,7 +9,7 @@
  * packages/bindings/<name> — see README.md's quickstart).
  */
 
-import { Account, Address, Contract, Keypair, rpc, scValToNative, TransactionBuilder, xdr, type Transaction } from "@stellar/stellar-sdk";
+import { Account, Address, Contract, Keypair, Operation, rpc, scValToNative, TransactionBuilder, xdr, type Transaction } from "@stellar/stellar-sdk";
 import { KeypairSigner, type MethodOptions } from "@stellar/stellar-sdk/contract";
 import type { Client as MarketCoreBindingClient } from "@oracledesk/bindings-market-core";
 import type { Client as ReasoningRegistryBindingClient } from "@oracledesk/bindings-reasoning-registry";
@@ -33,6 +33,16 @@ import {
   type FeeStatsResponse,
 } from "./fees.js";
 import { feeChargedOf, submitSorobanTransaction, type ReplacementPolicy } from "./submit.js";
+import { isArchivalError } from "./errors.js";
+import {
+  RestoreBudget,
+  restoreKeysOf,
+  restorePlanFromSimulation,
+  restoreRentOf,
+  type RestorePlan,
+} from "./restore.js";
+import type { RestoreConfig } from "../core/config.js";
+import type { StateStore } from "../runtime/state.js";
 import type { StellarSigner } from "./signers/types.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -90,6 +100,18 @@ export interface FeeReport {
   bumps: number;
 }
 
+/** Operator-visible restore budget/plan report (#323). */
+export interface RestoreReport {
+  task: string;
+  method: string;
+  decisionId: string;
+  plan: RestorePlan["kind"];
+  keys: string[];
+  rentEstimate: string;
+  remainingDailyBudget: string;
+  allowed: boolean;
+}
+
 interface CommonAdapterOptions {
   networkPassphrase: string;
   rpcUrl: string;
@@ -102,12 +124,24 @@ interface CommonAdapterOptions {
   task?: string;
   onFeeCharged?: (report: FeeReport) => void;
   nowUnix?: () => number;
+  /** Persists the per-task restore spend (#323). */
+  state?: StateStore;
+  /** Overrides for the archival restore caps. */
+  restore?: Partial<RestoreConfig>;
+  /** Emitted for every detected restore, including dry-run plans. */
+  onRestore?: (report: RestoreReport) => void;
 }
 
 interface AssembledCall<T = unknown> {
   built?: Transaction;
   signed?: Transaction;
-  simulation?: { error?: string };
+  simulation?: {
+    error?: string;
+    transactionData?: string;
+    minResourceFee?: string | number | bigint;
+    restorePreamble?: { transactionData: string; minResourceFee: string | number | bigint };
+    latestLedger?: number;
+  };
   result?: T | unknown;
   signAndSend(): Promise<{ result: T | unknown; sendTransactionResponse?: { hash?: string } }>;
 }
@@ -143,6 +177,8 @@ export interface DryRunResult {
   contractId: string;
   method: string;
   args: unknown;
+  /** Restore plan detected while preparing the call, when available. */
+  restore?: RestorePlan;
 }
 
 /** Real result shape depends on the call; see each wrapper method below. */
@@ -235,8 +271,21 @@ export class StellarAdapter {
   private readonly feePayerKeypair?: Keypair;
   private readonly feeSpent = new Map<string, bigint>();
   private feeStatsCache?: { ledger: number; stats: FeeStatsResponse };
+  private readonly restoreBudget: RestoreBudget;
+  /** Last non-restore resource fee per contract method, for inline rent estimates. */
+  private readonly restoreBaselines = new Map<string, bigint>();
 
   constructor(private readonly opts: StellarAdapterOptions) {
+    this.restoreBudget = new RestoreBudget(
+      {
+        maxFeeStroops: 100_000_000n,
+        dailyBudgetStroops: 300_000_000n,
+        maxRetries: 2,
+        ...opts.restore,
+      },
+      opts.state,
+      () => this.nowUnix(),
+    );
     switch (opts.mode) {
       case "dry-run":
         if (opts.agentSecret !== undefined || opts.signer !== undefined) {
@@ -401,6 +450,10 @@ export class StellarAdapter {
    * Runs `method(client)` (a call to one of the generated Client's methods,
    * returning its `AssembledTransaction`) either as a dry-run description
    * or a real signed submission, depending on `this.mode`.
+   *
+   * Live submissions are split into prepare (simulate + restore plan), sign
+   * and journaled submit. An entry that archives between simulation and apply
+   * is retried by re-simulating, never by rebroadcasting the stale envelope.
    */
   private async run<C, T>(
     pkg: keyof Deployments["contracts"],
@@ -408,18 +461,68 @@ export class StellarAdapter {
     methodName: string,
     args: unknown,
     call: (client: C, options?: MethodOptions) => Promise<AssembledCall<T>>,
-    opts: { deadlineUnix?: bigint } = {},
+    opts: { deadlineUnix?: bigint; restorePlan?: RestorePlan } = {},
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
     switch (this.opts.mode) {
       case "dry-run":
         await this.opts.beforeSend?.();
-        return { dryRun: true, contractId, method: methodName, args };
+        if (opts.restorePlan) this.reportRestore(methodName, "", opts.restorePlan, true);
+        return { dryRun: true, contractId, method: methodName, args, ...(opts.restorePlan && { restore: opts.restorePlan }) };
       case "live":
         break;
       default:
         assertNever(this.opts, "mode", (this.opts as { mode?: unknown }).mode);
     }
+
+    const maxRetries = this.restoreBudget.maxRetries;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.attemptRun(pkg, moduleName, methodName, args, call, opts, attempt);
+      } catch (error) {
+        if (!isArchivalError(error) || attempt >= maxRetries) throw error;
+      }
+    }
+  }
+
+  private baselineKey(pkg: string, methodName: string): string {
+    return `${pkg}:${methodName}`;
+  }
+
+  private resourceFeeOfCall(assembled: AssembledCall<unknown>): bigint {
+    const built = assembled.built ?? assembled.signed;
+    return built ? resourceFeeOf(built) : 0n;
+  }
+
+  private reportRestore(method: string, decisionId: string, plan: RestorePlan, allowed: boolean): void {
+    const report: RestoreReport = {
+      task: this.taskName,
+      method,
+      decisionId,
+      plan: plan.kind,
+      keys: restoreKeysOf(plan),
+      rentEstimate: restoreRentOf(plan).toString(),
+      remainingDailyBudget: this.restoreBudget.remaining(this.taskName).toString(),
+      allowed,
+    };
+    this.opts.onRestore?.(report);
+    if (plan.kind !== "none" && !allowed) {
+      console.warn(`[restore] ${method}: ${report.keys.join(", ")} rent ${report.rentEstimate} stroops refused (budget)`);
+    } else if (plan.kind !== "none") {
+      console.warn(`[restore] ${method}: ${plan.kind} ${report.keys.join(", ")} rent ${report.rentEstimate} stroops`);
+    }
+  }
+
+  /** One simulate → (restore) → sign → submit attempt. */
+  private async attemptRun<C, T>(
+    pkg: keyof Deployments["contracts"],
+    moduleName: string,
+    methodName: string,
+    args: unknown,
+    call: (client: C, options?: MethodOptions) => Promise<AssembledCall<T>>,
+    opts: { deadlineUnix?: bigint; restorePlan?: RestorePlan },
+    attempt: number,
+  ): Promise<AdapterResult<T>> {
     let assembled: AssembledCall<T>;
     try {
       const options = await this.feeOptionsFor(methodName, opts.deadlineUnix);
@@ -431,6 +534,42 @@ export class StellarAdapter {
     if (assembled.simulation?.error) {
       throw new NotSubmittedError(`${methodName} simulation failed: ${assembled.simulation.error}`);
     }
+
+    const key = this.baselineKey(pkg, methodName);
+    const baseline = this.restoreBaselines.get(key);
+    let plan = restorePlanFromSimulation(assembled.simulation ?? {}, baseline);
+    if (plan.kind === "none") this.restoreBaselines.set(key, this.resourceFeeOfCall(assembled));
+
+    const decisionId = attempt === 0 ? this.decisionId(methodName) : `${this.decisionId(methodName)}:retry-${attempt}`;
+    const refusal = this.restoreBudget.check(plan, this.taskName);
+    this.reportRestore(methodName, decisionId, plan, refusal === undefined);
+    if (refusal !== undefined) throw new NotSubmittedError(`${methodName}: ${refusal} [${restoreKeysOf(plan).join(", ")}]`);
+    this.restoreBudget.charge(plan, this.taskName);
+
+    if (plan.kind === "preamble") {
+      await this.submitRestoreFootprint(plan, decisionId, opts.deadlineUnix);
+      // Never reuse a stale simulation: the restore changes the ledger state.
+      const client = await this.client<C>(pkg, moduleName);
+      const options = await this.feeOptionsFor(methodName, opts.deadlineUnix);
+      try {
+        assembled = await call(client, options);
+      } catch (err) {
+        throw new NotSubmittedError(`${methodName}: re-simulation after restore failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+      }
+      if (assembled.simulation?.error) {
+        throw new NotSubmittedError(`${methodName} simulation after restore failed: ${assembled.simulation.error}`);
+      }
+      const after = restorePlanFromSimulation(assembled.simulation ?? {}, baseline);
+      if (after.kind === "preamble") throw new NotSubmittedError(`${methodName}: restore preamble did not clear`);
+      if (after.kind === "inline") {
+        const afterRefusal = this.restoreBudget.check(after, this.taskName);
+        this.reportRestore(methodName, decisionId, after, afterRefusal === undefined);
+        if (afterRefusal !== undefined) throw new NotSubmittedError(`${methodName}: ${afterRefusal}`);
+        this.restoreBudget.charge(after, this.taskName);
+      }
+      plan = after;
+    }
+
     const actionClass = feePolicyFor(methodName);
     const rule = this.opts.feePolicy?.policies[actionClass];
     const built = assembled.built ?? assembled.signed;
@@ -442,7 +581,6 @@ export class StellarAdapter {
       this.reserveDailyFee(actionClass, rule);
 
       const stats = await this.feeStats();
-      const decisionId = this.decisionId(methodName);
       const counter = { count: 0 };
       const result = await submitSorobanTransaction({
         id: decisionId,
@@ -461,6 +599,8 @@ export class StellarAdapter {
           counter,
         ),
         nowUnix: this.opts.nowUnix,
+        kind: "action",
+        ...(attempt > 0 && { dependsOn: `${decisionId.replace(/:retry-\d+$/, "")}` }),
       });
       const fee: FeeReport = {
         task: this.taskName,
@@ -482,6 +622,61 @@ export class StellarAdapter {
     const sent = await assembled.signAndSend();
     const txHash = sent.sendTransactionResponse?.hash;
     return { dryRun: false, value: unwrapContractResult(methodName, sent.result as T), ...(txHash ? { txHash } : {}) };
+  }
+
+  /**
+   * Submits an `Operation.restoreFootprint` built from the RPC's preamble.
+   * Uses the same source account as the dependent action so a channel account
+   * (#258) cannot break the restore → action ordering.
+   */
+  private async submitRestoreFootprint(
+    plan: Extract<RestorePlan, { kind: "preamble" }>,
+    actionId: string,
+    deadlineUnix?: bigint,
+  ): Promise<void> {
+    const journal = this.opts.journal;
+    if (!journal) throw new NotSubmittedError("a restore preamble requires a transaction journal in live mode");
+    const source = await this.rpcServer().getAccount(this.agent);
+    const rule = this.opts.feePolicy?.policies.maintenance;
+    const stats = await this.feeStats().catch(() => undefined);
+    const observed = stats ? BigInt(stats.sorobanInclusionFee.p90) : 100n;
+    const cap = rule?.maxInclusion ?? 10_000n;
+    const bid = observed < 100n ? 100n : observed > cap ? cap : observed;
+    const timeout = deadlineUnix === undefined ? 60 : Math.max(1, Number(deadlineUnix - BigInt(this.nowUnix())));
+    let tx = new TransactionBuilder(source, { fee: (bid + plan.minResourceFee).toString(), networkPassphrase: this.opts.networkPassphrase })
+      .addOperation(Operation.restoreFootprint({}))
+      .setSorobanData(plan.footprint)
+      .setTimeout(timeout)
+      .build();
+    if (this.agentKeypair) tx.sign(this.agentKeypair);
+    else {
+      const signer = this.signer as unknown as ((transaction: Transaction) => Promise<Transaction>) | undefined;
+      if (!signer) throw new NotSubmittedError("a restore preamble needs a local key or a transaction signer");
+      tx = await signer(tx);
+    }
+    await submitSorobanTransaction({
+      id: `${actionId}:restore`,
+      transaction: tx,
+      server: this.rpcServer(),
+      journal,
+      maxAttempts: 3,
+      maxPollsPerAttempt: 5,
+      beforeSend: this.opts.beforeSend,
+      nowUnix: this.opts.nowUnix,
+      kind: "restore",
+    });
+  }
+
+  /** Simulates a call (never signs) and returns its restore plan (#323). */
+  async planRestore<C>(
+    pkg: keyof Deployments["contracts"],
+    moduleName: string,
+    call: (client: C) => Promise<AssembledCall<unknown>>,
+  ): Promise<RestorePlan> {
+    const client = await this.client<C>(pkg, moduleName);
+    const assembled = await call(client);
+    if (assembled.simulation?.error) throw new NotSubmittedError(`restore plan simulation failed: ${assembled.simulation.error}`);
+    return restorePlanFromSimulation(assembled.simulation ?? {}, this.restoreBaselines.get(this.baselineKey(pkg, "plan")));
   }
 
   private async journalCancelled(methodName: string, assembled: unknown, error: unknown): Promise<void> {
@@ -860,8 +1055,29 @@ export class StellarAdapter {
     };
   }
 
-  /** Cumulative treasury spend for this market; sells and close_trade do not erase it. */
-  async marketExposure(marketId: bigint): Promise<bigint> {
+  /** Reads ledger keys together with the ledger they were read at, so TTLs can
+   * be interpreted (#323). An entry with `liveUntilLedgerSeq < latestLedger`
+   * is archived, not live, even though RPC still returns its bytes. */
+  private async readLedger(keys: xdr.LedgerKey[]): Promise<{
+    entries: Awaited<ReturnType<rpc.Server["getLedgerEntries"]>>["entries"];
+    latestLedger: number;
+  }> {
+    const response = await this.rpcServer().getLedgerEntries(...keys);
+    const latest = (response as { latestLedger?: number }).latestLedger
+      ?? (await this.rpcServer().getLatestLedger()).sequence;
+    return { entries: response.entries, latestLedger: latest };
+  }
+
+  private archived(entry: { liveUntilLedgerSeq?: number } | undefined, latestLedger: number): boolean {
+    return entry?.liveUntilLedgerSeq !== undefined && entry.liveUntilLedgerSeq < latestLedger;
+  }
+
+  /**
+   * Cumulative treasury spend for this market; sells and close_trade do not
+   * erase it. archived=true means the persistent entry needs a restore; no
+   * stale value is ever returned as live.
+   */
+  async marketExposureState(marketId: bigint): Promise<{ archived: boolean; amount?: bigint }> {
     const key = xdr.LedgerKey.contractData(
       new xdr.LedgerKeyContractData({
         contract: new Address(this.opts.deployments.contracts.treasury).toScAddress(),
@@ -869,13 +1085,20 @@ export class StellarAdapter {
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
-    const { entries } = await this.rpcServer().getLedgerEntries(key);
+    const { entries, latestLedger } = await this.readLedger([key]);
     const entry = entries[0];
-    if (!entry) return 0n;
+    if (!entry || this.archived(entry, latestLedger)) return { archived: entry !== undefined };
     const data = entry.val.contractData()?.val();
     const amount = data?.map()?.find((item) => item.key().sym?.().toString() === "amount")?.val()?.i128()?.toString();
     if (amount === undefined) throw new Error(`treasury market exposure ${marketId} has an invalid ledger entry`);
-    return BigInt(amount);
+    return { archived: false, amount: BigInt(amount) };
+  }
+
+  /** Cumulative treasury spend for this market; throws when the entry is archived. */
+  async marketExposure(marketId: bigint): Promise<bigint> {
+    const state = await this.marketExposureState(marketId);
+    if (state.archived) throw new NotSubmittedError(`treasury market exposure ${marketId} is archived; restore it before trading`);
+    return state.amount ?? 0n;
   }
 
   /** What the treasury has committed to `marketId` (its cost basis). */
@@ -927,8 +1150,8 @@ export class StellarAdapter {
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
-    const { entries } = await new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") }).getLedgerEntries(key);
-    return entries.length > 0;
+    const { entries, latestLedger } = await this.readLedger([key]);
+    return entries.some((entry) => !this.archived(entry, latestLedger));
   }
 
   // ─── Disputes (resolver) ────────────────────────────────────────────────
@@ -975,9 +1198,9 @@ export class StellarAdapter {
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
-    const { entries } = await this.rpcServer().getLedgerEntries(key);
+    const { entries, latestLedger } = await this.readLedger([key]);
     const entry = entries[0];
-    if (!entry) return undefined;
+    if (!entry || this.archived(entry, latestLedger)) return undefined;
     return scValToNative(entry.val.contractData().val()) as T;
   }
 

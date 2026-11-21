@@ -1,4 +1,11 @@
-export type SorobanErrorKind = "contract" | "auth" | "fee" | "transient" | "unknown";
+export type SorobanErrorKind =
+  | "contract"
+  | "auth"
+  | "fee"
+  | "archived_entry"
+  | "restore_failed"
+  | "transient"
+  | "unknown";
 
 export interface SorobanErrorClassification {
   kind: SorobanErrorKind;
@@ -33,11 +40,30 @@ function collectText(value: unknown, seen = new Set<object>()): string[] {
 /**
  * Classify explicit Soroban contract/auth failures as terminal. Generic RPC
  * and transport failures remain unknown, because they may have reached a node.
+ * Archival failures are non-terminal: the entry can be restored and the
+ * simulation retried, so an agent must never treat them as contract errors.
  */
 export function classifySorobanError(value: unknown): SorobanErrorClassification {
   const message = collectText(value).join(" ").replace(/\s+/g, " ").trim() || String(value);
   const normalized = message.toLowerCase();
 
+  // A failed RestoreFootprint transaction (or a restore preamble that cannot
+  // be satisfied) is distinct from an archived entry in the action itself.
+  if (
+    /\brestore[_ -]?(failed|footprint|error)\b/.test(normalized) ||
+    (/\brestore\b/.test(normalized) && /\b(fail|error|invalid|missing)\b/.test(normalized))
+  ) {
+    return { kind: "restore_failed", terminal: true, message };
+  }
+  // HostError(Ledger, #…)/contract diagnostics emitted when a footprint entry
+  // archived between simulation and apply. Re-simulate rather than blame the
+  // market logic.
+  if (
+    /\b(archived|archivedentry|archived_entry|entryarchived|entry_archived|storagetombstone|tombstone|ledgerentryarchived|restorerequired|restore_required|expiredstate|expired_state)\b/.test(normalized) ||
+    (/\b(hosterror|host_error)\b/.test(normalized) && /\bledger\b/.test(normalized) && /\b(archiv|expir|restor)/.test(normalized))
+  ) {
+    return { kind: "archived_entry", terminal: false, message };
+  }
   if (
     /\b(tx_bad_auth|txbadauth|bad_auth|badauth)\b/.test(normalized) ||
     (/\b(auth|authorization|signature)\b/.test(normalized) &&
@@ -65,6 +91,12 @@ export function classifySorobanError(value: unknown): SorobanErrorClassification
     return { kind: "transient", terminal: false, message };
   }
   return { kind: "unknown", terminal: false, message };
+}
+
+/** True when the failure should be retried with a fresh simulation. */
+export function isArchivalError(value: unknown): boolean {
+  const kind = classifySorobanError(value).kind;
+  return kind === "archived_entry" || kind === "restore_failed";
 }
 
 export class SorobanSubmissionError extends Error {

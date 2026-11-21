@@ -8,6 +8,7 @@
  * sequence always produce the same faults. `history` records what fired.
  */
 import { Rng } from "../../sim/rng.js";
+import type { ArchiveKey } from "./model.js";
 
 export type RpcMethod =
   | "getHealth"
@@ -43,6 +44,11 @@ export type Fault =
   | { kind: "apply-failure"; error: string }
   /** sendTransaction: accepted and applied, then the connection is reset before the response. */
   | { kind: "reset-after-accept" }
+  /** Expires a modelled persistent entry before simulation or just before apply (#323). */
+  | { kind: "archive"; key: ArchiveKey; at: "before-sim" | "between-sim-and-apply" }
+  /** simulateTransaction: asks for a separate RestoreFootprint instead of an
+   * inline restore list (#323). */
+  | { kind: "restore-preamble" }
   | { kind: "surge"; minInclusion: string | number | bigint; ledgers: number };
 
 export interface FaultRule {

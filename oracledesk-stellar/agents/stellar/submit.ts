@@ -28,6 +28,10 @@ export interface SorobanSubmitOptions {
   beforeSend?: () => void | Promise<void>;
   replacement?: ReplacementPolicy;
   nowUnix?: () => number;
+  /** Journal lineage: a restore's id on the dependent action, or the action's
+   * id on a re-simulation after an archival race. */
+  dependsOn?: string;
+  kind?: "action" | "restore";
 }
 
 export type SorobanSubmitResult = Extract<Awaited<ReturnType<rpc.Server["getTransaction"]>>, { status: "SUCCESS" }>;
@@ -82,6 +86,8 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
     beforeSend,
     replacement,
     nowUnix = () => Math.floor(Date.now() / 1000),
+    dependsOn,
+    kind,
   } = options;
   if (!id) throw new TypeError("transaction journal id is required");
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new RangeError("maxAttempts must be a positive integer");
@@ -113,6 +119,8 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
       attempt,
       detail,
       ...extra,
+      ...(dependsOn && { dependsOn }),
+      ...(kind && { kind }),
     }));
 
   const canBump = () =>
@@ -165,8 +173,12 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
       await log("confirmed", attempt, undefined, extra);
       return found.result;
     }
-    await log("failed", attempt, "transaction finalized with FAILED status", extra);
-    throw makeError(found.result, innerHash);
+    const error = makeError(found.result, innerHash);
+    const detail = error.classification.kind === "archived_entry"
+      ? "footprint entry archived before apply; re-simulate the action"
+      : "transaction finalized with FAILED status";
+    await log("failed", attempt, detail, extra);
+    throw error;
   };
 
   await log("signed");

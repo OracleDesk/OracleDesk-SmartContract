@@ -15,6 +15,8 @@
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { toTraceAction } from "../../core/trace.js";
 import { StellarAdapter, type Deployments, type FeeReport } from "../../stellar/adapter.js";
+import type { RestoreConfig } from "../../core/config.js";
+import type { StateStore } from "../../runtime/state.js";
 import type { FeePolicy } from "../../stellar/fees.js";
 import type { TransactionJournal } from "../../stellar/journal.js";
 import { contractIdFor, CONTRACT_NAMES, loadArtifact, type ContractArtifact, type ContractName, type ProbeCall } from "./artifacts.js";
@@ -98,6 +100,8 @@ export interface FakeNetworkOptions {
   journal?: TransactionJournal;
   task?: string;
   onFeeCharged?: (report: FeeReport) => void;
+  state?: StateStore;
+  restore?: Partial<RestoreConfig>;
 }
 
 export async function startFakeNetwork(opts: FakeNetworkOptions = {}): Promise<FakeNetwork> {
@@ -159,6 +163,8 @@ export async function startFakeNetwork(opts: FakeNetworkOptions = {}): Promise<F
         journal: opts.journal,
         task: opts.task,
         onFeeCharged: opts.onFeeCharged,
+        state: opts.state,
+        restore: opts.restore,
       }),
     stop: async () => {
       Date.now = realNow;

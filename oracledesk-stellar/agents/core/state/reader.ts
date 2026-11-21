@@ -36,7 +36,7 @@ export class ChainStateReader {
 
     // Fetch portfolio and markets concurrently
     const [portfolioResult, marketResults] = await Promise.allSettled([
-      this.readPortfolio(),
+      this.readPortfolio(errors),
       this.readMarkets(marketIds, errors),
     ]);
 
@@ -79,14 +79,21 @@ export class ChainStateReader {
       this.opts.server.getLedgerEntries(...keys),
       RPC_TIMEOUT_MS,
       "getLedgerEntries(markets) timed out",
-    );
+    ) as { entries?: RpcLedgerEntry[]; latestLedger?: number };
+    const latestLedger = entries.latestLedger ?? Math.max(0, ...(entries.entries ?? []).map((e) => e.lastModifiedLedgerSeq));
 
     const markets = new Map<bigint, ChainMarket>();
     let minLedger = Infinity;
     let maxLedger = 0;
 
-    for (const entry of (entries as any).entries ?? []) {
+    for (const entry of entries.entries ?? []) {
       const typed = entry as RpcLedgerEntry;
+      // Archived persistent entries still have bytes on RPC, but reading them
+      // as live would trade against stale reserves (#323).
+      if (typed.liveUntilLedgerSeq !== undefined && typed.liveUntilLedgerSeq < latestLedger) {
+        errors.push({ scope: "market-archived", message: `market entry expired at ledger ${typed.liveUntilLedgerSeq}; restore it before use` });
+        continue;
+      }
       minLedger = Math.min(minLedger, typed.lastModifiedLedgerSeq);
       maxLedger = Math.max(maxLedger, typed.lastModifiedLedgerSeq);
       try {
@@ -103,16 +110,20 @@ export class ChainStateReader {
     };
   }
 
-  private async readPortfolio(): Promise<PortfolioState> {
+  private async readPortfolio(errors: Snapshot["errors"] = []): Promise<PortfolioState> {
     const key = buildPortfolioKey(this.opts.portfolioContractId);
     const entries = await withTimeout(
       this.opts.server.getLedgerEntries(key),
       RPC_TIMEOUT_MS,
       "getLedgerEntries(portfolio) timed out",
-    );
-    const first = ((entries as any).entries ?? [])[0];
+    ) as { entries?: RpcLedgerEntry[]; latestLedger?: number };
+    const first = entries.entries?.[0];
     if (!first) return defaultPortfolio();
-    return decodePortfolioEntry(first as RpcLedgerEntry);
+    if (first.liveUntilLedgerSeq !== undefined && first.liveUntilLedgerSeq < (entries.latestLedger ?? 0)) {
+      errors.push({ scope: "portfolio-archived", message: `portfolio entry expired at ledger ${first.liveUntilLedgerSeq}; restore it before use` });
+      return defaultPortfolio();
+    }
+    return decodePortfolioEntry(first);
   }
 }
 

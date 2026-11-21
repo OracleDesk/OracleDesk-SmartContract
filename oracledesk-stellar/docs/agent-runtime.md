@@ -151,6 +151,9 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `WATCHER_MAX_DISPUTES_PER_DAY` | 5 | disputes opened per UTC day |
 | `WATCHER_VERDICTS_FILE` | `./watcher-verdicts.json` | operator verdicts for the manual source |
 | `WATCHER_IPFS_GATEWAY` | | gateway used to fetch metadata and evidence traces (`local://` URIs need none) |
+| `RESTORE_MAX_FEE_STROOPS` | `100000000` | maximum restore rent charged to one action |
+| `RESTORE_DAILY_BUDGET_STROOPS` | `300000000` | maximum restore rent per task per UTC day (persisted) |
+| `RESTORE_MAX_RETRIES` | `2` | re-simulations after an entry archives between simulation and apply |
 
 ## Proposal watcher
 
@@ -230,6 +233,40 @@ counts as success: nothing is spent and their dispute is followed.
 registered with the reasoning registry (`register_agent`), because the trace is
 published before the dispute. It never acts as an escalation member and does
 not change bond economics.
+
+## State archival
+
+Soroban persistent entries can archive while a market's redemption window is
+still open. Before every live submission the adapter now **prepares** the call:
+it simulates, detects a restore requirement and prices it before signing.
+
+- A Protocol 23 simulation carries an inline restore list in its transaction
+  data. The rent estimate is the resource fee above the last non-restore
+  simulation of the same method (or the whole fee when there is no baseline).
+- If RPC returns a `restorePreamble`, the adapter journals a
+  `RestoreFootprint` transaction as `${actionId}:restore` with `kind:
+  "restore"`, submits it on the same source account, then **re-simulates** the
+  action. The action record carries `dependsOn`; on restart,
+  `TransactionJournal.resumableActions()` finds a confirmed (or hash-checkable)
+  restore whose action was never confirmed and resumes it. A second restore is
+  harmless on chain but is logged.
+- `RESTORE_MAX_FEE_STROOPS` caps one action and `RESTORE_DAILY_BUDGET_STROOPS`
+  caps one task per UTC day. Spend is persisted in the state store namespace
+  `restore.spend`, so restarts cannot reset it. Over budget produces
+  `NotSubmittedError("restore budget exceeded")` with the offending ledger keys
+  in the log and in `onRestore` reports.
+- A failure classified `archived_entry` (an entry archived between simulation
+  and apply) is retried by fresh simulation up to `RESTORE_MAX_RETRIES`; the
+  retry journal id carries `:retry-N`. Ambiguous submissions stay `uncertain`
+  and are never retried as if they had not landed.
+- Raw ledger reads check `liveUntilLedgerSeq` against the response's
+  `latestLedger`. An archived entry is never returned as a live value: market
+  reads surface a `market-archived` error, and `marketExposureState()` returns
+  `{ archived: true }`.
+- Read-only simulations report restores but never refuse a read; they surface
+  archival to the caller. Temporary `Band(u64)` entries are not restorable and
+  their absence is normal state. Restoring a whole contract instance is an
+  operator job, not an agent budget item.
 
 ## Fees
 

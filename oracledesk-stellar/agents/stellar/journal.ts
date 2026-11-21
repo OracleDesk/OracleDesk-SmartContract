@@ -16,6 +16,12 @@ export interface TransactionJournalRecord {
   outerHash?: string;
   feeOffered?: string;
   feeCharged?: string;
+  /** Journal id of the transaction this one depends on (a restore before an
+   * action, or a re-simulation after an archival race). */
+  dependsOn?: string;
+  /** Restores are journaled under `${actionId}:restore`; actions use the
+   * caller's id. Absent means an action, so old records stay valid. */
+  kind?: "action" | "restore";
 }
 
 export interface TransactionJournalOptions {
@@ -55,6 +61,8 @@ function isJournalRecord(value: unknown): value is TransactionJournalRecord {
     (record.detail === undefined || typeof record.detail === "string") &&
     (record.innerHash === undefined || typeof record.innerHash === "string") &&
     (record.outerHash === undefined || typeof record.outerHash === "string") &&
+    (record.dependsOn === undefined || (typeof record.dependsOn === "string" && record.dependsOn.length > 0)) &&
+    (record.kind === undefined || record.kind === "action" || record.kind === "restore") &&
     optionalDecimal(record.feeOffered) &&
     optionalDecimal(record.feeCharged)
   );
@@ -126,6 +134,17 @@ export class TransactionJournal {
     return latest;
   }
 
+  /**
+   * Actions left incomplete by a crash after a preamble restore. The adapter
+   * uses this at startup: a confirmed restore means the action can simply be
+   * re-simulated; an uncertain restore must first be checked by hash (the
+   * caller does that through `dependsOn`). Restores are idempotent, so an
+   * unconfirmed restore may be rebuilt without risking a double action.
+   */
+  async resumableActions(): Promise<ResumableAction[]> {
+    return resumableActions(await this.readAll());
+  }
+
   private async appendSerialized(record: TransactionJournalRecord): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
     let existing = "";
@@ -169,6 +188,31 @@ export class TransactionJournal {
       await handle.close();
     }
   }
+}
+
+export interface ResumableAction {
+  actionId: string;
+  restore?: TransactionJournalRecord;
+  action?: TransactionJournalRecord;
+}
+
+/** Pure form of {@link TransactionJournal.resumableActions}, usable in tests. */
+export function resumableActions(records: readonly TransactionJournalRecord[]): ResumableAction[] {
+  const byId = new Map<string, TransactionJournalRecord>();
+  for (const record of records) byId.set(record.id, record);
+  const restoreIds = new Set(
+    records.filter((r) => r.kind === "restore" || r.id.endsWith(":restore")).map((r) => r.id),
+  );
+  const out: ResumableAction[] = [];
+  for (const restoreId of restoreIds) {
+    const restore = byId.get(restoreId)!;
+    const actionId = restoreId.replace(/:restore$/, "");
+    if (restore.stage !== "confirmed" && restore.stage !== "uncertain") continue;
+    const action = byId.get(actionId);
+    if (action && !["signed", "submitting", "uncertain"].includes(action.stage)) continue;
+    out.push({ actionId, restore, action });
+  }
+  return out;
 }
 
 export function createJournalRecord(
