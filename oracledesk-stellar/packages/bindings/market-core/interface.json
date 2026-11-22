@@ -328,6 +328,41 @@
         ]
       }
     },
+    "claim_pool_remainders": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the LP pool remainder for up to `MAX_BATCH` markets the `creator` owns, with one collateral transfer. Same ordering and skip semantics as `redeem_many`. A market closed by `finalize_market` reports `AlreadyClaimed` — the sweep already took the remainder.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "claim_pool_remainders",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "create_market": {
       "kind": "function_v0",
       "spec": {
@@ -392,6 +427,28 @@
             "result": {
               "error_type": "error",
               "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "finalize_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionless close-out of a final market after its redemption deadline. Sweeps the market's entire remaining balance — value reserved for shares never redeemed, an unclaimed LP remainder, per-holder rounding dust and accrued fees — to the treasury, and marks the market closed so nothing can ever pay out again. The deadline is `redeem_deadline(market_id)` = `finalized_at + horizon_secs`, the horizon being snapshotted at creation from the admin default. Anyone who redeems before the deadline is paid the exact `settle_value` they would have received without this call; only shares still unredeemed at the deadline are forfeit, and their value goes to the treasury rather than the LP so the LP cannot profit from suppressing redemptions. Returns the amount swept. The swept total is exactly the market's contract balance: sets plus fees minus everything already paid out.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -511,6 +568,44 @@
         ]
       }
     },
+    "max_batch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Largest accepted `market_ids` length for `redeem_many` / `claim_pool_remainders`. Frontends should chunk work into strictly ascending batches of at most this size (see `docs/frontend-integration.md`).",
+        "inputs": [],
+        "name": "max_batch",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "observe": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cumulative YES-price-seconds as of `now - seconds_ago`. The accumulator is piecewise linear in time (the price only moves when a trade lands), so between observations the value is interpolated along the chord, and times after the last trade extrapolate at the last traded price. Fails with `ObservationTooOld` when `seconds_ago` reaches before the oldest surviving observation (the ring keeps the most recent 16), and with `NotSupported` for markets created before the accumulator existed. A missing (archived) ring slot is skipped, never a panic.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seconds_ago",
+            "type_": "u64"
+          }
+        ],
+        "name": "observe",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "pending_admin": {
       "kind": "function_v0",
       "spec": {
@@ -525,6 +620,28 @@
                   "name": "PendingAdmin"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "price_cumulative": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cumulative `price_bps * seconds` for YES since creation, extrapolated to now: `observe(market_id, 0)`. Ready-made for consumers that store their own checkpoints and compute TWAPs off-chain.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "price_cumulative",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -690,6 +807,62 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_deadline": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Timestamp after which unredeemed shares are forfeit (see `finalize_market`). `None` while the market is still Open — its deadline is not known yet — and for legacy markets, which have no deadline and cannot be finalized.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "redeem_deadline",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_many": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Redeems `holder`'s positions across up to `MAX_BATCH` final markets with one collateral transfer. `market_ids` must be strictly ascending (`InvalidAmount` otherwise; empty or over-cap is `BatchTooLarge`) so the footprint is deterministic and duplicates are impossible. Markets that cannot pay do not abort the batch; they come back in `items` with a `SkipReason`. In particular an archived `Market` entry is NOT `NotFound` — the transaction fails at footprint time and the market must be restored first (simulation shows this before submission). `holder.require_auth()` covers the whole batch: the signed payload is the `market_ids` vector itself.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "redeem_many",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
             }
           }
         ]
@@ -876,6 +1049,28 @@
         ]
       }
     },
+    "set_default_redeem_horizon": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Affects markets created after the call; existing markets keep the horizon snapshotted at their creation. Must be within [180 days, 1825 days].",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_default_redeem_horizon",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_paused": {
       "kind": "function_v0",
       "spec": {
@@ -915,6 +1110,32 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "settle_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Outstanding-share accounting for a market (issue #14). `NotSupported` for markets created before this bookkeeping existed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "settle_state",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "SettleState"
+                }
+              }
             }
           }
         ]
@@ -1015,6 +1236,33 @@
         ]
       }
     },
+    "twap": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Time-weighted average YES price in bps over the trailing `window_secs`, floored. Rejects a zero window (`InvalidAmount`). A window reaching before the oldest observation fails with `ObservationTooOld`; a window extending past `close_time` keeps averaging the final price, because the accumulator only moves when trades are possible.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "window_secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "twap",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
     "void_market": {
       "kind": "function_v0",
       "spec": {
@@ -1095,6 +1343,92 @@
         "name": "BandState"
       }
     },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One market's outcome inside a `BatchResult`, in request order.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "BatchItem"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Result of `redeem_many` / `claim_pool_remainders`: `total` is the single aggregated transfer, `items` has one entry per requested market in the same order.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "The market settled and paid `BatchItem::payout`.",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "The market was skipped; `BatchItem::payout` is 0.",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "Per-market result of a batch settlement. This union stands in for the `Option<SkipReason>` sketched in the issue: a `#[contracttype]` struct field of type `Option<CustomType>` does not compile under the `testutils` feature (on for every `cargo test` build). The derive emits an xdr conversion gated on `CustomType: Into<ScVal>`, but `#[contracttype]` enums only derive `TryFrom`, and the missing impls cannot be supplied from this crate: `From<Enum> for ScVal` collides with the derive's own `TryFrom` through core's blanket impl (E0119), and `TryFrom<&Option<Enum>> for ScVal` violates the orphan rule (E0117). The union carries the same information and surfaces as a discriminated union in the generated TS bindings.",
+        "lib": "",
+        "name": "BatchStatus"
+      }
+    },
     "BreakerConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1159,6 +1493,36 @@
         "doc": "",
         "lib": "",
         "name": "Category"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Binds a market to a reusable committee registry subject to rotation bounds.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "min_epoch",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CommitteeRef"
       }
     },
     "Config": {
@@ -1253,6 +1617,12 @@
             }
           },
           {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultRedeemHorizon"
+            }
+          },
+          {
             "tuple_v0": {
               "doc": "",
               "name": "FeeTerms",
@@ -1283,6 +1653,25 @@
             "void_v0": {
               "doc": "",
               "name": "NextId"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Obs",
+              "type_": [
+                "u64",
+                "u32"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Oracle",
+              "type_": [
+                "u64"
+              ]
             }
           },
           {
@@ -1332,6 +1721,15 @@
             }
           },
           {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Settle",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
             "void_v0": {
               "doc": "",
               "name": "Treasury"
@@ -1341,6 +1739,84 @@
         "doc": "",
         "lib": "",
         "name": "DataKey"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Attested resolution whose proposal can be challenged with a bond during the dispute window. Hashed as `ResolutionSpec::SignersDisputable`, a separate variant, so existing `Signers` commitments are unaffected.",
+        "fields": [
+          {
+            "doc": "Collateral escrowed by `dispute`; must be positive.",
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "doc": "Seconds after a dispute opens before anyone may void it unresolved.",
+            "name": "escalation_timeout",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "`k` of these members, through `escalation_attest`. Must be disjoint from the proposing signers.",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The resolver admin, through `settle_dispute`.",
+              "name": "Guardian"
+            }
+          }
+        ],
+        "doc": "Who rules on a dispute.",
+        "lib": "",
+        "name": "Escalation"
       }
     },
     "FeeTerms": {
@@ -1361,6 +1837,39 @@
         ],
         "lib": "",
         "name": "FeeTerms"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Dual-path resolution mode: price feed first, falling back to signers.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfig"
       }
     },
     "Market": {
@@ -1489,6 +1998,89 @@
         "name": "MarketStatus"
       }
     },
+    "Observation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One point in the TWAP ring buffer. At most one per distinct timestamp.",
+        "fields": [
+          {
+            "doc": "`OracleState::price_cumulative` as of `ts`.",
+            "name": "cumulative",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "ts",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "Observation"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "OracleAsset"
+      }
+    },
+    "OracleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-market TWAP accumulator (issue #11). Lives in its own entry so the `Market` XDR stays unchanged. Semantics: at the start of every trade the price that held since the last trade is folded into `price_cumulative` over the elapsed interval; the post-trade price then becomes `last_price_bps` until the next trade. That is the Uniswap-v2 model, and it is what makes manipulation expensive — moving the average requires holding the price away from fair value across one or more ledger boundaries, not just within a single transaction. Overflow analysis: `last_price_bps <= 10_000` and each interval adds `price * dt` seconds. A 100-year market lifetime accumulates at most `10_000 * 3.2e9 ~ 3.2e13`; even a pathological `dt = u64::MAX` gives `1.8e19 * 1e4 = 1.8e23`. `i128::MAX` is ~1.7e38, so there is no feasible lifetime that overflows — and every step is `checked_*` anyway, so a violation rejects the transaction instead of corrupting the accumulator.",
+        "fields": [
+          {
+            "doc": "YES price in bps as of the most recent trade.",
+            "name": "last_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Timestamp the accumulator was last advanced to (the timestamp of the most recent trade). The last traded price holds from here onward.",
+            "name": "last_ts",
+            "type_": "u64"
+          },
+          {
+            "doc": "Observations written so far, capped at `ORACLE_RING`.",
+            "name": "obs_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "Ring slot of the newest observation, in `0..ORACLE_RING`.",
+            "name": "obs_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "Running sum of `last_price_bps * seconds_elapsed` since creation.",
+            "name": "price_cumulative",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "OracleState"
+      }
+    },
     "Outcome": {
       "kind": "udt_union_v0",
       "spec": {
@@ -1550,6 +2142,410 @@
         "lib": "",
         "name": "Position"
       }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "PriceConfig"
+      }
+    },
+    "PriceData": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PriceData"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "PriceDirection"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "The full resolution rule a market's `resolution_hash` commits to. Hashing this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two modes in disjoint hash spaces even if their field encodings could otherwise collide. See `docs/adr/0001-resolution-commitment.md`.",
+        "lib": "",
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the network and the market-core instance, and carries a creator-chosen `salt` that makes a pre-reveal brute-force of the (low-entropy) rule infeasible.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "`sha256(network passphrase)`, i.e. `env.ledger().network_id()`.",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "SettleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-market settlement bookkeeping (issue #14). Lives in its own entry so the `Market` XDR stays unchanged.",
+        "fields": [
+          {
+            "doc": "`finalize_market` has swept the market's remaining balance; no redemption or claim can ever pay out again.",
+            "name": "closed",
+            "type_": "bool"
+          },
+          {
+            "doc": "Timestamp of `resolve` / `void_market`; 0 while the market is Open.",
+            "name": "finalized_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "Redemption window, snapshotted at creation from the admin default. `redeem_deadline = finalized_at + horizon_secs`.",
+            "name": "horizon_secs",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outstanding_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "Outcome shares held outside the pool (user positions), still redeemable. `redeem` decrements the redeeming holder's shares on both sides, so a losing-side redemption (payout 0) still clears here.",
+            "name": "outstanding_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "Collateral already paid to holders and the LP (`redeem` + `claim_pool_remainder` payouts); tracks what has left the market.",
+            "name": "paid_out",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "SettleState"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "SignerConfig"
+      }
+    },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          }
+        ],
+        "doc": "Why a market in a batch call did not settle. `Duplicate` is reserved: ids are validated strictly ascending first, so a duplicate is rejected as `InvalidAmount` before the batch runs and never reaches a skip.",
+        "lib": "",
+        "name": "SkipReason"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "Raw Ed25519 public key. For a `G...` account address this is `StrKey.decodeEd25519PublicKey(address)`; `C...` addresses have none.",
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Total weight that must sign one outcome. Choose it above half the total weight so two outcomes can never both reach it.",
+            "name": "weight_threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKeyConfig"
+      }
     }
   },
   "errors": {
@@ -1561,6 +2557,16 @@
             "doc": "",
             "name": "AlreadyClaimed",
             "value": 17
+          },
+          {
+            "doc": "A batch call carried no ids or more than `MAX_BATCH` of them.",
+            "name": "BatchTooLarge",
+            "value": 31
+          },
+          {
+            "doc": "Inbound collateral transfer delivered fewer (or different) units than expected, e.g. a fee-on-transfer or under-delivering token (#137).",
+            "name": "CollateralShortfall",
+            "value": 32
           },
           {
             "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
@@ -1653,9 +2659,19 @@
             "value": 1
           },
           {
+            "doc": "Legacy market created before `SettleState` existed: outstanding shares cannot be reconstructed on-chain, so it has no deadline and cannot be finalized (still fully redeemable).",
+            "name": "NotSupported",
+            "value": 30
+          },
+          {
             "doc": "",
             "name": "NothingToRedeem",
             "value": 16
+          },
+          {
+            "doc": "`observe` / `twap` asked for a time older than every surviving observation of the market (the ring keeps the most recent 16).",
+            "name": "ObservationTooOld",
+            "value": 27
           },
           {
             "doc": "",
@@ -1681,6 +2697,16 @@
             "doc": "A single trade would move the price more than `max_impact_bps`. (Both this and the band reject the whole invocation, so their events, if any, roll back with it — see the note on `BreakerConfig`.)",
             "name": "PriceImpactTooHigh",
             "value": 21
+          },
+          {
+            "doc": "Market already closed by `finalize_market`; redemption is over.",
+            "name": "RedemptionClosed",
+            "value": 29
+          },
+          {
+            "doc": "`finalize_market` called before the redemption deadline.",
+            "name": "RedemptionWindowOpen",
+            "value": 28
           },
           {
             "doc": "",
@@ -1751,6 +2777,38 @@
         ],
         "prefix_topics": [
           "admin_transferred"
+        ]
+      }
+    },
+    "DefaultFeeSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: default fee for new markets changed.",
+        "lib": "",
+        "name": "DefaultFeeSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_fee_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "default_fee_set"
         ]
       }
     },
@@ -1930,6 +2988,44 @@
         ]
       }
     },
+    "MarketFinalized": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketFinalized",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "Everything swept to the treasury: expired user claims, an unclaimed LP remainder, rounding dust and accrued fees.",
+            "location": "data",
+            "name": "swept",
+            "type_": "i128"
+          },
+          {
+            "doc": "The part of `swept` that was reserved for shares never redeemed.",
+            "location": "data",
+            "name": "unclaimed_user",
+            "type_": "i128"
+          },
+          {
+            "doc": "Rounding left over after per-holder void floors were accounted for.",
+            "location": "data",
+            "name": "dust",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "market_finalized"
+        ]
+      }
+    },
     "MarketResolved": {
       "kind": "event_v0",
       "spec": {
@@ -1964,6 +3060,32 @@
         ]
       }
     },
+    "PausedSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: market pause state changed.",
+        "lib": "",
+        "name": "PausedSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "paused_set"
+        ]
+      }
+    },
     "PoolRemainderClaimed": {
       "kind": "event_v0",
       "spec": {
@@ -1993,6 +3115,44 @@
         ],
         "prefix_topics": [
           "pool_remainder_claimed"
+        ]
+      }
+    },
+    "PoolRemainderClaimedV1": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: pool remainder claimed by creator after market finality.",
+        "lib": "",
+        "name": "PoolRemainderClaimedV1",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "pool_remainder_claimed_v1"
         ]
       }
     },

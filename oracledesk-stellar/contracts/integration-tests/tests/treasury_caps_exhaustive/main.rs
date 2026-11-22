@@ -234,11 +234,12 @@ fn market_core_wasm_matches_native() {
     })
 }
 
-/// I5, documented: pausing stops spending and selling, but `close_trade`,
-/// `redeem` and `claim_pool_remainder` stay callable (they spend nothing and
-/// return capital), and their proceeds reconcile with the balance (I6).
+/// I5, documented (#272): an admin pause stops spending, selling and closing
+/// (`close_trade` is an agent reduction), but `redeem` and `claim_pool_remainder`
+/// stay callable (they spend nothing and return capital), and their proceeds
+/// reconcile with the balance (I6).
 #[test]
-fn close_redeem_and_claim_remain_callable_while_paused() {
+fn redeem_and_claim_remain_callable_while_paused() {
     unnamed(|| {
         // CFG_CLOSING: the pre-existing markets close after a day.
         let mut f = Sim::new(CFG_CLOSING);
@@ -255,7 +256,7 @@ fn close_redeem_and_claim_remain_callable_while_paused() {
         ] {
             assert_eq!(op, Some(Res::Err(treasury::Error::Paused as u32)));
         }
-        // ... but the exposure can still be closed.
+        // ... and so is closing an exposure (it stays open) ...
         f.close(2);
 
         for _ in 0..31 {

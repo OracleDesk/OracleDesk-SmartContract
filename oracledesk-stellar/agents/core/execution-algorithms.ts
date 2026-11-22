@@ -79,17 +79,17 @@ export class TWAPExecutor {
     parentOrder.status = "executing";
     const startTime = Date.now();
     const endTime = startTime + this.sliceDurationMs;
+    let slicesRemaining = Math.max(1, Math.ceil(this.sliceDurationMs / this.orderIntervalMs));
 
     const childIds: string[] = [];
-    let currentTime = startTime;
-
-    while (currentTime < endTime && parentOrder.executedShares < parentOrder.targetShares) {
+    while (Date.now() < endTime && parentOrder.executedShares < parentOrder.targetShares) {
+      const sliceStartedAt = Date.now();
       const remainingShares =
         parentOrder.targetShares - parentOrder.executedShares;
-      const numberOfSlices = Math.ceil(
-        (endTime - currentTime) / this.orderIntervalMs,
-      );
-      const sliceSize = remainingShares / BigInt(numberOfSlices);
+      const sliceSize = slicesRemaining <= 1
+        ? remainingShares
+        : remainingShares / BigInt(slicesRemaining);
+      slicesRemaining = Math.max(0, slicesRemaining - 1);
 
       const childOrder = await this.createAndExecuteChild(
         parentOrder,
@@ -102,11 +102,7 @@ export class TWAPExecutor {
         parentOrder.childOrders.push(childOrder.id);
       }
 
-      currentTime = Date.now();
-      const waitTime = Math.max(
-        0,
-        this.orderIntervalMs - (currentTime - (currentTime - startTime)),
-      );
+      const waitTime = Math.max(0, this.orderIntervalMs - (Date.now() - sliceStartedAt));
       if (waitTime > 0) {
         await new Promise((resolve) => setTimeout(resolve, waitTime));
       }
@@ -214,7 +210,7 @@ export class ParticipationLimitedExecutor {
 
     while (parentOrder.executedShares < parentOrder.targetShares) {
       const quote = await this.quote({ market, shares: 1000000n });
-      this.state.lastQuote = { timestamp: Date.now(), ...quote };
+      this.state.lastQuote = { ...quote };
 
       // Check if edge disappeared
       if (quote.price > parentOrder.limitPrice) {

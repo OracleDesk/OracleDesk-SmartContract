@@ -12,7 +12,8 @@
 //!   equals the observed spends since the window's reported start.
 //! * I4 sliding 24h: observed spend in any `[t, t + 86_400)` is `<= max_daily`.
 //! * I5 pause: no successful buy / create / sell while the admin has paused;
-//!   `close_trade` stays callable.
+//!   `close_trade` (an agent reduction) is refused while paused, and
+//!   `redeem` / `claim_pool_remainder` stay callable.
 //! * I6 accounting: treasury balance = initial - spends + sell proceeds.
 //! * I7 sell neutrality: `agent_sell` changes neither the window nor any
 //!   `MarketExposure`.
@@ -465,11 +466,14 @@ impl Sim {
                     (e.amount, e.open)
                 })
                 .collect();
+            // An admin pause is one of the independent reasons in `ModeState`
+            // (issue #272); a drawdown halt is not modelled by this search.
             let paused = self
                 .env
                 .storage()
                 .instance()
-                .get::<_, bool>(&DataKey::AdminPaused)
+                .get::<_, treasury::ModeState>(&DataKey::ModeState)
+                .map(|m| m.admin_pause_at.is_some())
                 .unwrap_or(false);
             (exposures, paused)
         });
@@ -830,8 +834,9 @@ impl Sim {
                 let _ = m;
             }
             Op::Close { .. } => {
-                // I5 (documented): close_trade has no pause check. It must
-                // succeed iff the exposure is open, paused or not.
+                // I5 (documented, #272): close_trade is an `AgentReduce`, refused
+                // while the admin has paused. It must succeed iff the exposure is
+                // open and the treasury is not admin-paused.
                 let was_open = before
                     .exposures
                     .get(match op {
@@ -840,7 +845,7 @@ impl Sim {
                     })
                     .map(|e| e.1)
                     .unwrap_or(false);
-                if was_open != res.is_ok() {
+                if (was_open && !was_paused) != res.is_ok() {
                     return v(
                         "I5 close_trade",
                         format!(

@@ -7,6 +7,7 @@ import {
   buyWithinLimit,
   calcBuy,
   calcSell,
+  calcSellShares,
   collateralOutForShares,
   grossForShares,
   mulDivCeil,
@@ -18,6 +19,8 @@ import {
   seedReserves,
   sellWithinLimit,
   settleValue,
+  collateralForShares,
+  MathError,
 } from "./fpmm.js";
 
 // Same worked examples as math.rs's unit tests and model/fpmm_model.py's
@@ -142,7 +145,8 @@ test("committed cross-language vectors match", () => {
   const lines = readFileSync(vectorsPath, "utf8").trim().split("\n");
   for (const [i, line] of lines.entries()) {
     const c = JSON.parse(line) as { fn: string; args: string[]; ok: Record<string, string> };
-    const a = c.args.map((x) => BigInt(x));
+    // settle_value's first arg is an outcome name, not a number.
+    const a = c.args.map((x) => (/^-?\d+$/.test(x) ? BigInt(x) : 0n));
     let actual: Record<string, string>;
     switch (c.fn) {
       case "calc_buy": {
@@ -217,4 +221,150 @@ test("buyWithinLimit and sellWithinLimit mirror the on-chain boundaries", () => 
   // a zero average price.
   assert.equal(sellWithinLimit(0n, 1n, 0n), true);
   assert.equal(buyWithinLimit(1n, 1n, 0n), false);
+});
+
+// Known-value fixtures shared bit-for-bit with math.rs's
+// `sell_shares_example_matches_model` and model/fpmm_model.py's
+// `_check_sell_shares_known_values`. Each entry is
+// [rSold, rOther, sharesIn, feeBps, collateralOut, fee, gross,
+//  newReserveSold, newReserveOther].
+const SELL_SHARES_FIXTURES: ReadonlyArray<
+  readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint]
+> = [
+  // 1000/1000 pool selling 212 shares at zero fee: gross 100, x = 100.
+  [1000n, 1000n, 212n, 0n, 100n, 0n, 100n, 1112n, 900n],
+  // Same pool, 1% fee: fee rounds up, collateral_out floors.
+  [1000n, 1000n, 212n, 100n, 99n, 1n, 100n, 1112n, 900n],
+  // Asymmetric reserves.
+  [1_000_000n, 2_000_000n, 500_000n, 0n, 400_000n, 0n, 400_000n, 1_100_000n, 1_600_000n],
+];
+
+test("calcSellShares matches Rust/Python known values", () => {
+  for (const [rSold, rOther, sharesIn, feeBps, out, fee, gross, ns, no] of SELL_SHARES_FIXTURES) {
+    const q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    assert.equal(q.collateralOut, out, `out r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.fee, fee, `fee r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.gross, gross, `gross r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.newReserveSold, ns, `ns r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.newReserveOther, no, `no r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+  }
+});
+
+test("calcSellShares never decreases k", () => {
+  let x = 0x9e3779b97f4a7c15n;
+  const mask = (1n << 64n) - 1n;
+  const next = () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 33n;
+  };
+  let checked = 0;
+  const trials = 2000;
+  for (let i = 0; i < trials; i++) {
+    const rSold = 1_000_000n + (next() % 1_000_000_000n);
+    const rOther = 1_000_000n + (next() % 1_000_000_000n);
+    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
+    const feeBps = next() % 300n;
+    const k0 = rSold * rOther;
+    let q;
+    try {
+      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    } catch {
+      continue;
+    }
+    assert.ok(
+      q.newReserveSold * q.newReserveOther >= k0,
+      `k decreased r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`,
+    );
+    checked++;
+  }
+  assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
+});
+
+test("calcSellShares never pays more than calcSell charges for the same shares", () => {
+  let x = 0xdeadbeefcafebaben;
+  const mask = (1n << 64n) - 1n;
+  const next = () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 33n;
+  };
+  let checked = 0;
+  const trials = 1000;
+  for (let i = 0; i < trials; i++) {
+    const rSold = 1_000_000n + (next() % 1_000_000_000n);
+    const rOther = 1_000_000n + (next() % 1_000_000_000n);
+    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
+    const feeBps = next() % 300n;
+    let q;
+    try {
+      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    } catch {
+      continue;
+    }
+    let back;
+    try {
+      back = calcSell(rSold, rOther, q.collateralOut, feeBps);
+    } catch {
+      continue;
+    }
+    assert.ok(
+      back.sharesIn <= sharesIn,
+      `overpaid r=${rSold}/${rOther} s=${sharesIn} f=${feeBps} back=${back.sharesIn}`,
+    );
+    checked++;
+  }
+  assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
+});
+
+// ─── collateralForShares (#108) ──────────────────────────────────────────────
+
+function sharesOrZero(rB: bigint, rO: bigint, c: bigint, fee: bigint): bigint {
+  if (c <= 0n) return 0n;
+  try {
+    return calcBuy(rB, rO, c, fee).sharesOut;
+  } catch {
+    return 0n;
+  }
+}
+
+test("collateralForShares matches the fpmm_model.py fixtures", () => {
+  const path = fileURLToPath(new URL("../../scripts/fpmm-diff/collateral_for_shares.jsonl", import.meta.url));
+  const lines = readFileSync(path, "utf8").trim().split("\n");
+  assert.ok(lines.length >= 40);
+  for (const line of lines) {
+    const c = JSON.parse(line) as { args: string[]; collateral_in: string };
+    const [rB, rO, s, fee] = c.args.map(BigInt);
+    assert.equal(collateralForShares(rB, rO, s, fee).toString(), c.collateral_in, line);
+  }
+});
+
+test("collateralForShares is the minimum collateral that buys the target (exhaustive, small reserves)", () => {
+  for (const [rB, rO] of [[50n, 50n], [7n, 90n], [90n, 7n], [1n, 30n]]) {
+    for (const fee of [0n, 100n, 3_000n]) {
+      for (let s = 1n; s <= rB * 2n; s++) {
+        let brute = 1n;
+        while (sharesOrZero(rB, rO, brute, fee) < s) brute++;
+        assert.equal(collateralForShares(rB, rO, s, fee), brute, `rB=${rB} rO=${rO} fee=${fee} s=${s}`);
+      }
+    }
+  }
+});
+
+test("collateralForShares stays minimal on large random pools", () => {
+  let seed = 108n;
+  const next = () => (seed = (seed * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n));
+  for (let i = 0; i < 500; i++) {
+    const rB = (next() % 10n ** 13n) + 1n;
+    const rO = (next() % 10n ** 13n) + 1n;
+    const fee = [0n, 30n, 100n, 250n][Number(next() % 4n)];
+    const s = (next() % (rB * 3n)) + 1n;
+    const c = collateralForShares(rB, rO, s, fee);
+    assert.ok(sharesOrZero(rB, rO, c, fee) >= s);
+    assert.ok(sharesOrZero(rB, rO, c - 1n, fee) < s);
+  }
+});
+
+test("collateralForShares rejects invalid input", () => {
+  assert.throws(() => collateralForShares(0n, 1n, 1n, 0n), MathError);
+  assert.throws(() => collateralForShares(1n, 1n, 0n, 0n), MathError);
+  assert.throws(() => collateralForShares(1n, 1n, 1n, 10_000n), MathError);
 });

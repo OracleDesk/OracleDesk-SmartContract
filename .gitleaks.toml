@@ -1,0 +1,25 @@
+# Gitleaks configuration for OracleDesk (Issue #126).
+# Extends default rules with a dedicated Stellar secret seed detector while
+# allowlisting documented public G.../C... testnet addresses and test vectors.
+
+title = "OracleDesk Gitleaks Policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "stellar-secret-seed"
+description = "Stellar Ed25519 secret seed (StrKey S...)"
+regex = '''\bS[A-Z2-7]{55}\b'''
+tags = ["key", "stellar", "secret"]
+
+[allowlist]
+description = "Public Stellar testnet G.../C... contract IDs, deployment records, and golden test vectors"
+paths = [
+  '''oracledesk-stellar/deployments/testnet\.json$''',
+  '''oracledesk-stellar/docs/vectors/.*\.json$''',
+  '''oracledesk-stellar/packages/bindings/.*/interface\.json$''',
+]
+regexes = [
+  '''\b[GC][A-Z2-7]{55}\b''',
+]

@@ -1,0 +1,27 @@
+{
+  "name": "@oracledesk/deployer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "node --test test/plan.test.ts test/record.test.ts",
+    "plan": "tsx src/cli.ts plan",
+    "apply": "tsx src/cli.ts apply",
+    "verify": "tsx src/cli.ts verify",
+    "migrate-record": "tsx src/cli.ts migrate-record"
+  },
+  "dependencies": {
+    "@oracledesk/bindings-market-core": "file:../../packages/bindings/market-core",
+    "@oracledesk/bindings-reasoning-registry": "file:../../packages/bindings/reasoning-registry",
+    "@oracledesk/bindings-resolver": "file:../../packages/bindings/resolver",
+    "@oracledesk/bindings-treasury": "file:../../packages/bindings/treasury",
+    "@stellar/stellar-sdk": "^16.0.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.8.3"
+  }
+}

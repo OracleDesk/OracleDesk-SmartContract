@@ -6,13 +6,18 @@
  * See docs/agent-runtime.md.
  */
 import { AsyncMutex, MarketLocks } from "./locks.js";
-import type { Lease } from "./lease.js";
+import { FenceLostError, type Fence, type FencedLease, type Lease } from "./lease.js";
 import { jsonLogger, type Logger } from "./log.js";
 import type { StateStore } from "./state.js";
+import { EXIT_KILLED } from "./config.js";
+import { KilledError, type KillReason, type KillSwitch } from "./kill-switch.js";
+import { classifySorobanError } from "../stellar/errors.js";
 
 export interface TaskContext {
-  /** Aborted when shutdown starts. Honour it between steps, never mid-submit. */
+  /** Aborted when shutdown or the kill switch trips. Honour it between steps, never mid-submit. */
   signal: AbortSignal;
+  /** Trips the kill switch, or performs a local kill when no switch is configured. */
+  kill: (reason: KillReason) => Promise<void>;
   state: StateStore;
   locks: MarketLocks;
   /**
@@ -24,6 +29,7 @@ export interface TaskContext {
   submit: <T>(fn: () => Promise<T>, intent?: string) => Promise<T>;
   log: Logger;
   now: () => number;
+  fence?: Fence;
 }
 
 export interface Task {
@@ -56,6 +62,7 @@ export interface RuntimeOptions {
   now?: () => number;
   random?: () => number;
   timers?: Timers;
+  killSwitch?: KillSwitch;
 }
 
 export class AbortedError extends Error {
@@ -72,15 +79,27 @@ export class CircuitOpenError extends Error {
   }
 }
 
+function composeSignal(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const controller = new AbortController();
+  for (const signal of [a, b]) {
+    if (signal.aborted) controller.abort(signal.reason);
+    else signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+  }
+  return controller.signal;
+}
+
 interface Sleep {
   handle: unknown;
   resolve: () => void;
 }
 
 export class Runtime {
-  /** 0 after a clean stop, 1 if the circuit opened or a --once task failed. */
+  /** 0 after a clean stop, 1 if the circuit opened, 3 if killed, 75 if the lease was held. */
   exitCode = 0;
   private readonly controller = new AbortController();
+  private readonly killController = new AbortController();
+  private readonly leaseController = new AbortController();
+  private readonly signal: AbortSignal;
   private readonly mutex = new AsyncMutex();
   private readonly locks: MarketLocks;
   private readonly log: Logger;
@@ -99,6 +118,10 @@ export class Runtime {
   private readonly finished = new Promise<void>((r) => (this.done = r));
 
   constructor(private readonly o: RuntimeOptions) {
+    this.signal = composeSignal(
+      composeSignal(this.controller.signal, this.killController.signal),
+      this.leaseController.signal,
+    );
     const modes = new Set(o.tasks.map((t) => t.mode).filter(Boolean));
     if (modes.size > 1) throw new Error(`mixed task modes ${[...modes].join("/")} in one runtime`);
     const names = new Set<string>();
@@ -114,6 +137,7 @@ export class Runtime {
     o.lease.onLost = (reason) => {
       this.log.error("LEASE_LOST", { reason });
       this.exitCode = 1;
+      this.leaseController.abort(reason);
       void this.stop("lease lost");
     };
   }
@@ -122,26 +146,65 @@ export class Runtime {
     return this.inFlight;
   }
 
+  kill(reason: KillReason): void {
+    if (this.killController.signal.aborted) return;
+    this.exitCode = EXIT_KILLED;
+    this.log.error("KILLED", { ...reason });
+    this.killController.abort(reason);
+    for (const s of this.sleeps) {
+      this.timers.clearTimeout(s.handle);
+      s.resolve();
+    }
+    this.sleeps.clear();
+    void this.stop(`kill:${reason.code}`);
+  }
+
   private context(task: Task): TaskContext {
+    const fenced = this.o.lease as FencedLease;
+    const fence = fenced.current?.();
     return {
-      signal: this.controller.signal,
+      signal: this.signal,
+      kill: (reason) => this.killLocally(reason),
       state: this.o.state,
       locks: this.locks,
-      submit: (fn, intent) => this.submit(fn, intent ?? task.name),
+      submit: (fn, intent) => this.submit(fn, intent ?? task.name, fence),
       log: {
         info: (e, f) => this.log.info(e, { task: task.name, ...f }),
         warn: (e, f) => this.log.warn(e, { task: task.name, ...f }),
         error: (e, f) => this.log.error(e, { task: task.name, ...f }),
       },
       now: this.now,
+      fence,
     };
   }
 
-  private async submit<T>(fn: () => Promise<T>, intent: string): Promise<T> {
+  private async killLocally(reason: KillReason): Promise<void> {
+    if (this.o.killSwitch) await this.o.killSwitch.trip(reason);
+    else await this.kill(reason);
+  }
+
+  private async assertAlive(): Promise<void> {
+    if (this.killController.signal.aborted) throw new KilledError(this.killController.signal.reason as KillReason);
+    if (this.o.killSwitch) {
+      const reason = await this.o.killSwitch.check();
+      if (reason) throw new KilledError(reason);
+    }
     if (this.controller.signal.aborted) throw new AbortedError();
+    if (this.leaseController.signal.aborted) throw new FenceLostError(
+      { name: "lease", epoch: 0n },
+    );
+  }
+
+  private async submit<T>(fn: () => Promise<T>, intent: string, fence?: Fence): Promise<T> {
+    await this.assertAlive();
     return this.mutex.run(async () => {
       // Queued behind another submission when shutdown began: not yet sent, so drop it.
-      if (this.controller.signal.aborted) throw new AbortedError();
+      await this.assertAlive();
+      if (fence) {
+        const fenced = this.o.lease as FencedLease;
+        if (fenced.assertHeld) await fenced.assertHeld(fence);
+        this.o.state.setFenceEpoch?.(fence.epoch);
+      }
       const id = this.nextIntent++;
       this.inFlight++;
       this.pending.set(id, intent);
@@ -185,6 +248,10 @@ export class Runtime {
       this.log.info("TASK_OK", { task: task.name, ms: this.now() - started });
       return true;
     } catch (err) {
+      if (err instanceof KilledError) {
+        this.log.warn("TASK_KILLED", { task: task.name, reason: err.reason });
+        return true;
+      }
       if (err instanceof AbortedError) {
         this.log.info("TASK_ABORTED", { task: task.name });
         return true;
@@ -208,22 +275,32 @@ export class Runtime {
           ? `${this.failures.length} failures within ${this.o.failureWindowMs}ms`
           : undefined;
     if (reason && !this.stopping) {
-      this.log.error("CIRCUIT_OPEN", { reason });
-      this.exitCode = 1;
-      void this.stop(`circuit open: ${reason}`);
+      const classification = classifySorobanError(err);
+      if (this.o.killSwitch && classification.kind === "contract") {
+        this.log.error("CIRCUIT_OPEN", { reason, kind: classification.kind });
+        void this.o.killSwitch.trip({ code: "errors", detail: reason, at: this.now() });
+      } else {
+        this.log.error("CIRCUIT_OPEN", { reason });
+        this.exitCode = 1;
+        void this.stop(`circuit open: ${reason}`);
+      }
     }
   }
 
   private async loop(task: Task): Promise<void> {
-    while (!this.controller.signal.aborted) {
+    while (!this.signal.aborted) {
       await this.runTask(task);
-      if (this.controller.signal.aborted) break;
+      if (this.signal.aborted) break;
       await this.sleep(this.delayFor(task, this.consecutive.get(task.name) ?? 0));
     }
   }
 
   /** Acquires the lease and runs every task on its own loop until {@link stop}. */
   async start(): Promise<void> {
+    if (this.o.killSwitch) {
+      const reason = await this.o.killSwitch.check();
+      if (reason) return;
+    }
     await this.o.lease.acquire();
     this.log.info("RUNTIME_START", { tasks: this.o.tasks.map((t) => t.name) });
     for (const task of this.o.tasks) this.loops.set(task.name, this.loop(task));
@@ -232,6 +309,10 @@ export class Runtime {
 
   /** Runs each task exactly once, in order, then releases everything (the old CLI behaviour). */
   async runOnce(): Promise<void> {
+    if (this.o.killSwitch) {
+      const reason = await this.o.killSwitch.check();
+      if (reason) return;
+    }
     await this.o.lease.acquire();
     let firstError: unknown;
     try {
@@ -240,6 +321,11 @@ export class Runtime {
           await task.run(this.context(task));
           this.log.info("TASK_OK", { task: task.name, once: true });
         } catch (err) {
+          if (err instanceof KilledError) {
+            this.log.warn("TASK_KILLED", { task: task.name, once: true, reason: err.reason });
+            this.exitCode = EXIT_KILLED;
+            break;
+          }
           this.log.error("TASK_FAILED", { task: task.name, once: true, err });
           this.exitCode = 1;
           firstError ??= err;

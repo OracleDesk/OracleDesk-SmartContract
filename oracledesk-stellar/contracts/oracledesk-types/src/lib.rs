@@ -24,7 +24,7 @@
 //! `contracts/resolver`'s `shared_types_are_byte_identical_to_imported` test
 //! pins that byte-for-byte.
 
-use soroban_sdk::{Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // market-core outcome surface
@@ -169,6 +169,36 @@ pub struct HybridConfig {
     pub fallback_after: u64,
 }
 
+/// Richer fallback authority for `HybridV2`: any attested resolution mode
+/// that can produce a quorum, not just bare signers.
+///
+/// Variants are intentionally additive and appended after `Signers` so that
+/// existing discriminant positions are stable (Soroban encodes as positional).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FallbackAuthority {
+    /// A simple threshold of well-known signers.
+    Signers(SignerConfig),
+    /// A committee registered in the resolver's registry.
+    Committee(CommitteeRef),
+    /// An explicit set of pubkeys with per-key weights.
+    WeightedKeys(WeightedKeyConfig),
+}
+
+/// Extended hybrid mode: price feed first, falling back to any attested
+/// authority after `fallback_after` seconds past `close_time`.
+///
+/// A separate struct (not an in-place update to `HybridConfig`) because
+/// `HybridConfig` is consensus-critical — existing commitment hashes must
+/// continue to verify.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HybridConfigV2 {
+    pub price: PriceConfig,
+    pub fallback: FallbackAuthority,
+    pub fallback_after: u64,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
@@ -182,6 +212,9 @@ pub enum ResolutionSpec {
     SignersDisputable(DisputableSignerConfig),
     Committee(CommitteeRef),
     Hybrid(HybridConfig),
+    /// Extended hybrid with richer fallback authority (issue #314).
+    /// Appended last to preserve discriminant positions of existing variants.
+    HybridV2(HybridConfigV2),
 }
 
 /// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
@@ -198,23 +231,119 @@ pub struct ResolutionSpecV2 {
     pub rule: ResolutionSpec,
 }
 
+// ---------------------------------------------------------------------------
+// Issue #292 — ResolutionSpecV3
+//
+// V1/V2 structs are frozen. The new envelope is strictly additive: it appends
+// two flat Invalid-policy fields and uses a different hash domain prefix
+// ("oracledesk:resolution-spec-v3") so V3 preimages can never collide with V2.
+//
+// The policy is flattened rather than stored as `Option<InvalidPolicy>`:
+// soroban-sdk 27's `#[contracttype]` derive cannot encode an `Option` of a
+// contracttype struct (it conflicts with the derived `TryFrom`), so the test
+// build of this crate failed on develop.
+// ---------------------------------------------------------------------------
+
+/// V3 commitment envelope.
+///
+/// Commitment domain: `sha256("oracledesk:resolution-spec-v3" || XDR(ResolutionSpecV3))`.
+/// The domain prefix differs from V2 (`"oracledesk:resolution-spec"`) so a V3
+/// preimage with `invalid_threshold = 0` cannot collide with the corresponding V2 hash.
+///
+/// Fields `version`, `network_id`, `market_core`, `salt` and `rule` carry
+/// identical semantics to [`ResolutionSpecV2`].  The additions are the two
+/// Invalid-policy fields below.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionSpecV3 {
+    /// Must be 3; `register_spec_v3` rejects any other value.
+    pub version: u32,
+    /// `sha256(network passphrase)`, i.e. `env.ledger().network_id()`.
+    pub network_id: BytesN<32>,
+    pub market_core: Address,
+    pub salt: BytesN<32>,
+    pub rule: ResolutionSpec,
+    /// Minimum Invalid-attestation count (address count, committee members, or
+    /// weight threshold) for an Invalid quorum.  `0` means no Invalid policy:
+    /// legacy V2 semantics, where Invalid uses the Yes/No threshold and
+    /// displacement is unrestricted.  A real policy threshold is always at least
+    /// 1, so `0` is an unambiguous sentinel.
+    ///
+    /// When non-zero it must be strictly greater than the Yes/No threshold of
+    /// `rule` and at most the member count (enforced by `validate_invalid_policy`).
+    /// Price / WeightedKeys rules reject a non-zero value (`InvalidConfig`).
+    pub invalid_threshold: u32,
+    /// Only meaningful when `invalid_threshold > 0`; must be `false` otherwise.
+    /// When `false`, an Invalid quorum can never displace a pending Yes/No
+    /// proposal.  When `true`, at most one displacement is permitted per market
+    /// (tracked by `DataKey::InvalidDisplaced`).
+    pub invalid_allow_displacement: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #291 — Multi-leg trade types (Leg / LegResult / LegKind)
+//
+// Shared by Router::execute_legs and Treasury::agent_execute_legs.
+// Existing commitment XDR is unaffected — these are new, non-commitment types.
+// ---------------------------------------------------------------------------
+
+/// Direction of a single leg in an atomic multi-leg trade bundle.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegKind {
+    /// Spend exactly `amount` collateral, receive at least `bound` shares.
+    BuyExactIn,
+    /// Receive exactly `amount` collateral, spend at most `bound` shares.
+    SellExactOut,
+}
+
+/// One leg of an atomic multi-leg trade bundle.
+///
+/// Duplicate `(market_id, outcome, kind)` triples are rejected with
+/// `Error::DuplicateLeg` to prevent circumventing `max_market` caps and
+/// to keep the auth tree unambiguous.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Leg {
+    pub market_id: u64,
+    pub outcome: Outcome,
+    pub kind: LegKind,
+    /// Collateral in (BuyExactIn) or collateral out (SellExactOut).
+    pub amount: i128,
+    /// Min shares out (BuyExactIn) or max shares in (SellExactOut).
+    pub bound: i128,
+    /// Slippage ceiling; 0 means no limit.
+    pub limit_price_bps: u32,
+}
+
+/// Per-leg result returned by `execute_legs` / `agent_execute_legs`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegResult {
+    pub market_id: u64,
+    /// Net collateral flow for this leg (positive = received, negative = spent).
+    pub collateral: i128,
+    pub shares: i128,
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, xdr::ToXdr, Env};
+    use soroban_sdk::{testutils::Address as _, vec, xdr::ToXdr, Env};
 
-    /// `#[contracttype]` enums encode their case name as an `ScSymbol`, so the
-    /// XDR of the shared `Outcome` must stay `Yes`/`No`, never reordered.
+    /// Unit `#[contracttype]` enum variants encode as a one-element `Vec` holding
+    /// their case name as an `ScSymbol`, so the XDR of the shared `Outcome` must
+    /// stay `Yes`/`No`, never reordered.
     #[test]
     fn outcome_encodes_as_expected_symbols() {
         let env = Env::default();
         assert_eq!(
             Outcome::Yes.to_xdr(&env),
-            Symbol::new(&env, "Yes").to_xdr(&env)
+            vec![&env, Symbol::new(&env, "Yes")].to_xdr(&env)
         );
         assert_eq!(
             Outcome::No.to_xdr(&env),
-            Symbol::new(&env, "No").to_xdr(&env)
+            vec![&env, Symbol::new(&env, "No")].to_xdr(&env)
         );
     }
 
@@ -229,7 +358,10 @@ mod test {
             (Category::Culture, "Culture"),
             (Category::Other, "Other"),
         ] {
-            assert_eq!(value.to_xdr(&env), Symbol::new(&env, name).to_xdr(&env));
+            assert_eq!(
+                value.to_xdr(&env),
+                vec![&env, Symbol::new(&env, name)].to_xdr(&env)
+            );
         }
     }
 

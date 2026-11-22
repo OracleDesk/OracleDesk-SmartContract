@@ -1,0 +1,30 @@
+{
+  "domain": "oracledesk.decision.v1",
+  "encoding": "sha256(domain || market_id:u64be || action_tag:u32be || outcome_tag:u32be || amount:i128be || bound:i128be || limit_price_bps:u32be || deadline:u64be)",
+  "cases": [
+    {
+      "name": "buy_yes",
+      "market_id": "7",
+      "action": "buy",
+      "action_tag": 2,
+      "outcome_tag": 0,
+      "amount": "1000",
+      "bound": "900",
+      "limit_price_bps": 6000,
+      "deadline": "100",
+      "hash": "715c6f5e16d59a6567df9f666a3ee93237a36b4d86baa8a04e927b32f93f392d"
+    },
+    {
+      "name": "sell_no",
+      "market_id": "7",
+      "action": "sell",
+      "action_tag": 3,
+      "outcome_tag": 1,
+      "amount": "900",
+      "bound": "1000",
+      "limit_price_bps": 4000,
+      "deadline": "100",
+      "hash": "46729b70575b48c7910a7dfbe68620f7aac6f123d2550ee9fa4a7338881a3311"
+    }
+  ]
+}

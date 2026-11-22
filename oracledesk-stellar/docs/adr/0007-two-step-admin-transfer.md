@@ -73,3 +73,15 @@ validates signatures. To hand a contract over to one:
   its own after seven days.
 - Operators must keep the pending proposal's deadline in mind; the deploy and
   migration scripts surface `pending_admin()` so a stuck proposal is visible.
+
+## Formal model
+
+The transfer is model-checked in
+[`docs/formal/governance.tla`](../formal/README.md#governance-model). It
+confirms that admin changes only through `accept_admin` by the address the
+then-admin proposed, and found one discrepancy with this ADR (finding G2): the
+text above says a proposal is inert once `expires_at <= now`, but every
+implementation rejects only `now > expires_at`, so a proposal can be accepted
+**at** `expires_at`. One side must change; `governance_admin_aligned.cfg` is the
+configuration for the ADR's boundary, and
+`model_trace_admin_accept_at_expiry_boundary` pins the current behaviour.

@@ -8,7 +8,8 @@ export type DueDiligenceReasonCode =
   | "RESOLUTION_UNAVAILABLE"
   | "ORACLE_UNTRUSTED"
   | "SIGNERS_UNTRUSTED"
-  | "VERIFICATION_UNAVAILABLE";
+  | "VERIFICATION_UNAVAILABLE"
+  | "RESOLVER_POLICY";
 
 export type VerificationStatus = "verified" | "failed" | "unavailable" | "not_applicable";
 
@@ -75,4 +76,51 @@ export function rejectChangedState(verdict: DueDiligenceVerdict): DueDiligenceVe
       },
     ],
   };
+}
+
+// ─── On-chain resolvability policy (#273) ────────────────────────────────────
+
+/** `resolver::SpecKind`, in the contract's order: the position is the bit in `allowedSpecs`. */
+export const SPEC_KINDS = ["None", "Price", "ScaledPrice", "Twap", "Signers", "Disputable", "WeightedKeys", "Committee", "Hybrid"] as const;
+export type SpecKind = (typeof SPEC_KINDS)[number];
+
+/** The treasury's `ResolvabilityPolicy`. */
+export interface ResolvabilityPolicy {
+  requireRevealed: boolean;
+  blockWhenDisputed: boolean;
+  blockWithOpenProposal: boolean;
+  minSecsToClose: bigint;
+  allowedSpecs: number;
+}
+
+/** The resolver's `trade_status` view. */
+export interface TradeStatus {
+  spec: SpecKind;
+  state: string;
+  closeTime: bigint;
+  deadline: bigint;
+  openProposal: boolean;
+}
+
+/**
+ * Pre-checks what the treasury's `check_resolvable` will enforce on a buy, in
+ * the same order and with the same boundaries, so an agent never submits a
+ * transaction that reverts. Returns the reasons it would be refused (empty =
+ * allowed). The contract stays the authority; this only saves a failed simulation.
+ */
+export function resolverPolicyReasons(
+  status: TradeStatus,
+  policy: ResolvabilityPolicy,
+  nowSecs: bigint,
+): DueDiligenceVerdict["reasons"] {
+  const refuse = (what: string) => [{ code: "RESOLVER_POLICY" as const, explanation: `treasury resolvability policy would refuse this buy: ${what}` }];
+  if (policy.requireRevealed && status.spec === "None") return refuse("SpecNotRevealed (the resolution spec was never revealed)");
+  if ((policy.allowedSpecs & (1 << SPEC_KINDS.indexOf(status.spec))) === 0) return refuse(`SpecKindNotAllowed (${status.spec})`);
+  if (policy.blockWhenDisputed && status.state === "Disputed") return refuse("MarketDisputed");
+  if (policy.blockWithOpenProposal && status.openProposal) return refuse("ProposalOpen");
+  if (nowSecs >= status.deadline) return refuse("PastResolutionDeadline");
+  if (policy.minSecsToClose > 0n && (status.closeTime > nowSecs ? status.closeTime - nowSecs : 0n) < policy.minSecsToClose) {
+    return refuse(`TooCloseToClose (needs ${policy.minSecsToClose}s before close)`);
+  }
+  return [];
 }

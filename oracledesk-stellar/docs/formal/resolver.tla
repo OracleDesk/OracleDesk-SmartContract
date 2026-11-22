@@ -198,17 +198,6 @@ Expire ==
     /\ UNCHANGED << now, mode, attested, proposal, cancels, oracleUp, propSeq,
                     cancelled, finalSeq >>
 
-\* Trust assumption: the market-core admin rotates the resolver
-\* (propose_resolver/accept_resolver) and the new one resolves. This resolver
-\* never sees it, so its own state is untouched.
-AdminBypass ==
-    /\ AllowBypass
-    /\ \E o \in {"Yes", "No", "Void"} :
-          /\ (o = "Void" \/ now >= C)
-          /\ Leave(o, "bypass")
-    /\ UNCHANGED << now, mode, state, attested, proposal, cancels, oracleUp,
-                    propSeq, cancelled, finalSeq >>
-
 Tick ==
     /\ \/ now < D
        \/ (HasProp /\ proposal.age < W)
@@ -230,7 +219,6 @@ Next ==
     \/ \E o \in {"Yes", "No"} : ResolvePrice(o)
     \/ OracleFlip
     \/ Expire
-    \/ AdminBypass
     \/ Tick
 
 Spec == Init /\ [][Next]_vars

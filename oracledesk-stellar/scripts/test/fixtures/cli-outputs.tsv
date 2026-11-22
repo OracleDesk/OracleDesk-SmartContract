@@ -1,0 +1,16 @@
+# Realistic Stellar CLI 27.1.0 stdout fixtures (command_pattern<TAB>exit_code<TAB>stdout)
+# Used by scripts/test/stubs/stellar when no test-specific scenario overrides a call.
+--version	0	stellar 27.1.0 (8e402ea28202950b272fbabc34caad4d2f64fe87)
+finalize_signers	0	"Yes"
+resolve_price	0	"Yes"
+get_price	0	5500
+verify_trace	0	true
+get_market	0	{"status":"Resolved","outcome":"Yes"}
+agent_create_market_and_reveal	0	1
+agent_create_market	0	1
+agent_buy	0	185000000
+publish_trace	0	7
+decimals	0	7
+name	0	"USD Coin"
+symbol	0	"USDC"
+resolution	0	300

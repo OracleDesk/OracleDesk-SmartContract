@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { calcBuy, priceAfterBuy } from "./fpmm.js";
-import { decideMarketProposal, decideTrade } from "./strategy.js";
+import { decideMarketProposal, decideTrade, decideTradeSized, twapFromObservations } from "./strategy.js";
+import type { CapsView } from "./sizing.js";
 
 test("decideMarketProposal skips a signal with no actionable estimate", () => {
   const d = decideMarketProposal(
@@ -70,6 +71,72 @@ test("decideTrade buys No when the market overprices Yes", () => {
   assert.equal(d.outcome, "No");
 });
 
+test("decideTrade uses twapBps when priceSource is twap", () => {
+  // Spot sits right on the fair value (no edge), but the TWAP reveals the
+  // real mispricing the spot price was dragged away from.
+  const d = decideTrade(
+    { marketId: 7, question: "q", yesBps: 6000, twapBps: 4000, closeTime: 0 },
+    6000,
+    { minEdgeBps: 100, tradeSizeStroops: 10_000_000n, priceSource: "twap" },
+  );
+  assert.equal(d.action, "buy");
+  assert.equal(d.outcome, "Yes");
+  assert.match(d.reasoning, /4000bps \(twap\)/);
+
+  // The same market read as spot skips.
+  const spot = decideTrade(
+    { marketId: 7, question: "q", yesBps: 6000, twapBps: 4000, closeTime: 0 },
+    6000,
+    { minEdgeBps: 100, tradeSizeStroops: 10_000_000n, priceSource: "spot" },
+  );
+  assert.equal(spot.action, "skip");
+});
+
+test("decideTrade with priceSource twap requires a twap price", () => {
+  assert.throws(
+    () =>
+      decideTrade(
+        { marketId: 7, question: "q", yesBps: 6000, closeTime: 0 },
+        6000,
+        { minEdgeBps: 100, tradeSizeStroops: 10_000_000n, priceSource: "twap" },
+      ),
+    /twapBps/,
+  );
+});
+
+test("twapFromObservations matches contract example", () => {
+  // Mirrors market-core's `twap_weights_by_time` arithmetic with round
+  // numbers: seeded at 6800bps, trade at t=1000 leaving 5000bps, trade at
+  // t=1100 leaving 6000bps, then the live edge counterfactually extended to
+  // t=1400. The 400s window from t=1000 to t=1400 averages
+  // (5000*100 + 6000*300) / 400 = 5750.
+  const observations = [
+    { ts: 0, cumulative: 0n },
+    { ts: 1000, cumulative: 6_800_000n },
+    { ts: 1100, cumulative: 6_800_000n + 100n * 5_000n },
+    { ts: 1400, cumulative: 6_800_000n + 100n * 5_000n + 300n * 6_000n },
+  ];
+  assert.equal(twapFromObservations(observations, 400), 5750);
+  // The last 300s were held at 6000bps exactly.
+  assert.equal(twapFromObservations(observations, 300), 6000);
+  // Windows may start strictly between observations (interpolated chord):
+  // t = 950 sits in the seeded-price stretch, so cum(950) = 6800 * 950.
+  assert.equal(
+    twapFromObservations(observations, 450),
+    Math.floor((9_100_000 - (6_800_000 * 950) / 1000) / 450),
+  );
+});
+
+test("twapFromObservations throws when the window predates the ring", () => {
+  const observations = [
+    { ts: 1000, cumulative: 0n },
+    { ts: 2000, cumulative: 5_000_000n },
+  ];
+  assert.throws(() => twapFromObservations(observations, 1001), /ObservationTooOld/);
+  assert.throws(() => twapFromObservations([], 100), /no observations/);
+  assert.throws(() => twapFromObservations(observations, 0), /positive integer/);
+});
+
 // The 100-sets pool at 50% with a 1% fee used by the calcBuy reference
 // example: 10 USDC moves the price 470bps, so a 200bps cap must clamp well
 // below the requested size.
@@ -136,4 +203,42 @@ test("decideTrade skips when every size would trip the impact cap", () => {
     { minEdgeBps: 100, tradeSizeStroops: 50n, maxImpactBps: 10 },
   );
   assert.equal(d.action, "skip");
+});
+
+test("decideTradeSized buys less than a fixed order on a thin pool", () => {
+  const market = {
+    marketId: 3,
+    question: "thin",
+    yesBps: 5_000,
+    closeTime: 0,
+    reserveYesStroops: 100_000n,
+    reserveNoStroops: 100_000n,
+    feeBps: 100,
+  };
+  const caps: CapsView = {
+    maxTrade: 50_000n,
+    maxMarket: 100_000n,
+    marketExposure: 0n,
+    maxDaily: 100_000n,
+    dailyUsed: 0n,
+    availableCapital: 50_000n,
+  };
+  const decision = decideTradeSized(
+    market,
+    { reserveYes: 100_000n, reserveNo: 100_000n, feeBps: 100n, setsMinted: 0n },
+    { yes: 0n, no: 0n },
+    caps,
+    { fairYesBps: 7_000n, uncertaintyBps: 0n },
+    {
+      kellyFractionNumerator: 1n,
+      kellyFractionDenominator: 4n,
+      bufferBps: 25n,
+      slippageBps: 50n,
+      minTradeStroops: 1n,
+    },
+    100,
+  );
+  assert.equal(decision.action, "buy");
+  assert.ok(decision.collateralInStroops! < 50_000n);
+  assert.ok(decision.sizing);
 });

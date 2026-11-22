@@ -24,6 +24,7 @@ export interface StateStore {
   /** All entries of a namespace, sorted by key. */
   entries<T>(ns: string): [string, T][];
   flush(): Promise<void>;
+  setFenceEpoch?(epoch: bigint): void;
 }
 
 type Data = Record<string, Record<string, unknown>>;
@@ -62,6 +63,7 @@ class Namespaces {
 /** Non-durable store (dry-run, tests). */
 export class MemoryStateStore extends Namespaces implements StateStore {
   async flush(): Promise<void> {}
+  setFenceEpoch(_epoch: bigint): void {}
 }
 
 export interface FileStateStoreOptions {
@@ -80,6 +82,7 @@ export class FileStateStore extends Namespaces implements StateStore {
   private readonly scope: string;
   private readonly debounceMs: number;
   private readonly renameFn: (from: string, to: string) => Promise<void>;
+  private fenceEpoch = 0n;
 
   constructor(
     private readonly path: string,
@@ -100,9 +103,14 @@ export class FileStateStore extends Namespaces implements StateStore {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return this;
       throw err;
     }
-    const parsed = decode(text) as { version: number; scopes: Record<string, Data> };
+    const parsed = decode(text) as { version: number; fenceEpoch?: bigint | string; scopes: Record<string, Data> };
     if (parsed.version !== STATE_VERSION) throw new Error(`${this.path}: unsupported state version ${parsed.version}`);
     const { [this.scope]: mine, ...rest } = parsed.scopes ?? {};
+    this.fenceEpoch = typeof parsed.fenceEpoch === "bigint"
+      ? parsed.fenceEpoch
+      : typeof parsed.fenceEpoch === "string"
+        ? BigInt(parsed.fenceEpoch)
+        : 0n;
     this.data = mine ?? {};
     this.other = rest;
     return this;
@@ -118,6 +126,14 @@ export class FileStateStore extends Namespaces implements StateStore {
     this.timer.unref();
   }
 
+  setFenceEpoch(epoch: bigint): void {
+    if (epoch < this.fenceEpoch) throw new Error(`refusing to overwrite fence epoch ${this.fenceEpoch} with ${epoch}`);
+    if (epoch !== this.fenceEpoch) {
+      this.fenceEpoch = epoch;
+      this.dirty = true;
+    }
+  }
+
   /** Writes now if anything changed; serialized with any write in progress. */
   flush(): Promise<void> {
     if (this.timer) {
@@ -130,7 +146,11 @@ export class FileStateStore extends Namespaces implements StateStore {
 
   private async write(): Promise<void> {
     this.dirty = false;
-    const body = encode({ version: STATE_VERSION, scopes: { ...this.other, [this.scope]: this.data } });
+    const body = encode({
+      version: STATE_VERSION,
+      fenceEpoch: this.fenceEpoch,
+      scopes: { ...this.other, [this.scope]: this.data },
+    });
     const dir = dirname(this.path);
     await mkdir(dir, { recursive: true });
     const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;

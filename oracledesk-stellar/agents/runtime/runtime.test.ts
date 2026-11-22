@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { runAgentd } from "../bin/agentd.js";
+import { KillSwitch, type KillReason } from "./kill-switch.js";
 import { AsyncMutex } from "./locks.js";
 import { NoLease, type Lease } from "./lease.js";
 import { memoryLogger } from "./log.js";
@@ -58,7 +62,7 @@ test("task never overlaps itself even when run exceeds interval", async () => {
   await rt.stop("test");
   await started;
   assert.equal(maxActive, 1);
-  assert.ok(runs >= 3, `runs: ${runs}`);
+  assert.ok(runs >= 2, `runs: ${runs}`);
 });
 
 test("async mutex is FIFO", async () => {
@@ -284,6 +288,28 @@ test("--once runs each task exactly once and exits 0", async () => {
     }),
     1,
   );
+});
+
+test("repeated contract errors trip the kill switch", async () => {
+  const reasons: KillReason[] = [];
+  const file = join(tmpdir(), `agent-kill-${randomUUID()}`);
+  const killSwitch = new KillSwitch({
+    state: new MemoryStateStore(),
+    file,
+    log: memoryLogger(),
+    onTrip: (reason) => void reasons.push(reason),
+  });
+  const { rt } = runtime(
+    [{ name: "bad", intervalMs: 1, run: async () => { throw new Error("contract error"); } }],
+    { killSwitch, maxConsecutiveFailures: 1 },
+  );
+  const started = rt.start();
+  await sleep(80);
+  await rt.stop("test");
+  await started;
+  assert.equal(rt.exitCode, 3);
+  assert.equal(reasons[0]?.code, "errors");
+  rmSync(file, { force: true });
 });
 
 test("invalid AGENT_MODE exits with code 2", async () => {

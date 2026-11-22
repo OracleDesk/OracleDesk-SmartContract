@@ -172,6 +172,190 @@ export interface BatchManifest {
   }>;
 }
 
+// ---------------------------------------------------------------------------
+// V2 leaf encoding — binds agent / market / action / position (issue #308)
+//
+// v1 leaf: sha256(0x00 || trace_hash)
+// v2 leaf: sha256(0x00 || 0x02 || trace_hash || agent_hash || market_id_be8 ||
+//                         action_hash || position_be8)
+//
+// 0x02 is a version discriminant so a v2 leaf can never collide with v1.
+// All string fields are sha256-hashed to give a fixed 32-byte slot.
+// ---------------------------------------------------------------------------
+
+export const MERKLE_V2_VERSION = Buffer.from([0x02]);
+export const MERKLE_V2_MAX_POSITION = 2 ** 32 - 1;
+
+export interface TraceLeafV2 {
+  traceHash: string;
+  agent: string;
+  marketId: bigint;
+  action: string;
+  /** 0-based position of this trace in the batch (u32, big-endian 8 bytes). */
+  position: number;
+}
+
+function hashField(s: string): Buffer {
+  return createHash("sha256").update(s, "utf8").digest();
+}
+
+function marketIdToBuffer(marketId: bigint): Buffer {
+  if (marketId < 0n || marketId > 0xffff_ffff_ffff_ffffn) {
+    throw new Error("marketId must fit in a u64");
+  }
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(marketId);
+  return buf;
+}
+
+function positionToBuffer(position: number): Buffer {
+  if (!Number.isInteger(position) || position < 0 || position > MERKLE_V2_MAX_POSITION) {
+    throw new Error("position must be a non-negative integer fitting in u32");
+  }
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(0, 0);
+  buf.writeUInt32BE(position, 4);
+  return buf;
+}
+
+/**
+ * Hashes a single trace into a v2 Merkle leaf.
+ * The leaf binds all four semantic fields to prevent cross-batch replay attacks.
+ */
+export function hashLeafV2(leaf: TraceLeafV2): string {
+  const norm = cleanHex(leaf.traceHash);
+  if (norm.length !== 64) throw new Error("traceHash must be 32 bytes hex");
+  return createHash("sha256")
+    .update(MERKLE_LEAF_PREFIX)      // 0x00 — leaf domain separator
+    .update(MERKLE_V2_VERSION)       // 0x02 — v2 discriminant
+    .update(Buffer.from(norm, "hex"))
+    .update(hashField(leaf.agent))
+    .update(marketIdToBuffer(leaf.marketId))
+    .update(hashField(leaf.action))
+    .update(positionToBuffer(leaf.position))
+    .digest("hex");
+}
+
+export interface BatchManifestV2 {
+  version: "oracledesk.batch.manifest.v2";
+  root: string;
+  leafCount: number;
+  publishedAt: number;
+  traces: Array<{
+    index: number;
+    traceHash: string;
+    cid: string;
+    agent: string;
+    marketId: string;
+    action: string;
+  }>;
+}
+
+export interface BatchTraceProof {
+  root: string;
+  leafCount: number;
+  index: number;
+  leaf: TraceLeafV2;
+  proof: string[];
+}
+
+/**
+ * Builds a v2 Merkle tree from a list of leaf descriptors and returns the
+ * tree plus an inclusion proof for the requested index.
+ */
+export function prove_batched_trace(
+  leaves: TraceLeafV2[],
+  proofIndex: number,
+): { tree: MerkleTree; batchProof: BatchTraceProof } {
+  if (leaves.length === 0) throw new Error("cannot build tree from empty leaves");
+  if (leaves.length > MAX_LEAVES) throw new Error(`leaf count exceeds maximum ${MAX_LEAVES}`);
+  if (proofIndex < 0 || proofIndex >= leaves.length) {
+    throw new Error(`proofIndex ${proofIndex} out of bounds`);
+  }
+
+  const leafHashes = leaves.map((l) => hashLeafV2(l));
+
+  // Build tree from raw leaf hashes (bypassing hashLeaf — leaves are already hashed)
+  const layers: string[][] = [leafHashes];
+  let currentLayer = leafHashes;
+  while (currentLayer.length > 1) {
+    const nextLayer: string[] = [];
+    for (let i = 0; i < currentLayer.length; i += 2) {
+      if (i + 1 < currentLayer.length) {
+        nextLayer.push(hashNode(currentLayer[i], currentLayer[i + 1]));
+      } else {
+        nextLayer.push(currentLayer[i]);
+      }
+    }
+    layers.push(nextLayer);
+    currentLayer = nextLayer;
+  }
+
+  const tree: MerkleTree = {
+    root: currentLayer[0],
+    leafCount: leaves.length,
+    layers,
+  };
+
+  // Generate proof by walking up the tree
+  const proof: string[] = [];
+  let currIdx = proofIndex;
+  for (let l = 0; l < tree.layers.length - 1; l++) {
+    const layer = tree.layers[l];
+    const currLen = layer.length;
+    if (currLen % 2 === 1 && currIdx === currLen - 1) {
+      // odd lone node — no sibling
+    } else if (currIdx % 2 === 0) {
+      proof.push(layer[currIdx + 1]);
+    } else {
+      proof.push(layer[currIdx - 1]);
+    }
+    currIdx = Math.floor(currIdx / 2);
+  }
+
+  return {
+    tree,
+    batchProof: {
+      root: tree.root,
+      leafCount: tree.leafCount,
+      index: proofIndex,
+      leaf: leaves[proofIndex],
+      proof,
+    },
+  };
+}
+
+/**
+ * Verifies a BatchTraceProof produced by prove_batched_trace.
+ */
+export function verifyBatchTraceProof(batchProof: BatchTraceProof): boolean {
+  const { root, leafCount, index, leaf, proof } = batchProof;
+  if (leafCount <= 0 || leafCount > MAX_LEAVES) return false;
+  if (index < 0 || index >= leafCount) return false;
+  if (proof.length > MAX_PROOF_LEN) return false;
+
+  let current = hashLeafV2(leaf);
+  let currIdx = index;
+  let currLen = leafCount;
+  let proofIdx = 0;
+
+  while (currLen > 1) {
+    if (currLen % 2 === 1 && currIdx === currLen - 1) {
+      // odd lone node
+    } else {
+      if (proofIdx >= proof.length) return false;
+      const sibling = proof[proofIdx++];
+      current = currIdx % 2 === 0
+        ? hashNode(current, sibling)
+        : hashNode(sibling, current);
+    }
+    currIdx = Math.floor(currIdx / 2);
+    currLen = Math.floor((currLen + 1) / 2);
+  }
+
+  return proofIdx === proof.length && cleanHex(current) === cleanHex(root);
+}
+
 export class BatchCollector {
   private queue: QueuedBatchTrace[] = [];
 

@@ -682,6 +682,32 @@
         ]
       }
     },
+    "preview_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The feed's newest observation (`lastprice`) for the market's committed asset: a read-only health check for keepers before calling `resolve_price`. Resolution never consults it (issue #26): a live `lastprice` can be fresher than `close_time`, and the historical grid lookup is the only settlement source. A trapping feed or a feed with no record is `PriceUnavailable`; signer-mode markets are `WrongMode`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "preview_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "PriceData"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "propose_admin": {
       "kind": "function_v0",
       "spec": {
@@ -864,6 +890,37 @@
         ]
       }
     },
+    "register_scaled_price_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reveals a decimal-explicit price rule committed to as `sha256(SCALED_SPEC_DOMAIN || XDR(ScaledPriceConfig))` (issue #26). Same commit/reveal flow as [`register_price_spec`]; `threshold_decimals` above [`MAX_THRESHOLD_DECIMALS`] is `InvalidConfig` (no `i128` scale factor exists that large). The preimage is its own domain-tagged space rather than a `ResolutionSpec` variant because PR #176 moved that enum to `oracledesk-types` (edited only via maintainer follow-up; see ADR 0001) — every existing `Price` / `Signers` / V2 commitment stays byte-for-byte valid either way.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "ScaledPriceConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_scaled_price_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "register_signer_spec": {
       "kind": "function_v0",
       "spec": {
@@ -916,6 +973,37 @@
           }
         ],
         "name": "register_spec_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_twap_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reveals a time-weighted-average price rule committed to as `sha256(TWAP_SPEC_DOMAIN || XDR(TwapConfig))` (issue #27). Same commit/reveal flow as [`register_scaled_price_spec`], with two differences. First, the static validation ([`validate_twap_rule`]): `window > 0`, `min_samples >= 2`, `max_gap` in `(0, window]`, `threshold >= 0`. Second, feasibility is checked *against the live feed*: the grid period only exists on-chain, so registration calls `resolution()` on the configured reflector and rejects `window / resolution > MAX_TWAP_SAMPLES` or `min_samples > window / resolution` with `InvalidConfig`. This makes the reflector required reachable at registration (a trapping feed gives `PriceUnavailable`) — deliberate: an unresolvable TWAP market is caught at reveal time, not at close.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "TwapConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_twap_spec",
         "outputs": [
           {
             "result": {
@@ -991,6 +1079,32 @@
           }
         ],
         "name": "resolve_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Outcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "resolve_twap": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Resolves a [`TwapConfig`] market (issue #27). Same lifecycle as `resolve_price` (closed, not terminal), and markets already revealed as TWAP also resolve through `resolve_price`, which dispatches here. Non-TWAP markets are `WrongMode`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolve_twap",
         "outputs": [
           {
             "result": {
@@ -1123,10 +1237,31 @@
         ]
       }
     },
+    "spec_kind": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Which kind of rule `market_id` has revealed (`SpecKind::None` before any reveal). Existence checks only (`has`), so the read footprint stays minimal; a missing or archived entry reads as `None`, it never panics. Needed because `state()` stays `Unconfigured` for a revealed price or signer market (#273).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "spec_kind",
+        "outputs": [
+          {
+            "udt": {
+              "name": "SpecKind"
+            }
+          }
+        ]
+      }
+    },
     "state": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Pure view: no TTL extensions. The instance and the market's entries are kept alive by the mutating entrypoints above, so a view-only simulation stays read-only.",
         "inputs": [
           {
             "doc": "",
@@ -1199,6 +1334,32 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "trade_status": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The spec kind, resolution state, deadline and proposal flag in one read: one cross-contract call from the treasury instead of four. Reads market-core's `close_time` once. A pure view: it does not extend any TTL (so a simulation stays read-only), unlike `instance_get`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "trade_status",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TradeStatus"
+                }
+              }
             }
           }
         ]
@@ -1952,6 +2113,54 @@
         "name": "ResolutionState"
       }
     },
+    "ScaledPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Decimal-explicit price rule (issue #26, goal 2). Unlike the legacy [`PriceConfig`] — re-exported here from `oracledesk-types`, whose `threshold` is in *feed-native units* and is compared to the raw feed price with no scaling, so every committed legacy hash and meaning is unchanged (ADR 0001) — this struct records `threshold_decimals`, and resolution rescales both the threshold and the feed price to `max(feed_decimals, threshold_decimals)` with checked arithmetic before comparing. A creator who means \"$0.20\" commits `threshold = 20`, `threshold_decimals = 2` instead of guessing the feed's scale. `PriceConfig` and `SignerConfig` deliberately do **not** appear here: PR #176 made `contracts/oracledesk-types` their canonical home and this crate re-exports them (see the `pub use` at the top of this file), so a `resolution_hash` commitment never depends on which crate declared the type. [`ScaledPriceConfig`] stays resolver-local for now for the same reason ADR 0001 can state its append-only rule so precisely",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "threshold_decimals",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ScaledPriceConfig"
+      }
+    },
     "SignerConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1979,6 +2188,166 @@
         ],
         "lib": "",
         "name": "SignerConfig"
+      }
+    },
+    "SpecKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Committee"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Disputable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "A hybrid price-then-signers market, before and after its fallback opens.",
+              "name": "Hybrid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "No spec has been revealed for this market.",
+              "name": "None"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ScaledPrice"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Twap"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WeightedKeys"
+            }
+          }
+        ],
+        "doc": "Which kind of resolution rule a market has *revealed*, as read by [`Resolver::spec_kind`]. `ResolutionState` cannot tell \"revealed\" from \"not revealed\": a revealed price or signer market still reads `Unconfigured` until it is finalized, disputed or reset, so the kind is derived from which spec entry exists (#273).",
+        "lib": "",
+        "name": "SpecKind"
+      }
+    },
+    "TradeStatus": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Everything the treasury's pre-trade resolvability check needs, in one cross-contract call (#273).",
+        "fields": [
+          {
+            "doc": "market-core `close_time`.",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "`close_time + RESOLUTION_GRACE_SECS`: when `expire_market` becomes callable.",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "A signer proposal is pending (its dispute window may be open).",
+            "name": "open_proposal",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "SpecKind"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "state",
+            "type_": {
+              "udt": {
+                "name": "ResolutionState"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TradeStatus"
+      }
+    },
+    "TwapConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Time-weighted-average price rule (issue #27). The market settles on the average of the feed's records over a window ending at `close_time` instead of a single print: a manipulated or anomalous close record can no longer decide the market on its own. Like the legacy [`PriceConfig`] (and unlike [`ScaledPriceConfig`], issue #26) the `threshold` is in feed-native units — the TWAP is a raw-price average — and the committed comparison applies to the floored average (see `twap_outcome` and ADR 0001). `min_samples`/`max_gap` encode how much of the window the feed must actually have filled: resolution is rejected (`StalePrice`) below `min_samples` present records or when any gap — window start to first sample, consecutive samples, or last sample to `close_time` — exceeds `max_gap`. Same canonical-home note as [`ScaledPriceConfig`]: this is a resolver-local type committing through a domain-tagged preimage ([`twap_spec_hash`]) because PR #176 froze `oracledesk-types`' `ResolutionSpec` as the shared enum router",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_gap",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "min_samples",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "window",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "TwapConfig"
       }
     },
     "Verdict": {
@@ -2179,6 +2548,66 @@
           },
           {
             "doc": "",
+            "name": "MarketCoreAlreadyClaimed",
+            "value": 1049
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreCallFailed",
+            "value": 1042
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientLiquidity",
+            "value": 1047
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientShares",
+            "value": 1048
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInvalidAmount",
+            "value": 1051
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketClosed",
+            "value": 1046
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotFound",
+            "value": 1043
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotOpen",
+            "value": 1045
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNotFinal",
+            "value": 1044
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNothingToRedeem",
+            "value": 1050
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreOverflow",
+            "value": 1052
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreSlippageExceeded",
+            "value": 1053
+          },
+          {
+            "doc": "",
             "name": "MarketNotClosed",
             "value": 7
           },
@@ -2221,6 +2650,11 @@
             "doc": "",
             "name": "PriceUnavailable",
             "value": 8
+          },
+          {
+            "doc": "A reasoning-registry read failed.",
+            "name": "RegistryCallFailed",
+            "value": 1054
           },
           {
             "doc": "",
@@ -2760,6 +3194,60 @@
         ]
       }
     },
+    "PriceResolutionScaled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Emitted alongside the unchanged [`PriceResolution`]/[`PriceResolutionV2`] for a [`ScaledPriceConfig`] settlement (issue #26): the raw feed price, the feed's `decimals()`, the threshold rescaled to the comparison scale, and the grid-aligned lookup timestamp. New event type, so existing indexer decoders are untouched.",
+        "lib": "",
+        "name": "PriceResolutionScaled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "raw_price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "feed_decimals",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "threshold_scaled",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "lookup_timestamp",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "price_resolution_scaled"
+        ]
+      }
+    },
     "PriceResolutionV2": {
       "kind": "event_v0",
       "spec": {
@@ -2987,6 +3475,60 @@
         ],
         "prefix_topics": [
           "rotation_proposed"
+        ]
+      }
+    },
+    "TwapResolution": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Emitted alongside the [`PriceResolution`]/[`PriceResolutionV2`] pair for a [`TwapConfig`] settlement (issue #27): the floored time-weighted average, how many grid records answered, and the oldest/newest sample timestamps. New event type, so existing indexer decoders are untouched.",
+        "lib": "",
+        "name": "TwapResolution",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "twap",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "samples",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "first_ts",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "last_ts",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "twap_resolution"
         ]
       }
     }

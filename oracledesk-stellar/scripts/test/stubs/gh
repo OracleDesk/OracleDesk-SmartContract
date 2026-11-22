@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub `gh` CLI for bats tests (Issue #132).
+set -euo pipefail
+
+if [ -n "${STUB_LOG:-}" ]; then
+  printf 'gh %s\n' "$*" >>"$STUB_LOG"
+fi
+
+printf 'https://github.com/OracleDesk/OracleDesk-SmartContract/issues/999\n'

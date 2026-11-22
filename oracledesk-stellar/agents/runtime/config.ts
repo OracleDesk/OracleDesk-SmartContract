@@ -9,19 +9,29 @@ export class ConfigError extends Error {
   }
 }
 
-/** Exit codes: 2 = bad configuration, 75 = EX_TEMPFAIL (lease held elsewhere). */
+/** Exit codes: 2 = bad configuration, 3 = killed, 75 = EX_TEMPFAIL (lease held elsewhere). */
 export const EXIT_CONFIG = 2;
+export const EXIT_KILLED = 3;
 export const EXIT_TEMPFAIL = 75;
 
 /**
- * `AGENT_MODE` must be exactly "dry-run" or "live" (unset = "dry-run").
+ * `AGENT_MODE` must be exactly "dry-run" or "live" (unset = "dry-run"; "" is rejected).
  * Anything else used to fall through to the live path; now it is fatal.
  */
 export function parseAgentMode(env: NodeJS.ProcessEnv): AgentMode {
   const raw = env.AGENT_MODE;
-  if (raw === undefined || raw === "") return "dry-run";
+  if (raw === undefined) return "dry-run";
   if (raw === "dry-run" || raw === "live") return raw;
   throw new ConfigError(`AGENT_MODE must be "dry-run" or "live", got ${JSON.stringify(raw)}`);
+}
+
+/**
+ * Compile-time exhaustiveness check; throws if an unexpected value slips
+ * through at runtime. `shown` is what the message prints, so callers can pass
+ * a whole narrowed object as `value` without echoing its other fields.
+ */
+export function assertNever(value: never, what: string, shown: unknown = value): never {
+  throw new Error(`unknown ${what} ${JSON.stringify(shown)}: expected "dry-run" or "live"`);
 }
 
 export function intEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min = 0): number {
