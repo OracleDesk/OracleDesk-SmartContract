@@ -1,0 +1,146 @@
+# Curated caller/auth and storage metadata for resolver.
+# Validated against packages/bindings/resolver/interface.json by scripts/gen-contract-docs/generate.mjs.
+
+[functions.__constructor]
+caller = "deployer (constructor)"
+
+[functions.accept_admin]
+caller = "pending admin (require_auth)"
+
+[functions.accept_market_core_role]
+caller = "anyone (permissionless)"
+notes = "Completes authenticated market-core wiring by calling accept_resolver on configured market_core."
+
+[functions.admin]
+caller = "anyone (read-only)"
+
+[functions.attest]
+caller = "configured signer (require_auth)"
+
+[functions.attest_with_evidence]
+caller = "configured signer (require_auth)"
+
+[functions.cancel_admin_transfer]
+caller = "admin (require_auth)"
+
+[functions.cancel_count]
+caller = "anyone (read-only)"
+
+[functions.cancel_proposal]
+caller = "admin / guardian (require_auth)"
+
+[functions.cancel_rotation]
+caller = "admin (require_auth)"
+
+[functions.claim_dispute_bond]
+caller = "bond recipient (require_auth)"
+
+[functions.create_committee]
+caller = "admin (require_auth)"
+
+[functions.current_round]
+caller = "anyone (read-only)"
+
+[functions.dispute]
+caller = "challenger (require_auth)"
+
+[functions.escalation_attest]
+caller = "escalation signer (require_auth)"
+
+[functions.evidence_at]
+caller = "anyone (read-only)"
+
+[functions.evidence_config]
+caller = "anyone (read-only)"
+
+[functions.evidence_count]
+caller = "anyone (read-only)"
+
+[functions.execute_rotation]
+caller = "anyone (permissionless after timelock)"
+
+[functions.expire_dispute]
+caller = "anyone (permissionless after dispute window)"
+
+[functions.expire_market]
+caller = "anyone (permissionless after expiry)"
+
+[functions.finalize_signers]
+caller = "anyone (permissionless after dispute window)"
+
+[functions.get_committee]
+caller = "anyone (read-only)"
+
+[functions.guardian_options]
+caller = "anyone (read-only)"
+
+[functions.guardian_void_market]
+caller = "admin / guardian (require_auth)"
+
+[functions.market_core]
+caller = "anyone (read-only)"
+
+[functions.open_fallback]
+caller = "anyone (permissionless when feed unavailable)"
+
+[functions.pending_admin]
+caller = "anyone (read-only)"
+
+[functions.propose_admin]
+caller = "admin (require_auth)"
+
+[functions.propose_rotation]
+caller = "admin (require_auth)"
+
+[functions.register_committee_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.register_disputable_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.register_hybrid_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.register_price_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.register_signer_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.register_spec_v2]
+caller = "anyone (permissionless; salted V2 hash commitment verified)"
+
+[functions.register_weighted_key_spec]
+caller = "anyone (permissionless; hash commitment verified)"
+
+[functions.resolution_deadline]
+caller = "anyone (read-only)"
+
+[functions.resolve_price]
+caller = "anyone (permissionless after close_time)"
+
+[functions.set_evidence_config]
+caller = "admin (require_auth)"
+
+[functions.settle_dispute]
+caller = "anyone (permissionless after dispute resolution)"
+
+[functions.snapshot]
+caller = "anyone (read-only)"
+
+[functions.snapshot_price]
+caller = "anyone (permissionless)"
+
+[functions.state]
+caller = "anyone (read-only)"
+
+[functions.submit_signatures]
+caller = "anyone (verifies weighted Ed25519 signatures)"
+
+[storage.Admin]
+durability = "instance"
+ttl = "extended with contract instance TTL"
+
+[storage.MarketCore]
+durability = "instance"
+ttl = "extended with contract instance TTL"

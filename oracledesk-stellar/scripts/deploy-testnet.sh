@@ -7,32 +7,76 @@
 # key or contract is touched. Each network gets its own record in
 # deployments/<network>.json, so local runs never clobber testnet.
 #
+# Collateral modes (Issue #134):
+#   COLLATERAL_MODE=self-issued (default) — deploys self-issued USDC:<deployer>
+#   COLLATERAL_MODE=existing              — uses COLLATERAL_ASSET=CODE:G... SAC
+#                                           (e.g. Circle testnet USDC), checks
+#                                           decimals==7 & issuer flags, adds
+#                                           trustlines, funds via deposit only.
+#
 # Safe to re-run: each step checks the network's record first and skips
 # anything already deployed. Delete an entry (or the whole file) to force
 # that piece to redeploy. The deterministic salts make a re-run idempotent.
 #
-# Requires: stellar CLI, jq. Builds the contracts first if their wasm
-# isn't already built (`make build` does this, or run `stellar contract
-# build` yourself first).
+# Requires: stellar CLI, jq (and curl in existing collateral mode).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 NETWORK=${NETWORK:-testnet}
 case "$NETWORK" in
-  testnet|local) ;;
-  *) echo "error: NETWORK must be testnet or local (never mainnet)" >&2; exit 1 ;;
+  testnet | local) ;;
+  *)
+    echo "error: NETWORK must be testnet or local (never mainnet)" >&2
+    exit 1
+    ;;
 esac
+
+COLLATERAL_MODE=${COLLATERAL_MODE:-self-issued}
+COLLATERAL_ASSET=${COLLATERAL_ASSET:-}
+COLLATERAL_CONTRACT_ID=${COLLATERAL_CONTRACT_ID:-}
+FORCE_REDEPLOY=${FORCE_REDEPLOY:-0}
+case "$COLLATERAL_MODE" in
+  self-issued | existing) ;;
+  *)
+    echo "error: COLLATERAL_MODE must be self-issued or existing (got '$COLLATERAL_MODE')" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$COLLATERAL_MODE" = "existing" ]; then
+  if [ -z "$COLLATERAL_ASSET" ]; then
+    echo "error: COLLATERAL_MODE=existing requires COLLATERAL_ASSET=CODE:G..." >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$COLLATERAL_ASSET" | grep -Eq '^[A-Za-z0-9]{1,12}:G[A-Z2-7]{55}$'; then
+    echo "error: malformed COLLATERAL_ASSET '$COLLATERAL_ASSET' (expected CODE:G<55 base32 chars>)" >&2
+    exit 1
+  fi
+fi
+
+if [ -z "${HORIZON_URL:-}" ]; then
+  if [ "$NETWORK" = "local" ]; then
+    HORIZON_URL="http://localhost:8000"
+  else
+    HORIZON_URL="https://horizon-testnet.stellar.org"
+  fi
+fi
 
 IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
 DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
 AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
-# Least-privilege per-role agents registered in the treasury's agent
-# registry: the maker creates/seeds and settles, the trader trades and
-# settles. The constructor agent above keeps every role until removed.
 MAKER_KEY=${MAKER_KEY:-${IDENTITY_PREFIX}-maker}
 TRADER_KEY=${TRADER_KEY:-${IDENTITY_PREFIX}-trader}
 OUT=${OUT:-deployments/$NETWORK.json}
-WASM_DIR=target/wasm32v1-none/release
+WASM_DIR=${WASM_DIR:-target/wasm32v1-none/release}
+case "$WASM_DIR" in
+  *local-short*)
+    [ "$NETWORK" = "local" ] || {
+      echo "error: local-short-windows wasm may only be deployed on NETWORK=local" >&2
+      exit 1
+    }
+    ;;
+esac
 
 # treasury's risk caps (7-decimal USDC units). Must comfortably clear
 # market-core's MIN_SEED (100 USDC) since agent_create_market's seed amount
@@ -40,69 +84,41 @@ WASM_DIR=target/wasm32v1-none/release
 MAX_TRADE=${MAX_TRADE:-2000000000}   # 200 USDC
 MAX_MARKET=${MAX_MARKET:-5000000000} # 500 USDC
 MAX_DAILY=${MAX_DAILY:-10000000000}  # 1,000 USDC
-# Cap on capital deployed in open positions across all markets at once
-# (must be >= MAX_TRADE).
 MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
-# Drawdown risk controls (Issue #46)
 MAX_DRAWDOWN=${MAX_DRAWDOWN:-50000000000} # 5,000 USDC
 DRAWDOWN_WINDOW_DAYS=${DRAWDOWN_WINDOW_DAYS:-7}
-# Market creation risk controls (Issue #47)
 MAX_SEED=${MAX_SEED:-$MAX_MARKET}
 MAX_MARKETS_PER_DAY=${MAX_MARKETS_PER_DAY:-20}
-# The local E2E harness uses 10-second markets; testnet keeps a 60s floor so
-# a market cannot close before the deploy transaction is observable.
 if [ "$NETWORK" = "local" ]; then
   MIN_CLOSE_HORIZON=${MIN_CLOSE_HORIZON:-5}
 else
   MIN_CLOSE_HORIZON=${MIN_CLOSE_HORIZON:-60}
 fi
 MAX_CLOSE_HORIZON=${MAX_CLOSE_HORIZON:-7776000} # 90 days
-ALLOWED_CATEGORIES=${ALLOWED_CATEGORIES:-63}     # 0x3F (Crypto, Forex, Equities, Commodities, Macro, Politics)
-# Timelock (seconds, >= 86400) on every loosening treasury change: raising a
-# cap, adding or widening an agent, switching market-core or collateral.
+ALLOWED_CATEGORIES=${ALLOWED_CATEGORIES:-63}    # 0x3F
 CONFIG_DELAY=${CONFIG_DELAY:-86400}
-# Per-agent sub-budgets, within the global caps above. The maker's max_trade
-# must clear market-core's 100 USDC MIN_SEED.
 MAKER_MAX_TRADE=${MAKER_MAX_TRADE:-$MAX_TRADE}
-MAKER_MAX_DAILY=${MAKER_MAX_DAILY:-5000000000}   # 500 USDC
+MAKER_MAX_DAILY=${MAKER_MAX_DAILY:-5000000000}
 TRADER_MAX_TRADE=${TRADER_MAX_TRADE:-$MAX_TRADE}
-TRADER_MAX_DAILY=${TRADER_MAX_DAILY:-5000000000} # 500 USDC
+TRADER_MAX_DAILY=${TRADER_MAX_DAILY:-5000000000}
 ROLE_CREATE=1
 ROLE_TRADE=2
 ROLE_SETTLE=4
-# Deterministic deploy salts (#61). The contract id for a `deploy --salt` is
-# derived from (network, source account, salt) — not the constructor — so the
-# real resolver and treasury addresses are known *before* market-core's
-# constructor runs and no placeholder window ever exists. Changing a salt
-# re-deploys that contract at a new address; delete its entry in
-# deployments/testnet.json to force a fresh deploy at the recorded salt.
+
 MARKET_CORE_SALT=${MARKET_CORE_SALT:-6f7261636c656465736b2d6d61726b65742d636f72652d7631}
 RESOLVER_SALT=${RESOLVER_SALT:-6f7261636c656465736b2d7265736f6c7665722d7631}
 TREASURY_SALT=${TREASURY_SALT:-6f7261636c656465736b2d74726561737572792d7631}
 REGISTRY_SALT=${REGISTRY_SALT:-6f7261636c656465736b2d72656769737472792d7631}
 TIMELOCK_SALT=${TIMELOCK_SALT:-6f7261636c656465736b2d74696d656c6f636b2d7631}
+ROUTER_SALT=${ROUTER_SALT:-6f7261636c656465736b2d726f757465722d7631}
 # Local-only Reflector-shaped oracle (contracts/test-oracle). Never deployed
 # on testnet, so nobody can commit a real market to a fake feed.
 TEST_ORACLE_SALT=${TEST_ORACLE_SALT:-6f7261636c656465736b2d746573742d6f7261636c652d7631}
-# #63: when 1 every contract's admin is the timelock, passed in the
-# constructor, so no single key can act instantly. It stays 0 by default
-# because it turns the rest of this script's admin setup into timelocked
-# schedule/execute calls (testnet cannot fast-forward the delay), and the
-# deployer-admin path is the one exercised end to end. Set USE_TIMELOCK=1 once
-# the operational keys exist; see docs/adr/0008-governance-timelock.md for the
-# full procedure and scripts/wire-timelock.sh for moving an existing
-# deployment to the timelock via the two-step admin handover.
 USE_TIMELOCK=${USE_TIMELOCK:-0}
-# Timelock proposer/canceller/executor/emergency all default to the deployer
-# for bootstrap. Point them at real operational keys for anything but testnet.
 TIMELOCK_PROPOSER_KEY=${TIMELOCK_PROPOSER_KEY:-$DEPLOYER_KEY}
 TIMELOCK_CANCELLER_KEY=${TIMELOCK_CANCELLER_KEY:-$DEPLOYER_KEY}
-# Timelock default delay floor (seconds, >= 86400).
 TIMELOCK_DELAY=${TIMELOCK_DELAY:-86400}
-DEFAULT_FEE_BPS=${DEFAULT_FEE_BPS:-100} # 1%
-# Portion of each fee kept by the protocol treasury (bps). The remainder
-# accrues to the market creator, claimable before resolution. 10000 = the
-# protocol keeps everything (pre-#8 behavior).
+DEFAULT_FEE_BPS=${DEFAULT_FEE_BPS:-100}
 PROTOCOL_FEE_SHARE_BPS=${PROTOCOL_FEE_SHARE_BPS:-10000}
 
 log() { echo "==> $*" >&2; }
@@ -115,20 +131,37 @@ require_cmd() {
 }
 require_cmd stellar
 require_cmd jq
+if [ "$COLLATERAL_MODE" = "existing" ]; then
+  require_cmd curl
+fi
 
-mkdir -p deployments
+mkdir -p "$(dirname "$OUT")"
 [ -f "$OUT" ] || echo '{}' >"$OUT"
 
 json_get() { jq -r "$1 // empty" "$OUT"; }
-json_set() {
-  local tmp
+
+json_set_str() {
+  local path=$1 val=$2 tmp
   tmp=$(mktemp)
-  jq "$@" "$OUT" >"$tmp" && mv "$tmp" "$OUT"
+  jq --arg p "$path" --arg v "$val" \
+    'setpath($p | split(".") | map(select(length > 0)); $v)' \
+    "$OUT" >"$tmp" && mv "$tmp" "$OUT"
 }
 
-# Predict the address a `--salt` deploy will land at, without deploying.
-# The id is a pure function of (network, source account, salt), so this is
-# stable across runs and independent of the constructor arguments.
+json_set_raw() {
+  local path=$1 val=$2 tmp
+  tmp=$(mktemp)
+  jq --arg p "$path" --argjson v "$val" \
+    'setpath($p | split(".") | map(select(length > 0)); $v)' \
+    "$OUT" >"$tmp" && mv "$tmp" "$OUT"
+}
+
+json_del() {
+  local filter=$1 tmp
+  tmp=$(mktemp)
+  jq "$filter" "$OUT" >"$tmp" && mv "$tmp" "$OUT"
+}
+
 predict_id() {
   stellar contract id wasm \
     --salt "$1" \
@@ -136,15 +169,6 @@ predict_id() {
     --network "$NETWORK"
 }
 
-# Generate a 32-byte hex salt if the caller has not pinned one.
-new_salt() { openssl rand -hex 32; }
-
-# Run an admin-gated call. When the admin is the deployer (`USE_TIMELOCK=0`)
-# it invokes directly; when the timelock owns admin it prints the
-# `schedule`/`execute` pair an operator must run and reports a skip. Building
-# `Vec<Val>` arguments for `schedule` needs the ScVal encoding, which is left
-# to the operator on purpose: an automatic, unverified encoding is how a
-# governance bypass would slip in. See docs/adr/0008-governance-timelock.md.
 admin_invoke() {
   local target=$1 fn=$2
   shift 2
@@ -154,9 +178,13 @@ admin_invoke() {
     return 0
   fi
   log "timelock owns admin: schedule $fn on $target through $TIMELOCK"
-  log "  stellar contract invoke --id $TIMELOCK --source-account $TIMELOCK_PROPOSER_KEY \\"
-  log "    --network $NETWORK -- schedule --target $target --fn_name $fn --args '<scval-json>'"
-  log "  then execute after ${TIMELOCK_DELAY}s; skipped for now"
+  log "  cd scripts/governance"
+  log "  npm run cli -- propose --network $NETWORK --timelock $TIMELOCK \\"
+  log "    --target $target --contract <binding-name> --fn $fn \\"
+  log "    --args '<json-object>' --title '<review title>' --submit"
+  log "  npm run cli -- status <id> --network $NETWORK"
+  log "  npm run cli -- execute <id> --network $NETWORK --submit"
+  log "  skipped for now; see docs/governance-cli.md"
   return 1
 }
 
@@ -170,29 +198,45 @@ ensure_identity() {
   fi
 }
 
+ensure_trustline() {
+  local key_name=$1 addr=$2 asset=$3 code issuer acct has_tl
+  code="${asset%%:*}"
+  issuer="${asset#*:}"
+  acct=$(curl -sf "$HORIZON_URL/accounts/$addr" || echo '{}')
+  has_tl=$(printf '%s\n' "$acct" | jq -r --arg c "$code" --arg i "$issuer" \
+    '[.balances[]? | select(.asset_code == $c and .asset_issuer == $i)] | length')
+  if [ "${has_tl:-0}" -gt 0 ]; then
+    log "trustline for $asset already exists on $key_name ($addr)"
+    return 0
+  fi
+  log "creating classic trustline for $asset on $key_name ($addr)"
+  stellar tx new change-trust \
+    --source-account "$key_name" \
+    --line "$asset" \
+    --network "$NETWORK" >/dev/null
+}
+
 # --- wasm must already be built -------------------------------------------
-EXTRA_WASM=""
-[ "$NETWORK" = "local" ] && EXTRA_WASM="test_oracle"
-for f in market_core resolver reasoning_registry treasury timelock router $EXTRA_WASM; do
+WASM_MISSING=0
+for f in market_core resolver reasoning_registry treasury timelock router test_oracle; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     log "missing $WASM_DIR/$f.wasm — building all contracts first"
-    stellar contract build
+    WASM_MISSING=1
     break
   fi
 done
-
-# contractimport! (resolver, treasury, router) reads a vendored copy of
-# market-core's wasm at *their* compile time — keep it fresh before
-# rebuilding them. See docs/adr/0002-cross-contract-calls.md.
-cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
-cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
-cp "$WASM_DIR/market_core.wasm" contracts/reasoning-registry/market_core.wasm
-cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
-cp "$WASM_DIR/market_core.wasm" contracts/router/market_core.wasm
-cp "$WASM_DIR/resolver.wasm" contracts/router/resolver.wasm
-cp "$WASM_DIR/reasoning_registry.wasm" contracts/router/reasoning_registry.wasm
-cp "$WASM_DIR/resolver.wasm" contracts/treasury/resolver.wasm
-stellar contract build
+if [ "$WASM_MISSING" = "1" ]; then
+  stellar contract build
+  cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
+  cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
+  cp "$WASM_DIR/market_core.wasm" contracts/reasoning-registry/market_core.wasm
+  cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+  cp "$WASM_DIR/market_core.wasm" contracts/router/market_core.wasm
+  cp "$WASM_DIR/resolver.wasm" contracts/router/resolver.wasm
+  cp "$WASM_DIR/reasoning_registry.wasm" contracts/router/reasoning_registry.wasm
+  cp "$WASM_DIR/resolver.wasm" contracts/treasury/resolver.wasm
+  stellar contract build
+fi
 
 # --- identities -------------------------------------------------------------
 ensure_identity "$DEPLOYER_KEY"
@@ -203,21 +247,18 @@ DEPLOYER=$(stellar keys address "$DEPLOYER_KEY")
 AGENT=$(stellar keys address "$AGENT_KEY")
 MAKER=$(stellar keys address "$MAKER_KEY")
 TRADER=$(stellar keys address "$TRADER_KEY")
-# `.agent` stays for tools that predate the registry.
-json_set --arg d "$DEPLOYER" --arg a "$AGENT" --arg m "$MAKER" --arg t "$TRADER" \
-  '.deployer = $d | .agent = $a | .agents = {maker: $m, trader: $t}'
+json_set_str ".deployer" "$DEPLOYER"
+json_set_str ".agent" "$AGENT"
+json_set_str ".agents.maker" "$MAKER"
+json_set_str ".agents.trader" "$TRADER"
 
 # --- timelock (#63) ----------------------------------------------------------
-# Deployed before the four core contracts so its address can be passed as their
-# admin in the constructor (the "timelock owns admin from birth" path). The
-# timelock needs no other contract's address, so it is not part of the
-# resolver/treasury/market-core circular ordering.
 TIMELOCK_PROPOSER=$(stellar keys address "$TIMELOCK_PROPOSER_KEY")
 TIMELOCK_CANCELLER=$(stellar keys address "$TIMELOCK_CANCELLER_KEY")
 if [ "$USE_TIMELOCK" = "1" ]; then
   TIMELOCK=$(json_get .contracts.timelock)
   [ -n "$TIMELOCK" ] || TIMELOCK=$(predict_id "$TIMELOCK_SALT")
-  json_set --arg s "$TIMELOCK_SALT" '.salts.timelock = $s'
+  json_set_str ".salts.timelock" "$TIMELOCK_SALT"
   if [ "$(json_get .contracts.timelock)" = "" ]; then
     log "deploying timelock at deterministic address $TIMELOCK"
     DEPLOYED=$(stellar contract deploy \
@@ -232,11 +273,11 @@ if [ "$USE_TIMELOCK" = "1" ]; then
       --executor "$DEPLOYER" \
       --emergency "$DEPLOYER" \
       --default_delay "$TIMELOCK_DELAY")
-    [ "$DEPLOYED" = "$TIMELOCK" ] || {
+    if [ "$DEPLOYED" != "$TIMELOCK" ]; then
       echo "error: timelock landed at $DEPLOYED, expected $TIMELOCK" >&2
       exit 1
-    }
-    json_set --arg id "$TIMELOCK" '.contracts.timelock = $id'
+    fi
+    json_set_str ".contracts.timelock" "$TIMELOCK"
   else
     log "timelock already deployed: $TIMELOCK"
   fi
@@ -245,28 +286,107 @@ else
   ADMIN="$DEPLOYER"
 fi
 
-# --- USDC test asset ---------------------------------------------------------
-# Self-issued testnet "USDC": a real SEP-41 token (7 decimals, matching the
-# design doc) with no dependency on guessing a real issuer's contract id.
-# <!-- TODO(maintainer): point `collateral` at Circle's real testnet USDC
-# issuer if/when this needs to interoperate with other testnet apps. -->
-USDC=$(json_get .contracts.usdc)
-if [ -z "$USDC" ]; then
-  log "deploying self-issued testnet USDC (SEP-41)"
-  USDC=$(stellar contract asset deploy \
-    --asset "USDC:$DEPLOYER" \
-    --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK")
-  json_set --arg id "$USDC" '.contracts.usdc = $id'
+# --- Collateral resolution & verification (#134) ----------------------------
+PREV_USDC=$(json_get .contracts.usdc)
+PREV_MC=$(json_get .contracts.market_core)
+
+if [ "$COLLATERAL_MODE" = "self-issued" ]; then
+  USDC="$PREV_USDC"
+  if [ -z "$USDC" ]; then
+    log "deploying self-issued testnet USDC (SEP-41)"
+    USDC=$(stellar contract asset deploy \
+      --asset "USDC:$DEPLOYER" \
+      --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK")
+    json_set_str ".contracts.usdc" "$USDC"
+  else
+    log "USDC already deployed: $USDC"
+  fi
+  json_set_raw ".collateral" "$(jq -nc --arg asset "USDC:$DEPLOYER" --arg id "$USDC" \
+    '{mode: "self-issued", asset: $asset, contract_id: $id, decimals: 7, issuer_flags: null}')"
 else
-  log "USDC already deployed: $USDC"
+  ASSET_CODE="${COLLATERAL_ASSET%%:*}"
+  ASSET_ISSUER="${COLLATERAL_ASSET#*:}"
+  if [ -n "$COLLATERAL_CONTRACT_ID" ]; then
+    USDC="$COLLATERAL_CONTRACT_ID"
+  else
+    USDC=$(stellar contract id asset --asset "$COLLATERAL_ASSET" --network "$NETWORK")
+  fi
+
+  # Verify SAC exists (deploy it permissionlessly if not yet deployed on testnet).
+  DECIMALS=$(stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- decimals 2>/dev/null || true)
+  if [ -z "$DECIMALS" ]; then
+    log "SAC for $COLLATERAL_ASSET not deployed yet — deploying SAC at $USDC"
+    USDC=$(stellar contract asset deploy \
+      --asset "$COLLATERAL_ASSET" \
+      --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK")
+    DECIMALS=$(stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- decimals)
+  fi
+  DECIMALS=$(printf '%s\n' "$DECIMALS" | tr -d '"[:space:]')
+  if [ "$DECIMALS" != "7" ]; then
+    echo "error: collateral $COLLATERAL_ASSET ($USDC) reports decimals=$DECIMALS; market-core MIN_SEED and MAX_SETS require exactly 7 decimals" >&2
+    exit 1
+  fi
+  TOKEN_NAME=$(stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- name | jq -r '. // empty' 2>/dev/null || echo "$ASSET_CODE")
+  TOKEN_SYMBOL=$(stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- symbol | jq -r '. // empty' 2>/dev/null || echo "$ASSET_CODE")
+
+  # Inspect issuer flags via Horizon.
+  ISSUER_JSON=$(curl -sf "$HORIZON_URL/accounts/$ASSET_ISSUER")
+  AUTH_REQUIRED=$(printf '%s\n' "$ISSUER_JSON" | jq -r '.flags.auth_required // false')
+  AUTH_REVOCABLE=$(printf '%s\n' "$ISSUER_JSON" | jq -r '.flags.auth_revocable // false')
+  AUTH_CLAWBACK=$(printf '%s\n' "$ISSUER_JSON" | jq -r '.flags.auth_clawback_enabled // false')
+  if [ "$AUTH_REQUIRED" = "true" ]; then
+    echo "error: issuer $ASSET_ISSUER has auth_required=true; trustlines require manual issuer authorization and cannot be used permissionlessly" >&2
+    exit 1
+  fi
+  if [ "$AUTH_REVOCABLE" = "true" ] || [ "$AUTH_CLAWBACK" = "true" ]; then
+    log "WARNING: issuer $ASSET_ISSUER has auth_revocable=$AUTH_REVOCABLE, auth_clawback_enabled=$AUTH_CLAWBACK — frozen or clawed-back SAC balances can break market-core solvency (see docs/collateral.md)"
+  fi
+
+  # Refuse silently switching collateral on an existing market-core deployment.
+  if [ -n "$PREV_MC" ] && [ -n "$PREV_USDC" ] && [ "$PREV_USDC" != "$USDC" ]; then
+    if [ "$FORCE_REDEPLOY" != "1" ]; then
+      echo "error: collateral changed ($PREV_USDC -> $USDC) while market_core ($PREV_MC) is already deployed; re-run with FORCE_REDEPLOY=1 to redeploy market-core, resolver, and treasury" >&2
+      exit 1
+    fi
+    log "FORCE_REDEPLOY=1: clearing existing market_core, resolver, treasury, wiring, and funding totals for collateral switch"
+    json_del 'del(.contracts.market_core, .contracts.resolver, .contracts.treasury, .wired, .wired_resolver, .wired_treasury, .treasury_minted_total, .treasury_funded_amount, .treasury_deposited_total)'
+  fi
+
+  json_set_str ".contracts.usdc" "$USDC"
+  FLAGS_JSON=$(jq -nc \
+    --argjson req "$AUTH_REQUIRED" \
+    --argjson rev "$AUTH_REVOCABLE" \
+    --argjson claw "$AUTH_CLAWBACK" \
+    '{auth_required: $req, auth_revocable: $rev, auth_clawback_enabled: $claw}')
+  json_set_raw ".collateral" "$(jq -nc \
+    --arg asset "$COLLATERAL_ASSET" \
+    --arg id "$USDC" \
+    --arg name "$TOKEN_NAME" \
+    --arg symbol "$TOKEN_SYMBOL" \
+    --argjson flags "$FLAGS_JSON" \
+    '{mode: "existing", asset: $asset, contract_id: $id, decimals: 7, name: $name, symbol: $symbol, issuer_flags: $flags}')"
+
+  # Ensure classic trustlines for deployer and agent G-accounts (never C-addresses).
+  ensure_trustline "$DEPLOYER_KEY" "$DEPLOYER" "$COLLATERAL_ASSET"
+  ensure_trustline "$AGENT_KEY" "$AGENT" "$COLLATERAL_ASSET"
+fi
+
+# --- dependency check when market_core is removed or changed (#132) ---------
+RECORDED_MC=$(json_get .contracts.market_core)
+RECORDED_RESOLVER=$(json_get .contracts.resolver)
+RECORDED_TREASURY=$(json_get .contracts.treasury)
+if [ -z "$RECORDED_MC" ] && { [ -n "$RECORDED_RESOLVER" ] || [ -n "$RECORDED_TREASURY" ]; }; then
+  log "market_core missing from record while resolver/treasury exist — clearing stale dependents for redeploy"
+  json_del 'del(.contracts.resolver, .contracts.treasury, .wired, .wired_resolver, .wired_treasury)'
 fi
 
 # --- deterministic addresses (#61) -------------------------------------------
-# Predict the resolver and treasury ids up front so market-core's constructor
-# can receive the *real* addresses (never the deployer EOA). The predicted id
-# is a pure function of (network, source account, salt), so it is stable and
-# available before either contract is deployed.
 RESOLVER=$(json_get .contracts.resolver)
 TREASURY=$(json_get .contracts.treasury)
 MARKET_CORE=$(json_get .contracts.market_core)
@@ -277,12 +397,12 @@ REGISTRY=$(json_get .contracts.reasoning_registry)
 [ -n "$MARKET_CORE" ] || MARKET_CORE=$(predict_id "$MARKET_CORE_SALT")
 [ -n "$REGISTRY" ] || REGISTRY=$(predict_id "$REGISTRY_SALT")
 
-# Persist the salts so a re-run (or a migration) can reproduce the ids.
-json_set --arg r "$RESOLVER_SALT" --arg t "$TREASURY_SALT" \
-  --arg mc "$MARKET_CORE_SALT" --arg rg "$REGISTRY_SALT" \
-  '.salts = {market_core: $mc, resolver: $r, treasury: $t, reasoning_registry: $rg}'
+json_set_str ".salts.market_core" "$MARKET_CORE_SALT"
+json_set_str ".salts.resolver" "$RESOLVER_SALT"
+json_set_str ".salts.treasury" "$TREASURY_SALT"
+json_set_str ".salts.reasoning_registry" "$REGISTRY_SALT"
 
-# --- resolver (deployed first: it only needs market-core's *predicted* id) ---
+# --- resolver ----------------------------------------------------------------
 if [ "$(json_get .contracts.resolver)" = "" ]; then
   log "deploying resolver at deterministic address $RESOLVER"
   DEPLOYED=$(stellar contract deploy \
@@ -293,18 +413,18 @@ if [ "$(json_get .contracts.resolver)" = "" ]; then
     -- \
     --admin "$ADMIN" \
     --market_core "$MARKET_CORE")
-  [ "$DEPLOYED" = "$RESOLVER" ] || {
+  if [ "$DEPLOYED" != "$RESOLVER" ]; then
     echo "error: resolver landed at $DEPLOYED, expected $RESOLVER" >&2
     exit 1
-  }
-  json_set --arg id "$RESOLVER" '.contracts.resolver = $id'
+  fi
+  json_set_str ".contracts.resolver" "$RESOLVER"
 else
   log "resolver already deployed: $RESOLVER"
 fi
 
-# --- treasury ------------------------------------------------------------
-TREASURY=$(json_get .contracts.treasury)
-if [ -z "$TREASURY" ]; then
+# --- treasury ----------------------------------------------------------------
+TREASURY_RECORDED=$(json_get .contracts.treasury)
+if [ -z "$TREASURY_RECORDED" ]; then
   log "deploying treasury"
   CREATION_POLICY=$(jq -nc \
     --argjson max_seed "$MAX_SEED" \
@@ -314,7 +434,7 @@ if [ -z "$TREASURY" ]; then
     --argjson max_h "$MAX_CLOSE_HORIZON" \
     --argjson cats "$ALLOWED_CATEGORIES" \
     '{"max_seed": $max_seed, "max_markets_per_window": $max_markets, "creation_window_secs": $window_secs, "min_close_horizon": $min_h, "max_close_horizon": $max_h, "allowed_categories": $cats}')
-  TREASURY=$(stellar contract deploy \
+  DEPLOYED=$(stellar contract deploy \
     --wasm "$WASM_DIR/treasury.wasm" \
     --salt "$TREASURY_SALT" \
     --source-account "$DEPLOYER_KEY" \
@@ -332,12 +452,14 @@ if [ -z "$TREASURY" ]; then
     --max_drawdown "$MAX_DRAWDOWN" \
     --window_days "$DRAWDOWN_WINDOW_DAYS" \
     --creation_policy "$CREATION_POLICY")
-  json_set --arg id "$TREASURY" '.contracts.treasury = $id'
+  TREASURY="$DEPLOYED"
+  json_set_str ".contracts.treasury" "$TREASURY"
 else
+  TREASURY="$TREASURY_RECORDED"
   log "treasury already deployed: $TREASURY"
 fi
 
-# --- market-core (constructor receives the real resolver/treasury) ----------
+# --- market-core -------------------------------------------------------------
 if [ "$(json_get .contracts.market_core)" = "" ]; then
   log "deploying market-core with real resolver/treasury in the constructor"
   DEPLOYED=$(stellar contract deploy \
@@ -352,11 +474,11 @@ if [ "$(json_get .contracts.market_core)" = "" ]; then
     --resolver "$RESOLVER" \
     --default_fee_bps "$DEFAULT_FEE_BPS" \
     --protocol_fee_share_bps "$PROTOCOL_FEE_SHARE_BPS")
-  [ "$DEPLOYED" = "$MARKET_CORE" ] || {
+  if [ "$DEPLOYED" != "$MARKET_CORE" ]; then
     echo "error: market-core landed at $DEPLOYED, expected $MARKET_CORE" >&2
     exit 1
-  }
-  json_set --arg id "$MARKET_CORE" '.contracts.market_core = $id'
+  fi
+  json_set_str ".contracts.market_core" "$MARKET_CORE"
 else
   log "market-core already deployed: $MARKET_CORE"
 fi
@@ -371,13 +493,70 @@ if [ "$(json_get .contracts.reasoning_registry)" = "" ]; then
     --network "$NETWORK" \
     -- \
     --admin "$ADMIN")
-  [ "$DEPLOYED" = "$REGISTRY" ] || {
+  if [ "$DEPLOYED" != "$REGISTRY" ]; then
     echo "error: reasoning-registry landed at $DEPLOYED, expected $REGISTRY" >&2
     exit 1
-  }
-  json_set --arg id "$REGISTRY" '.contracts.reasoning_registry = $id'
+  fi
+  json_set_str ".contracts.reasoning_registry" "$REGISTRY"
 else
   log "reasoning-registry already deployed: $REGISTRY"
+fi
+
+# --- authenticate the resolver/treasury wiring (#61, #132) ------------------
+WIRED=$(json_get .wired)
+WIRED_RESOLVER=$(json_get .wired_resolver)
+WIRED_TREASURY=$(json_get .wired_treasury)
+if [ "$WIRED" != "true" ] || [ "$WIRED_RESOLVER" != "$RESOLVER" ] || [ "$WIRED_TREASURY" != "$TREASURY" ]; then
+  WIRING_OK=1
+  if [ "$WIRED" != "true" ] || [ "$WIRED_RESOLVER" != "$RESOLVER" ]; then
+    log "authenticating market-core <-> resolver wiring"
+    if admin_invoke "$MARKET_CORE" propose_resolver --resolver "$RESOLVER"; then
+      stellar contract invoke --id "$RESOLVER" --source-account "$DEPLOYER_KEY" \
+        --network "$NETWORK" -- accept_market_core_role
+      json_set_str ".wired_resolver" "$RESOLVER"
+    else
+      WIRING_OK=0
+      log "resolver wiring is timelocked; run scripts/migrate-market-core-wiring.sh after the delay"
+    fi
+  fi
+  if [ "$WIRING_OK" = "1" ] && { [ "$WIRED" != "true" ] || [ "$WIRED_TREASURY" != "$TREASURY" ]; }; then
+    log "authenticating market-core <-> treasury wiring"
+    if admin_invoke "$MARKET_CORE" propose_treasury --treasury "$TREASURY"; then
+      stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+        --network "$NETWORK" -- accept_market_core_role
+      json_set_str ".wired_treasury" "$TREASURY"
+    else
+      WIRING_OK=0
+      log "treasury wiring is timelocked; run scripts/migrate-market-core-wiring.sh after the delay"
+    fi
+  fi
+  if [ "$WIRING_OK" = "1" ]; then
+    json_del 'del(.needs_treasury_wiring)'
+    json_set_raw ".wired" "true"
+# --- optional router ---------------------------------------------------------
+if [ "${DEPLOY_ROUTER:-0}" = "1" ] || [ "${NETWORK}" = "local" ]; then
+  ROUTER=$(json_get .contracts.router)
+  [ -n "$ROUTER" ] || ROUTER=$(predict_id "$ROUTER_SALT")
+  json_set --arg s "$ROUTER_SALT" '.salts.router = $s'
+  if [ "$(json_get .contracts.router)" = "" ]; then
+    log "deploying router at deterministic address $ROUTER"
+    DEPLOYED=$(stellar contract deploy \
+      --wasm "$WASM_DIR/router.wasm" \
+      --salt "$ROUTER_SALT" \
+      --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" \
+      -- \
+      --market_core "$MARKET_CORE" \
+      --resolver "$RESOLVER" \
+      --reasoning_registry "$REGISTRY")
+    [ "$DEPLOYED" = "$ROUTER" ] || {
+      echo "error: router landed at $DEPLOYED, expected $ROUTER" >&2
+      exit 1
+    }
+    json_set --arg id "$ROUTER" '.contracts.router = $id'
+  else
+    log "router already deployed: $ROUTER"
+  fi
 fi
 
 # --- authenticate the resolver/treasury wiring (#61) ------------------------
@@ -410,7 +589,7 @@ fi
 if [ "$(json_get .agent_registered)" != "true" ]; then
   log "registering agent with reasoning-registry"
   if admin_invoke "$REGISTRY" register_agent --agent "$AGENT"; then
-    json_set '.agent_registered = true'
+    json_set_raw ".agent_registered" "true"
   fi
 else
   log "agent already registered"
@@ -421,16 +600,13 @@ if [ "$(json_get .role_agents_registered)" != "true" ]; then
     admin_invoke "$REGISTRY" register_agent --agent "$a" || true
   done
   if [ "$ADMIN" = "$DEPLOYER" ]; then
-    json_set '.role_agents_registered = true'
+    json_set_raw ".role_agents_registered" "true"
   fi
 else
   log "maker and trader already registered with reasoning-registry"
 fi
 
 # --- maker / trader policies in the treasury's agent registry ---------------
-# New agents are a loosening, so set_agent only queues them; they go live
-# once execute_agent runs after CONFIG_DELAY. Re-run this script after the
-# delay to execute (until then the constructor agent keeps every role).
 agent_policy() {
   jq -nc --argjson roles "$1" --arg t "$2" --arg d "$3" \
     '{roles: $roles, max_trade: $t, max_daily: $d, active: true}'
@@ -441,14 +617,14 @@ propose_agent() {
     log "treasury.set_agent($name) — live after ${CONFIG_DELAY}s"
     if admin_invoke "$TREASURY" set_agent --agent "$addr" \
       --policy "$(agent_policy "$roles" "$max_trade" "$max_daily")"; then
-      json_set --arg n "$name" '.agent_policies[$n] = "proposed"'
+      json_set_str ".agent_policies.$name" "proposed"
     fi
   fi
   if [ "$(json_get ".agent_policies.$name")" = "proposed" ]; then
     if stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
       --network "$NETWORK" -- execute_agent --agent "$addr" >/dev/null 2>&1; then
       log "treasury.execute_agent($name): live"
-      json_set --arg n "$name" '.agent_policies[$n] = "active"'
+      json_set_str ".agent_policies.$name" "active"
     else
       log "treasury.execute_agent($name): still timelocked, re-run after the delay"
     fi
@@ -459,49 +635,103 @@ propose_agent() {
 propose_agent maker "$MAKER" $((ROLE_CREATE | ROLE_SETTLE)) "$MAKER_MAX_TRADE" "$MAKER_MAX_DAILY"
 propose_agent trader "$TRADER" $((ROLE_TRADE | ROLE_SETTLE)) "$TRADER_MAX_TRADE" "$TRADER_MAX_DAILY"
 
-# --- fund the treasury with test USDC ---------------------------------------
-# The treasury is a share vault: collateral sent to it directly would be a
-# donation to existing shareholders, so the deployer mints to itself and
-# deposits, receiving shares (docs/adr/0005-treasury-vault.md).
-TREASURY_FUNDED=$(json_get .treasury_funded_amount)
-FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-10000000000000} # 1,000,000 USDC
-if [ "$TREASURY_FUNDED" != "$FUND_AMOUNT" ]; then
-  log "minting $FUND_AMOUNT stroops of test USDC and depositing it into the treasury"
-  stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- mint --to "$DEPLOYER" --amount "$FUND_AMOUNT"
-  stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- deposit --from "$DEPLOYER" --amount "$FUND_AMOUNT"
-  json_set --arg a "$FUND_AMOUNT" '.treasury_funded_amount = $a'
+# --- fund the treasury (#132, #134) -----------------------------------------
+if [ "$COLLATERAL_MODE" = "self-issued" ]; then
+  MINTED_TOTAL=$(json_get .treasury_minted_total)
+  if [ -z "$MINTED_TOTAL" ]; then
+    MINTED_TOTAL=$(json_get .treasury_funded_amount)
+  fi
+  MINTED_TOTAL=${MINTED_TOTAL:-0}
+  FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-10000000000000} # 1,000,000 USDC
+  MINT_DELTA=$((FUND_AMOUNT - MINTED_TOTAL))
+  if [ "$MINT_DELTA" -gt 0 ]; then
+    log "minting $MINT_DELTA stroops of test USDC and depositing into treasury (target total $FUND_AMOUNT)"
+    stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- mint --to "$DEPLOYER" --amount "$MINT_DELTA"
+    stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- deposit --from "$DEPLOYER" --amount "$MINT_DELTA"
+    NEW_TOTAL=$((MINTED_TOTAL + MINT_DELTA))
+    json_set_str ".treasury_minted_total" "$NEW_TOTAL"
+    json_set_str ".treasury_funded_amount" "$NEW_TOTAL"
+  else
+    log "treasury already funded with $MINTED_TOTAL stroops (target $FUND_AMOUNT)"
+  fi
 else
-  log "treasury already funded with $FUND_AMOUNT stroops"
+  DEPOSITED_TOTAL=$(json_get .treasury_deposited_total)
+  DEPOSITED_TOTAL=${DEPOSITED_TOTAL:-0}
+  FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-5000000000} # 500 USDC (faucet-realistic)
+  DEPOSIT_DELTA=$((FUND_AMOUNT - DEPOSITED_TOTAL))
+  if [ "$DEPOSIT_DELTA" -gt 0 ]; then
+    DEPLOYER_BAL=$(stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- balance --id "$DEPLOYER" | tr -d '"[:space:]')
+    DEPLOYER_BAL=${DEPLOYER_BAL:-0}
+    if [ "$DEPLOYER_BAL" -lt "$DEPOSIT_DELTA" ]; then
+      json_set_str ".last_deployed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "action required: deployer $DEPLOYER holds $DEPLOYER_BAL stroops of $COLLATERAL_ASSET, needs $DEPOSIT_DELTA stroops to fund treasury" >&2
+      echo "  1. Visit Circle's testnet faucet: https://faucet.circle.com/ (select Stellar Testnet)" >&2
+      echo "  2. Fund deployer address: $DEPLOYER" >&2
+      echo "  3. Re-run: COLLATERAL_MODE=existing COLLATERAL_ASSET=$COLLATERAL_ASSET ./scripts/deploy-testnet.sh" >&2
+      exit 3
+    fi
+    log "depositing $DEPOSIT_DELTA stroops of $COLLATERAL_ASSET from deployer into treasury (no mint)"
+    stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- deposit --from "$DEPLOYER" --amount "$DEPOSIT_DELTA"
+    NEW_TOTAL=$((DEPOSITED_TOTAL + DEPOSIT_DELTA))
+    json_set_str ".treasury_deposited_total" "$NEW_TOTAL"
+  else
+    log "treasury already funded with $DEPOSITED_TOTAL stroops via deposit (target $FUND_AMOUNT)"
+  fi
 fi
 
-# --- local-only test oracle --------------------------------------------------
-# Price-mode resolution needs a Reflector-shaped feed. It exists only on the
-# quickstart network; the testnet path must keep using the real resolver
-# rules and never a fake oracle.
-if [ "$NETWORK" = "local" ]; then
+# --- test oracle (testnet and local only; never mainnet, #133) --------------
+# Deployed with Reflector-aligned defaults (USD base, 14 decimals, 300s
+# resolution, 86400s retention) and XLM registered as a supported asset.
+TEST_ORACLE_DECIMALS=${TEST_ORACLE_DECIMALS:-14}
+TEST_ORACLE_RESOLUTION=${TEST_ORACLE_RESOLUTION:-300}
+TEST_ORACLE_PERIOD=${TEST_ORACLE_PERIOD:-86400}
+if [ "$NETWORK" = "testnet" ] || [ "$NETWORK" = "local" ]; then
   TEST_ORACLE=$(json_get .contracts.test_oracle)
   [ -n "$TEST_ORACLE" ] || TEST_ORACLE=$(predict_id "$TEST_ORACLE_SALT")
-  json_set --arg s "$TEST_ORACLE_SALT" '.salts.test_oracle = $s'
+  json_set_str ".salts.test_oracle" "$TEST_ORACLE_SALT"
   if [ "$(json_get .contracts.test_oracle)" = "" ]; then
-    log "deploying local test oracle at deterministic address $TEST_ORACLE"
+    log "deploying SEP-40 test oracle at deterministic address $TEST_ORACLE"
     DEPLOYED=$(stellar contract deploy \
       --wasm "$WASM_DIR/test_oracle.wasm" \
       --salt "$TEST_ORACLE_SALT" \
       --source-account "$DEPLOYER_KEY" \
       --network "$NETWORK" \
       -- \
-      --admin "$ADMIN")
-    [ "$DEPLOYED" = "$TEST_ORACLE" ] || {
+      --admin "$ADMIN" \
+      --base '{"Other":"USD"}' \
+      --decimals "$TEST_ORACLE_DECIMALS" \
+      --resolution "$TEST_ORACLE_RESOLUTION" \
+      --period "$TEST_ORACLE_PERIOD")
+    if [ "$DEPLOYED" != "$TEST_ORACLE" ]; then
       echo "error: test oracle landed at $DEPLOYED, expected $TEST_ORACLE" >&2
       exit 1
-    }
-    json_set --arg id "$TEST_ORACLE" '.contracts.test_oracle = $id'
+    fi
+    json_set_str ".contracts.test_oracle" "$TEST_ORACLE"
   else
     log "test oracle already deployed: $TEST_ORACLE"
   fi
+  if [ "$(json_get .test_oracle_assets_seeded)" != "true" ]; then
+    log "registering default asset Other(XLM) on test oracle"
+    if admin_invoke "$TEST_ORACLE" add_asset --asset '{"Other":"XLM"}'; then
+      json_set_raw ".test_oracle_assets_seeded" "true"
+    fi
+  else
+    log "test oracle default assets already registered"
+  fi
 fi
+
+json_set_str ".last_deployed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Record SHA-256 hashes of the deployed contract WASM files (additive, #127).
+for contract_name in market_core resolver treasury reasoning_registry; do
+  if [ -f "$WASM_DIR/${contract_name}.wasm" ]; then
+    wasm_hash=$(sha256sum "$WASM_DIR/${contract_name}.wasm" | awk '{print $1}')
+    json_set --arg k "$contract_name" --arg h "$wasm_hash" '.wasm_sha256[$k] = $h'
+  fi
+done
 
 json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_deployed_at = $ts'
 

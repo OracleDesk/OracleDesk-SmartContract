@@ -1,0 +1,26 @@
+{
+  "name": "clones",
+  "steps": 300,
+  "stepSeconds": 600,
+  "feeBps": 100,
+  "protocolShareBps": 10000,
+  "markets": { "initial": 5, "seed": "10000000000", "closeInSteps": 288, "lpPriceNoiseBps": 800 },
+  "outcome": { "kind": "drift", "p0": { "min": 0.2, "max": 0.8 }, "sigma": 0.02, "voidRate": 0.05 },
+  "policy": "shuffle",
+  "agents": [
+    { "type": "noise", "id": "noise", "count": 10, "balance": "100000000000", "activity": 0.2, "minTrade": "10000000", "maxTrade": "200000000", "sellProb": 0.3 },
+    {
+      "type": "oracledesk-trader",
+      "id": "od",
+      "count": "$k",
+      "signalGroup": "shared",
+      "signalNoiseBps": 300,
+      "minEdgeBps": 300,
+      "tradeSize": "500000000",
+      "sizing": "fixed",
+      "slippageBps": 50,
+      "treasury": { "balance": "100000000000", "maxTrade": "1000000000", "maxMarket": "5000000000", "maxDaily": "20000000000" }
+    }
+  ],
+  "sweep": { "param": "k", "values": [1, 2, 3, 4, 5] }
+}

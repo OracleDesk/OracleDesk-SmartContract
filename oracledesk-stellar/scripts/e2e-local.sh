@@ -25,6 +25,21 @@ DEPLOYMENTS=deployments/local.json
 IDENTITY_PREFIX=oracledesk-e2e
 export NETWORK IDENTITY_PREFIX DEPLOYMENTS SOROBAN_RPC_URL="$RPC_URL"
 
+STAGES="core"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stages)
+      STAGES="${2:-}"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+
+source scripts/e2e/lib.sh
+mkdir -p deployments
+printf '{"stages":{}}\n' >"$REPORT"
+
 log() { echo "==> $*" >&2; }
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -156,6 +171,15 @@ BODY=$(curl -sf "http://127.0.0.1:$X402_PORT/traces/$TRACE_ID") || {
 echo "$BODY" | jq -e --arg h "$TRACE_HASH" '.traceHash == $h' >/dev/null \
   || fail "x402 traceHash mismatch (expected $TRACE_HASH): $BODY"
 pass "x402 registry fetch + trace hash ($TRACE_ID)"
+
+IFS=',' read -ra STAGE_LIST <<<"$STAGES"
+for stage in "${STAGE_LIST[@]}"; do
+  stage="$(echo "$stage" | xargs)"
+  [ "$stage" = "core" ] && continue
+  stage_script="scripts/e2e/stages/$stage.sh"
+  [ -f "$stage_script" ] || fail "unknown E2E stage: $stage"
+  source "$stage_script"
+done
 
 echo
 echo "E2E OK on $NETWORK"

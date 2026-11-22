@@ -1,5 +1,11 @@
 use super::*;
 use market_core::MarketStatus;
+// Test-only import of the vendored registry. Kept out of the crate root: the
+// contract import's spec types would collide with the router's own event types.
+mod reasoning_registry {
+    soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
+}
+use reasoning_registry::Client as RegistryClient;
 use resolver::{PriceConfig, SignerConfig};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -281,20 +287,50 @@ fn buy_and_publish_trace_does_both() {
     let token = StellarAssetClient::new(&f.env, &f.market_core.get_config().collateral);
     token.mint(&admin, &(100 * 10_000_000_i128));
 
-    let trace_id = f.router.buy_and_publish_trace(
+    let result = f.router.buy_and_publish_trace(
         &admin,
         &market_id,
         &Outcome::Yes,
         &(10 * 10_000_000_i128),
         &0i128,
-        &String::from_str(&f.env, "buy"),
         &BytesN::from_array(&f.env, &[1u8; 32]),
         &String::from_str(&f.env, "ipfs://trace"),
     );
-    assert_eq!(trace_id, 0);
+    assert_eq!(result.trace_id, 0);
+    assert!(result.shares > 0);
+    assert_eq!(result.chain_seq, None);
     // The position exists (the buy landed) and the trace exists.
     let pos = f.market_core.get_position(&market_id, &admin);
     assert!(pos.yes > 0);
+}
+
+#[test]
+fn action_mismatch_rejected_before_any_call() {
+    let f = fixture();
+    let err = f.router.try_trade_and_publish_trace(
+        &f.creator,
+        &0u64,
+        &Outcome::Yes,
+        &Side::Buy,
+        &TradeBounds {
+            amount: 1,
+            limit_shares: 0,
+            limit_price_bps: 0,
+            deadline: 2_000,
+        },
+        &TraceArgs {
+            action: TraceAction::Sell,
+            trace_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            ipfs_cid: String::from_str(&f.env, "ipfs://trace"),
+            chained: false,
+            chain_expected_seq: 0,
+            chain_prev_trace_hash: BytesN::from_array(&f.env, &[0u8; 32]),
+            signed: false,
+            signing_key: BytesN::from_array(&f.env, &[0u8; 32]),
+            signature: BytesN::from_array(&f.env, &[0u8; 64]),
+        },
+    );
+    assert_eq!(err, Err(Ok(Error::ActionMismatch)));
 }
 
 #[test]
@@ -312,7 +348,6 @@ fn buy_and_publish_trace_without_registry_reverts() {
         &Outcome::Yes,
         &1i128,
         &0i128,
-        &String::from_str(&env, "buy"),
         &BytesN::from_array(&env, &[1u8; 32]),
         &String::from_str(&env, "ipfs://trace"),
     );

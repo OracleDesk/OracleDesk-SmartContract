@@ -1,0 +1,26 @@
+{
+  "name": "mixed",
+  "steps": 400,
+  "stepSeconds": 600,
+  "feeBps": 150,
+  "protocolShareBps": 6000,
+  "txCost": "10000",
+  "markets": { "initial": 3, "seed": "5000000000", "closeInSteps": 150, "lpPriceNoiseBps": 600 },
+  "outcome": { "kind": "jump", "p0": { "min": 0.1, "max": 0.9 }, "jumpRate": 0.02, "jumpSize": 1.0, "voidRate": 0.15 },
+  "policy": "sandwich",
+  "agents": [
+    { "type": "noise", "id": "noise", "count": 6, "balance": "50000000000", "activity": 0.3, "minTrade": "10000000", "maxTrade": "300000000", "sellProb": 0.4 },
+    { "type": "informed", "id": "informed", "count": 2, "balance": "50000000000", "activity": 0.3, "noiseBps": 200, "minEdgeBps": 400, "tradeSize": "300000000", "slippageBps": 100 },
+    { "type": "sandwicher", "id": "mev", "balance": "50000000000", "minVictim": "200000000", "frontSize": "1000000000", "aggression": 0.7 },
+    {
+      "type": "oracledesk-trader", "id": "od", "count": 3, "signalGroup": "shared", "signalNoiseBps": 300, "minEdgeBps": 300,
+      "tradeSize": "400000000", "sizing": "edge", "slippageBps": 50,
+      "treasury": { "balance": "30000000000", "maxTrade": "500000000", "maxMarket": "2000000000", "maxDaily": "6000000000", "agentMaxDaily": "5000000000" }
+    },
+    {
+      "type": "oracledesk-maker", "id": "maker", "signalNoiseBps": 500, "everySteps": 60, "maxMarkets": 4, "confidenceThresholdBps": 500,
+      "seed": "3000000000", "closeInSteps": 120,
+      "treasury": { "balance": "30000000000", "maxTrade": "500000000", "maxMarket": "4000000000", "maxDaily": "8000000000", "maxSeed": "5000000000" }
+    }
+  ]
+}

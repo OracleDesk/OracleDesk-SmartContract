@@ -75,9 +75,14 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
 
 - **Trade-off accepted**: `market_core.wasm` is a checked-in binary build
   artifact in two places (`contracts/resolver/` and `contracts/treasury/`), and
-  `reasoning_registry.wasm` in `contracts/resolver/`. `contractimport!` reads
-  the file at the dependent crate's own compile time, so a stale copy would
-  otherwise silently keep the old interface.
+  `reasoning_registry.wasm` in `contracts/resolver/`, and (since #273)
+  `resolver.wasm` in `contracts/treasury/`, from which the treasury's resolver
+  client (`register_spec_v2`, `trade_status`) is generated. `contractimport!`
+  reads the file at the dependent crate's own compile time, so a stale copy
+  would otherwise silently keep the old interface. The treasury's copy was
+  previously unpinned; it now has a `resolver.wasm.sha256` like the others, and
+  `sync-vendored-wasm.sh resolver` (run by `make build` after the resolver is
+  built against the already-synced market-core and registry) refreshes it.
 - **A stale copy is now a compile error (#58).** Each dependent crate has a
   `build.rs` that hashes the vendored wasm and compares it to a committed
   `<name>.wasm.sha256`; a mismatch aborts the build with a contributor-facing
@@ -107,5 +112,15 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
   verifying cryptographic traces for attestation evidence (#34) without pulling
   the reasoning-registry crate into cdylib builds, `contracts/resolver/reasoning_registry.wasm`
   is imported via `soroban_sdk::contractimport!(file = "reasoning_registry.wasm")`.
-  `make build` ensures both `market_core.wasm` and `reasoning_registry.wasm` are
-  compiled and placed prior to resolver compilation.
+   `make build` ensures both `market_core.wasm` and `reasoning_registry.wasm` are
+   compiled and placed prior to resolver compilation.
+ - **Router's registry calls are dynamic (#260).** The router's vendored
+   `reasoning_registry.wasm` is an older build whose `publish_trace` still takes
+   a `String`, so generating a typed client from it would hard-code a stale
+   interface. The router imports the wasm only for its `WASM` constant (tests)
+   and invokes the four current publish entrypoints plus `agent_chain_head` by
+   name with `env.invoke_contract`, using a local `TraceAction`/`ChainHead`
+   definition whose XDR shape matches the registry. Its `market_core.wasm` and
+   `treasury.wasm` imports remain generated; the treasury wasm is refreshed by
+   `scripts/sync-vendored-wasm.sh` and all four router vendored files are pinned
+   by `contracts/router/build.rs`. See [ADR 0009](0009-atomic-router.md).

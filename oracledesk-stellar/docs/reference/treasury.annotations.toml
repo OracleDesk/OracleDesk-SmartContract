@@ -1,0 +1,242 @@
+# Curated caller/auth and storage metadata for treasury.
+# Validated against packages/bindings/treasury/interface.json by scripts/gen-contract-docs/generate.mjs.
+
+[functions.__constructor]
+caller = "deployer (constructor)"
+
+[functions.acknowledge_drawdown]
+caller = "admin (require_auth)"
+
+[functions.agent_at]
+caller = "anyone (read-only)"
+
+[functions.agent_buy]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_buy_v2]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_claim_lp_fees]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_count]
+caller = "anyone (read-only)"
+
+[functions.agent_create_market]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_create_market_and_reveal]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_daily_usage]
+caller = "anyone (read-only)"
+
+[functions.agent_sell]
+caller = "authorized agent (require_auth)"
+
+[functions.agent_sell_v2]
+caller = "authorized agent (require_auth)"
+
+[functions.allocate_to_yield]
+caller = "admin (require_auth)"
+
+[functions.available_capital]
+caller = "anyone (read-only)"
+
+[functions.cancel_agent]
+caller = "admin (require_auth)"
+
+[functions.cancel_config]
+caller = "admin (require_auth)"
+
+[functions.cancel_price_policy]
+caller = "admin (require_auth)"
+
+[functions.capital_breakdown]
+caller = "anyone (read-only)"
+
+[functions.claim_pool_remainder]
+caller = "authorized agent (require_auth)"
+
+[functions.claim_withdraw]
+caller = "depositor (require_auth)"
+
+[functions.close_trade]
+caller = "authorized agent (require_auth)"
+notes = "Closes an open position accounting entry without reducing cumulative per-market lifetime spend."
+
+[functions.collect_market_fees]
+caller = "admin (require_auth)"
+
+[functions.config_delay]
+caller = "anyone (read-only)"
+
+[functions.creation_usage]
+caller = "anyone (read-only)"
+
+[functions.daily_headroom]
+caller = "anyone (read-only)"
+
+[functions.daily_usage]
+caller = "anyone (read-only)"
+
+[functions.daily_usage_detail]
+caller = "anyone (read-only)"
+
+[functions.deposit]
+caller = "depositor (require_auth)"
+
+[functions.disable_yield]
+caller = "admin (require_auth)"
+
+[functions.drawdown_status]
+caller = "anyone (read-only)"
+
+[functions.emergency_withdraw]
+caller = "admin (require_auth)"
+
+[functions.execute_agent]
+caller = "anyone (permissionless after config_delay)"
+
+[functions.execute_config]
+caller = "anyone (permissionless after config_delay)"
+
+[functions.execute_price_policy]
+caller = "anyone (permissionless after config_delay)"
+
+[functions.get_agent]
+caller = "anyone (read-only)"
+
+[functions.get_config]
+caller = "anyone (read-only)"
+
+[functions.get_creation_policy]
+caller = "anyone (read-only)"
+
+[functions.get_global]
+caller = "anyone (read-only)"
+
+[functions.get_net_cap]
+caller = "anyone (read-only)"
+
+[functions.get_price_policy]
+caller = "anyone (read-only)"
+
+[functions.legacy_claim_pool_remainder]
+caller = "admin (require_auth)"
+
+[functions.legacy_redeem]
+caller = "admin (require_auth)"
+
+[functions.liquid_capital]
+caller = "anyone (read-only)"
+
+[functions.market_pnl]
+caller = "anyone (read-only)"
+
+[functions.market_valuation]
+caller = "anyone (read-only)"
+
+[functions.migrate_market]
+caller = "admin (require_auth)"
+
+[functions.nav]
+caller = "anyone (read-only)"
+
+[functions.net_exposure]
+caller = "anyone (read-only)"
+
+[functions.net_position]
+caller = "anyone (read-only)"
+
+[functions.open_market_at]
+caller = "anyone (read-only)"
+
+[functions.open_market_count]
+caller = "anyone (read-only)"
+
+[functions.pending_agent]
+caller = "anyone (read-only)"
+
+[functions.pending_config]
+caller = "anyone (read-only)"
+
+[functions.pending_price_policy]
+caller = "anyone (read-only)"
+
+[functions.propose_config]
+caller = "admin (require_auth)"
+
+[functions.queue_bounds]
+caller = "anyone (read-only)"
+
+[functions.queue_reserved]
+caller = "anyone (read-only)"
+
+[functions.realize]
+caller = "anyone (permissionless after settlement)"
+
+[functions.realized]
+caller = "anyone (read-only)"
+
+[functions.recall_from_yield]
+caller = "admin (require_auth)"
+
+[functions.redeem]
+caller = "authorized agent (require_auth)"
+
+[functions.remove_agent]
+caller = "admin (require_auth)"
+
+[functions.request_withdraw]
+caller = "depositor (require_auth)"
+
+[functions.reset_pnl_window]
+caller = "admin (require_auth)"
+
+[functions.set_agent]
+caller = "admin (require_auth)"
+
+[functions.set_config_delay]
+caller = "admin (require_auth)"
+
+[functions.set_creation_policy]
+caller = "admin (require_auth)"
+
+[functions.set_drawdown_config]
+caller = "admin (require_auth)"
+
+[functions.set_paused]
+caller = "admin (require_auth)"
+
+[functions.set_price_policy]
+caller = "admin (require_auth)"
+
+[functions.set_successor]
+caller = "admin (require_auth)"
+
+[functions.set_yield_venue]
+caller = "admin (require_auth)"
+
+[functions.settle_market]
+caller = "anyone (permissionless)"
+notes = "Recovers treasury positions and LP remainders on resolved markets without hot agent keys."
+
+[functions.shares_of]
+caller = "anyone (read-only)"
+
+[functions.total_shares]
+caller = "anyone (read-only)"
+
+[functions.window_pnl]
+caller = "anyone (read-only)"
+
+[functions.withdraw]
+caller = "admin / depositor (require_auth)"
+
+[functions.withdraw_ticket]
+caller = "anyone (read-only)"
+
+[storage.RiskConfig]
+durability = "instance"
+ttl = "extended with contract instance TTL"

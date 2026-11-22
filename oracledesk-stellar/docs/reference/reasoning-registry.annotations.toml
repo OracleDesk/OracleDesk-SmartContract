@@ -1,0 +1,92 @@
+# Curated caller/auth and storage metadata for reasoning-registry.
+# Validated against packages/bindings/reasoning-registry/interface.json by scripts/gen-contract-docs/generate.mjs.
+
+[functions.__constructor]
+caller = "deployer (constructor)"
+
+[functions.accept_admin]
+caller = "pending admin (require_auth)"
+
+[functions.admin]
+caller = "anyone (read-only)"
+
+[functions.agent_chain_head]
+caller = "anyone (read-only)"
+
+[functions.agent_trace_at]
+caller = "anyone (read-only)"
+
+[functions.cancel_admin_transfer]
+caller = "admin (require_auth)"
+
+[functions.consume_trace]
+caller = "registered consumer contract (require_auth)"
+
+[functions.get_trace]
+caller = "anyone (read-only)"
+
+[functions.get_trace_ledger]
+caller = "anyone (read-only)"
+
+[functions.get_trace_link]
+caller = "anyone (read-only)"
+
+[functions.is_consumed]
+caller = "anyone (read-only)"
+
+[functions.is_consumer]
+caller = "anyone (read-only)"
+
+[functions.is_registered]
+caller = "anyone (read-only)"
+
+[functions.market_trace_at]
+caller = "anyone (read-only)"
+
+[functions.market_trace_count]
+caller = "anyone (read-only)"
+
+[functions.pending_admin]
+caller = "anyone (read-only)"
+
+[functions.propose_admin]
+caller = "admin (require_auth)"
+
+[functions.publish_chained_trace]
+caller = "registered agent (require_auth)"
+
+[functions.publish_trace]
+caller = "registered agent (require_auth)"
+
+[functions.register_agent]
+caller = "admin (require_auth)"
+
+[functions.register_consumer]
+caller = "admin (require_auth)"
+
+[functions.trace_count]
+caller = "anyone (read-only)"
+
+[functions.unregister_agent]
+caller = "admin (require_auth)"
+
+[functions.unregister_consumer]
+caller = "admin (require_auth)"
+
+[functions.verify_commitment]
+caller = "anyone (read-only)"
+
+[functions.verify_trace]
+caller = "anyone (read-only)"
+
+[storage.Admin]
+durability = "instance"
+ttl = "extended with contract instance TTL"
+
+[storage.Agent]
+durability = "persistent"
+ttl = "extended on agent registration/updates"
+
+[storage.AgentHead]
+durability = "persistent"
+ttl = "extended on chained trace publication"

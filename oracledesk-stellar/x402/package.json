@@ -6,20 +6,28 @@
   "scripts": {
     "build": "tsc --noEmit",
     "start": "tsx server.ts",
-    "test": "tsx --test *.test.ts"
+    "test": "tsx --test *.test.ts",
+    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/x402 --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test *.test.ts"
   },
   "dependencies": {
     "@oracledesk/bindings-reasoning-registry": "file:../packages/bindings/reasoning-registry",
-    "@x402/core": "^2.23.0",
-    "@x402/express": "^2.23.0",
-    "@x402/stellar": "^2.23.0",
+    "@x402/core": "2.26.0",
+    "@x402/express": "2.26.0",
+    "@x402/stellar": "2.26.0",
+    "better-sqlite3": "11.10.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.0",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.1",
     "tsx": "^4.22.0",
     "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

@@ -1,0 +1,1417 @@
+{
+  "schema": 1,
+  "contract": "router",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Stores the address book once, at deploy time. There is no privileged role and the values never change, so this is not admin-gated.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "reasoning_registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "agent_trade_and_publish_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Same atomic trade+trace flow, but the trade runs through the caller's treasury (`agent_buy_v2`/`agent_sell_v2`) and the agent is the trace author. The treasury is checked against the router's market-core both ways before any call.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "treasury",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "side",
+            "type_": {
+              "udt": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "bounds",
+            "type_": {
+              "udt": {
+                "name": "TradeBounds"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace",
+            "type_": {
+              "udt": {
+                "name": "TraceArgs"
+              }
+            }
+          }
+        ],
+        "name": "agent_trade_and_publish_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TradeTraceResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "buy_and_publish_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Deprecated one-release compatibility wrapper for the direct buy path. New callers should use `trade_and_publish_trace` with explicit bounds, a typed action and optional chain/signature arguments.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          }
+        ],
+        "name": "buy_and_publish_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TradeTraceResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "RouterConfig"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "create_and_reveal_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See [`Router::create_and_reveal_signers`] — same flow, price rule.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "create_and_reveal_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "create_and_reveal_signers": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a market and reveals its signer-mode rule in one transaction. The commitment is computed from `spec_v2` locally and passed to market-core, so the reveal necessarily matches.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "create_and_reveal_signers",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "reveal_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reveals a spec the creator committed to in a previous transaction (ADR 0001's commit-now/reveal-later path). Kept here so a creator can use one contract for both the atomic and the deferred flows.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "reveal_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "trade_and_publish_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Trades `outcome` shares through market-core's `buy_v2`/`sell_v2` and publishes a typed reasoning trace through the registry in the same transaction. Optional chain and signature arguments select one of the registry's four publish entrypoints. Emits `TradeTraced`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "side",
+            "type_": {
+              "udt": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "bounds",
+            "type_": {
+              "udt": {
+                "name": "TradeBounds"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace",
+            "type_": {
+              "udt": {
+                "name": "TraceArgs"
+              }
+            }
+          }
+        ],
+        "name": "trade_and_publish_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TradeTraceResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "ChainArgs": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "expected_seq",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "ChainArgs"
+      }
+    },
+    "SigArgs": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "SigArgs"
+      }
+    },
+    "Side": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Side"
+      }
+    },
+    "TraceAction": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ClaimRemainder"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CreateMarket"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ProposeMarket"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Redeem"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolve"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Skip"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TraceAction"
+      }
+    },
+    "TraceArgs": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "chain",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "ChainArgs"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "sig",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "SigArgs"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TraceArgs"
+      }
+    },
+    "TradeBounds": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit_shares",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "TradeBounds"
+      }
+    },
+    "TradeTraceResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "chain_seq",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "TradeTraceResult"
+      }
+    },
+    "Category": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Crypto"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Culture"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Geopolitics"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Macro"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Other"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sports"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Category"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "min_epoch",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CommitteeRef"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "escalation_timeout",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Guardian"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Escalation"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfig"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "OracleAsset"
+      }
+    },
+    "Outcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Outcome"
+      }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "PriceConfig"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "PriceDirection"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "RouterConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "The address book the router calls into. Without it, every entrypoint would have to take the downstream contract addresses from the caller, letting anyone point the router at a hostile \"resolver\". With it, the router is stateless apart from this one instance value.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "reasoning_registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "RouterConfig"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "SignerConfig"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight_threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKeyConfig"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "The envelope named a different network or market-core.",
+            "name": "DomainMismatch",
+            "value": 3
+          },
+          {
+            "doc": "A `price`/`signers` config failed the resolver's own validation rules.",
+            "name": "InvalidConfig",
+            "value": 2
+          },
+          {
+            "doc": "Empty or over-long trace content.",
+            "name": "InvalidTrace",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "The router was asked to reveal a rule variant it does not support.",
+            "name": "UnsupportedRule",
+            "value": 5
+          },
+          {
+            "doc": "`TraceArgs.action` does not match the trade side.",
+            "name": "ActionMismatch",
+            "value": 6
+          },
+          {
+            "doc": "The downstream trade returned no positive shares.",
+            "name": "InvalidTradeResult",
+            "value": 7
+          },
+          {
+            "doc": "The supplied treasury is not wired to this router's market-core.",
+            "name": "TreasuryMismatch",
+            "value": 8
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "TradeTraced": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TradeTraced",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "side",
+            "type_": {
+              "udt": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "chain_seq",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "trade_traced"
+        ]
+      }
+    },
+    "MarketCreatedAndRevealed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketCreatedAndRevealed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "spec_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "market_created_and_revealed"
+        ]
+      }
+    }
+  },
+  "type_origins": {
+    "Category": "market-core",
+    "CommitteeRef": "resolver",
+    "DisputableSignerConfig": "resolver",
+    "Escalation": "resolver",
+    "HybridConfig": "resolver",
+    "OracleAsset": "resolver",
+    "Outcome": "market-core",
+    "PriceConfig": "resolver",
+    "PriceDirection": "resolver",
+    "ResolutionSpec": "resolver",
+    "ResolutionSpecV2": "resolver",
+    "SignerConfig": "resolver",
+    "WeightedKey": "resolver",
+    "WeightedKeyConfig": "resolver"
+  },
+  "hash_critical": []
+}

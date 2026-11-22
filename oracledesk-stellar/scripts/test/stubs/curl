@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Stub `curl` CLI for bats tests (Issues #132, #134).
+set -euo pipefail
+
+CMD="$*"
+if [ -n "${STUB_LOG:-}" ]; then
+  printf 'curl %s\n' "$CMD" >>"$STUB_LOG"
+fi
+
+if [ -n "${STUB_CURL_SCENARIO:-}" ] && [ -f "$STUB_CURL_SCENARIO" ]; then
+  while IFS=$'\t' read -r pat rc out; do
+    [ -n "$pat" ] || continue
+    case "$pat" in
+      \#*) continue ;;
+    esac
+    if printf '%s\n' "$CMD" | grep -Eq -- "$pat"; then
+      if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+      fi
+      exit "${rc:-0}"
+    fi
+  done <"$STUB_CURL_SCENARIO"
+fi
+
+if printf '%s\n' "$CMD" | grep -q 'getLatestLedger'; then
+  printf '{"jsonrpc":"2.0","id":1,"result":{"closeTime":%s}}\n' "${STUB_LEDGER_TIME:-9999999999}"
+  exit 0
+fi
+
+printf '{}\n'
