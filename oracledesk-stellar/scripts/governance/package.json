@@ -1,0 +1,28 @@
+{
+  "name": "@oracledesk/governance-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "tsx --test *.test.ts",
+    "cli": "tsx timelock-cli.ts"
+  },
+  "dependencies": {
+    "@oracledesk/bindings-market-core": "file:../../packages/bindings/market-core",
+    "@oracledesk/bindings-reasoning-registry": "file:../../packages/bindings/reasoning-registry",
+    "@oracledesk/bindings-resolver": "file:../../packages/bindings/resolver",
+    "@oracledesk/bindings-router": "file:../../packages/bindings/router",
+    "@oracledesk/bindings-timelock": "file:../../packages/bindings/timelock",
+    "@oracledesk/bindings-treasury": "file:../../packages/bindings/treasury",
+    "@stellar/stellar-sdk": "^16.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.8.3"
+  }
+}

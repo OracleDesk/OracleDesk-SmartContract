@@ -3,6 +3,6 @@
 # fixed compiler. Bump this deliberately, in the same commit that refreshes
 # the vendored wasm and its .sha256 pins.
 [toolchain]
-channel = "1.90.0"
+channel = "1.93.1"
 targets = ["wasm32v1-none"]
 components = ["rustfmt", "clippy"]

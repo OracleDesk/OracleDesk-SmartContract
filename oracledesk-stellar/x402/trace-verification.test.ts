@@ -27,6 +27,13 @@ test("builds an encoded IPFS gateway URL", () => {
   );
 });
 
+test("ipfsUrl leaves a bare CIDv1 unchanged", () => {
+  // What agents/core/ipfs-store.ts publishes: raw-codec CIDv1, base32 lower.
+  const cid = "bafkreicecnx2gvntm6fbcrvnc336qze6st5u7qq7457igegamd3bzkx7ri";
+  assert.equal(ipfsUrl("https://ipfs.io/ipfs", cid), `https://ipfs.io/ipfs/${cid}`);
+  assert.equal(ipfsUrl("https://ipfs.io/ipfs/", cid), `https://ipfs.io/ipfs/${cid}`);
+});
+
 // ─── Hash-chained traces (#52) ───────────────────────────────────────────────
 
 
@@ -42,31 +49,46 @@ function chain(n: number): ChainEntry[] {
 }
 
 test("verifyChain accepts a valid chain from genesis", () => {
-  assert.deepEqual(verifyChain(chain(4), true), { ok: true });
-  assert.deepEqual(verifyChain([], true), { ok: true });
+  assert.deepEqual(verifyChain(chain(4), true), { ok: true, tainted: [] });
+  assert.deepEqual(verifyChain([], true), { ok: true, tainted: [] });
 });
 
 test("verifyChain accepts a valid middle range without genesis", () => {
-  assert.deepEqual(verifyChain(chain(5).slice(2), false), { ok: true });
+  assert.deepEqual(verifyChain(chain(5).slice(2), false), { ok: true, tainted: [] });
 });
 
 test("verifyChain detects a gap", () => {
   const entries = chain(4);
   entries.splice(2, 1); // drop seq 3
-  assert.deepEqual(verifyChain(entries, true), { ok: false, reason: "gap", atSeq: 3n });
+  assert.deepEqual(verifyChain(entries, true), { ok: false, reason: "gap", atSeq: 3n, tainted: [] });
 });
 
 test("verifyChain detects a broken link", () => {
   const entries = chain(3);
   entries[2] = { ...entries[2], prevTraceHash: h(9) };
-  assert.deepEqual(verifyChain(entries, true), { ok: false, reason: "broken-link", atSeq: 3n });
+  assert.deepEqual(verifyChain(entries, true), { ok: false, reason: "broken-link", atSeq: 3n, tainted: [] });
 });
 
 test("verifyChain detects a bad genesis", () => {
-  assert.deepEqual(verifyChain(chain(4).slice(1), true), { ok: false, reason: "bad-genesis", atSeq: 2n });
+  assert.deepEqual(verifyChain(chain(4).slice(1), true), { ok: false, reason: "bad-genesis", atSeq: 2n, tainted: [] });
   const forged = chain(2);
   forged[0] = { ...forged[0], prevTraceHash: h(7) };
-  assert.deepEqual(verifyChain(forged, true), { ok: false, reason: "bad-genesis", atSeq: 1n });
+  assert.deepEqual(verifyChain(forged, true), { ok: false, reason: "bad-genesis", atSeq: 1n, tainted: [] });
+});
+
+test("verifyChain reports tainted seqs from KeyCompromised verdicts", () => {
+  const entries = chain(4);
+  const verdicts = [
+    { tag: "Valid" as const },
+    { tag: "KeyCompromised" as const, values: [1n] as [bigint] },
+    { tag: "KeyCompromised" as const, values: [1n] as [bigint] },
+    { tag: "Valid" as const },
+  ];
+  assert.deepEqual(verifyChain(entries, true, verdicts), { ok: true, tainted: [2n, 3n] });
+});
+
+test("verifyChain with no verdicts reports empty tainted", () => {
+  assert.deepEqual(verifyChain(chain(3), true), { ok: true, tainted: [] });
 });
 
 // ─── Merkle batch inclusion (#54) ──────────────────────────────────────────

@@ -47,6 +47,15 @@ for wasm in market_core resolver treasury reasoning_registry; do
   fi
 done
 
+# Default builds must never carry the local-only short-window meta entry.
+for wasm in market_core treasury timelock; do
+  wasm_path="$work/a/wasm32v1-none/release/$wasm.wasm"
+  if stellar contract info meta --wasm "$wasm_path" 2>/dev/null | grep -q 'local-short-windows'; then
+    echo "LOCAL BUILD META IN DEFAULT WASM: $wasm.wasm" >&2
+    status=1
+  fi
+done
+
 check_pin() {
   local vendored="$1" built="$2" pin="$3"
   local expected actual
@@ -74,6 +83,9 @@ check_pin contracts/treasury/market_core.wasm \
 check_pin contracts/resolver/reasoning_registry.wasm \
   "$work/a/wasm32v1-none/release/reasoning_registry.wasm" \
   contracts/resolver/reasoning_registry.wasm.sha256
+check_pin contracts/treasury/resolver.wasm \
+  "$work/a/wasm32v1-none/release/resolver.wasm" \
+  contracts/treasury/resolver.wasm.sha256
 
 if [ "$status" -ne 0 ]; then
   echo "wasm determinism/drift check FAILED" >&2

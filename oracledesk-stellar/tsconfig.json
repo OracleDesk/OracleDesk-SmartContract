@@ -1,0 +1,9 @@
+{
+  "//": "Generated bindings under packages/bindings/* are built via their own CLI-generated tsconfig (`npm run build -w packages/bindings --if-present`) rather than composite project references so `scripts/gen-bindings.sh --overwrite` never conflicts with workspace config.",
+  "files": [],
+  "references": [
+    { "path": "./agents" },
+    { "path": "./x402" },
+    { "path": "./scripts/deployer" }
+  ]
+}

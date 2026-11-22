@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts sim/*.test.ts",
+    "test": "tsx --test core/*.test.ts core/events/*.test.ts core/outcomes/*.test.ts core/strategies/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts runtime/tasks/*.test.ts sim/*.test.ts",
     "market-maker": "tsx bin/market-maker.ts",
     "trader": "tsx bin/trader.ts",
-    "sim": "tsx sim/cli.ts"
+    "unwind": "tsx bin/unwind.ts",
+    "agentd": "tsx bin/agentd.ts",
+    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/agents --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test core/*.test.ts core/events/*.test.ts core/outcomes/*.test.ts core/strategies/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts runtime/tasks/*.test.ts sim/*.test.ts",
+    "test:chaos": "tsx --test test/chaos/*.test.ts"
   },
   "dependencies": {
     "@oracledesk/bindings-market-core": "file:../packages/bindings/market-core",
@@ -16,10 +19,15 @@
     "@oracledesk/bindings-resolver": "file:../packages/bindings/resolver",
     "@oracledesk/bindings-treasury": "file:../packages/bindings/treasury",
     "@stellar/stellar-sdk": "^16.0.1",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "multiformats": "14.0.5",
+    "pg": "^8.16.3",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.15.5",
+    "c8": "^12.0.0",
     "tsx": "^4.22.0",
     "typescript": "^5.8.3"
   }

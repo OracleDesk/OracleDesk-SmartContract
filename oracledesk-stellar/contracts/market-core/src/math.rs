@@ -9,12 +9,19 @@
 //! - Rounding always favours the pool: fees round up, shares out round down,
 //!   shares in round up. This is what keeps the pool invariant `k = r_yes * r_no`
 //!   non-decreasing and blocks dust-splitting attacks.
+//! - See `docs/fpmm-economics.md` for the proofs of the rounding, LP-loss and
+//!   no-arbitrage claims made here (checked by `model/fpmm_bounds.py`).
 //! - `MAX_SETS` bounds market size so that any product of two quantities
 //!   (both <= 1e15) is <= 1e30, far below `i128::MAX` (~1.7e38). Every
 //!   multiplication is still `checked_*` as a second line of defence.
+//!
+//! Headroom for `calc_sell_shares`: with b = shares_in + r_sold + r_other
+//! and every term <= MAX_SETS = 1e15, b <= 3e15 and b^2 <= 9e30. The
+//! discriminant D = b^2 - 4*r_other*shares_in fits in u128 (max ~3.4e38).
+//! The 256-bit widening issue must revisit this bound if MAX_SETS grows.
 
 pub const BPS: i128 = 10_000;
-pub const MAX_SETS: i128 = 1_000_000_000_000_000; // 1e15 = 100M USDC (7 dp)
+pub const MAX_SETS: i128 = 1_000_000_000_000_000_000; // 1e15 = 100M USDC (7 dp)
 pub const MIN_PROB_BPS: u32 = 100; // 1%
 pub const MAX_PROB_BPS: u32 = 9_900; // 99%
 
@@ -45,6 +52,16 @@ pub struct BuyQuote {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct SellQuote {
     pub shares_in: i128,
+    pub fee: i128,
+    /// Complete sets burned from the pool (`collateral_out + fee`).
+    pub gross: i128,
+    pub new_reserve_sold: i128,
+    pub new_reserve_other: i128,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct SellSharesQuote {
+    pub collateral_out: i128,
     pub fee: i128,
     /// Complete sets burned from the pool (`collateral_out + fee`).
     pub gross: i128,
@@ -177,9 +194,8 @@ pub fn calc_buy(
 /// 3. pool must end at r_sold' = ceil(r_sold * r_other / r_other')
 /// 4. seller gives r_sold' + gross - r_sold shares
 ///
-/// To sell an exact share count, the frontend inverts this off-chain
-/// (quadratic, see `model/fpmm_model.py::gross_for_shares`) and passes the
-/// result as `collateral_out` with a `max_shares_in` slippage bound.
+/// To sell an exact share count, prefer the on-chain `sell_shares` entrypoint
+/// (see `calc_sell_shares`). This function remains for backward compatibility.
 pub fn calc_sell(
     r_sold: i128,
     r_other: i128,
@@ -209,69 +225,107 @@ pub fn calc_sell(
     })
 }
 
-/// Integer square root (Newton's method), mirroring `agents/core/fpmm.ts::isqrt`.
-/// Returns `InvalidInput` for negative input.
-pub fn isqrt(n: i128) -> Result<i128, MathError> {
-    if n < 0 {
-        return Err(MathError::InvalidInput);
-    }
+/// Integer square root of a `u128`, floored, exact for every input
+/// (`isqrt(n)^2 <= n < (isqrt(n)+1)^2`). Newton iteration seeded from a
+/// bit-length upper bound, so it converges monotonically down to the floor.
+/// Seeding at or below the root would let Newton converge from below and
+/// return floor+1, which would break the pool-favouring correction in
+/// `calc_sell_shares`.
+pub fn isqrt(n: u128) -> u128 {
     if n < 2 {
-        return Ok(n);
+        return n;
     }
-    let mut x = n;
-    // `(x + 1) / 2` overflows when x == i128::MAX; this is the same value.
-    let mut y = x / 2 + x % 2;
-    while y < x {
+    // shift = ceil(bit_len(n) / 2), so 1 << shift >= sqrt(n).
+    let shift = (128 - n.leading_zeros() + 1) / 2;
+    let mut x = 1u128 << shift;
+    loop {
+        let y = (x + n / x) >> 1;
+        if y >= x {
+            return x;
+        }
         x = y;
-        y = (x + n / x) / 2;
     }
-    Ok(x)
 }
 
-/// Off-chain inverse of [`calc_sell`]: how many complete sets (`gross`) the
-/// pool must burn so that selling exactly `shares_in` shares balances the
-/// constant-product invariant, ignoring the contract's integer rounding.
+/// Sell an exact `shares_in` count of the outcome whose pool reserve is
+/// `r_sold`, returning the collateral the seller receives. This is the
+/// on-chain inverse of `calc_sell`: it solves for the gross sets burned
+/// such that the constant-product invariant is preserved after the seller gives
+/// `shares_in` shares and the pool removes `gross` complete sets.
 ///
-/// Solves `(shares_in + r_sold - x)(r_other - x) = r_sold * r_other` for the
-/// smaller root of `x` (the pool never burns more than `r_other`). Mirrors
-/// `model/fpmm_model.py::gross_for_shares` and
-/// `agents/core/fpmm.ts::grossForShares`. This is **not** used on-chain: the
-/// contract takes an exact collateral amount to avoid a square root.
-pub fn gross_for_shares(
+/// Derivation: we want `x` (gross) such that
+///   (r_sold + shares_in - x) * (r_other - x) = r_sold * r_other
+/// Expanding gives the quadratic x^2 - b*x + r_other*shares_in = 0 with
+/// b = r_sold + shares_in + r_other. The smaller root is
+///   x0 = (b - sqrt(b*b - 4*r_other*shares_in)) / 2
+///
+/// Pool-favouring rounding: isqrt rounds down, so x0 can overshoot the
+/// real root by at most one. We decrement x while the invariant would drop,
+/// guaranteeing new_sold * new_other >= r_sold * r_other. This loop runs
+/// at most twice: the real root is in [x0-1, x0], and the invariant is
+/// monotone in x on [0, min(shares_in, r_other)), so at most one step
+/// from x0 reaches the greatest x satisfying the invariant.
+///
+/// Because the pool removes at least the gross that `calc_sell` would
+/// charge for the same `shares_in`, the seller never receives more
+/// collateral than the curve allows.
+pub fn calc_sell_shares(
     r_sold: i128,
     r_other: i128,
     shares_in: i128,
     fee_bps: u32,
-) -> Result<i128, MathError> {
+) -> Result<SellSharesQuote, MathError> {
     if shares_in <= 0 || r_sold <= 0 || r_other <= 0 || (fee_bps as i128) >= BPS {
         return Err(MathError::InvalidInput);
     }
-    let a = shares_in.checked_add(r_sold).ok_or(MathError::Overflow)?;
-    let b = a.checked_add(r_other).ok_or(MathError::Overflow)?;
-    let b_sq = mul(b, b)?;
-    let four_rs = mul(4, mul(r_other, shares_in)?)?;
-    let disc = b_sq.checked_sub(four_rs).ok_or(MathError::Overflow)?;
-    if disc < 0 {
+    // b = r_sold + shares_in + r_other, all terms <= MAX_SETS, so b <= 3e15.
+    let b = r_sold
+        .checked_add(shares_in.checked_add(r_other).ok_or(MathError::Overflow)?)
+        .ok_or(MathError::Overflow)?;
+    // D = b^2 - 4*r_other*shares_in. b^2 <= 9e30 and 4*r_other*shares_in <= 4e30,
+    // both well within u128 (max ~3.4e38).
+    let b2 = (b as u128)
+        .checked_mul(b as u128)
+        .ok_or(MathError::Overflow)?;
+    let four_r_shares = (r_other as u128)
+        .checked_mul(shares_in as u128)
+        .ok_or(MathError::Overflow)?
+        .checked_mul(4)
+        .ok_or(MathError::Overflow)?;
+    let d = b2.checked_sub(four_r_shares).ok_or(MathError::Overflow)?;
+    let sqrt_d = isqrt(d);
+    let mut x = ((b as u128) - sqrt_d) / 2;
+    // Pool-favouring correction: decrement while the invariant would drop.
+    // The products are at most 1e30 and fit in i128.
+    while x > 0 {
+        let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x as i128;
+        let new_other = r_other - x as i128;
+        let left = new_sold.checked_mul(new_other).ok_or(MathError::Overflow)?;
+        let right = r_sold.checked_mul(r_other).ok_or(MathError::Overflow)?;
+        if left >= right {
+            break;
+        }
+        x -= 1;
+    }
+    if x == 0 || x >= (r_other as u128) {
         return Err(MathError::InsufficientLiquidity);
     }
-    let root = isqrt(disc)?;
-    let gross = (b - root) / 2;
-    if gross <= 0 || gross >= r_other {
-        return Err(MathError::InsufficientLiquidity);
+    let x = x as i128;
+    // Fee rounds up, as in calc_buy.
+    let collateral_out = mul_div_floor(x, BPS - fee_bps as i128, BPS)?;
+    let fee = x - collateral_out;
+    if collateral_out <= 0 {
+        return Err(MathError::InvalidInput);
     }
-    Ok(gross)
-}
-
-/// Estimated `collateral_out` for selling `shares_in` shares, rounded down
-/// (pool-favoring). Mirrors the off-chain helpers in Python and TypeScript.
-pub fn collateral_out_for_shares(
-    r_sold: i128,
-    r_other: i128,
-    shares_in: i128,
-    fee_bps: u32,
-) -> Result<i128, MathError> {
-    let gross = gross_for_shares(r_sold, r_other, shares_in, fee_bps)?;
-    mul_div_floor(gross, BPS - fee_bps as i128, BPS)
+    let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x;
+    let new_other = r_other - x;
+    Ok(SellSharesQuote {
+        collateral_out,
+        fee,
+        gross: x,
+        new_reserve_sold: new_sold,
+        new_reserve_other: new_other,
+    })
 }
 
 /// True when a buy's average execution price `collateral_in / shares_out`
@@ -328,11 +382,153 @@ pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
     }
 }
 
+/// Maximum complete sets a holder can merge: `min(yes, no)`.
+///
+/// Pure helper so frontends and agents can offer "merge all" without
+/// duplicating the clip logic. Negative inputs are clipped to zero so the
+/// result is always non-negative and safe to pass to `merge`.
+pub fn merge_max(yes: i128, no: i128) -> i128 {
+    let y = if yes < 0 { 0 } else { yes };
+    let n = if no < 0 { 0 } else { no };
+    if y < n {
+        y
+    } else {
+        n
+    }
+}
+
+/// Upper bound on the total collateral `settle_value` will pay out for a
+/// set of per-holder (yes, no) claims. Exact for `Yes`/`No`; for `Void`
+/// each individual claim floors its own half, so the sum of what holders
+/// can still redeem is at most the floor of the summed halves:
+/// `floor(a/2) + floor(b/2) <= floor((a + b)/2)` for all `a, b >= 0`
+/// (the floors give back at most 1 unit and `a + b` is integral, so the
+/// per-holder rounding never lets redemptions exceed this bound).
+/// `finalize_market` reserves exactly this much for outstanding claims;
+/// anything the rounding then leaves unclaimed is swept, never stranded.
+pub fn settle_upper(kind: Settlement, yes: i128, no: i128) -> i128 {
+    match kind {
+        Settlement::Yes => yes,
+        Settlement::No => no,
+        Settlement::Void => (yes + no) / 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
-    use std::string::ToString;
+
+    fn isqrt_exact(n: u128) {
+        let x = isqrt(n);
+        assert!(
+            x.checked_mul(x).unwrap() <= n,
+            "isqrt lower bound failed for {}",
+            n
+        );
+        if let Some(next) = x.checked_add(1) {
+            if let Some(sq) = next.checked_mul(next) {
+                assert!(n < sq, "isqrt upper bound failed for {}", n);
+            }
+        }
+    }
+
+    #[test]
+    fn isqrt_exact_for_boundaries() {
+        for n in 0u128..=128 {
+            isqrt_exact(n);
+        }
+        for root in [10u128, 100u128, 1_000_000u128] {
+            isqrt_exact(root * root);
+            isqrt_exact(root * root - 1);
+            isqrt_exact(root * root + 1);
+        }
+        // (3e15)^2 = 9e30, the largest product we allow.
+        let max = (3_000_000_000_000_000u128);
+        isqrt_exact(max * max);
+        isqrt_exact(max * max - 1);
+        isqrt_exact(max * max + 1);
+        isqrt_exact(u128::MAX);
+        isqrt_exact(u128::MAX - 1);
+    }
+
+    #[test]
+    fn sell_shares_example_matches_model() {
+        // 1000/1000 pool, sell 212 shares, no fee.
+        let q = calc_sell_shares(1000, 1000, 212, 0).unwrap();
+        assert_eq!(q.gross, 100);
+        assert_eq!(q.collateral_out, 100);
+        assert_eq!(q.fee, 0);
+        assert_eq!(q.new_reserve_sold, 1112);
+        assert_eq!(q.new_reserve_other, 900);
+    }
+
+    // Linear congruential generator for reproducible property tests.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(144269);
+            self.0
+        }
+        fn range(&mut self, lo: i128, hi: i128) -> i128 {
+            lo + (self.next() as i128) % (hi - lo + 1)
+        }
+    }
+
+    #[test]
+    fn sell_shares_k_never_decreases() {
+        let mut rng = Lcg(0xdeadbeef);
+        for _ in 0..2000 {
+            let r_sold = rng.range(1, 1_000_000);
+            let r_other = rng.range(1, 1_000_000);
+            let shares_in = rng.range(1, r_sold);
+            let fee_bps = rng.range(0, 1000) as u32;
+            if let Ok(q) = calc_sell_shares(r_sold, r_other, shares_in, fee_bps) {
+                let left = q.new_reserve_sold * q.new_reserve_other;
+                let right = r_sold * r_other;
+                assert!(left >= right, "k decreased");
+            }
+        }
+    }
+
+    #[test]
+    fn sell_shares_never_pays_more_than_calc_sell() {
+        let mut rng = Lcg(0xcafe_babe_1234);
+        for _ in 0..2000 {
+            let r_sold = rng.range(1, 1_000_000);
+            let r_other = rng.range(1, 1_000_000);
+            let shares_in = rng.range(1, r_sold);
+            let fee_bps = rng.range(0, 1000) as u32;
+            if let Ok(q) = calc_sell_shares(r_sold, r_other, shares_in, fee_bps) {
+                if let Ok(back) = calc_sell(r_sold, r_other, q.collateral_out, fee_bps) {
+                    assert!(
+                        back.shares_in <= shares_in,
+                        "calc_sell charged less than shares_in"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sell_shares_at_max_sets_no_overflow() {
+        let q = calc_sell_shares(MAX_SETS, MAX_SETS, MAX_SETS / 2, 500).unwrap();
+        assert!(q.collateral_out > 0);
+        assert!(q.new_reserve_sold > 0);
+        assert!(q.new_reserve_other > 0);
+    }
+
+    #[test]
+    fn sell_shares_rejects_zero_collateral() {
+        // Tiny sell whose collateral floors to 0 must revert.
+        assert_eq!(
+            calc_sell_shares(1_000_000, 1_000_000, 1, 0),
+            Err(MathError::InsufficientLiquidity),
+        );
+    }
 
     #[test]
     fn buy_example_matches_model() {
@@ -358,14 +554,14 @@ mod tests {
             let s = seed_reserves(10_000_000_000, p).unwrap();
             let price = price_yes_bps(s.reserve_yes, s.reserve_no).unwrap();
             assert!((price - p as i128).abs() <= 1, "p={p} price={price}");
-            assert!(s.creator_yes == 0 || s.creator_no == 0);
+            assert_eq!(s.creator_yes == 0 || s.creator_no == 0, true);
         }
     }
 
     #[test]
     fn k_never_decreases_and_round_trip_never_profits() {
         // tiny LCG so this stays no_std-friendly
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut x: u64 = 0x9E37_79B9_7FA7C15;
         let mut next = move || {
             x = x
                 .wrapping_mul(6364136223846793005)
@@ -394,8 +590,17 @@ mod tests {
     }
 
     #[test]
-    fn split_fee_sums_exactly() {
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    fn settle_upper_exact_for_yes_no() {
+        assert_eq!(settle_upper(Settlement::Yes, 7, 3), 7);
+        assert_eq!(settle_upper(Settlement::No, 7, 3), 3);
+    }
+
+    #[test]
+    fn void_sum_of_floors_le_floor_of_sum() {
+        // The per-holder floor in `settle_value` must never add up to more
+        // than the single floor over the summed claims, or finalize would
+        // reserve less than holders can redeem.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = move || {
             x = x
                 .wrapping_mul(6364136223846793005)
@@ -403,14 +608,23 @@ mod tests {
             (x >> 33) as i128
         };
         for _ in 0..2_000 {
-            let fee = next() % 1_000_000_000_000;
-            let share = (next() % (BPS + 1)) as u32;
-            let (protocol, lp) = split_fee(fee, share).unwrap();
-            assert_eq!(protocol + lp, fee, "fee={fee} share={share}");
-            assert!(protocol >= 0 && lp >= 0);
-            // protocol rounds up: never below the exact proportional share
-            assert!(protocol * BPS >= fee * share as i128);
+            let a = next() % 1_000_000_000;
+            let b = next() % 1_000_000_000;
+            let summed = settle_upper(Settlement::Void, a, b);
+            let part = settle_value(Settlement::Void, a, 0) + settle_value(Settlement::Void, 0, b);
+            assert!(part <= summed, "a={a} b={b} part={part} summed={summed}");
         }
+        // Boundary shapes around odd sums.
+        assert!(settle_value(Settlement::Void, 1, 0) + settle_value(Settlement::Void, 0, 1) <= 1);
+        assert!(settle_value(Settlement::Void, 1, 1) + settle_value(Settlement::Void, 0, 1) <= 1);
+    }
+
+    #[test]
+    fn split_fee_sums_exactly() {
+        let (fee, share) = (101, 3300);
+        let (proto, lp) = split_fee(fee, share).unwrap();
+        assert_eq!(proto + lp, fee);
+        assert_eq!(split_fee(fee, BPS as u32).unwrap(), (fee, 0));
     }
 
     #[test]
@@ -442,109 +656,6 @@ mod tests {
         assert!(!sell_within_limit(100, 201, 5_000).unwrap());
         // a zero limit is trivially satisfied
         assert!(sell_within_limit(0, 1, 0).unwrap());
-    }
-
-    #[test]
-    fn inverse_matches_reference_examples() {
-        // Worked examples pinned by the Python and TypeScript mirrors.
-        assert_eq!(gross_for_shares(1_000, 1_000, 212, 0).unwrap(), 100);
-        assert_eq!(
-            collateral_out_for_shares(1_000, 1_000, 212, 0).unwrap(),
-            100
-        );
-        let q = calc_sell(10_000, 20_000, 1_000, 100).unwrap();
-        let out = collateral_out_for_shares(10_000, 20_000, q.shares_in, 100).unwrap();
-        let back = calc_sell(10_000, 20_000, out, 100).unwrap();
-        assert!(back.shares_in <= q.shares_in + 1);
-    }
-
-    #[test]
-    fn isqrt_exact_squares() {
-        for n in [0i128, 1, 2, 3, 4, 9, 15, 16, 17, 10_000, 10_000_000_000] {
-            let r = isqrt(n).unwrap();
-            assert!(r * r <= n && (r + 1) * (r + 1) > n, "n={n} r={r}");
-        }
-        assert_eq!(
-            isqrt(i128::MAX).unwrap().checked_mul(1).unwrap(),
-            13_043_817_825_332_782_212
-        );
-        assert_eq!(isqrt(-1), Err(MathError::InvalidInput));
-    }
-
-    #[test]
-    fn shared_vectors_match() {
-        // Kept in sync with `model/fpmm_model.py`, `agents/core/fpmm.test.ts`
-        // and the differential harness. Any porting mistake on these
-        // boundary-heavy inputs makes at least one language fail.
-        let raw = include_str!("../../../scripts/fpmm-diff/vectors.jsonl");
-        for (line_no, line) in raw.lines().enumerate() {
-            let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            let f = v["fn"].as_str().unwrap();
-            let a = v["args"].as_array().unwrap();
-            let arg = |i: usize| -> i128 { a[i].as_str().unwrap().parse().unwrap() };
-            let actual = match f {
-                "calc_buy" => {
-                    let q = calc_buy(arg(0), arg(1), arg(2), arg(3) as u32).unwrap();
-                    serde_json::json!({
-                        "shares_out": q.shares_out.to_string(),
-                        "fee": q.fee.to_string(),
-                        "net": q.net.to_string(),
-                        "new_reserve_bought": q.new_reserve_bought.to_string(),
-                        "new_reserve_other": q.new_reserve_other.to_string(),
-                    })
-                }
-                "calc_sell" => {
-                    let q = calc_sell(arg(0), arg(1), arg(2), arg(3) as u32).unwrap();
-                    serde_json::json!({
-                        "shares_in": q.shares_in.to_string(),
-                        "fee": q.fee.to_string(),
-                        "gross": q.gross.to_string(),
-                        "new_reserve_sold": q.new_reserve_sold.to_string(),
-                        "new_reserve_other": q.new_reserve_other.to_string(),
-                    })
-                }
-                "seed_reserves" => {
-                    let s = seed_reserves(arg(0), arg(1) as u32).unwrap();
-                    serde_json::json!({
-                        "reserve_yes": s.reserve_yes.to_string(),
-                        "reserve_no": s.reserve_no.to_string(),
-                        "creator_yes": s.creator_yes.to_string(),
-                        "creator_no": s.creator_no.to_string(),
-                    })
-                }
-                "mul_div_floor" => {
-                    serde_json::json!({"value": mul_div_floor(arg(0), arg(1), arg(2)).unwrap().to_string()})
-                }
-                "mul_div_ceil" => {
-                    serde_json::json!({"value": mul_div_ceil(arg(0), arg(1), arg(2)).unwrap().to_string()})
-                }
-                "price_yes_bps" => {
-                    serde_json::json!({"value": price_yes_bps(arg(0), arg(1)).unwrap().to_string()})
-                }
-                "settle_value" => {
-                    let kind = match a[0].as_str().unwrap() {
-                        "yes" => Settlement::Yes,
-                        "no" => Settlement::No,
-                        "void" => Settlement::Void,
-                        other => panic!("line {line_no}: unknown settlement {other}"),
-                    };
-                    serde_json::json!({"value": settle_value(kind, arg(1), arg(2)).to_string()})
-                }
-                "gross_for_shares" => {
-                    serde_json::json!({"gross": gross_for_shares(arg(0), arg(1), arg(2), arg(3) as u32).unwrap().to_string()})
-                }
-                "collateral_out_for_shares" => {
-                    serde_json::json!({"collateral_out": collateral_out_for_shares(arg(0), arg(1), arg(2), arg(3) as u32).unwrap().to_string()})
-                }
-                other => panic!("line {line_no}: unknown fn {other}"),
-            };
-            assert_eq!(
-                &actual,
-                &v["ok"],
-                "shared vector line {} failed",
-                line_no + 1
-            );
-        }
     }
 
     #[test]

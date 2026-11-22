@@ -791,6 +791,73 @@ fn auth_resolver_snapshot_price_signs_as_caller() {
 }
 
 #[test]
+fn auth_resolver_create_committee_requires_admin_auth() {
+    // #304: create_committee must require the named admin's auth.
+    let w = World::new();
+    let committee_admin = w.admin.clone();
+    let member_a = w.signer_a.clone();
+    let member_b = w.signer_b.clone();
+    let mut members = Vec::new(&w.env);
+    members.push_back(member_a.clone());
+    members.push_back(member_b.clone());
+    let threshold = 1u32;
+    let rotation_delay = 86_400u64; // MIN_ROTATION_DELAY = 1 day
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (
+        committee_admin.clone(),
+        members.clone(),
+        threshold,
+        rotation_delay,
+    )
+        .into_val(&w.env);
+    let id = w
+        .resolver
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &committee_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.resolver_id,
+                fn_name: "create_committee",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .create_committee(&committee_admin, &members, &threshold, &rotation_delay);
+    assert_eq!(id, 0, "first committee id is 0");
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &committee_admin,
+            &w.resolver_id,
+            "create_committee",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    // A wrong caller cannot create a committee in someone else's name.
+    w.env.set_auths(&[]);
+    let attacker = w.random.clone();
+    let result = w
+        .resolver
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.resolver_id,
+                fn_name: "create_committee",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_committee(&committee_admin, &members, &threshold, &rotation_delay);
+    assert!(
+        result.is_err(),
+        "attacker must not create a committee for a different admin"
+    );
+}
+
+#[test]
 fn resolver_contract_is_only_address_that_can_resolve() {
     let w = World::new();
     w.set_time(MARKET_CLOSE + 1);
@@ -974,12 +1041,12 @@ fn auth_treasury_admin_actions_and_role_separation() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "withdraw",
+                fn_name: "request_withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_withdraw(&w.random, &1i128);
+        .try_request_withdraw(&w.random, &1i128);
     assert!(result.is_err(), "agent must not withdraw vault capital");
 
     w.env.set_auths(&[]);
@@ -1024,19 +1091,19 @@ fn auth_treasury_admin_withdraw_and_collect_market_fees() {
             address: &w.admin,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "withdraw",
+                fn_name: "request_withdraw",
                 args: args.clone(),
                 sub_invokes: &[],
             },
         }])
-        .withdraw(&w.random, &1i128);
+        .request_withdraw(&w.random, &1i128);
     assert_eq!(
         w.env.auths(),
         vec![invocation(
             &w.env,
             &w.admin,
             &w.treasury_id,
-            "withdraw",
+            "request_withdraw",
             args.clone(),
             vec![],
         )]
@@ -1439,12 +1506,12 @@ fn treasury_admin_cannot_trade_and_agent_cannot_withdraw() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "withdraw",
+                fn_name: "request_withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_withdraw(&w.random, &1i128);
+        .try_request_withdraw(&w.random, &1i128);
     assert!(agent_withdraw.is_err());
 }
 
@@ -1460,6 +1527,9 @@ const MATRIX: &[(&str, &[&str])] = &[
         "market-core",
         &[
             "create_market",
+            "create_market_with_collateral",
+            "add_collateral",
+            "set_collateral_enabled",
             "buy",
             "sell",
             "redeem",
@@ -1483,6 +1553,7 @@ const MATRIX: &[(&str, &[&str])] = &[
             "register_price_spec",
             "register_signer_spec",
             "snapshot_price",
+            "create_committee",
         ],
     ),
     (
@@ -1491,7 +1562,7 @@ const MATRIX: &[(&str, &[&str])] = &[
             "deposit",
             "agent_buy",
             "set_paused",
-            "withdraw",
+            "request_withdraw",
             "collect_market_fees",
             "close_trade",
         ],
@@ -1524,6 +1595,10 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "pending_admin",
             "market_count",
             "get_market",
+            "get_market_collateral",
+            "market_collateral_info",
+            "collateral_params",
+            "locked",
             "get_position",
             "get_price",
             "get_config",
@@ -1566,7 +1641,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "evidence_config",
             "set_evidence_config",
             "get_committee",
-            "create_committee",
             "propose_rotation",
             "execute_rotation",
             "cancel_rotation",
@@ -1597,15 +1671,21 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "queue_reserved",
             "queue_bounds",
             "deposit",
+            "deposit_token",
             "request_withdraw",
             "claim_withdraw",
             "emergency_withdraw",
+            "set_token_caps",
+            "token_caps",
+            "available_capital_of",
             "agent_sell",
             "agent_sell_v2",
             "agent_buy_v2",
             "agent_create_market",
+            "agent_create_market_collateral",
             "agent_create_market_and_reveal",
             "agent_claim_lp_fees",
+            "collect_market_fees",
             "agent_daily_usage",
             "agent_at",
             "agent_count",
@@ -1629,6 +1709,27 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "drawdown_status",
             "acknowledge_drawdown",
             "reset_pnl_window",
+            "set_mode",
+            "mode",
+            "set_unwinder",
+            "unwinder",
+            "set_exit_floor",
+            "set_default_exit_floor",
+            "exit_floor",
+            "unwound",
+            "unwind_sell",
+            "propose_op",
+            "execute_op",
+            "cancel_op",
+            "pending_op",
+            "correlation_caps",
+            "category_exposure",
+            "bucket_exposure",
+            "correlation_headroom",
+            "pending_correlation_caps",
+            "propose_correlation_caps",
+            "execute_correlation_caps",
+            "cancel_correlation_caps",
             "set_drawdown_config",
             "get_creation_policy",
             "creation_usage",
@@ -1658,8 +1759,10 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "recall_from_yield",
             "disable_yield",
             "set_successor",
-            "migrate_market",
+            "migrate_markets",
             "settle_market",
+            "redeem_many",
+            "claim_pool_remainders",
             "legacy_redeem",
             "legacy_claim_pool_remainder",
             "withdraw_ticket",

@@ -3,7 +3,7 @@
  * Uses getLedgerEntries for atomic multi-key reads to ensure ledger consistency.
  */
 import type { Server as StellarServer } from "@stellar/stellar-sdk/rpc";
-import { xdr } from "@stellar/stellar-sdk";
+import { Address, xdr } from "@stellar/stellar-sdk";
 import type { ChainMarket, PortfolioState, Snapshot, MarketStatus, ResolutionMode } from "./types.js";
 
 const MAX_LEDGER_DRIFT = Number(process.env.AGENT_MAX_LEDGER_DRIFT ?? 2);
@@ -121,9 +121,7 @@ export class ChainStateReader {
 function buildMarketKey(contractId: string, marketId: bigint): xdr.LedgerKey {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
-      contract: xdr.ScAddress.scAddressTypeContract(
-        xdr.Hash.fromXDR(Buffer.from(contractId, "hex")),
-      ),
+      contract: new Address(contractId).toScAddress(),
       key: xdr.ScVal.scvMap([
         new xdr.ScMapEntry({
           key: xdr.ScVal.scvSymbol("MarketState"),
@@ -138,9 +136,7 @@ function buildMarketKey(contractId: string, marketId: bigint): xdr.LedgerKey {
 function buildPortfolioKey(contractId: string): xdr.LedgerKey {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
-      contract: xdr.ScAddress.scAddressTypeContract(
-        xdr.Hash.fromXDR(Buffer.from(contractId, "hex")),
-      ),
+      contract: new Address(contractId).toScAddress(),
       key: xdr.ScVal.scvSymbol("PortfolioState"),
       durability: xdr.ContractDataDurability.persistent(),
     }),
@@ -166,7 +162,7 @@ function decodeMarketEntry(entry: RpcLedgerEntry): ChainMarket {
     reserveNo: BigInt(get("reserve_no")?.i128()?.toString() ?? "0"),
     setsMinted: BigInt(get("sets_minted")?.i128()?.toString() ?? "0"),
     feesAccrued: BigInt(get("fees_accrued")?.i128()?.toString() ?? "0"),
-    lpClaimed: get("lp_claimed")?.bool() ?? false,
+    lpClaimed: get("lp_claimed")?.b() ?? false,
     resolution: decodeResolution(get("resolution")),
   };
 }

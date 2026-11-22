@@ -44,13 +44,25 @@ export const Errors = {
    */
   3: {message:"DomainMismatch"},
   /**
-   * `buy_and_publish_trace` was given empty trace content.
+   * Empty or over-long trace content.
    */
   4: {message:"InvalidTrace"},
   /**
    * The router was asked to reveal a rule variant it does not support.
    */
-  5: {message:"UnsupportedRule"}
+  5: {message:"UnsupportedRule"},
+  /**
+   * `TraceArgs.action` does not match the trade side.
+   */
+  6: {message:"ActionMismatch"},
+  /**
+   * The downstream trade returned no positive shares.
+   */
+  7: {message:"InvalidTradeResult"},
+  /**
+   * The supplied treasury is not wired to this router's market-core.
+   */
+  8: {message:"TreasuryMismatch"}
 }
 
 
@@ -66,7 +78,40 @@ export interface RouterConfig {
   resolver: string;
 }
 
+export type Side = {tag: "Buy", values: void} | {tag: "Sell", values: void};
 
+export type TraceAction = {tag: "CreateMarket", values: void} | {tag: "ProposeMarket", values: void} | {tag: "Buy", values: void} | {tag: "Sell", values: void} | {tag: "Skip", values: void} | {tag: "Redeem", values: void} | {tag: "ClaimRemainder", values: void} | {tag: "Resolve", values: void} | {tag: "Other", values: readonly [string]};
+
+export interface ChainArgs {
+  expected_seq: u64;
+  prev_trace_hash: Buffer;
+}
+
+export interface SigArgs {
+  signature: Buffer;
+  signing_key: Buffer;
+}
+
+export interface TraceArgs {
+  action: TraceAction;
+  chain: Option<ChainArgs>;
+  ipfs_cid: string;
+  sig: Option<SigArgs>;
+  trace_hash: Buffer;
+}
+
+export interface TradeBounds {
+  amount: i128;
+  deadline: u64;
+  limit_price_bps: u32;
+  limit_shares: i128;
+}
+
+export interface TradeTraceResult {
+  chain_seq: Option<u64>;
+  shares: i128;
+  trace_id: u64;
+}
 
 export type Outcome = {tag: "Yes", values: void} | {tag: "No", values: void};
 
@@ -145,6 +190,12 @@ export interface DisputableSignerConfig {
 
 export interface Client {
   /**
+   * Construct and simulate an agent_trade_and_publish_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Same atomic trade+trace flow, but the trade runs through the caller's treasury and the agent is the trace author.
+   */
+  agent_trade_and_publish_trace: ({treasury, agent, market_id, outcome, side, bounds, trace}: {treasury: string, agent: string, market_id: u64, outcome: Outcome, side: Side, bounds: TradeBounds, trace: TraceArgs}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TradeTraceResult>>>
+
+  /**
    * Construct and simulate a config transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   config: (options?: MethodOptions) => Promise<AssembledTransaction<Result<RouterConfig>>>
@@ -159,11 +210,10 @@ export interface Client {
 
   /**
    * Construct and simulate a buy_and_publish_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Buys `outcome` shares through market-core and publishes a reasoning
-   * trace through the reasoning registry in the same transaction, so a
-   * trace cannot be skipped after a trade. The registry must be configured.
+   * Deprecated one-release compatibility wrapper for the direct buy path.
+   * The `action: string` argument is gone; use `trade_and_publish_trace` for typed actions.
    */
-  buy_and_publish_trace: ({trader, market_id, outcome, collateral_in, min_shares_out, action, trace_hash, ipfs_cid}: {trader: string, market_id: u64, outcome: Outcome, collateral_in: i128, min_shares_out: i128, action: string, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  buy_and_publish_trace: ({trader, market_id, outcome, collateral_in, min_shares_out, trace_hash, ipfs_cid}: {trader: string, market_id: u64, outcome: Outcome, collateral_in: i128, min_shares_out: i128, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TradeTraceResult>>>
 
   /**
    * Construct and simulate a create_and_reveal_price transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -178,6 +228,12 @@ export interface Client {
    * market-core, so the reveal necessarily matches.
    */
   create_and_reveal_signers: ({creator, question_hash, meta_uri, category, close_time, seed_amount, initial_yes_bps, spec_v2}: {creator: string, question_hash: Buffer, meta_uri: string, category: Category, close_time: u64, seed_amount: i128, initial_yes_bps: u32, spec_v2: ResolutionSpecV2}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+
+  /**
+   * Construct and simulate a trade_and_publish_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Trades through `buy_v2`/`sell_v2` and publishes a typed trace in one transaction.
+   */
+  trade_and_publish_trace: ({trader, market_id, outcome, side, bounds, trace}: {trader: string, market_id: u64, outcome: Outcome, side: Side, bounds: TradeBounds, trace: TraceArgs}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TradeTraceResult>>>
 
 }
 export class Client extends ContractClient {
@@ -229,8 +285,10 @@ export class Client extends ContractClient {
   public readonly fromJSON = {
     config: this.txFromJSON<Result<RouterConfig>>,
         reveal_spec: this.txFromJSON<Result<void>>,
-        buy_and_publish_trace: this.txFromJSON<Result<u64>>,
+        buy_and_publish_trace: this.txFromJSON<Result<TradeTraceResult>>,
         create_and_reveal_price: this.txFromJSON<Result<u64>>,
-        create_and_reveal_signers: this.txFromJSON<Result<u64>>
+        create_and_reveal_signers: this.txFromJSON<Result<u64>>,
+        trade_and_publish_trace: this.txFromJSON<Result<TradeTraceResult>>,
+        agent_trade_and_publish_trace: this.txFromJSON<Result<TradeTraceResult>>
   }
 }
