@@ -6,6 +6,7 @@ publish = false
 
 [features]
 local-short-windows = []
+test-v2 = []
 
 [lib]
 crate-type = ["cdylib", "rlib"]

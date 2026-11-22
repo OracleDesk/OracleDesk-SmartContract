@@ -1,5 +1,10 @@
 #![no_std]
 
+pub mod ttl;
+
+#[cfg(any(test, feature = "test-v2"))]
+mod tests_upgrade;
+
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -43,6 +48,13 @@ pub mod correlation;
 const DAY_SECONDS: u64 = 86_400;
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+
+#[cfg(not(feature = "test-v2"))]
+pub const SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "test-v2")]
+pub const SCHEMA_VERSION: u32 = 2;
+const PRE_VERSIONING_SCHEMA_VERSION: u32 = 1;
+const MAX_MIGRATION_BATCH: u32 = 50;
 /// Width of one bucket of the sliding daily window.
 const BUCKET_SECONDS: u64 = 3_600;
 /// Buckets checked against `max_daily`: the trade's own hour plus the 24
@@ -118,14 +130,29 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// used.
 fn core_call<T>(
     result: Result<
-        Result<T, market_core::Error>,
-        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+        Result<T, soroban_sdk::Error>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
     >,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+        Ok(Err(error)) => Err(map_market_core_code(error)),
+        Err(Ok(error)) => Err(map_market_core_error(error)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+fn core_price_call(
+    result: Result<
+        Result<u32, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >,
+) -> Result<u32, Error> {
+    match result {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(err)) => Err(map_market_core_error(err)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
     }
 }
 
@@ -563,6 +590,9 @@ pub enum DataKey {
     DataGlobalCap,
     /// #318: sliding 25-bucket daily window for data spend, per agent.
     DataBudgetWindow(Address),
+    SchemaVersion,
+    MigrationCursor,
+    ExposureV2(u64),
 }
 
 #[contracttype]
@@ -705,6 +735,18 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
+    MarketCoreMarketNotFound = 29,
+    MarketCoreNotFinal = 30,
+    MarketCoreMarketNotOpen = 31,
+    MarketCoreMarketClosed = 32,
+    MarketCoreInsufficientLiquidity = 33,
+    MarketCoreInsufficientShares = 34,
+    MarketCoreAlreadyClaimed = 35,
+    MarketCoreNothingToRedeem = 36,
+    MarketCoreInvalidAmount = 37,
+    MarketCoreOverflow = 38,
+    MarketCoreSlippageExceeded = 39,
+    MarketCoreCallFailed = 40,
     MarketNotFinal = 44,
     MarketCoreError = 45,
     DrawdownTripped = 46,
@@ -744,6 +786,52 @@ pub enum Error {
     TraceTimelockActive = 74,
     StaleMarks = 75,
     MarkBatchTooLarge = 76,
+    MigrationBatchTooLarge = 77,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Upgraded {
+    #[topic]
+    pub old_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    #[topic]
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u32,
+    pub done: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCursor {
+    pub from_version: u32,
+    pub next_id: u64,
+    pub done: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub processed: u32,
+    pub next_id: u64,
+    pub done: bool,
+}
+
+#[cfg(feature = "test-v2")]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExposureV2 {
+    pub v1: MarketExposure,
+    pub net: i128,
+    pub schema: u32,
 }
 
 #[contractevent]
@@ -1186,6 +1274,8 @@ impl Treasury {
         let buckets: Vec<CreationBucket> = Vec::new(&env);
         storage.set(&DataKey::CreationBuckets, &buckets);
         storage.set(&DataKey::YieldPrincipal, &0i128);
+        storage.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        ttl::bump_instance(&env);
 
         let full = AgentPolicy {
             roles: ROLE_ALL,
@@ -1262,6 +1352,11 @@ impl Treasury {
     pub fn daily_usage(env: Env) -> Result<DailyUsage, Error> {
         let window = Self::daily_usage_detail(env)?;
         Self::summarize(&window)
+    }
+
+    pub fn market_exposure(env: Env, market_id: u64) -> Result<MarketExposure, Error> {
+        let global = Self::load_global(&env)?;
+        Ok(Self::load_market_exposure(&env, &global.market_core, market_id))
     }
 
     /// The hourly buckets behind `daily_usage`, advanced to now (not stored).
@@ -2309,7 +2404,7 @@ impl Treasury {
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2385,7 +2480,7 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2451,7 +2546,7 @@ impl Treasury {
         collateral_in: i128,
         min_shares_out: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2481,7 +2576,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2509,7 +2604,7 @@ impl Treasury {
         collateral_out: i128,
         max_shares_in: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -2537,7 +2632,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -2559,7 +2654,7 @@ impl Treasury {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let core = global.market_core;
-        let mut exposure = Self::market_exposure(&env, &core, market_id);
+        let mut exposure = Self::load_market_exposure(&env, &core, market_id);
         if !exposure.open {
             return Err(Error::MarketNotOpen);
         }
@@ -2829,7 +2924,7 @@ impl Treasury {
             Self::close_market_exposure(&env, core, market_id);
         }
         Self::save_realized(&env, market_id, &r);
-        Self::prune_if_settled(&env, core, market_id);
+        let _ = Self::prune_if_settled(&env, core, market_id);
         if r.settled {
             Self::try_realize(&env, core, market_id)?;
         }
@@ -3195,7 +3290,7 @@ impl Treasury {
         if lp {
             client.transfer_lp(&market_id, &successor);
         }
-        let mut exposure = Self::market_exposure(&env, &core, market_id);
+        let mut exposure = Self::load_market_exposure(&env, &core, market_id);
         exposure.open = false;
         Self::save_market(&env, &core, market_id, &exposure);
         // The holdings now belong to the successor, so none of this market's
@@ -3212,9 +3307,161 @@ impl Treasury {
         .publish(&env);
         Ok(())
     }
+
+    pub fn schema_version(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
+        Self::load_schema_version(&env)
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let old_version = Self::load_schema_version(&env);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Upgraded {
+            old_version,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn migrate(env: Env, batch: u32) -> Result<MigrationProgress, Error> {
+        Self::require_admin(&env)?;
+        if batch == 0 || batch > MAX_MIGRATION_BATCH {
+            return Err(Error::MigrationBatchTooLarge);
+        }
+
+        let from_version = Self::load_schema_version(&env);
+        if from_version >= SCHEMA_VERSION {
+            return Ok(MigrationProgress {
+                from_version,
+                to_version: from_version,
+                processed: 0,
+                next_id: 0,
+                done: true,
+            });
+        }
+
+        let total = Self::migration_bound(&env)?;
+        let mut cursor = match Self::load_migration_cursor(&env) {
+            Some(c) if c.from_version == from_version => c,
+            _ => MigrationCursor {
+                from_version,
+                next_id: 0,
+                done: false,
+            },
+        };
+
+        let mut processed = 0u32;
+        while processed < batch && cursor.next_id < total {
+            let id = cursor.next_id;
+            Self::migrate_market_entry(&env, id, from_version);
+            cursor.next_id = id + 1;
+            processed += 1;
+        }
+        cursor.done = cursor.next_id >= total;
+        let to_version = if cursor.done {
+            SCHEMA_VERSION
+        } else {
+            from_version
+        };
+
+        Self::bump_instance_ttl(&env);
+        let s = env.storage().instance();
+        if cursor.done {
+            s.set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+            s.remove(&DataKey::MigrationCursor);
+        } else {
+            s.set(&DataKey::MigrationCursor, &cursor);
+        }
+
+        Migrated {
+            from_version,
+            to_version,
+            processed,
+            done: cursor.done,
+        }
+        .publish(&env);
+        Ok(MigrationProgress {
+            from_version,
+            to_version,
+            processed,
+            next_id: cursor.next_id,
+            done: cursor.done,
+        })
+    }
 }
 
 impl Treasury {
+    fn bump_instance_ttl(env: &Env) {
+        ttl::bump_instance(env);
+    }
+
+    fn load_schema_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(PRE_VERSIONING_SCHEMA_VERSION)
+    }
+
+    fn load_migration_cursor(env: &Env) -> Option<MigrationCursor> {
+        env.storage().instance().get(&DataKey::MigrationCursor)
+    }
+
+    #[cfg(feature = "test-v2")]
+    fn migration_bound(env: &Env) -> Result<u64, Error> {
+        let global = Self::load_global(env)?;
+        match MarketCoreClient::new(env, &global.market_core).try_market_count() {
+            Ok(Ok(n)) => Ok(n),
+            _ => Err(Error::NotInitialized),
+        }
+    }
+
+    #[cfg(not(feature = "test-v2"))]
+    fn migration_bound(_env: &Env) -> Result<u64, Error> {
+        Ok(0)
+    }
+
+    fn ensure_entry_migrated(env: &Env, market_id: u64) {
+        let from_version = Self::load_schema_version(env);
+        if from_version >= SCHEMA_VERSION {
+            return;
+        }
+        Self::migrate_market_entry(env, market_id, from_version);
+        Self::bump_instance_ttl(env);
+    }
+
+    fn migrate_market_entry(env: &Env, market_id: u64, from_version: u32) {
+        Self::migrate_from(env, market_id, from_version);
+    }
+
+    fn migrate_from(env: &Env, market_id: u64, from_version: u32) {
+        #[cfg(feature = "test-v2")]
+        {
+            if from_version < 2 {
+                let storage = env.storage().persistent();
+                let target = DataKey::ExposureV2(market_id);
+                if storage.has(&target) {
+                    return;
+                }
+                let source = DataKey::Market(market_id);
+                let Some(v1) = storage.get::<_, MarketExposure>(&source) else {
+                    return;
+                };
+                let net = storage
+                    .get::<_, i128>(&DataKey::Net(market_id))
+                    .unwrap_or(0);
+                let v2 = ExposureV2 { v1, net, schema: 2 };
+                storage.set(&target, &v2);
+                storage.extend_ttl(&target, BUMP_THRESHOLD, BUMP_TO);
+            }
+        }
+        #[cfg(not(feature = "test-v2"))]
+        {
+            let _ = (env, market_id, from_version);
+        }
+    }
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -3519,7 +3766,7 @@ impl Treasury {
 
         let prices = Self::load_price_policy(&env);
         let client = MarketCoreClient::new(&env, &global.market_core);
-        let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
+        let p_before = core_price_call(client.try_get_price(&market_id, &outcome))?;
         if p_before > prices.max_buy_price_bps {
             return Err(Error::PriceOutOfBand);
         }
@@ -3552,7 +3799,7 @@ impl Treasury {
         ];
         let fn_name = Self::push_bound(&env, &mut args, bound, "buy", "buy_v2");
         let shares = Self::core_trade(&env, &global.market_core, fn_name, args)?;
-        let p_after = core_call(client.try_get_price(&market_id, &outcome))?;
+        let p_after = core_price_call(client.try_get_price(&market_id, &outcome))?;
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
@@ -3590,7 +3837,7 @@ impl Treasury {
         let prices = Self::load_price_policy(&env);
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(&env, &global.market_core);
-        let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
+        let p_before = core_price_call(client.try_get_price(&market_id, &outcome))?;
         if p_before < prices.min_sell_price_bps {
             return Err(Error::PriceOutOfBand);
         }
@@ -3608,7 +3855,7 @@ impl Treasury {
         ];
         let fn_name = Self::push_bound(&env, &mut args, bound, "sell", "sell_v2");
         let shares_in = Self::core_trade(&env, &global.market_core, fn_name, args)?;
-        let p_after = core_call(client.try_get_price(&market_id, &outcome))?;
+        let p_after = core_price_call(client.try_get_price(&market_id, &outcome))?;
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
@@ -3756,7 +4003,7 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        let _ = Self::prune_if_settled(env, core, market_id);
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
@@ -3791,7 +4038,7 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        let _ = Self::prune_if_settled(env, core, market_id);
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
@@ -3925,9 +4172,10 @@ impl Treasury {
     ) -> Result<(), Error> {
         let core = &global.market_core;
         let now = env.ledger().timestamp();
+        Self::ensure_entry_migrated(env, market_id);
         let mut window = Self::load_window(env)?;
         let mut agent_window = Self::load_agent_window(env, agent);
-        let mut exposure = Self::market_exposure(env, core, market_id);
+        let mut exposure = Self::load_market_exposure(env, core, market_id);
         let new_market = exposure
             .amount
             .checked_add(amount)
@@ -4097,8 +4345,14 @@ impl Treasury {
     ) -> Result<(i128, i128, MarkRecord), Error> {
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let market = core_call(client.try_get_market(&market_id))?;
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let market = match client.try_get_market(&market_id) {
+            Ok(Ok(m)) => m,
+            _ => return Err(Error::MarketCoreCallFailed),
+        };
+        let position = match client.try_get_position(&market_id, &treasury_addr) {
+            Ok(Ok(p)) => p,
+            _ => return Err(Error::MarketCoreCallFailed),
+        };
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         let (lp_yes, lp_no) = if lp {
             (market.reserve_yes, market.reserve_no)
@@ -4151,7 +4405,7 @@ impl Treasury {
         let holdings = if Self::marks_migrated(env) {
             Self::nav_holdings(env)
         } else {
-            let mut total = 0;
+            let mut total: i128 = 0;
             for i in 0..Self::open_count(env) {
                 let key = DataKey::OpenMarketAt(i);
                 let entry: OpenMarket = env
@@ -4406,8 +4660,14 @@ impl Treasury {
         }
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
-        let market = core_call(client.try_get_market(&market_id))?;
+        let position = match client.try_get_position(&market_id, &treasury_addr) {
+            Ok(Ok(p)) => p,
+            _ => return Err(Error::MarketCoreCallFailed),
+        };
+        let market = match client.try_get_market(&market_id) {
+            Ok(Ok(m)) => m,
+            _ => return Err(Error::MarketCoreCallFailed),
+        };
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         if position.yes == 0 && position.no == 0 && !lp {
             Self::index_remove(env, core, market_id)?;
@@ -4628,7 +4888,8 @@ impl Treasury {
     }
 
     fn close_market_exposure(env: &Env, core: &Address, market_id: u64) {
-        let mut exposure = Self::market_exposure(env, core, market_id);
+        Self::ensure_entry_migrated(env, market_id);
+        let mut exposure = Self::load_market_exposure(env, core, market_id);
         if exposure.open {
             exposure.open = false;
             Self::save_market(env, core, market_id, &exposure);
@@ -4865,7 +5126,7 @@ impl Treasury {
         Ok(())
     }
 
-    fn market_exposure(env: &Env, core: &Address, market_id: u64) -> MarketExposure {
+    fn load_market_exposure(env: &Env, core: &Address, market_id: u64) -> MarketExposure {
         env.storage()
             .persistent()
             .get(&Self::market_key(env, core, market_id))
@@ -4930,7 +5191,7 @@ impl Treasury {
         };
         let args = vec![env, agent.clone().into_val(env)];
         let record: Option<AgentRecord> =
-            match env.try_invoke_contract(&registry, &Symbol::new(env, "get_agent"), args) {
+            match env.try_invoke_contract::<Option<AgentRecord>, soroban_sdk::Error>(&registry, &Symbol::new(env, "get_agent"), args) {
                 Ok(Ok(v)) => v,
                 _ => return Err(Error::TraceRegistryCallFailed),
             };
@@ -5025,13 +5286,13 @@ impl Treasury {
             action.clone().into_val(env),
             cfg.max_trace_age_ledgers.into_val(env),
         ];
-        let info: TraceConsumeInfo = match env.try_invoke_contract(
+        let info: TraceConsumeInfo = match env.try_invoke_contract::<TraceConsumeInfo, soroban_sdk::Error>(
             &registry,
             &Symbol::new(env, "consume_trace_for"),
             args,
         ) {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(Self::map_registry_trace_error(e)),
+            Ok(Err(_)) => return Err(Error::TraceRegistryCallFailed),
             Err(Ok(e)) => return Err(Self::map_registry_trace_error(e)),
             Err(Err(_)) => return Err(Error::TraceRegistryCallFailed),
         };
@@ -6363,7 +6624,7 @@ mod test {
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(15 * USDC), &0);
         assert_eq!(f.treasury.net_exposure(), 30 * USDC);
         let exposure = f.env.as_contract(&f.treasury_id, || {
-            Treasury::market_exposure(&f.env, &f.market_core.address, f.market_id)
+            Treasury::load_market_exposure(&f.env, &f.market_core.address, f.market_id)
         });
         // The lifetime cap counts the sold capital too.
         assert_eq!(exposure.amount, 35 * USDC);
@@ -6547,6 +6808,28 @@ mod test {
             env.storage().instance().set(&1u32, &(calls + 1));
             collateral_in
         }
+
+        pub fn get_market(env: Env, _market_id: u64) -> market_core::Market {
+            market_core::Market {
+                creator: env.current_contract_address(),
+                question_hash: BytesN::from_array(&env, &[0u8; 32]),
+                resolution_hash: BytesN::from_array(&env, &[0u8; 32]),
+                meta_uri: String::from_str(&env, ""),
+                category: Category::Crypto,
+                close_time: 1_000_000,
+                fee_bps: 0,
+                status: MarketStatus::Open,
+                reserve_yes: 100 * 10_000_000,
+                reserve_no: 100 * 10_000_000,
+                sets_minted: 0,
+                lp_claimed: false,
+                fees_accrued: 0,
+            }
+        }
+
+        pub fn get_position(_env: Env, _market_id: u64, _holder: Address) -> market_core::Position {
+            market_core::Position { yes: 0, no: 0 }
+        }
     }
 
     #[test]
@@ -6616,7 +6899,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_net_cap_below_max_trade() {
         fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
     }
@@ -7109,13 +7392,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_invalid_caps_panics_with_contract_error_3() {
         fixture_with_caps(20 * USDC, 10 * USDC, 60 * USDC);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_config_delay_below_minimum() {
         let default_policy = CreationPolicy {
             max_seed: USDC,
@@ -7337,11 +7620,11 @@ mod test {
         );
         f.env.as_contract(&f.treasury_id, || {
             assert_eq!(
-                Treasury::market_exposure(&f.env, &old_core, f.market_id).amount,
+                Treasury::load_market_exposure(&f.env, &old_core, f.market_id).amount,
                 20 * USDC
             );
             assert_eq!(
-                Treasury::market_exposure(&f.env, &new_core_id, new_market).amount,
+                Treasury::load_market_exposure(&f.env, &new_core_id, new_market).amount,
                 20 * USDC
             );
         });
@@ -7618,6 +7901,7 @@ mod test {
             .agent_buy(&f.agent, &f.market_id, &Outcome::No, &(10 * USDC), &0);
         f.env.ledger().set_timestamp(MARKET_CLOSE);
         f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury.refresh_mark(&vec![&f.env, f.market_id]);
         let nav = f.treasury.nav();
         assert_eq!(f.treasury.open_market_count(), 1);
         f.treasury.redeem(&f.agent, &f.market_id);
