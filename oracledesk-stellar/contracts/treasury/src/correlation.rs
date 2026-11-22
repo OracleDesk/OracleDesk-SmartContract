@@ -1,17 +1,21 @@
-//! Correlated-risk caps by market category and close-date bucket (#49).
+//! Correlated-risk caps by market category and close-date bucket (#49/#259).
 //!
 //! `max_trade`, `max_market` and `max_daily` don't bound correlated risk: ten
 //! Crypto markets that all close the same week can each stay under
 //! `max_market` and be spread across days to stay under `max_daily`, yet all
 //! lose together. These helpers add the two missing dimensions, exposure per
-//! `Category` and per close-date bucket, with the same lifetime-cumulative
-//! semantics as `MarketExposure`.
+//! `Category` and per close-date bucket.
 //!
-//! Notes on semantics:
-//! - Exposure is never released, so bucket caps act as lifetime caps per bucket.
+//! Notes on semantics (net / cost-basis, not lifetime):
+//! - Exposure is `collateral_in - collateral_out` per market, floored at 0,
+//!   and is released by sells, redemptions, claims, settlement and migration.
+//! - A profitable sell can drive a market's basis to zero but never below, so
+//!   profit in one market cannot create headroom in another.
 //! - `close_time / bucket_secs` puts markets closing either side of a bucket
 //!   boundary (e.g. 23:59 vs 00:01) in different buckets. Counting a market
 //!   toward the next bucket too is out of scope.
+//! - `bucket_secs` may not change while any correlated exposure is open,
+//!   otherwise releases would decrement the wrong bucket.
 //!
 //! Storage keys use `category_index` (a `u32`), not the imported `Category`,
 //! so they don't depend on the vendored enum's Rust identity.

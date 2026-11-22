@@ -47,22 +47,59 @@ need no per-call address arguments. `config()` exposes it.
 - `reveal_spec(market_id, spec_v2)` — the deferred reveal for a market created
   by the commit-now/reveal-later path, validating the rule before
   `resolver.register_spec_v2`.
-- `buy_and_publish_trace(trader, market_id, outcome, collateral_in,
-  min_shares_out, action, trace_hash, ipfs_cid)` — buys through market-core
-  and publishes the trace through the registry in one transaction, so the
-  trace cannot be skipped after the trade. Emits `BoughtAndPublishedTrace`.
-  Rejects empty `action`/`ipfs_cid` with `InvalidTrace`.
+- `trade_and_publish_trace(trader, market_id, outcome, side, bounds, trace)` —
+  trades through market-core's `buy_v2`/`sell_v2` (limit price, deadline and
+  share bounds) and publishes a typed `TraceAction` in the same transaction.
+  `TraceArgs.chain` and `TraceArgs.sig` select one of `publish_trace`,
+  `publish_chained_trace`, `publish_trace_signed` or
+  `publish_chained_trace_signed`. A non-positive trade result fails in every
+  profile with `InvalidTradeResult` (the old `debug_assert!` disappeared in
+  release builds). Emits `TradeTraced { market_id, trader, side, shares,
+  trace_id, chain_seq }`. The action must be `Buy`/`Sell` to match `side`
+  (`ActionMismatch`), and the CID is checked against the registry's 128-byte
+  bound before any call.
+- `agent_trade_and_publish_trace(treasury, agent, market_id, outcome, side,
+  bounds, trace)` — the same atomic flow with the treasury's capital via
+  `agent_buy_v2`/`agent_sell_v2`, publishing the trace as `agent`. Because the
+  treasury address is caller-supplied, the router first checks
+  `treasury.get_global().market_core == cfg.market_core` and
+  `market_core.get_config().treasury == treasury`; a hostile treasury gets
+  `TreasuryMismatch` before any trade or trace.
+- `buy_and_publish_trace` — deprecated one-release wrapper over the direct
+  buy path. It drops the old `action: String` argument (breaking change, see
+  `packages/bindings/router/CHANGELOG.md`), uses `TraceAction::Buy`, an
+  unbounded limit price and the current timestamp as deadline. It returns a
+  `TradeTraceResult`, not a bare trace id. Remove in the next minor version.
 
 ### Authorization
 
-Each entrypoint calls `creator.require_auth()` / `trader.require_auth()` at the
-**root** of the call tree. market-core and the registry call `require_auth`
-for the same address deeper down; a non-root `require_auth` fails unless the
-address is already anchored, so the router anchors it first. A caller still
-authorizes exactly one account — the router adds no authority of its own.
+Each entrypoint calls `creator.require_auth()` / `trader.require_auth()` /
+`agent.require_auth()` at the **root** of the call tree. Downstream contracts
+call `require_auth` for the same address deeper down; a non-root
+`require_auth` fails unless the address is already anchored, so the router
+anchors it first. A caller still authorizes exactly one account — the router
+adds no authority of its own. The exact trees are:
 
-`reasoning_registry` is optional: if it is `None`, `buy_and_publish_trace`
-returns `NotInitialized`.
+```
+trader → router.trade_and_publish_trace
+         ├─ market_core.buy_v2 → token.transfer(trader → core)
+         └─ registry.publish_*
+
+agent → router.agent_trade_and_publish_trace
+        ├─ treasury.agent_buy_v2
+        └─ registry.publish_*
+```
+
+The treasury's token pull is pre-authorized inside treasury
+(`authorize_token_pull` with `authorize_as_current_contract`), so no extra
+signature is needed for the nested transfer. The signed publishing variants
+need no extra auth either: the registry verifies the Ed25519 signature over
+`trace_attestation_message`. `chain_seq` is read back with `agent_chain_head`;
+a concurrent publish by the same agent reverts the whole call with
+`ChainHeadMismatch`, so clients should retry with a fresh head.
+
+`reasoning_registry` is optional: if it is `None`, all trade+trace entrypoints
+return `NotInitialized`.
 
 ## Consequences
 

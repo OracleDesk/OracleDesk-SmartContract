@@ -1,10 +1,13 @@
 import { createHash, createPublicKey, verify } from "node:crypto";
+import { verifyBatchTraceProof } from "../agents/core/merkle.js";
+export type { BatchTraceProof, TraceLeafV2 } from "../agents/core/merkle.js";
 
 export type TraceVerdict =
   | { tag: "Valid"; values?: void }
   | { tag: "HashMismatch"; values?: void }
   | { tag: "Flagged"; values: [string] | readonly [string] }
-  | { tag: "AgentRevokedAfter"; values: [bigint] | readonly [bigint] };
+  | { tag: "AgentRevokedAfter"; values: [bigint] | readonly [bigint] }
+  | { tag: "KeyCompromised"; values: [bigint] | readonly [bigint] };
 
 export interface TraceRecord {
   traceId: string;
@@ -12,6 +15,8 @@ export interface TraceRecord {
   traceHash: string;
   marketId?: bigint;
   agent?: string;
+  /** #299: verdict from the registry's `trace_verdict`, if available. */
+  verdict?: TraceVerdict;
 }
 
 export function sha256Hex(content: Uint8Array): string {
@@ -105,25 +110,84 @@ function normalizeHash(hash: string): string {
   return hash.toLowerCase().replace(/^0x/, "");
 }
 
-export function verifyChain(entries: ChainEntry[], fromGenesis: boolean): ChainVerdict {
-  if (entries.length === 0) return { ok: true };
+export function verifyChain(
+  entries: ChainEntry[],
+  fromGenesis: boolean,
+  verdicts?: (TraceVerdict | undefined)[],
+): ChainVerdict & { tainted: bigint[] } {
+  const tainted: bigint[] = [];
+
+  if (entries.length === 0) return { ok: true, tainted };
 
   const first = entries[0];
   if (fromGenesis && (first.seq !== 1n || normalizeHash(first.prevTraceHash) !== GENESIS_HASH)) {
-    return { ok: false, reason: "bad-genesis", atSeq: first.seq };
+    return { ok: false, reason: "bad-genesis", atSeq: first.seq, tainted };
   }
 
   for (let i = 1; i < entries.length; i += 1) {
     const prev = entries[i - 1];
     const cur = entries[i];
     if (cur.seq !== prev.seq + 1n) {
-      return { ok: false, reason: "gap", atSeq: prev.seq + 1n };
+      return { ok: false, reason: "gap", atSeq: prev.seq + 1n, tainted };
     }
     if (normalizeHash(cur.prevTraceHash) !== normalizeHash(prev.traceHash)) {
-      return { ok: false, reason: "broken-link", atSeq: cur.seq };
+      return { ok: false, reason: "broken-link", atSeq: cur.seq, tainted };
     }
   }
-  return { ok: true };
+
+  // #299: report compromised links without failing the chain.
+  if (verdicts) {
+    for (let i = 0; i < entries.length && i < verdicts.length; i += 1) {
+      const v = verdicts[i];
+      if (v && v.tag === "KeyCompromised") {
+        tainted.push(entries[i].seq);
+      }
+    }
+  }
+
+  return { ok: true, tainted };
+}
+
+// ---------------------------------------------------------------------------
+// Batch inclusion verification (issue #308)
+// ---------------------------------------------------------------------------
+
+export interface BatchInclusionResult {
+  verified: boolean;
+  root: string;
+  index: number;
+  traceHash: string;
+  agent: string;
+  marketId: bigint;
+  action: string;
+}
+
+/**
+ * Verifies that a trace is included in an on-chain Merkle batch, using the v2
+ * leaf encoding that binds agent/market/action/position.
+ *
+ * The `batchRoot` must come from the on-chain `publish_trace_batch` call;
+ * the `batchProof` is produced by `prove_batched_trace`.
+ *
+ * Returns `verified: false` rather than throwing so callers can handle
+ * partial-batch scenarios gracefully.
+ */
+export function verifyBatchInclusion(
+  batchRoot: string,
+  batchProof: BatchTraceProof,
+): BatchInclusionResult {
+  const normalizedRoot = batchRoot.toLowerCase().replace(/^0x/, "");
+  const proofWithRoot = { ...batchProof, root: normalizedRoot };
+  const verified = verifyBatchTraceProof(proofWithRoot);
+  return {
+    verified,
+    root: normalizedRoot,
+    index: batchProof.index,
+    traceHash: batchProof.leaf.traceHash,
+    agent: batchProof.leaf.agent,
+    marketId: batchProof.leaf.marketId,
+    action: batchProof.leaf.action,
+  };
 }
 
 // ─── Ed25519 trace attestations (#53) ───────────────────────────────────────

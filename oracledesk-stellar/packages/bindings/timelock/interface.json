@@ -1,0 +1,938 @@
+{
+  "schema": 1,
+  "contract": "timelock",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "default_delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "accept_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "cancel": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cancels a pending operation. Only the canceller role may call this.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_admin_transfer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_admin_transfer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "default_delay": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "default_delay",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "delay_for": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The delay a call to `(target, fn_name)` would wait right now.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "fn_name",
+            "type_": "symbol"
+          }
+        ],
+        "name": "delay_for",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "emergency": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Bypasses the delay for a small allow-list of safety calls. The `emergency` role must be configured and hold auth.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "name": "args",
+            "type_": {
+              "vec": {
+                "element_type": "val"
+              }
+            }
+          }
+        ],
+        "name": "emergency",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Executes a due operation. Callable by the configured `executor`, or by anyone when `executor` is `None`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "name": "execute",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "operation": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "name": "operation",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "Operation"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "operation_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "operation_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "pending_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_admin",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "propose_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "roles": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "roles",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Roles"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "schedule": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Schedules `target.fn_name(args)`. The proposer must hold the proposer role; the effective delay is the larger of the global floor and any `(target, fn_name)` override.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "name": "args",
+            "type_": {
+              "vec": {
+                "element_type": "val"
+              }
+            }
+          }
+        ],
+        "name": "schedule",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "set_default_delay": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the global delay floor. Increasing it must go through the timelock itself (schedule a self-call), so an operator cannot quietly extend every in-flight delay; decreasing it is a normal admin action.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "delay",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_default_delay",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_delay": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets or clears a `(target, fn_name)` delay override.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "name": "delay",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "set_delay",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_roles": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the roles. Admin action (redirect it through `schedule` in production so operators cannot silently swap each other).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "set_roles",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "DataKey": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Admin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultDelay"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Delay",
+              "type_": [
+                "address",
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NextId"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Op",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdmin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdminAt"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Roles"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "DataKey"
+      }
+    },
+    "Operation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A scheduled call. It exists in storage only while pending; `execute` and `cancel` both remove it.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "args",
+            "type_": {
+              "vec": {
+                "element_type": "val"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "eta",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "expires",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "target",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "Operation"
+      }
+    },
+    "Roles": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposer",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "Roles"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "AdminTransferExpired",
+            "value": 12
+          },
+          {
+            "doc": "",
+            "name": "DelayOutOfRange",
+            "value": 9
+          },
+          {
+            "doc": "",
+            "name": "EmergencyNotAllowed",
+            "value": 8
+          },
+          {
+            "doc": "",
+            "name": "FloorRaiseRequiresTimelock",
+            "value": 10
+          },
+          {
+            "doc": "",
+            "name": "InvalidConfig",
+            "value": 3
+          },
+          {
+            "doc": "",
+            "name": "NoPendingAdmin",
+            "value": 11
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "",
+            "name": "OperationExpired",
+            "value": 6
+          },
+          {
+            "doc": "",
+            "name": "OperationNotFound",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "OperationNotPending",
+            "value": 7
+          },
+          {
+            "doc": "",
+            "name": "OperationNotReady",
+            "value": 5
+          },
+          {
+            "doc": "A scheduled self-call to a function the timelock cannot apply itself.",
+            "name": "SelfCallUnsupported",
+            "value": 13
+          },
+          {
+            "doc": "",
+            "name": "Unauthorized",
+            "value": 2
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "AdminTransferCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferCancelled",
+        "params": [],
+        "prefix_topics": [
+          "admin_transfer_cancelled"
+        ]
+      }
+    },
+    "AdminTransferProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transfer_proposed"
+        ]
+      }
+    },
+    "AdminTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transferred"
+        ]
+      }
+    },
+    "DefaultDelaySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "DefaultDelaySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "delay",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "default_delay_set"
+        ]
+      }
+    },
+    "DelaySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "DelaySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "delay",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "delay_set"
+        ]
+      }
+    },
+    "EmergencyExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "EmergencyExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fn_name",
+            "type_": "symbol"
+          }
+        ],
+        "prefix_topics": [
+          "emergency_executed"
+        ]
+      }
+    },
+    "OperationCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "OperationCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "operation_cancelled"
+        ]
+      }
+    },
+    "OperationExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "OperationExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "id",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "operation_executed"
+        ]
+      }
+    },
+    "OperationScheduled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "OperationScheduled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "target",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fn_name",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "eta",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "operation_scheduled"
+        ]
+      }
+    },
+    "RolesSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "RolesSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "proposer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "canceller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executor",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "emergency",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "roles_set"
+        ]
+      }
+    }
+  },
+  "type_origins": {},
+  "hash_critical": []
+}

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Stub `stellar` CLI for bats tests (Issue #132).
+# Logs every invocation to $STUB_LOG, matches against $STUB_SCENARIO (TSV:
+# regex<TAB>exit_code<TAB>stdout), then falls back to deterministic CLI 27.1.0
+# responses and scripts/test/fixtures/cli-outputs.tsv.
+set -euo pipefail
+
+CMD="$*"
+if [ -n "${STUB_LOG:-}" ]; then
+  printf 'stellar %s\n' "$CMD" >>"$STUB_LOG"
+fi
+
+STATE_DIR="${STUB_STATE_DIR:-/tmp/stub-state}"
+mkdir -p "$STATE_DIR"
+
+match_tsv() {
+  local file=$1
+  [ -f "$file" ] || return 1
+  local pat rc out
+  while IFS=$'\t' read -r pat rc out; do
+    [ -n "$pat" ] || continue
+    case "$pat" in
+      \#*) continue ;;
+    esac
+    if printf '%s\n' "$CMD" | grep -Eq -- "$pat"; then
+      if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+      fi
+      exit "${rc:-0}"
+    fi
+  done <"$file"
+  return 1
+}
+
+if [ -n "${STUB_SCENARIO:-}" ]; then
+  match_tsv "$STUB_SCENARIO" || true
+fi
+
+if [ "$1" = "--version" ]; then
+  printf 'stellar 27.1.0 (8e402ea28202950b272fbabc34caad4d2f64fe87)\n'
+  exit 0
+fi
+
+# Identity helpers
+if [ "$1" = "keys" ] && [ "${2:-}" = "address" ]; then
+  name="${3:-default}"
+  key_file="$STATE_DIR/key_${name}"
+  if [ ! -f "$key_file" ]; then
+    exit 1
+  fi
+  cat "$key_file"
+  exit 0
+fi
+
+if [ "$1" = "keys" ] && [ "${2:-}" = "generate" ]; then
+  name="${3:-default}"
+  # Deterministic 56-char G-address per identity name.
+  suffix=$(printf '%s' "$name" | tr '[:lower:]-_' '[:upper:]AA' | tr -cd 'A-Z2-7')
+  addr=$(printf 'G%-55s' "$suffix" | tr ' ' 'A' | cut -c1-56)
+  printf '%s\n' "$addr" >"$STATE_DIR/key_${name}"
+  printf '%s\n' "$addr"
+  exit 0
+fi
+
+# Contract build
+if [ "$1" = "contract" ] && [ "${2:-}" = "build" ]; then
+  mkdir -p target/wasm32v1-none/release
+  for w in market_core resolver reasoning_registry treasury timelock router test_oracle; do
+    printf 'stub-wasm-%s\n' "$w" >"target/wasm32v1-none/release/${w}.wasm"
+  done
+  exit 0
+fi
+
+# Deterministic contract id prediction & deployment
+derive_cid() {
+  local seed=$1
+  local tag
+  tag=$(printf '%s' "$seed" | tr '[:lower:]-_/.:' '[:upper:]AAAAA' | tr -cd 'A-Z2-7')
+  printf 'C%-55s' "$tag" | tr ' ' 'A' | cut -c1-56
+}
+
+if [ "$1" = "contract" ] && [ "${2:-}" = "id" ] && [ "${3:-}" = "wasm" ]; then
+  salt="DEFAULT"
+  shift 3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --salt)
+        salt="$2"
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  derive_cid "SALT${salt}"
+  printf '\n'
+  exit 0
+fi
+
+if [ "$1" = "contract" ] && [ "${2:-}" = "id" ] && [ "${3:-}" = "asset" ]; then
+  asset="USDC"
+  shift 3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --asset)
+        asset="$2"
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  derive_cid "ASSET${asset}"
+  printf '\n'
+  exit 0
+fi
+
+if [ "$1" = "contract" ] && [ "${2:-}" = "asset" ] && [ "${3:-}" = "deploy" ]; then
+  asset="USDC"
+  shift 3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --asset)
+        asset="$2"
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  derive_cid "ASSET${asset}"
+  printf '\n'
+  exit 0
+fi
+
+if [ "$1" = "contract" ] && [ "${2:-}" = "deploy" ]; then
+  salt=""
+  wasm="contract"
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --salt)
+        salt="$2"
+        shift 2
+        ;;
+      --wasm)
+        wasm=$(basename "$2" .wasm)
+        shift 2
+        ;;
+      --) break ;;
+      *) shift ;;
+    esac
+  done
+  if [ -n "$salt" ]; then
+    derive_cid "SALT${salt}"
+  else
+    derive_cid "WASM${wasm}"
+  fi
+  printf '\n'
+  exit 0
+fi
+
+if [ "$1" = "contract" ] && [ "${2:-}" = "bindings" ] && [ "${3:-}" = "typescript" ]; then
+  out_dir=""
+  wasm=""
+  shift 3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --output-dir)
+        out_dir="$2"
+        shift 2
+        ;;
+      --wasm)
+        wasm=$(basename "$2" .wasm)
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  mkdir -p "$out_dir/src"
+  printf '{"name":"%s","version":"0.1.0"}\n' "$wasm" >"$out_dir/package.json"
+  printf 'export const contract = "%s";\n' "$wasm" >"$out_dir/src/index.ts"
+  exit 0
+fi
+
+if [ "$1" = "tx" ] && [ "${2:-}" = "new" ] && [ "${3:-}" = "change-trust" ]; then
+  printf 'stub-change-trust-tx\n'
+  exit 0
+fi
+
+if [ -n "${STUB_FIXTURES:-}" ]; then
+  match_tsv "$STUB_FIXTURES" || true
+fi
+
+exit 0

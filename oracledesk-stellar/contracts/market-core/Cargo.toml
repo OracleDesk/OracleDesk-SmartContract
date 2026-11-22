@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+local-short-windows = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 doctest = false
@@ -14,7 +17,8 @@ soroban-sdk = "27.0.6"
 
 [dev-dependencies]
 ed25519-dalek = "2"
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
+adversarial-mocks = { path = "../adversarial-mocks", features = ["testutils"] }
 
 # `cfg(kani)` is only set by `cargo kani`; declaring it here keeps
 # `cargo clippy -D warnings` quiet about the proof module.

@@ -1,0 +1,31 @@
+{
+  "name": "@oracledesk/workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/bindings/*",
+    "agents",
+    "x402",
+    "scripts/deployer",
+    "scripts/governance"
+  ],
+  "scripts": {
+    "build": "npm run build -w packages/bindings --if-present && tsc -b",
+    "typecheck": "tsc -b --pretty",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "test": "npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "eslint": "^9.25.0",
+    "prettier": "^3.5.3",
+    "tsx": "^4.22.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.31.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

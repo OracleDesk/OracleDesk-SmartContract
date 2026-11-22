@@ -1,0 +1,93 @@
+name: Coverage
+
+# Measures Rust (cargo llvm-cov, market-core as wasm and native) and TypeScript
+# (c8), uploads the merged report, and gates it with
+# oracledesk-stellar/coverage/thresholds.json plus a no-decrease rule (> 0.5
+# points) against the latest successful run on `develop`.
+#
+# This lives at the repository root because GitHub only runs workflows from
+# here; oracledesk-stellar/.github/workflows/ci.yml is not picked up. It is a
+# separate job so the main test job's latency is unaffected.
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+    paths:
+      - "oracledesk-stellar/**"
+      - ".github/workflows/coverage.yml"
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  coverage:
+    name: Coverage (Rust + TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: oracledesk-stellar
+    env:
+      CARGO_INCREMENTAL: "0"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oracledesk-stellar
+      # Pinned. The vendored wasm copies are committed, so the Stellar CLI is
+      # not needed to measure coverage.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and build the TypeScript packages
+        run: make setup
+      - name: Measure
+        run: ./scripts/coverage.sh
+      - name: Fetch the base report (latest successful run on develop)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          id=$(gh run list --workflow coverage.yml --branch develop --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          if [ -n "$id" ] && [ "$id" != "null" ]; then
+            gh run download "$id" --name coverage --dir ../base-coverage
+          else
+            echo "no successful develop run yet; skipping the no-decrease check"
+          fi
+      - name: Gate
+        id: gate
+        run: |
+          base=""
+          [ -f ../base-coverage/lcov.info ] && base="--base ../base-coverage/lcov.info"
+          set +e
+          python3 scripts/coverage-gate.py $base | tee coverage/gate.md
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: |
+            oracledesk-stellar/coverage/lcov.info
+            oracledesk-stellar/coverage/*.lcov
+            oracledesk-stellar/coverage/html
+            oracledesk-stellar/coverage/summary.md
+            oracledesk-stellar/coverage/gate.md
+      - name: Comment on the PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file coverage/gate.md
+      - name: Fail if the gate failed
+        if: steps.gate.outputs.code != '0'
+        run: exit 1

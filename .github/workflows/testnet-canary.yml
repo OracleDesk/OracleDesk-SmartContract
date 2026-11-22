@@ -1,0 +1,134 @@
+name: Testnet Canary
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Canary phase to execute (existence, wiring, cycle, all)'
+        required: false
+        default: 'all'
+      redeploy:
+        description: 'Trigger gated redeploy job (requires testnet-deploy environment approval)'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: testnet-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Verify live Stellar testnet deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Restore canary state cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: oracledesk-stellar/.canary-state.json
+          key: testnet-canary-state-${{ github.run_id }}
+          restore-keys: |
+            testnet-canary-state-
+
+      - name: Verify README deployed-address table matches deployments/testnet.json
+        run: node oracledesk-stellar/scripts/render-addresses.mjs --check
+
+      - name: Run canary phases
+        id: run_canary
+        continue-on-error: true
+        env:
+          TESTNET_CANARY_SECRET: ${{ secrets.TESTNET_CANARY_SECRET }}
+        run: |
+          bash oracledesk-stellar/scripts/canary.sh \
+            --phase "${{ inputs.phase || 'all' }}" \
+            --out oracledesk-stellar/canary-result.json \
+            --state-file oracledesk-stellar/.canary-state.json
+
+      - name: Reconcile deduplicated tracking issues
+        if: always() && hashFiles('oracledesk-stellar/canary-result.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status="$(jq -r '.status' oracledesk-stellar/canary-result.json)"
+          should_file="$(jq -r '.shouldFileIssue' oracledesk-stellar/canary-result.json)"
+          title="$(jq -r '.issueTitle // empty' oracledesk-stellar/canary-result.json)"
+          summary="$(jq -r '.summary' oracledesk-stellar/canary-result.json)"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [[ "${status}" == "healthy" ]]; then
+            for cls in reset drift degraded functional; do
+              issue_num="$(gh issue list --state open --search "Testnet canary: ${cls} in:title" --json number --jq '.[0].number // empty')"
+              if [[ -n "${issue_num}" ]]; then
+                gh issue close "${issue_num}" --comment "Recovered automatically on canary run ${run_url}."
+              fi
+            done
+          elif [[ "${should_file}" == "true" && -n "${title}" ]]; then
+            issue_num="$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
+            body="**Status:** \`${status}\`
+          **Summary:** ${summary}
+          **Run:** ${run_url}"
+            if [[ -n "${issue_num}" ]]; then
+              gh issue comment "${issue_num}" --body "${body}"
+            else
+              gh issue create --title "${title}" --body "${body}"
+            fi
+          fi
+
+      - name: Fail job when canary is unhealthy
+        if: steps.run_canary.outcome == 'failure'
+        run: exit 1
+
+  redeploy:
+    name: Gated Testnet Redeploy & Address Sync PR
+    if: github.event_name == 'workflow_dispatch' && inputs.redeploy == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: testnet-deploy
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Import deploy identities & redeploy contracts
+        env:
+          TESTNET_DEPLOYER_SECRET: ${{ secrets.TESTNET_DEPLOYER_SECRET }}
+          TESTNET_AGENT_SECRET: ${{ secrets.TESTNET_AGENT_SECRET }}
+        run: |
+          set -euo pipefail
+          tmp_cfg="$(mktemp -d "${RUNNER_TEMP}/oracledesk-deploy.XXXXXX")"
+          trap 'rm -rf "${tmp_cfg}"' EXIT
+          STELLAR_SECRET_KEY="${TESTNET_DEPLOYER_SECRET}" stellar keys add oracledesk-deployer --config-dir "${tmp_cfg}" --secret-key >/dev/null
+          STELLAR_SECRET_KEY="${TESTNET_AGENT_SECRET}" stellar keys add oracledesk-agent --config-dir "${tmp_cfg}" --secret-key >/dev/null
+          cd oracledesk-stellar
+          make build
+          LEGACY_BASH_DEPLOY=1 ./scripts/deploy-testnet.sh
+
+      - name: Regenerate root README deployed-address table
+        run: node oracledesk-stellar/scripts/render-addresses.mjs --write
+
+      - name: Open PR updating deployments/testnet.json and README.md
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7.0.8
+        with:
+          base: develop
+          branch: chore/testnet-redeploy-${{ github.run_id }}
+          commit-message: "chore(deploy): refresh testnet deployment addresses after reset"
+          title: "chore(deploy): refresh Stellar testnet contract addresses"
+          body: |
+            Automated redeploy triggered from the `testnet-deploy` environment.
+
+            ### Downstream Sync Required
+            After merging this PR, run the address sync commands in:
+            - **OracleDesk-Backend**: refresh `src/generated/deployments.testnet.json`
+            - **OracleDesk-Frontend**: update testnet contract IDs in frontend config

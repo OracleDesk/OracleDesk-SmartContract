@@ -13,7 +13,7 @@ doctest = false
 # (Outcome, Category, ResolutionSpecV2, …) into this contract's own spec, so
 # generated TS bindings see them instead of an opaque/missing type. See
 # docs/adr/0002-cross-contract-calls.md.
-soroban-sdk = { version = "27.0.6", features = ["experimental_spec_shaking_v2"] }
+soroban-sdk = { version = "=27.0.6", features = ["experimental_spec_shaking_v2"] }
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }

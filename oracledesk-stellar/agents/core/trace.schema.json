@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracledesk.dev/schemas/trace/v2.json",
+  "title": "ReasoningTraceV2",
+  "description": "Versioned reasoning trace envelope for OracleDesk agents. schemaVersion 2 adds ledger-pinned inputs for buy/sell actions and per-action input schemas. V1 traces (no schemaVersion field) remain hash-stable — canonicalize is not changed.",
+  "type": "object",
+  "required": ["schemaVersion", "agent", "marketId", "action", "reasoning", "inputs", "timestamp"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 2,
+      "description": "Schema version. Absence of this field indicates a v1 trace."
+    },
+    "agent": {
+      "type": "string",
+      "enum": ["market-maker", "trader"],
+      "description": "Role of the agent that produced this trace."
+    },
+    "marketId": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "description": "u64 market ID as a decimal string (avoids JS number precision loss)."
+        },
+        { "type": "null" }
+      ],
+      "description": "On-chain market ID, or null for a not-yet-created market."
+    },
+    "action": {
+      "type": "string",
+      "enum": ["buy", "sell", "create_market", "inventory_rebalance", "risk_reject", "skip", "redeem", "claim_remainder", "resolve"],
+      "description": "The action the agent took or decided on."
+    },
+    "reasoning": {
+      "type": "string",
+      "maxLength": 16384,
+      "description": "Free-text explanation of why the agent chose this action."
+    },
+    "inputs": {
+      "type": "object",
+      "description": "Action-specific input snapshot. Schema selected by action via if/then."
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix epoch seconds when the trace was built."
+    }
+  },
+  "$defs": {
+    "stroopAmount": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "A non-negative integer amount in stroops, encoded as a decimal string to preserve u64 precision."
+    },
+    "inputs_buy": {
+      "type": "object",
+      "required": [
+        "marketId",
+        "ledgerSequence",
+        "ledgerCloseTime",
+        "reserveYes",
+        "reserveNo",
+        "feeBps",
+        "priceYesBps",
+        "fairValue",
+        "order",
+        "contracts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "marketId": { "$ref": "#/$defs/stroopAmount" },
+        "ledgerSequence": { "type": "integer", "minimum": 0 },
+        "ledgerCloseTime": { "type": "integer", "minimum": 0, "description": "Unix epoch seconds of the ledger close." },
+        "reserveYes": { "$ref": "#/$defs/stroopAmount" },
+        "reserveNo": { "$ref": "#/$defs/stroopAmount" },
+        "feeBps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "priceYesBps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "description": "floor(reserveNo * 10000 / (reserveYes + reserveNo)). Must be derivable from the reserves."
+        },
+        "fairValue": {
+          "type": "object",
+          "required": ["bps", "source", "observedAt"],
+          "additionalProperties": false,
+          "properties": {
+            "bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+            "source": { "type": "string", "minLength": 1 },
+            "observedAt": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "order": {
+          "type": "object",
+          "required": ["outcome", "collateralIn", "minSharesOut"],
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "type": "string", "enum": ["yes", "no"] },
+            "collateralIn": { "$ref": "#/$defs/stroopAmount" },
+            "minSharesOut": { "$ref": "#/$defs/stroopAmount" }
+          }
+        },
+        "contracts": {
+          "type": "object",
+          "required": ["marketCore", "treasury"],
+          "additionalProperties": false,
+          "properties": {
+            "marketCore": { "type": "string", "minLength": 56, "maxLength": 56 },
+            "treasury": { "type": "string", "minLength": 56, "maxLength": 56 }
+          }
+        },
+        "extensions": {
+          "type": "object",
+          "description": "Forward-compatible slot for extra inputs without breaking validation."
+        }
+      }
+    },
+    "inputs_sell": {
+      "type": "object",
+      "required": [
+        "marketId",
+        "ledgerSequence",
+        "ledgerCloseTime",
+        "reserveYes",
+        "reserveNo",
+        "feeBps",
+        "priceYesBps",
+        "fairValue",
+        "order",
+        "contracts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "marketId": { "$ref": "#/$defs/stroopAmount" },
+        "ledgerSequence": { "type": "integer", "minimum": 0 },
+        "ledgerCloseTime": { "type": "integer", "minimum": 0 },
+        "reserveYes": { "$ref": "#/$defs/stroopAmount" },
+        "reserveNo": { "$ref": "#/$defs/stroopAmount" },
+        "feeBps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "priceYesBps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "fairValue": {
+          "type": "object",
+          "required": ["bps", "source", "observedAt"],
+          "additionalProperties": false,
+          "properties": {
+            "bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+            "source": { "type": "string", "minLength": 1 },
+            "observedAt": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "order": {
+          "type": "object",
+          "required": ["outcome", "sharesIn", "minCollateralOut"],
+          "additionalProperties": false,
+          "properties": {
+            "outcome": { "type": "string", "enum": ["yes", "no"] },
+            "sharesIn": { "$ref": "#/$defs/stroopAmount" },
+            "minCollateralOut": { "$ref": "#/$defs/stroopAmount" }
+          }
+        },
+        "contracts": {
+          "type": "object",
+          "required": ["marketCore", "treasury"],
+          "additionalProperties": false,
+          "properties": {
+            "marketCore": { "type": "string", "minLength": 56, "maxLength": 56 },
+            "treasury": { "type": "string", "minLength": 56, "maxLength": 56 }
+          }
+        },
+        "extensions": { "type": "object" }
+      }
+    },
+    "inputs_create_market": {
+      "type": "object",
+      "required": [
+        "questionHash",
+        "resolutionCommitment",
+        "initialYesBps",
+        "seedAmount",
+        "closeTime",
+        "category"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "questionHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "sha256 of the market question text, lowercase hex."
+        },
+        "resolutionCommitment": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Commit-reveal commitment for the resolution spec."
+        },
+        "initialYesBps": { "type": "integer", "minimum": 1, "maximum": 9999 },
+        "seedAmount": { "$ref": "#/$defs/stroopAmount" },
+        "closeTime": { "type": "integer", "minimum": 0, "description": "Unix epoch seconds." },
+        "category": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "extensions": { "type": "object" }
+      }
+    },
+    "inputs_inventory_rebalance": {
+      "type": "object",
+      "required": ["marketId", "ledgerSequence", "currentExposure", "targetExposure", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "marketId": { "$ref": "#/$defs/stroopAmount" },
+        "ledgerSequence": { "type": "integer", "minimum": 0 },
+        "currentExposure": {
+          "type": "object",
+          "required": ["yes", "no"],
+          "additionalProperties": false,
+          "properties": {
+            "yes": { "$ref": "#/$defs/stroopAmount" },
+            "no": { "$ref": "#/$defs/stroopAmount" }
+          }
+        },
+        "targetExposure": {
+          "type": "object",
+          "required": ["yes", "no"],
+          "additionalProperties": false,
+          "properties": {
+            "yes": { "$ref": "#/$defs/stroopAmount" },
+            "no": { "$ref": "#/$defs/stroopAmount" }
+          }
+        },
+        "action": { "type": "string", "enum": ["buy_yes", "buy_no", "sell_yes", "sell_no", "none"] },
+        "extensions": { "type": "object" }
+      }
+    },
+    "inputs_risk_reject": {
+      "type": "object",
+      "required": ["marketId", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "marketId": { "$ref": "#/$defs/stroopAmount" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "checkedAt": { "type": "integer", "minimum": 0 },
+        "extensions": { "type": "object" }
+      }
+    }
+  },
+  "if": { "properties": { "action": { "const": "buy" } }, "required": ["action"] },
+  "then": { "properties": { "inputs": { "$ref": "#/$defs/inputs_buy" } } },
+  "else": {
+    "if": { "properties": { "action": { "const": "sell" } }, "required": ["action"] },
+    "then": { "properties": { "inputs": { "$ref": "#/$defs/inputs_sell" } } },
+    "else": {
+      "if": { "properties": { "action": { "const": "create_market" } }, "required": ["action"] },
+      "then": { "properties": { "inputs": { "$ref": "#/$defs/inputs_create_market" } } },
+      "else": {
+        "if": { "properties": { "action": { "const": "inventory_rebalance" } }, "required": ["action"] },
+        "then": { "properties": { "inputs": { "$ref": "#/$defs/inputs_inventory_rebalance" } } },
+        "else": {
+          "if": { "properties": { "action": { "const": "risk_reject" } }, "required": ["action"] },
+          "then": { "properties": { "inputs": { "$ref": "#/$defs/inputs_risk_reject" } } }
+        }
+      }
+    }
+  }
+}

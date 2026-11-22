@@ -62,5 +62,10 @@ export class RepositoryUnavailable extends Error {
   }
 }
 
-/** Contract error code for TraceNotFound in reasoning-registry */
-export const TRACE_NOT_FOUND_CODE = 5;
+/**
+ * Contract error code for TraceNotFound in reasoning-registry (#306).
+ * The registry uses Error::TraceNotFound = 3005, not 5.
+ * Old value (5) was wrong and made TraceNotFound indistinguishable from
+ * other low-numbered contract errors.
+ */
+export const TRACE_NOT_FOUND_CODE = 3005;
