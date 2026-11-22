@@ -1,0 +1,29 @@
+{
+  "name": "@oracledesk/reference-agent",
+  "version": "0.0.1",
+  "description": "Standalone reference agent implementation for OracleDesk",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/main.js",
+    "test": "npm run build",
+    "e2e": "npm run build && node dist/main.js"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^16.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "oracle",
+    "oracledesk",
+    "agent",
+    "stellar",
+    "soroban"
+  ],
+  "author": "OracleDesk Contributors",
+  "license": "Apache-2.0"
+}

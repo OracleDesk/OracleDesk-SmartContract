@@ -15,7 +15,7 @@ async function createMockQuote() {
 }
 
 test("TWAPExecutor creates parent order", async () => {
-  const executor = new TWAPExecutor(createMockQuote, 1000, 100);
+  const executor = new TWAPExecutor(createMockQuote, 1000, 1000);
 
   const parentOrder: ParentOrder = {
     id: "parent-1",
@@ -33,11 +33,11 @@ test("TWAPExecutor creates parent order", async () => {
 
   const executionId = await executor.executeParentOrder(parentOrder, "market-1");
   assert.ok(executionId);
-  assert.equal(parentOrder.status, "completed" || "failed");
+  assert.equal(parentOrder.status, "completed");
 });
 
 test("TWAPExecutor generates child orders", async () => {
-  const executor = new TWAPExecutor(createMockQuote, 1000, 100);
+  const executor = new TWAPExecutor(createMockQuote, 1000, 1000);
 
   const parentOrder: ParentOrder = {
     id: "parent-2",

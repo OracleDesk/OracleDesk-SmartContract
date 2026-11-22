@@ -1,0 +1,9 @@
+{
+  "description": "Maximum allowed optimized WASM size in bytes for each Soroban contract release artifact (#127).",
+  "budgets": {
+    "market_core": 65536,
+    "resolver": 65536,
+    "treasury": 65536,
+    "reasoning_registry": 49152
+  }
+}

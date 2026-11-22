@@ -5,8 +5,11 @@ members = [
     "contracts/resolver",
     "contracts/reasoning-registry",
     "contracts/treasury",
+    "contracts/signer-stake",
     "contracts/timelock",
     "contracts/router",
+    "contracts/test-oracle",
+    "contracts/adversarial-mocks",
     "contracts/integration-tests",
 ]
 resolver = "2"

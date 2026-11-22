@@ -1,4 +1,17 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: setup build test test-scripts lint fmt deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+
+# Verify local or CI tool versions match `toolchain.env` (#135).
+doctor:
+	./scripts/doctor.sh
+
+# Fail if toolchain.env drifted from rust-toolchain.toml, Dockerfile, or flake.nix.
+check-toolchain-sync:
+	./scripts/check-toolchain-sync.sh
+
+# Run the on-chain monitoring and alerting service (#131).
+monitor:
+	cd monitor && npm start
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -7,11 +20,12 @@
 # agents/ and x402/ install, since both depend on them by local file: path
 # and need real type declarations, not just a package.json, to typecheck.
 setup:
-	for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+	for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
 		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
 	done
 	cd agents && npm install
 	cd x402 && npm install
+	cd scripts/governance && npm install
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI. The vendored
 # cross-contract copies (resolver/treasury's market_core.wasm, resolver's
@@ -28,6 +42,12 @@ build:
 	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
+
+.PHONY: build-local-short
+build-local-short:
+	stellar contract build --package market-core --features local-short-windows --out-dir target/local-short
+	stellar contract build --package treasury --features local-short-windows --out-dir target/local-short
+	stellar contract build --package timelock --features local-short-windows --out-dir target/local-short
 
 # Proves the contract build is bit-for-bit reproducible and that the vendored
 # wasm matches a clean build (issue #58). Slow: it compiles the workspace
@@ -55,6 +75,11 @@ test: build
 	python3 scripts/coverage-gate.py --self-test
 	cd x402 && npm test
 	cd agents && npm test
+	cd scripts/governance && npm test
+	$(MAKE) test-scripts
+
+test-scripts:
+	./scripts/test/bats/bin/bats scripts/test
 
 lint:
 	./scripts/check-no-mock-all-auths.sh
@@ -115,7 +140,7 @@ clean:
 # Compare to the PR target, not the contributor fork's tracking branch.
 INTERFACE_BASE_REF ?= upstream/develop
 interface-check:
-	@for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+	@for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
 		CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
 		check --pkg-dir packages/bindings/$$pkg --base-ref "$(INTERFACE_BASE_REF)" || exit 1; \
 	done

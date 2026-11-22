@@ -16,4 +16,4 @@ publish = false
 [dependencies]
 getrandom = "0.3"
 resolver = { path = "../../contracts/resolver" }
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }

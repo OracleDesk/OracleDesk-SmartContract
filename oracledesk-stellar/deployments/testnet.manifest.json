@@ -1,0 +1,63 @@
+{
+  "network": "testnet",
+  "identities": {
+    "deployer": "oracledesk-deployer",
+    "agent": "oracledesk-agent"
+  },
+  "collateral": {
+    "kind": "self-issued",
+    "code": "USDC"
+  },
+  "contracts": {
+    "market_core": {
+      "wasm": "target/wasm32v1-none/release/market_core.wasm",
+      "args": {
+        "admin": "${identities.deployer}",
+        "collateral": "${contracts.usdc}",
+        "treasury": "${contracts.treasury}",
+        "resolver": "${contracts.resolver}",
+        "default_fee_bps": 100,
+        "protocol_fee_share_bps": 10000
+      }
+    },
+    "resolver": {
+      "wasm": "target/wasm32v1-none/release/resolver.wasm",
+      "args": {
+        "admin": "${identities.deployer}",
+        "market_core": "${contracts.market_core}"
+      }
+    },
+    "treasury": {
+      "wasm": "target/wasm32v1-none/release/treasury.wasm",
+      "args": {
+        "admin": "${identities.deployer}",
+        "agent": "${identities.agent}",
+        "collateral": "${contracts.usdc}",
+        "market_core": "${contracts.market_core}",
+        "max_trade": "2000000000",
+        "max_market": "5000000000",
+        "max_daily": "10000000000"
+      }
+    },
+    "reasoning_registry": {
+      "wasm": "target/wasm32v1-none/release/reasoning_registry.wasm",
+      "args": {
+        "admin": "${identities.deployer}"
+      }
+    }
+  },
+  "wiring": {
+    "market_core": {
+      "resolver": "${contracts.resolver}",
+      "treasury": "${contracts.treasury}",
+      "default_fee_bps": 100,
+      "paused": false
+    }
+  },
+  "registry": {
+    "agents": ["${identities.agent}"]
+  },
+  "funding": {
+    "treasury_min_balance": "10000000000000"
+  }
+}

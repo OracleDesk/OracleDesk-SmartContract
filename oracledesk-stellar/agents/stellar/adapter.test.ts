@@ -3,11 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Keypair } from "@stellar/stellar-sdk";
+import { KeypairSigner } from "@stellar/stellar-sdk/contract";
 import {
   agentCredentials,
   loadDeployments,
   StellarAdapter,
   type Deployments,
+  type StellarAdapterOptions,
 } from "./adapter.js";
 
 const deployments: Deployments = {
@@ -41,7 +44,33 @@ test("live mode without an agent secret throws immediately", () => {
       rpcUrl: "https://soroban-testnet.stellar.org",
       deployments,
     });
-  }, /agentSecret/);
+  }, /signer or agentSecret/);
+});
+
+test("live mode accepts a policy-backed signer with the configured agent identity", () => {
+  const keypair = Keypair.random();
+  const signer = new KeypairSigner(keypair, "Test SDF Network ; September 2015");
+  const adapter = new StellarAdapter({
+    mode: "live",
+    signer,
+    agentAddress: keypair.publicKey(),
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  assert.equal(adapter.agent, keypair.publicKey());
+});
+
+test("live mode rejects an injected signer that does not match the configured agent", () => {
+  const keypair = Keypair.random();
+  assert.throws(() => new StellarAdapter({
+    mode: "live",
+    signer: new KeypairSigner(keypair, "Test SDF Network ; September 2015"),
+    agentAddress: Keypair.random().publicKey(),
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  }), /does not match/);
 });
 
 test("adapter rejects unknown mode", () => {
@@ -53,6 +82,50 @@ test("adapter rejects unknown mode", () => {
       deployments,
     });
   }, /unknown mode/);
+});
+
+test("an unknown mode is rejected by the constructor without echoing the secret", () => {
+  const secret = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 7)).secret();
+  assert.throws(
+    () =>
+      new StellarAdapter({
+        mode: "Live",
+        agentSecret: secret,
+        networkPassphrase: "Test SDF Network ; September 2015",
+        rpcUrl: "https://soroban-testnet.stellar.org",
+        deployments,
+      } as unknown as StellarAdapterOptions),
+    (err: Error) => /unknown mode "Live"/.test(err.message) && !err.message.includes(secret),
+  );
+});
+
+test("an unknown mode that reaches run() throws before any network access", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  // Simulate the options being corrupted after construction.
+  (adapter as unknown as { opts: { mode: string } }).opts.mode = "yolo";
+  await assert.rejects(
+    adapter.agentBuy({ market_id: 0n, outcome: { tag: "Yes", values: undefined }, collateral_in: 1n, min_shares_out: 0n }),
+    /unknown mode "yolo"/,
+  );
+});
+
+test("dry-run refuses to be handed an agent secret", () => {
+  assert.throws(
+    () =>
+      new StellarAdapter({
+        mode: "dry-run",
+        agentSecret: Keypair.random().secret(),
+        networkPassphrase: "Test SDF Network ; September 2015",
+        rpcUrl: "https://soroban-testnet.stellar.org",
+        deployments,
+      } as unknown as StellarAdapterOptions),
+    /dry-run mode must not be given a signer or agentSecret/,
+  );
 });
 
 test("dry-run agentBuy describes the call without touching the network", async () => {
@@ -72,6 +145,34 @@ test("dry-run agentBuy describes the call without touching the network", async (
   if (result.dryRun) {
     assert.equal(result.contractId, "CTREASURY");
     assert.equal(result.method, "agent_buy");
+  }
+});
+
+test("dry-run unwindSell describes caller and market", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    agentAddress: "GUNWINDER",
+    deployments,
+  });
+  const result = await adapter.unwindSell({
+    market_id: 4n,
+    outcome: { tag: "No", values: undefined },
+    collateral_out: 25n,
+    max_shares_in: 30n,
+  });
+  assert.equal(result.dryRun, true);
+  if (result.dryRun) {
+    assert.equal(result.contractId, "CTREASURY");
+    assert.equal(result.method, "unwind_sell");
+    assert.deepEqual(result.args, {
+      caller: "GUNWINDER",
+      market_id: 4n,
+      outcome: { tag: "No", values: undefined },
+      collateral_out: 25n,
+      max_shares_in: 30n,
+    });
   }
 });
 

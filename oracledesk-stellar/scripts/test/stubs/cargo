@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stub `cargo` CLI for bats tests (Issue #132).
+# Intercepts `spec-hash` and `interface-manifest` invocations and returns
+# deterministic hex/JSON outputs without compiling Rust.
+set -euo pipefail
+
+CMD="$*"
+if [ -n "${STUB_LOG:-}" ]; then
+  printf 'cargo %s\n' "$CMD" >>"$STUB_LOG"
+fi
+
+if printf '%s\n' "$CMD" | grep -q 'spec-hash'; then
+  if printf '%s\n' "$CMD" | grep -q 'gen-salt'; then
+    printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'
+    exit 0
+  fi
+  if printf '%s\n' "$CMD" | grep -q ' verify '; then
+    printf 'ok\n'
+    exit 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$*" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$*" | shasum -a 256 | cut -d' ' -f1
+  else
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(" ".join(sys.argv[1:]).encode()).hexdigest())' "$@"
+  fi
+  exit 0
+fi
+
+if printf '%s\n' "$CMD" | grep -q 'interface-manifest'; then
+  printf '{"contract":"stub","functions":[]}\n'
+  exit 0
+fi
+
+exit 0

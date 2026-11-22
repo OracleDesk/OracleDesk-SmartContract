@@ -10,10 +10,11 @@
 #      deployments/testnet.json and the old treasury's RiskConfig on-chain
 #      (agent, collateral, caps),
 #   2. deploys a new treasury with the same config,
-#   3. calls set_successor(new) on the OLD treasury,
-#   4. calls migrate_market(i) on the old treasury for every i in
-#      0..market_count, moving each market's position and (if still held)
-#      LP ownership to the new treasury.
+#   3. queues set_successor(new) on the OLD treasury, waits out the
+#      timelock, then executes it,
+#   4. queues one migrate_markets([0..market_count]) call, waits out the
+#      timelock, then executes it, moving every market's position and (if
+#      still held) LP ownership to the new treasury.
 #
 # It does NOT rewire market-core (`propose_treasury`) — that is a separate,
 # deliberate cutover step, because it changes the fee recipient for future
@@ -118,27 +119,38 @@ fi
 # --- record the successor on the old treasury --------------------------------
 SET_FOR=$(json_get .migration.successor_set_for)
 if [ "$SET_FOR" != "$NEW_TREASURY" ]; then
-  log "old treasury: set_successor($NEW_TREASURY)"
+  log "old treasury: queue set_successor($NEW_TREASURY)"
   stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
     --network "$NETWORK" -- set_successor --successor "$NEW_TREASURY"
+  log "waiting ${CONFIG_DELAY}s for the successor proposal timelock"
+  sleep "$CONFIG_DELAY"
+  log "old treasury: execute successor (op kind 2)"
+  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- execute_op --kind 2
   json_set --arg id "$NEW_TREASURY" '.migration.successor_set_for = $id'
 else
   log "old treasury already points at the successor"
 fi
 
-# --- migrate every market, market by market ----------------------------------
+# --- migrate every market in one delayed batch ------------------------------
 MARKET_COUNT=$(stellar contract invoke --id "$MARKET_CORE" --source-account "$DEPLOYER_KEY" \
   --network "$NETWORK" -- market_count)
 log "migrating $MARKET_COUNT market(s)"
-i=0
-while [ "$i" -lt "$MARKET_COUNT" ]; do
-  log "migrate_market($i)"
+if [ "$MARKET_COUNT" -gt 0 ]; then
+  MARKET_IDS=$(jq -nc --argjson n "$MARKET_COUNT" '[range(0; $n)]')
+  log "old treasury: queue migrate_markets($MARKET_IDS)"
   stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- migrate_market --market_id "$i"
-  i=$((i + 1))
-done
-json_set --arg n "$MARKET_COUNT" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '.migration.markets_migrated = ($n | tonumber) | .migration.completed_at = $ts'
+    --network "$NETWORK" -- migrate_markets --market_ids "$MARKET_IDS"
+  log "waiting ${CONFIG_DELAY}s for the migration proposal timelock"
+  sleep "$CONFIG_DELAY"
+  log "old treasury: execute migration (op kind 3)"
+  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- execute_op --kind 3
+  json_set --arg n "$MARKET_COUNT" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.migration.markets_migrated = ($n | tonumber) | .migration.completed_at = $ts'
+else
+  log "no markets to migrate"
+fi
 
 log "done. Successor: $NEW_TREASURY"
 log "next steps (deliberate, operator-owned):"

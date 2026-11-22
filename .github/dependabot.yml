@@ -1,0 +1,58 @@
+# Dependabot configuration for OracleDesk (Issue #126).
+# Every PR targets `develop` to comply with the repository's develop-only PR policy.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/oracledesk-stellar"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "cargo"
+    directory: "/oracledesk-stellar/scripts/spec-hash"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      spec-hash-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/oracledesk-stellar"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      npm-workspace-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/oracledesk-stellar/x402"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      x402-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/oracledesk-stellar/agents"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      agents-minor-patch:
+        update-types: ["minor", "patch"]

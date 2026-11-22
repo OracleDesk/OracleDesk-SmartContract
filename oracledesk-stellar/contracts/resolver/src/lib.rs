@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod bounds;
+pub mod ttl;
+
 #[cfg(test)]
 extern crate std;
 
@@ -24,15 +27,80 @@ mod market_core {
 }
 use market_core::Client as MarketCoreClient;
 
+// ─── Cross-contract call helpers (#293 / ADR 0006) ───────────────────────────
+
+/// Base discriminant for resolver error codes (ADR 0006: 1001..=1999).
+pub const RESOLVER_ERROR_BASE: u32 = 1000;
+
+/// Map a market-core error to the resolver's cross-contract error range.
+fn map_market_core_error(e: market_core::Error) -> Error {
+    use market_core::Error as M;
+    match e {
+        M::MarketNotFound => Error::MarketCoreMarketNotFound,
+        M::NotFinal => Error::MarketCoreNotFinal,
+        M::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        M::MarketClosed => Error::MarketCoreMarketClosed,
+        M::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        M::InsufficientShares => Error::MarketCoreInsufficientShares,
+        M::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        M::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        M::InvalidAmount => Error::MarketCoreInvalidAmount,
+        M::Overflow => Error::MarketCoreOverflow,
+        M::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Unwrap a cross-contract call result into the resolver's error type.
+///
+/// soroban-sdk 27 `try_*` clients return `Result<Result<T, ConversionError>,
+/// Result<ContractError, InvokeError>>`: a return-value conversion failure is
+/// the inner `Err`, and a contract error is the outer `Err(Ok(_))`.
+fn core_call<T>(
+    r: Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(e)) => Err(map_market_core_error(e)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Unwrap a reasoning-registry cross-contract call.
+///
+/// Same soroban-sdk 27 `try_*` shape as `core_call`; any failure is opaque to
+/// the caller, so the error payloads are not inspected.
+fn registry_call<T, E>(
+    r: Result<Result<T, soroban_sdk::ConversionError>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(Error::RegistryCallFailed),
+    }
+}
+
+/// Convert the shared `Outcome` (Yes/No only) to the market-core imported
+/// `Outcome`. `Invalid` never reaches here: it is routed to `void_market`.
+fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
+    match o {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+    }
+}
+
 // The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
 // sha256(spec.to_xdr())`), so its definitions now live in the shared
 // `oracledesk-types` crate rather than being duplicated per contract. Re-export
 // them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
 // keep working.
 pub use oracledesk_types::{
-    CommitteeRef, DisputableSignerConfig, Escalation, FeedRef, HybridConfig, OracleAsset, Outcome,
-    PriceConfig, PriceData, PriceDirection, QuorumPriceConfig, ResolutionSpec, ResolutionSpecV2,
-    SignerConfig, WeightedKey, WeightedKeyConfig,
+    CommitteeRef, DisputableSignerConfig, Escalation, FallbackAuthority, FeedRef, HybridConfig,
+    HybridConfigV2, OracleAsset, Outcome, PriceConfig, PriceData, PriceDirection, QuorumPriceConfig,
+    ResolutionSpec, ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -70,6 +138,9 @@ pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
 
+// #293: removed duplicate local OracleAsset — the shared type from oracledesk_types is re-exported
+// above (line 35). Keeping it here caused E0255 / orphan-impl errors.
+
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
 /// Grace period for oracle recovery before guardian void is allowed (1 day).
@@ -78,6 +149,12 @@ pub const ORACLE_GRACE_SECS: u64 = 86_400;
 pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
 /// Maximum number of proposal cancellations per market allowed by the guardian.
 pub const MAX_CANCELS_PER_MARKET: u32 = 2;
+/// Maximum number of feed records a grid lookback may inspect per resolution
+/// attempt (issue #26). Bounds the cross-contract calls: a record older than
+/// `MAX_LOOKBACK_RECORDS * resolution()` is reported `StalePrice` even when
+/// `max_staleness` would still allow it, because resolution is only known at
+/// resolve time and the cap cannot be validated at registration.
+pub const MAX_LOOKBACK_RECORDS: u32 = 12;
 
 /// Most feeds a quorum spec may commit. Reasoned, not measured on the PR
 /// host (it cannot build this workspace): each feed is one `try_price`
@@ -117,6 +194,44 @@ impl ResolutionState {
     }
 }
 
+/// Which kind of resolution rule a market has *revealed*, as read by
+/// [`Resolver::spec_kind`]. `ResolutionState` cannot tell "revealed" from "not
+/// revealed": a revealed price or signer market still reads `Unconfigured`
+/// until it is finalized, disputed or reset, so the kind is derived from which
+/// spec entry exists (#273).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecKind {
+    /// No spec has been revealed for this market.
+    None,
+    Price,
+    ScaledPrice,
+    Twap,
+    Signers,
+    Disputable,
+    WeightedKeys,
+    Committee,
+    /// A hybrid price-then-signers market, before and after its fallback opens.
+    Hybrid,
+    /// Extended hybrid with committee or weighted-key fallback (issue #314).
+    HybridV2,
+}
+
+/// Everything the treasury's pre-trade resolvability check needs, in one
+/// cross-contract call (#273).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeStatus {
+    pub spec: SpecKind,
+    pub state: ResolutionState,
+    /// market-core `close_time`.
+    pub close_time: u64,
+    /// `close_time + RESOLUTION_GRACE_SECS`: when `expire_market` becomes callable.
+    pub deadline: u64,
+    /// A signer proposal is pending (its dispute window may be open).
+    pub open_proposal: bool,
+}
+
 /// Which resolution path a market was on when it expired.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +239,94 @@ pub enum ExpiryMode {
     Unrevealed,
     Price,
     Signers,
+}
+
+/// Maximum decimal places a [`ScaledPriceConfig`] threshold or a feed's
+/// `decimals()` may report. `i128` holds `10^38` but not `10^39`, so any
+/// larger scale factor overflows on rescale (issue #26).
+pub const MAX_THRESHOLD_DECIMALS: u32 = 38;
+
+/// Decimal-explicit price rule (issue #26, goal 2). Unlike the legacy
+/// [`PriceConfig`] — re-exported here from `oracledesk-types`, whose
+/// `threshold` is in *feed-native units* and is compared to the raw feed
+/// price with no scaling, so every committed legacy hash and meaning is
+/// unchanged (ADR 0001) — this struct records
+/// `threshold_decimals`, and resolution rescales both the threshold and the
+/// feed price to `max(feed_decimals, threshold_decimals)` with checked
+/// arithmetic before comparing. A creator who means "$0.20" commits
+/// `threshold = 20`, `threshold_decimals = 2` instead of guessing the feed's
+/// scale.
+///
+/// `PriceConfig` and `SignerConfig` deliberately do **not** appear here:
+/// PR #176 made `contracts/oracledesk-types` their canonical home and this
+/// crate re-exports them (see the `pub use` at the top of this file), so a
+/// `resolution_hash` commitment never depends on which crate declared the
+/// type. [`ScaledPriceConfig`] stays resolver-local for now for the same
+/// reason ADR 0001 can state its append-only rule so precisely — see
+/// [`scaled_spec_hash`] for the commitment preimage and
+/// `docs/adr/0001-resolution-commitment.md`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScaledPriceConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    pub threshold: i128,
+    pub threshold_decimals: u32,
+    pub direction: PriceDirection,
+    pub max_staleness: u64,
+}
+
+/// Hard cap on the grid slots a TWAP resolution attempt reads (issue #27).
+/// Bounds the cross-contract `price(asset, ts)` calls the sampling loop may
+/// make, so a TWAP market stays inside Soroban's per-transaction CPU budget
+/// even when most records in the window are missing (the cap applies to
+/// *reads inspected*, not samples found — a window of absent records
+/// terminates after this many calls instead of walking the whole grid).
+///
+/// **Reasoned, not measured.** The issue asks for a value "chosen from
+/// measured CPU cost" via `env.cost_estimate()` against the registered
+/// wasm; that measurement is not executable in the environment this change
+/// landed in (the wasm-hash build gate fails before any test can run, so no
+/// cost number is recorded — see `docs/adr/0001-resolution-commitment.md`,
+/// "TWAP variant"). 32 is instead taken from the contract's own accepted
+/// ceilings: [`MAX_WEIGHTED_SIGNERS`] and [`MAX_COMMITTEE`] are both 32, and
+/// the weighted-keys path already verifies up to 32 ed25519 signatures in
+/// one call — a cost per item strictly above one bounded cross-contract
+/// price read — so a 32-sample TWAP cannot be more expensive than flows the
+/// protocol already accepts. Registration rejects `window / resolution()`
+/// above this cap outright (`register_twap_spec`), so a compliant feed
+/// never hits the resolve-time truncation; the cap only guards against a
+/// feed changing `resolution()` after the commitment.
+pub const MAX_TWAP_SAMPLES: u32 = 32;
+
+/// Time-weighted-average price rule (issue #27). The market settles on the
+/// average of the feed's records over a window ending at `close_time`
+/// instead of a single print: a manipulated or anomalous close record can no
+/// longer decide the market on its own. Like the legacy [`PriceConfig`] (and
+/// unlike [`ScaledPriceConfig`], issue #26) the `threshold` is in
+/// feed-native units — the TWAP is a raw-price average — and the committed
+/// comparison applies to the floored average (see `twap_outcome` and ADR
+/// 0001). `min_samples`/`max_gap` encode how much of the window the feed
+/// must actually have filled: resolution is rejected (`StalePrice`) below
+/// `min_samples` present records or when any gap — window start to first
+/// sample, consecutive samples, or last sample to `close_time` — exceeds
+/// `max_gap`.
+///
+/// Same canonical-home note as [`ScaledPriceConfig`]: this is a
+/// resolver-local type committing through a domain-tagged preimage
+/// ([`twap_spec_hash`]) because PR #176 froze `oracledesk-types`'
+/// `ResolutionSpec` as the shared enum router and treasury consume; the
+/// append-into-types-crate follow-up is recorded in ADR 0001.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapConfig {
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    pub threshold: i128,
+    pub direction: PriceDirection,
+    pub window: u64,
+    pub min_samples: u32,
+    pub max_gap: u64,
 }
 
 /// Legacy proposal shape, stored under [`DataKey::Proposal`]. Only read (as a
@@ -223,6 +426,19 @@ pub struct Committee {
     pub rotation_delay: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleKind {
+    Price,
+    Signers,
+    WeightedKeys,
+    SignersDisputable,
+    Committee,
+    Hybrid,
+    ScaledPrice,
+    Twap,
+}
+
 /// A proposed rotation of committee members/threshold waiting for its delay.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,6 +492,19 @@ pub enum GuardianActionKind {
     CancelProposal,
 }
 
+// The resolution-rule enum itself is **not** declared here any more: PR #176
+// moved `ResolutionSpec` (and every config type it wraps) to
+// `contracts/oracledesk-types`, re-exported at the top of this file. Router
+// and treasury pass `resolver::ResolutionSpec` straight into
+// `ResolutionSpecV2.rule`, so re-declaring a local superset enum here would
+// break those crates — the enum's canonical home is the shared types crate,
+// full stop. The decimal-scaled mode of issue #26 and the TWAP mode of issue
+// #27 therefore commit through their own domain-tagged preimages,
+// [`scaled_spec_hash`] and [`twap_spec_hash`], instead of through seventh and
+// eighth `ResolutionSpec` variants; see ADR 0001 for the hash-space argument
+// and the maintainer follow-up of moving the variants into the types crate
+// (append-only) once that crate's toolchain gate is restored.
+
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
 /// preimage is the XDR of an `ScVal` and so starts with the bytes `00 00 00 10`
 /// (`ScValType::Vec`), never with ASCII, which keeps the two hash spaces
@@ -292,6 +521,50 @@ pub fn legacy_spec_hash(env: &Env, rule: &ResolutionSpec) -> BytesN<32> {
 pub fn spec_v2_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
     let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN.as_bytes());
     preimage.append(&spec.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Domain tag prepended to a [`ScaledPriceConfig`] before hashing (issue #26).
+/// Same disjointness argument as [`SPEC_DOMAIN`]: every legacy preimage is an
+/// `ScVal` XDR starting `00 00 00 10`, every V2 preimage starts with
+/// `oracledesk:resolution-spec`, and this tag starts `oracledesk:scaled-` —
+/// no preimage of one mode can be a preimage of another. Appending the tag
+/// to the bare struct XDR (rather than wrapping it in a `ResolutionSpec`
+/// variant) keeps `oracledesk-types` — the canonical, re-exported rule enum
+/// every sibling contract flows through — untouched, and therefore every
+/// already-committed `Price` / `Signers` / V2 `resolution_hash` byte-for-byte
+/// unchanged. See `docs/adr/0001-resolution-commitment.md`.
+pub const SCALED_SPEC_DOMAIN: &str = "oracledesk:scaled-price-spec";
+
+/// Hash a decimal-scaled price commitment is checked against:
+/// `sha256(SCALED_SPEC_DOMAIN || XDR(cfg))`. This is the preimage a market
+/// commits to in `resolution_hash` for [`ScaledPriceConfig`] rules registered
+/// through [`Resolver::register_scaled_price_spec`]; `scripts/spec-hash`
+/// delegates to this same function so the tool cannot drift from the
+/// contract.
+pub fn scaled_spec_hash(env: &Env, cfg: &ScaledPriceConfig) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, SCALED_SPEC_DOMAIN.as_bytes());
+    preimage.append(&cfg.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Domain tag prepended to a [`TwapConfig`] before hashing (issue #27).
+/// Same disjointness argument as [`SCALED_SPEC_DOMAIN`]: legacy preimages
+/// start `00 00 00 10` (ScVal), V2 preimages start `oracledesk:resolution-`,
+/// scaled preimages start `oracledesk:scaled-price-spec` and this tag starts
+/// `oracledesk:price-twap-spec` — no preimage of one mode can be a preimage
+/// of another. A TWAP market's `resolution_hash` therefore lives in its own
+/// hash space and every already-committed `Price` / `Signers` / V2 hash
+/// stays byte-for-byte valid (ADR 0001).
+pub const TWAP_SPEC_DOMAIN: &str = "oracledesk:price-twap-spec";
+
+/// Hash a TWAP commitment is checked against:
+/// `sha256(TWAP_SPEC_DOMAIN || XDR(cfg))`, the [`TwapConfig`] counterpart
+/// of [`scaled_spec_hash`]; `scripts/spec-hash` delegates to this same
+/// function so the tool cannot drift from the contract.
+pub fn twap_spec_hash(env: &Env, cfg: &TwapConfig) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, TWAP_SPEC_DOMAIN.as_bytes());
+    preimage.append(&cfg.clone().to_xdr(env));
     env.crypto().sha256(&preimage).into()
 }
 
@@ -359,9 +632,25 @@ pub enum Error {
     /// Accepted feeds disagree beyond `max_deviation_bps`. Retryable like
     /// `QuorumNotReached`: a later call re-reads every feed from scratch.
     FeedsDisagree = 45,
+
+    // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
+    MarketCoreMarketNotFound      = 1044,
+    MarketCoreNotFinal            = 1045,
+    MarketCoreMarketNotOpen       = 1046,
+    MarketCoreMarketClosed        = 1047,
+    MarketCoreInsufficientLiquidity = 1048,
+    MarketCoreInsufficientShares  = 1049,
+    MarketCoreAlreadyClaimed      = 1050,
+    MarketCoreNothingToRedeem     = 1051,
+    MarketCoreInvalidAmount       = 1052,
+    MarketCoreOverflow            = 1053,
+    MarketCoreSlippageExceeded    = 1054,
+    MarketCoreCallFailed          = 1055,
+    RegistryCallFailed            = 1056,
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -406,10 +695,25 @@ pub enum DataKey {
     CountV2(u64, AttestedOutcome),
     ProposalV2(u64),
     Snapshot(u64),
+    PriceScaled(u64),
+    PriceTwap(u64),
+    EpochStart(u64, u32),
+    MarketEpoch(u64),
+    HybridV2(u64),
     /// Committed [`QuorumPriceConfig`] of a multi-oracle market (#28).
     /// Appended at the tail: `DataKey` is an XDR union with positional
     /// discriminants, so no existing key shifts.
     Quorum(u64),
+}
+
+/// #297: A committee member set snapshotted at a specific epoch. Loaded from
+/// `MemberAt(committee_id, epoch)` so attestations and quorum always use the
+/// epoch that was in force at the market's close_time, not the live committee.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeSnapshot {
+    pub epoch: u32,
+    pub members: Vec<Address>,
+    pub threshold: u32,
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -419,8 +723,14 @@ enum SignerAuthority {
     Signers(SignerConfig),
     Weighted(WeightedKeyConfig),
     Disputable(DisputableSignerConfig),
-    Committee(CommitteeRef, Committee),
+    /// #297: the second field is the pinned epoch snapshot, loaded from
+    /// `MemberAt(committee_id, pinned_epoch)`. If the market is not yet pinned
+    /// (no attestation has happened and `pin_committee_epoch` has not run),
+    /// the snapshot is computed from the would-be pin without writing.
+    Committee(CommitteeRef, CommitteeSnapshot),
     Hybrid(HybridConfig),
+    /// #314: extended hybrid with richer fallback authority.
+    HybridV2(HybridConfigV2, Option<CommitteeSnapshot>),
 }
 
 impl SignerAuthority {
@@ -431,6 +741,11 @@ impl SignerAuthority {
             Self::Disputable(cfg) => cfg.dispute_window,
             Self::Committee(r, _) => r.dispute_window,
             Self::Hybrid(cfg) => cfg.fallback.dispute_window,
+            Self::HybridV2(cfg, _) => match &cfg.fallback {
+                FallbackAuthority::Signers(s) => s.dispute_window,
+                FallbackAuthority::Committee(r) => r.dispute_window,
+                FallbackAuthority::WeightedKeys(w) => w.dispute_window,
+            },
         }
     }
 }
@@ -457,6 +772,39 @@ pub struct PriceResolutionV2 {
     pub price_timestamp: u64,
     pub outcome: Outcome,
     pub from_snapshot: bool,
+}
+
+/// Emitted alongside the unchanged [`PriceResolution`]/[`PriceResolutionV2`]
+/// for a [`ScaledPriceConfig`] settlement (issue #26): the raw feed price,
+/// the feed's `decimals()`, the threshold rescaled to the comparison scale,
+/// and the grid-aligned lookup timestamp. New event type, so existing
+/// indexer decoders are untouched.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceResolutionScaled {
+    #[topic]
+    pub market_id: u64,
+    pub raw_price: i128,
+    pub feed_decimals: u32,
+    pub threshold_scaled: i128,
+    pub lookup_timestamp: u64,
+    pub outcome: Outcome,
+}
+
+/// Emitted alongside the [`PriceResolution`]/[`PriceResolutionV2`] pair for
+/// a [`TwapConfig`] settlement (issue #27): the floored time-weighted
+/// average, how many grid records answered, and the oldest/newest sample
+/// timestamps. New event type, so existing indexer decoders are untouched.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapResolution {
+    #[topic]
+    pub market_id: u64,
+    pub twap: i128,
+    pub samples: u32,
+    pub first_ts: u64,
+    pub last_ts: u64,
+    pub outcome: Outcome,
 }
 
 #[contractevent]
@@ -592,6 +940,18 @@ pub struct RotationCancelled {
     pub committee_id: u64,
 }
 
+/// #297: Emitted when a committee market's epoch is pinned to the epoch in
+/// force at close_time, either through the first attestation or through
+/// `pin_committee_epoch`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeEpochPinned {
+    #[topic]
+    pub market_id: u64,
+    pub committee_id: u64,
+    pub epoch: u32,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FallbackOpened {
@@ -698,9 +1058,18 @@ pub struct QuorumResolution {
     pub outcome: Outcome,
 }
 
+/// SEP-40 Oracle Consumer interface, as implemented by Reflector feeds.
+/// `decimals` and `resolution` are the feed's fixed-point scale and record
+/// grid; `price` returns a record only for a timestamp exactly on one
+/// (`Option<PriceData>` for a gap or an aged-out query); `lastprice` is the
+/// newest stored observation, used by [`Resolver::preview_price`] for feed
+/// health checks only, never for resolution.
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
+    fn decimals(env: Env) -> u32;
+    fn resolution(env: Env) -> u32;
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
+    fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData>;
 }
 
 /// Per-feed classification inside a quorum resolution. `Failed` absorbs every
@@ -734,6 +1103,29 @@ impl Resolver {
         env.storage().instance().get(&DataKey::MarketCore).unwrap()
     }
 
+    pub fn rule_kind(env: Env, market_id: u64) -> Option<RuleKind> {
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::Price(market_id)) {
+            Some(RuleKind::Price)
+        } else if storage.has(&DataKey::Signers(market_id)) {
+            Some(RuleKind::Signers)
+        } else if storage.has(&DataKey::WeightedKeys(market_id)) {
+            Some(RuleKind::WeightedKeys)
+        } else if storage.has(&DataKey::Disputable(market_id)) {
+            Some(RuleKind::SignersDisputable)
+        } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
+            Some(RuleKind::Committee)
+        } else if storage.has(&DataKey::Hybrid(market_id)) {
+            Some(RuleKind::Hybrid)
+        } else if storage.has(&DataKey::PriceScaled(market_id)) {
+            Some(RuleKind::ScaledPrice)
+        } else if storage.has(&DataKey::PriceTwap(market_id)) {
+            Some(RuleKind::Twap)
+        } else {
+            None
+        }
+    }
+
     pub fn admin(env: Env) -> Result<Address, Error> {
         Self::instance_get(&env, DataKey::Admin)
     }
@@ -746,6 +1138,20 @@ impl Resolver {
     pub fn accept_market_core_role(env: Env) {
         let core = Self::market_core(env.clone());
         MarketCoreWiringClient::new(&env, &core).accept_resolver();
+    }
+
+    /// Consent to migrate one market from this resolver to a newly wired resolver.
+    /// The market-core migration only succeeds while this resolver's address
+    /// authorizes the market-core call, so this entrypoint provides governance
+    /// acknowledgement from the resolver admin.
+    pub fn consent_resolver_migration(
+        env: Env,
+        _market_id: u64,
+        _new_resolver: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.current_contract_address().require_auth();
+        Ok(())
     }
 
     // ----- admin ----------------------------------------------------------
@@ -807,6 +1213,51 @@ impl Resolver {
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
     }
 
+    /// Reveals a decimal-explicit price rule committed to as
+    /// `sha256(SCALED_SPEC_DOMAIN || XDR(ScaledPriceConfig))` (issue #26).
+    /// Same commit/reveal flow as [`register_price_spec`];
+    /// `threshold_decimals` above [`MAX_THRESHOLD_DECIMALS`] is
+    /// `InvalidConfig` (no `i128` scale factor exists that large). The
+    /// preimage is its own domain-tagged space rather than a
+    /// `ResolutionSpec` variant because PR #176 moved that enum to
+    /// `oracledesk-types` (edited only via maintainer follow-up; see ADR
+    /// 0001) — every existing `Price` / `Signers` / V2 commitment stays
+    /// byte-for-byte valid either way.
+    pub fn register_scaled_price_spec(
+        env: Env,
+        market_id: u64,
+        spec: ScaledPriceConfig,
+    ) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        Self::validate_scaled_rule(&spec)?;
+        let close_time = Self::assert_matches_commitment(&env, market_id, &scaled_spec_hash(&env, &spec))?;
+        Self::store_scaled_rule(&env, market_id, &spec, close_time);
+        Self::bump_market_entries(&env, market_id, close_time);
+        Ok(())
+    }
+
+    /// Reveals a time-weighted-average price rule committed to as
+    /// `sha256(TWAP_SPEC_DOMAIN || XDR(TwapConfig))` (issue #27). Same
+    /// commit/reveal flow as [`register_scaled_price_spec`], with two
+    /// differences. First, the static validation
+    /// ([`validate_twap_rule`]): `window > 0`, `min_samples >= 2`,
+    /// `max_gap` in `(0, window]`, `threshold >= 0`. Second, feasibility is
+    /// checked *against the live feed*: the grid period only exists
+    /// on-chain, so registration calls `resolution()` on the configured
+    /// reflector and rejects `window / resolution > MAX_TWAP_SAMPLES` or
+    /// `min_samples > window / resolution` with `InvalidConfig`. This makes
+    /// the reflector required reachable at registration (a trapping feed
+    /// gives `PriceUnavailable`) — deliberate: an unresolvable TWAP market
+    /// is caught at reveal time, not at close.
+    pub fn register_twap_spec(env: Env, market_id: u64, spec: TwapConfig) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        Self::validate_twap_rule(&env, &spec)?;
+        let close_time = Self::assert_matches_commitment(&env, market_id, &twap_spec_hash(&env, &spec))?;
+        Self::store_twap_rule(&env, market_id, &spec, close_time);
+        Self::bump_market_entries(&env, market_id, close_time);
+        Ok(())
+    }
+
     /// See `register_price_spec` — same commit/reveal rule, signer mode.
     pub fn register_signer_spec(env: Env, market_id: u64, spec: SignerConfig) -> Result<(), Error> {
         let rule = ResolutionSpec::Signers(spec);
@@ -860,16 +1311,10 @@ impl Resolver {
         spec: CommitteeRef,
     ) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
-        let committee = Self::load_committee(&env, spec.committee_id)?;
-        if committee.epoch < spec.min_epoch {
-            return Err(Error::RotationBoundExceeded);
-        }
-        if spec.dispute_window == 0 {
-            return Err(Error::InvalidConfig);
-        }
+        Self::validate_committee_ref(&env, &spec)?;
         let rule = ResolutionSpec::Committee(spec);
-        Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
-        Self::store_rule(&env, market_id, &rule);
+        let close_time = Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
+        Self::store_rule(&env, market_id, &rule, close_time);
         Ok(())
     }
 
@@ -893,7 +1338,24 @@ impl Resolver {
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
     }
 
+    /// Registers a hybrid V2 resolution specification (price feed with richer fallback).
+    ///
+    /// Unlike `register_hybrid_spec`, the fallback can be a committee or a
+    /// weighted-key group, not only bare signers (issue #314).
+    pub fn register_hybrid_v2_spec(
+        env: Env,
+        market_id: u64,
+        spec: HybridConfigV2,
+    ) -> Result<(), Error> {
+        Self::validate_hybrid_v2(&env, &spec)?;
+        let rule = ResolutionSpec::HybridV2(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
     /// Creates a reusable committee with an admin, member set, threshold, and time-lock delay.
+    /// The named `admin` must authorise creation (#304): without this gate anyone could
+    /// create a committee claiming any address as its admin, consuming sequential ids and
+    /// filling instance storage at zero cost beyond fees.
     pub fn create_committee(
         env: Env,
         admin: Address,
@@ -901,6 +1363,8 @@ impl Resolver {
         threshold: u32,
         rotation_delay: u64,
     ) -> Result<u64, Error> {
+        // #304: require the named admin's auth before allocating a committee id.
+        admin.require_auth();
         Self::validate_committee_members(&members)?;
         if threshold == 0 || threshold > members.len() {
             return Err(Error::InvalidConfig);
@@ -924,6 +1388,10 @@ impl Resolver {
 
         let snap_key = DataKey::MemberAt(id, 1);
         Self::persist(&env, &snap_key, &(members.clone(), threshold));
+
+        // #297: record the timestamp at which epoch 1 started.
+        let epoch_start_key = DataKey::EpochStart(id, 1);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
 
         CommitteeCreated {
             committee_id: id,
@@ -993,6 +1461,9 @@ impl Resolver {
             &DataKey::MemberAt(committee_id, new_epoch),
             &(pending.members, pending.threshold),
         );
+        // #297: record the timestamp at which the new epoch started.
+        let epoch_start_key = DataKey::EpochStart(committee_id, new_epoch);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
         RotationExecuted {
             committee_id,
             epoch: new_epoch,
@@ -1019,6 +1490,50 @@ impl Resolver {
         Self::load_committee(&env, committee_id)
     }
 
+    /// #297: Permissionlessly pins the committee epoch for a market to the
+    /// epoch in force at `close_time`. Can be called by keepers right after
+    /// close, before any rotation lands. Idempotent: if already pinned, the
+    /// existing pin is kept. Must not run before close_time.
+    pub fn pin_committee_epoch(env: Env, market_id: u64) -> Result<(u64, u32), Error> {
+        let ref_spec: CommitteeRef = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitteeSpec(market_id))
+            .ok_or(Error::MarketNotConfigured)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let snapshot = Self::pin_epoch_for_market(&env, market_id, &ref_spec, market.close_time)?;
+        Ok((ref_spec.committee_id, snapshot.epoch))
+    }
+
+    /// #297: View returning the pinned (committee_id, epoch) for a market, or
+    /// `None` if not yet pinned.
+    pub fn market_committee_epoch(env: Env, market_id: u64) -> Option<(u64, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketEpoch(market_id))
+    }
+
+    /// #297: View returning the members and threshold for a committee at a
+    /// specific epoch, from the `MemberAt` snapshot.
+    pub fn committee_members_at(
+        env: Env,
+        committee_id: u64,
+        epoch: u32,
+    ) -> Result<(Vec<Address>, u32), Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok((members, threshold))
+    }
+
     /// Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.
     pub fn open_fallback(env: Env, market_id: u64) -> Result<(), Error> {
         let config: HybridConfig = Self::load(&env, DataKey::Hybrid(market_id))?;
@@ -1026,9 +1541,8 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
         if now < fallback_deadline {
@@ -1144,22 +1658,16 @@ impl Resolver {
                 reasons.push_back(GuardianReason::UnrevealedSpec);
             }
 
-            let price_cfg = if let Some(cfg) =
-                storage.get::<_, PriceConfig>(&DataKey::Price(market_id))
+            if (storage.has(&DataKey::Price(market_id))
+                || storage.has(&DataKey::PriceScaled(market_id))
+                || storage.has(&DataKey::PriceTwap(market_id))
+                || storage.has(&DataKey::Hybrid(market_id)))
+                && now >= market.close_time.saturating_add(ORACLE_GRACE_SECS)
             {
-                Some(cfg)
-            } else if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
-                Some(h.price)
-            } else {
-                None
-            };
-            if let Some(cfg) = price_cfg {
-                if now >= market.close_time.saturating_add(ORACLE_GRACE_SECS) {
-                    if let Err(Error::PriceUnavailable | Error::StalePrice) =
-                        Self::price_outcome(&env, market_id, &cfg, market.close_time)
-                    {
-                        reasons.push_back(GuardianReason::OracleUnavailable);
-                    }
+                if let Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) =
+                    Self::committed_price_outcome(&env, market_id, market.close_time)
+                {
+                    reasons.push_back(GuardianReason::OracleUnavailable);
                 }
             }
 
@@ -1201,6 +1709,7 @@ impl Resolver {
         if env.ledger().timestamp() >= proposal.proposed_at.saturating_add(dispute_window) {
             return Err(Error::DisputeWindowClosed);
         }
+        let close_time = Self::market_close_time(&env, market_id)?;
         let cancel_key = DataKey::Cancels(market_id);
         let cancels: u32 = storage.get(&cancel_key).unwrap_or(0);
         if cancels >= MAX_CANCELS_PER_MARKET {
@@ -1208,13 +1717,11 @@ impl Resolver {
         }
         Self::persist(&env, &cancel_key, &(cancels + 1));
         Self::remove_proposal(&env, market_id);
-        if storage.has(&DataKey::WeightedKeys(market_id)) {
-            Self::persist(
-                &env,
-                &DataKey::Round(market_id),
-                &(Self::round(&env, market_id) + 1),
-            );
-        }
+        // #286: bump round for every signer mode, not just weighted-key markets.
+        // This allows signers to re-attest after a cancel, fixing the stranded-quorum bug.
+        let next_round = Self::round(&env, market_id) + 1;
+        Self::persist(&env, &DataKey::Round(market_id), &next_round);
+        Self::bump_market_entries(&env, market_id, close_time);
         GuardianAction {
             market_id,
             action: GuardianActionKind::CancelProposal,
@@ -1254,22 +1761,14 @@ impl Resolver {
                 }
             }
             GuardianReason::OracleUnavailable => {
-                let storage = env.storage().persistent();
-                let config: PriceConfig = if let Some(cfg) = storage.get(&DataKey::Price(market_id))
-                {
-                    cfg
-                } else if let Some(hybrid) =
-                    storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id))
-                {
-                    hybrid.price
-                } else {
-                    return Err(Error::GuardianNotAllowed);
-                };
                 if now < market.close_time.saturating_add(ORACLE_GRACE_SECS) {
                     return Err(Error::GuardianNotAllowed);
                 }
-                match Self::price_outcome(&env, market_id, &config, market.close_time) {
-                    Err(Error::PriceUnavailable | Error::StalePrice) => {}
+                match Self::committed_price_outcome(&env, market_id, market.close_time) {
+                    // A feed that traps, has no acceptable record, or reports
+                    // a price the resolver must not settle on (`InvalidPrice`,
+                    // issue #26) is feed-unusable and permits the void.
+                    Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
                     _ => return Err(Error::GuardianNotAllowed),
                 }
             }
@@ -1303,6 +1802,7 @@ impl Resolver {
         core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         GuardianAction {
             market_id,
             action: GuardianActionKind::Void,
@@ -1314,6 +1814,22 @@ impl Resolver {
     }
 
     pub fn resolve_price(env: Env, market_id: u64) -> Result<Outcome, Error> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PriceTwap(market_id))
+        {
+            // TWAP markets resolve through the same entrypoint as scaled
+            // ones (issue #27); `resolve_twap` is the explicit alias.
+            return Self::resolve_twap(env, market_id);
+        }
+        if let Ok(scaled) = Self::load::<ScaledPriceConfig>(&env, DataKey::PriceScaled(market_id)) {
+            if Self::resolution_state(&env, market_id).is_terminal() {
+                return Err(Error::AlreadyFinalized);
+            }
+            let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+            return Self::settle_scaled(&env, &market_core, market_id, &scaled);
+        }
         // Quorum markets carry their config under `DataKey::Quorum`
         // (`assert_unconfigured` keeps the modes exclusive); everything else
         // follows the single-feed and hybrid paths unchanged.
@@ -1326,13 +1842,14 @@ impl Resolver {
             (cfg, false)
         } else if let Ok(hybrid) = Self::load::<HybridConfig>(&env, DataKey::Hybrid(market_id)) {
             (hybrid.price, true)
+        } else if let Ok(hybrid) = Self::load::<HybridConfigV2>(&env, DataKey::HybridV2(market_id)) {
+            (hybrid.price, true)
         } else {
             return Err(Error::WrongMode);
         };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1364,6 +1881,301 @@ impl Resolver {
         Ok(outcome)
     }
 
+    /// Resolves a [`TwapConfig`] market (issue #27). Same lifecycle as
+    /// `resolve_price` (closed, not terminal), and markets already revealed
+    /// as TWAP also resolve through `resolve_price`, which dispatches here.
+    /// Non-TWAP markets are `WrongMode`.
+    pub fn resolve_twap(env: Env, market_id: u64) -> Result<Outcome, Error> {
+        if let Ok(config) = Self::load::<TwapConfig>(&env, DataKey::PriceTwap(market_id)) {
+            if Self::resolution_state(&env, market_id).is_terminal() {
+                return Err(Error::AlreadyFinalized);
+            }
+            let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+            return Self::settle_twap(&env, &market_core, market_id, &config);
+        }
+        Err(Error::WrongMode)
+    }
+
+    /// Samples the committed feed at every `resolution()`-aligned timestamp
+    /// in `(close_time - window, close_time]` and computes the floored,
+    /// time-weighted average with checked `i128` arithmetic. Returns
+    /// `(twap, samples, first_ts, last_ts, outcome)`.
+    ///
+    /// Sampling details (issue #27):
+    /// - Grid alignment reuses the #26 machinery: the newest queried
+    ///   timestamp is `close_time - close_time % resolution()`, walked down
+    ///   in `resolution()` steps while it stays inside the window.
+    /// - Missing records (`None`) are skipped, not fatal; a trapping feed
+    ///   or a failing `price` call is `PriceUnavailable`; `resolution()` of
+    ///   0 is a broken feed (`InvalidPrice`, it would divide by zero).
+    /// - The loop is capped at [`MAX_TWAP_SAMPLES`] *reads inspected* (not
+    ///   samples found), so a window of absent records terminates bounded
+    ///   and then fails the `min_samples`/gap checks below.
+    /// - Records are kept keyed by their returned `timestamp`, duplicates
+    ///   (a feed answering with the same record for several queries) are
+    ///   counted once, and records outside the window or newer than
+    ///   `close_time` are ignored / rejected like `validate_price` does.
+    /// - Weights: each sample is weighted by the time until the next
+    ///   sample; the newest sample is weighted `close_time - last_ts + 1`
+    ///   so the closing second is included, the convention picked in ADR
+    ///   0001 and applied consistently on both the numerator and the
+    ///   denominator.
+    /// - Any sample price `<= 0` is `InvalidPrice` (same rule as #26);
+    ///   any `checked_mul`/`checked_add` overflow is `InvalidPrice`.
+    /// - Floor division: the `AtOrAbove`/`AtOrBelow` comparison of
+    ///   `compare_price` applies to the floored average.
+    fn twap_outcome(
+        env: &Env,
+        config: &TwapConfig,
+        close_time: u64,
+    ) -> Result<(i128, u32, u64, u64, Outcome), Error> {
+        let client = ReflectorPriceClient::new(env, &config.reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
+            return Err(Error::PriceUnavailable);
+        };
+        if resolution == 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let res = resolution as u64;
+        let end = close_time - close_time % res;
+        let start = close_time.saturating_sub(config.window);
+        // Oldest-first, strictly ascending timestamps. Bounded in memory by
+        // MAX_TWAP_SAMPLES; never persisted.
+        let mut samples: Vec<(u64, i128)> = Vec::new(env);
+        let mut ts = end;
+        let mut inspected = 0u32;
+        while ts > start {
+            if inspected >= MAX_TWAP_SAMPLES {
+                // Read cap on *reads*, not found samples (issue #27
+                // budget): only reachable if the feed changed
+                // `resolution()` after registration widened the slot count
+                // past MAX_TWAP_SAMPLES. Validation below then rejects via
+                // the min_samples / gap rules rather than trusting a
+                // silently truncated window's average as complete.
+                break;
+            }
+            inspected += 1;
+            match client.try_price(&config.asset, &ts) {
+                Ok(Ok(Some(data))) => {
+                    if data.price <= 0 {
+                        return Err(Error::InvalidPrice);
+                    }
+                    if data.timestamp > close_time {
+                        return Err(Error::StalePrice);
+                    }
+                    if data.timestamp > start {
+                        // Keep the ascending invariant and count each
+                        // distinct timestamp once: samples collected so far
+                        // all have timestamp > this slot's query, so an
+                        // already-seen or newer timestamp is a duplicate of
+                        // a record the walk counted already.
+                        let duplicate = samples
+                            .get(0)
+                            .is_some_and(|(head, _)| data.timestamp >= head);
+                        if !duplicate {
+                            samples.push_front((data.timestamp, data.price));
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {}
+                _ => return Err(Error::PriceUnavailable),
+            }
+            if ts < res {
+                break;
+            }
+            ts -= res;
+        }
+
+        let count = samples.len();
+        if count < config.min_samples {
+            return Err(Error::StalePrice);
+        }
+        // Gap checks, all three kinds (issue #27 step 3): window start to
+        // first sample, every consecutive pair, last sample to close_time.
+        let (first_ts, _) = samples.get(0).unwrap();
+        let (last_ts, _) = samples.get(count - 1).unwrap();
+        if first_ts - start > config.max_gap || close_time - last_ts > config.max_gap {
+            return Err(Error::StalePrice);
+        }
+        for i in 1..count {
+            let (prev, _) = samples.get(i - 1).unwrap();
+            let (next, _) = samples.get(i).unwrap();
+            if next - prev > config.max_gap {
+                return Err(Error::StalePrice);
+            }
+        }
+
+        let mut weighted_sum: i128 = 0;
+        let mut total_weight: u64 = 0;
+        for i in 0..count {
+            let (sample_ts, sample_price) = samples.get(i).unwrap();
+            let next_ts = if i + 1 < count {
+                samples.get(i + 1).unwrap().0
+            } else {
+                close_time.saturating_add(1)
+            };
+            // dt >= 1 always: timestamps are strictly ascending and
+            // sample_ts <= close_time < close_time + 1.
+            let dt = next_ts - sample_ts;
+            total_weight = total_weight.checked_add(dt).ok_or(Error::InvalidPrice)?;
+            let term = sample_price
+                .checked_mul(dt as i128)
+                .ok_or(Error::InvalidPrice)?;
+            weighted_sum = weighted_sum.checked_add(term).ok_or(Error::InvalidPrice)?;
+        }
+        let twap = weighted_sum
+            .checked_div(total_weight as i128)
+            .ok_or(Error::InvalidPrice)?;
+        let outcome = Self::compare_price(&config.direction, twap, config.threshold);
+        Ok((twap, count, first_ts, last_ts, outcome))
+    }
+
+    /// Settles a [`TwapConfig`] market: same lifecycle preconditions as
+    /// `settle_scaled`, then the shared `settle_price` finalize with the
+    /// averaged price stamped at the newest sample, alongside the dedicated
+    /// [`TwapResolution`] event (the dual-event pattern #26 established with
+    /// [`PriceResolutionScaled`]). TWAP markets do not use `snapshot_price`:
+    /// snapshots pin a single record, which is exactly what issue #27
+    /// exists to avoid.
+    fn settle_twap(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        config: &TwapConfig,
+    ) -> Result<Outcome, Error> {
+        let market = MarketCoreClient::new(env, market_core).get_market(&market_id);
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let (twap, samples, first_ts, last_ts, outcome) =
+            Self::twap_outcome(env, config, market.close_time)?;
+        Self::settle_price(
+            env,
+            market_core,
+            market_id,
+            &outcome,
+            &PriceData {
+                price: twap,
+                timestamp: last_ts,
+            },
+            false,
+        )?;
+        TwapResolution {
+            market_id,
+            twap,
+            samples,
+            first_ts,
+            last_ts,
+            outcome: outcome.clone(),
+        }
+        .publish(env);
+        Ok(outcome)
+    }
+
+    /// The live-read outcome of a [`ScaledPriceConfig`] rule: grid-aligned
+    /// feed read, the feed's `decimals()`, and both sides rescaled to
+    /// `max(feed_decimals, threshold_decimals)`. Returns the outcome, the raw
+    /// record, the feed's decimals and the rescaled threshold (for
+    /// [`PriceResolutionScaled`]).
+    fn scaled_price_outcome(
+        env: &Env,
+        config: &ScaledPriceConfig,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, u32, i128), Error> {
+        let data = Self::read_feed_on_grid(
+            env,
+            &config.reflector,
+            &config.asset,
+            config.max_staleness,
+            close_time,
+        )?;
+        let Ok(Ok(feed_decimals)) =
+            ReflectorPriceClient::new(env, &config.reflector).try_decimals()
+        else {
+            return Err(Error::PriceUnavailable);
+        };
+        let (price_scaled, threshold_scaled) = Self::rescale(
+            data.price,
+            feed_decimals,
+            config.threshold,
+            config.threshold_decimals,
+        )?;
+        let outcome = Self::compare_price(&config.direction, price_scaled, threshold_scaled);
+        Ok((outcome, data, feed_decimals, threshold_scaled))
+    }
+
+    /// The committed price rule's outcome at `close_time`, covering all four
+    /// price shapes (legacy `Price`, the `Hybrid` price leg, `PriceScaled`
+    /// and `PriceTwap`). Guardian and availability paths use it so "feed
+    /// unusable" is one uniform check; snapshot precedence works exactly as
+    /// in `resolve_price` for the legacy shapes.
+    fn committed_price_outcome(
+        env: &Env,
+        market_id: u64,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, bool), Error> {
+        let storage = env.storage().persistent();
+        if let Some(cfg) = storage.get::<_, PriceConfig>(&DataKey::Price(market_id)) {
+            return Self::price_outcome(env, market_id, &cfg, close_time);
+        }
+        if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Self::price_outcome(env, market_id, &h.price, close_time);
+        }
+        if let Some(h) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            return Self::price_outcome(env, market_id, &h.price, close_time);
+        }
+        if let Some(s) = storage.get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id)) {
+            let (outcome, data, _feed_decimals, _threshold_scaled) =
+                Self::scaled_price_outcome(env, &s, close_time)?;
+            return Ok((outcome, data, false));
+        }
+        if let Some(t) = storage.get::<_, TwapConfig>(&DataKey::PriceTwap(market_id)) {
+            let (twap, _n, _first, last, outcome) = Self::twap_outcome(env, &t, close_time)?;
+            return Ok((
+                outcome,
+                PriceData {
+                    price: twap,
+                    timestamp: last,
+                },
+                false,
+            ));
+        }
+        Err(Error::WrongMode)
+    }
+
+    /// Settles a [`ScaledPriceConfig`] market: the same grid-aligned feed
+    /// read as legacy mode, then both sides of the comparison are rescaled to
+    /// `max(feed_decimals, threshold_decimals)` before applying the
+    /// direction. Emits the unchanged [`PriceResolution`]/[`PriceResolutionV2`]
+    /// events plus [`PriceResolutionScaled`] with the decimals metadata
+    /// (issue #26). Scaled markets do not use the `snapshot_price` pin: the
+    /// snapshot type stores a raw `PriceConfig` shape (issue #37 will
+    /// revisit snapshots).
+    fn settle_scaled(
+        env: &Env,
+        market_core: &Address,
+        market_id: u64,
+        config: &ScaledPriceConfig,
+    ) -> Result<Outcome, Error> {
+        let market = MarketCoreClient::new(env, market_core).get_market(&market_id);
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let (outcome, data, feed_decimals, threshold_scaled) =
+            Self::scaled_price_outcome(env, config, market.close_time)?;
+        Self::settle_price(env, market_core, market_id, &outcome, &data, false)?;
+        PriceResolutionScaled {
+            market_id,
+            raw_price: data.price,
+            feed_decimals,
+            threshold_scaled,
+            lookup_timestamp: data.timestamp,
+            outcome: outcome.clone(),
+        }
+        .publish(env);
+        Ok(outcome)
+    }
+
     /// Pins the committed feed's price for `close_time` in resolver storage,
     /// so `resolve_price` still works after the oracle's bounded history has
     /// aged that record out (SEP-40 `price(asset, timestamp)` returns `None`
@@ -1381,9 +2193,8 @@ impl Resolver {
         caller.require_auth();
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         if now < market.close_time {
             return Err(Error::MarketNotClosed);
@@ -1422,14 +2233,29 @@ impl Resolver {
             .get(&DataKey::Snapshot(market_id))
     }
 
+    /// The feed's newest observation (`lastprice`) for the market's committed
+    /// asset: a read-only health check for keepers before calling
+    /// `resolve_price`. Resolution never consults it (issue #26): a live
+    /// `lastprice` can be fresher than `close_time`, and the historical grid
+    /// lookup is the only settlement source. A trapping feed or a feed with
+    /// no record is `PriceUnavailable`; signer-mode markets are `WrongMode`.
+    pub fn preview_price(env: Env, market_id: u64) -> Result<PriceData, Error> {
+        let config = Self::price_config(&env, market_id)?;
+        let Ok(Ok(Some(data))) =
+            ReflectorPriceClient::new(&env, &config.reflector).try_lastprice(&config.asset)
+        else {
+            return Err(Error::PriceUnavailable);
+        };
+        Ok(data)
+    }
+
     /// When `expire_market` becomes callable for `market_id`: `close_time` plus
     /// [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it
     /// is known before (and without) a spec reveal.
     pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         Ok(Self::deadline(&market))
     }
 
@@ -1458,23 +2284,47 @@ impl Resolver {
         let mode = Self::expiry_mode(&env, market_id);
         match mode {
             ExpiryMode::Price => {
-                let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
-                match Self::price_outcome(&env, market_id, &config, market.close_time) {
-                    Ok((outcome, data, from_snapshot)) => {
-                        Self::settle_price(
-                            &env,
-                            &market_core,
-                            market_id,
-                            &outcome,
-                            &data,
-                            from_snapshot,
-                        )?;
-                        return Ok(());
+                if let Ok(twap) = Self::load::<TwapConfig>(&env, DataKey::PriceTwap(market_id)) {
+                    match Self::settle_twap(&env, &market_core, market_id, &twap) {
+                        Ok(_) => return Ok(()),
+                        // Same uniform feed-unusable set as scaled/legacy
+                        // below (issue #27 mirrors #26 here).
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
                     }
-                    // Only an unusable feed lets the market expire; any other
-                    // error (e.g. NotInitialized) is a real fault.
-                    Err(Error::PriceUnavailable | Error::StalePrice) => {}
-                    Err(other) => return Err(other),
+                } else if let Ok(scaled) =
+                    Self::load::<ScaledPriceConfig>(&env, DataKey::PriceScaled(market_id))
+                {
+                    match Self::settle_scaled(&env, &market_core, market_id, &scaled) {
+                        Ok(_) => return Ok(()),
+                        // Only an unusable feed lets the market expire; any
+                        // other error (e.g. NotInitialized) is a real fault.
+                        // InvalidPrice counts as unusable since #26: a zeroed
+                        // or negative feed must not block the void forever.
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
+                    }
+                } else {
+                    let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
+                    match Self::price_outcome(&env, market_id, &config, market.close_time) {
+                        Ok((outcome, data, from_snapshot)) => {
+                            Self::settle_price(
+                                &env,
+                                &market_core,
+                                market_id,
+                                &outcome,
+                                &data,
+                                from_snapshot,
+                            )?;
+                            return Ok(());
+                        }
+                        // Only an unusable feed lets the market expire; any
+                        // other error (e.g. NotInitialized) is a real fault.
+                        // InvalidPrice counts as unusable since #26: a zeroed
+                        // or negative feed must not block the void forever.
+                        Err(Error::PriceUnavailable | Error::StalePrice | Error::InvalidPrice) => {}
+                        Err(other) => return Err(other),
+                    }
                 }
             }
             ExpiryMode::Signers if Self::has_valid_proposal(&env, market_id)? => {
@@ -1485,6 +2335,7 @@ impl Resolver {
 
         core_call(core.try_void_market(&market_id))?;
         Self::set_state(&env, market_id, ResolutionState::Expired);
+        Self::bump_market_entries(&env, market_id, market.close_time);
         MarketExpired {
             market_id,
             close_time: market.close_time,
@@ -1557,9 +2408,8 @@ impl Resolver {
             return Err(Error::StaleRound);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1614,7 +2464,7 @@ impl Resolver {
         Self::assert_not_disputed(&env, market_id)?;
         let authority = Self::signer_authority(&env, market_id)?;
         let proposal = Self::load_proposal(&env, market_id).ok_or(Error::NoProposal)?;
-        if env.ledger().timestamp() < proposal.proposed_at + authority.dispute_window() {
+        if env.ledger().timestamp() < proposal.proposed_at.saturating_add(authority.dispute_window()) {
             return Err(Error::DisputeWindowOpen);
         }
         if !Self::has_quorum(&env, &authority, market_id, proposal.outcome) {
@@ -1640,6 +2490,7 @@ impl Resolver {
             }
         }
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        Self::bump_market_entries(&env, market_id, Self::market_close_time(&env, market_id)?);
         ResolutionFinalizedV2 {
             market_id,
             outcome: proposal.outcome,
@@ -1683,7 +2534,8 @@ impl Resolver {
         }
 
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let token = core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
+        let token =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
         token::Client::new(&env, &token).transfer(
             &disputer,
             env.current_contract_address(),
@@ -1794,8 +2646,62 @@ impl Resolver {
         Ok(())
     }
 
+    /// Pure view: no TTL extensions. The instance and the market's entries
+    /// are kept alive by the mutating entrypoints above, so a view-only
+    /// simulation stays read-only.
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
+    }
+
+    /// Which kind of rule `market_id` has revealed (`SpecKind::None` before any
+    /// reveal). Existence checks only (`has`), so the read footprint stays
+    /// minimal; a missing or archived entry reads as `None`, it never panics.
+    /// Needed because `state()` stays `Unconfigured` for a revealed price or
+    /// signer market (#273).
+    pub fn spec_kind(env: Env, market_id: u64) -> SpecKind {
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::Price(market_id)) {
+            SpecKind::Price
+        } else if storage.has(&DataKey::PriceScaled(market_id)) {
+            SpecKind::ScaledPrice
+        } else if storage.has(&DataKey::PriceTwap(market_id)) {
+            SpecKind::Twap
+        } else if storage.has(&DataKey::Signers(market_id)) {
+            SpecKind::Signers
+        } else if storage.has(&DataKey::Disputable(market_id)) {
+            SpecKind::Disputable
+        } else if storage.has(&DataKey::WeightedKeys(market_id)) {
+            SpecKind::WeightedKeys
+        } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
+            SpecKind::Committee
+        } else if storage.has(&DataKey::Hybrid(market_id)) {
+            SpecKind::Hybrid
+        } else if storage.has(&DataKey::HybridV2(market_id)) {
+            SpecKind::HybridV2
+        } else {
+            SpecKind::None
+        }
+    }
+
+    /// The spec kind, resolution state, deadline and proposal flag in one read:
+    /// one cross-contract call from the treasury instead of four. Reads
+    /// market-core's `close_time` once. A pure view: it does not extend any TTL
+    /// (so a simulation stays read-only), unlike `instance_get`.
+    pub fn trade_status(env: Env, market_id: u64) -> Result<TradeStatus, Error> {
+        let market_core: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        Ok(TradeStatus {
+            spec: Self::spec_kind(env.clone(), market_id),
+            state: Self::resolution_state(&env, market_id),
+            close_time: market.close_time,
+            deadline: Self::deadline(&market),
+            open_proposal: Self::has_proposal(&env, market_id),
+        })
     }
 }
 
@@ -1804,6 +2710,7 @@ impl Resolver {
         env: &Env,
         key: DataKey,
     ) -> Result<V, Error> {
+        ttl::bump_instance(env);
         env.storage()
             .instance()
             .get(&key)
@@ -1837,15 +2744,17 @@ impl Resolver {
             .unwrap_or(ResolutionState::Unconfigured)
     }
 
-    /// Writes the per-market state and extends its TTL. An archived entry is
-    /// not lost (it must be restored before any transaction can touch it),
-    /// but keeping terminal state live spares every later call the restore.
+    /// Writes the per-market state and extends its TTL to the market's
+    /// close-time-aware target. An archived entry is not lost (it must be
+    /// restored before any transaction can touch it), but keeping terminal
+    /// state live spares every later call the restore.
     fn set_state(env: &Env, market_id: u64, state: ResolutionState) {
         let key = DataKey::State(market_id);
         env.storage().persistent().set(&key, &state);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        if let Ok(close_time) = Self::market_close_time(env, market_id) {
+            let target = ttl::market_target(env, close_time);
+            ttl::bump_persistent(env, &key, target);
+        }
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -1855,6 +2764,8 @@ impl Resolver {
     fn expiry_mode(env: &Env, market_id: u64) -> ExpiryMode {
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Price(market_id))
+            || storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
             || (storage.has(&DataKey::Hybrid(market_id))
                 && Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen)
         {
@@ -2031,11 +2942,23 @@ impl Resolver {
             return Ok(SignerAuthority::Weighted(cfg));
         }
         if let Some(ref_spec) = storage.get::<_, CommitteeRef>(&DataKey::CommitteeSpec(market_id)) {
-            let comm = Self::load_committee(env, ref_spec.committee_id)?;
-            return Ok(SignerAuthority::Committee(ref_spec, comm));
+            // #297: use the pinned epoch snapshot, or compute the would-be pin
+            // without writing, so views stay read-only before the first attestation.
+            let close_time = Self::market_close_time(env, market_id)?;
+            let snapshot = Self::committee_snapshot(env, market_id, &ref_spec, close_time)?;
+            return Ok(SignerAuthority::Committee(ref_spec, snapshot));
         }
         if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(SignerAuthority::Hybrid(cfg));
+        }
+        if let Some(cfg) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            let snapshot = if let FallbackAuthority::Committee(ref ref_spec) = cfg.fallback {
+                let close_time = Self::market_close_time(env, market_id)?;
+                Some(Self::committee_snapshot(env, market_id, ref_spec, close_time)?)
+            } else {
+                None
+            };
+            return Ok(SignerAuthority::HybridV2(cfg, snapshot));
         }
         Err(Error::MarketNotConfigured)
     }
@@ -2059,24 +2982,44 @@ impl Resolver {
                 let round = Self::round(env, market_id);
                 Self::round_weight(env, market_id, round, &o) >= cfg.weight_threshold
             }),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return false;
-                }
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: quorum is counted against the pinned epoch's snapshot
+                // only. Rotations after close have no effect.
+                let _ = ref_spec;
                 let mut votes: u32 = 0;
-                for member in comm.members.iter() {
+                for member in snapshot.members.iter() {
                     if Self::has_attested(env, market_id, outcome, &member) {
                         votes += 1;
                     }
                 }
-                votes >= comm.threshold
+                votes >= snapshot.threshold
             }
             SignerAuthority::Hybrid(cfg) => {
                 Self::attestation_count(env, market_id, outcome) >= cfg.fallback.threshold
             }
+            SignerAuthority::HybridV2(cfg, snapshot) => match &cfg.fallback {
+                FallbackAuthority::Signers(s) => {
+                    Self::attestation_count(env, market_id, outcome) >= s.threshold
+                }
+                FallbackAuthority::WeightedKeys(w) => outcome.to_market().is_some_and(|o| {
+                    let round = Self::round(env, market_id);
+                    Self::round_weight(env, market_id, round, &o) >= w.weight_threshold
+                }),
+                FallbackAuthority::Committee(ref_spec) => {
+                    let _ = ref_spec;
+                    if let Some(snap) = snapshot {
+                        let mut votes: u32 = 0;
+                        for member in snap.members.iter() {
+                            if Self::has_attested(env, market_id, outcome, &member) {
+                                votes += 1;
+                            }
+                        }
+                        votes >= snap.threshold
+                    } else {
+                        false
+                    }
+                }
+            },
         }
     }
 
@@ -2196,19 +3139,14 @@ impl Resolver {
     }
 
     /// The single rule for whether a feed read may settle a market, shared by
-    /// `snapshot_price` and every resolution path so a snapshot can never pin
-    /// a price resolution would reject. The place to add further checks (for
-    /// example rejecting `price <= 0`).
-    fn validate_price(
-        config: &PriceConfig,
-        close_time: u64,
-        data: &PriceData,
-    ) -> Result<(), Error> {
-        if Self::staleness_ok(config.max_staleness, close_time, data) {
-            Ok(())
-        } else {
-            Err(Error::StalePrice)
+    fn validate_price(max_staleness: u64, close_time: u64, data: &PriceData) -> Result<(), Error> {
+        if data.price <= 0 {
+            return Err(Error::InvalidPrice);
         }
+        if data.timestamp > close_time || close_time - data.timestamp > max_staleness {
+            return Err(Error::StalePrice);
+        }
+        Ok(())
     }
 
     /// The committed freshness rule itself, factored out of `validate_price`
@@ -2220,13 +3158,14 @@ impl Resolver {
 
     /// Applies the committed comparison.
     fn outcome_for(config: &PriceConfig, price: i128) -> Outcome {
-        Self::outcome_at(config.direction, config.threshold, price)
+        Self::compare_price(&config.direction, price, config.threshold)
     }
 
-    /// The committed comparison, split from `PriceConfig` so the quorum path
-    /// (whose strike lives in `QuorumPriceConfig`, normalised) reuses it
-    /// verbatim.
     fn outcome_at(direction: PriceDirection, threshold: i128, price: i128) -> Outcome {
+        Self::compare_price(&direction, price, threshold)
+    }
+
+    fn compare_price(direction: &PriceDirection, price: i128, threshold: i128) -> Outcome {
         let hit = match direction {
             PriceDirection::Above => price > threshold,
             PriceDirection::AtOrAbove => price >= threshold,
@@ -2240,16 +3179,93 @@ impl Resolver {
         }
     }
 
-    /// Reads the committed feed at `close_time` and validates it. A missing
-    /// record or a trapping oracle is `PriceUnavailable`, never a host error.
-    fn read_feed(env: &Env, config: &PriceConfig, close_time: u64) -> Result<PriceData, Error> {
-        let Ok(Ok(Some(data))) =
-            ReflectorPriceClient::new(env, &config.reflector).try_price(&config.asset, &close_time)
-        else {
+    /// `10^k` as `i128`, `None` past `i128::MAX` (`10^38` fits, `10^39` does
+    /// not) — the checked scale factor of [`Resolver::rescale`].
+    fn pow10_i128(k: u32) -> Option<i128> {
+        (0..k).try_fold(1i128, |acc, _| acc.checked_mul(10))
+    }
+
+    /// Brings a feed price and a [`ScaledPriceConfig`] threshold to the common
+    /// scale `max(feed_decimals, threshold_decimals)` with checked
+    /// arithmetic. Any scale factor beyond `i128` capacity is an overflow and
+    /// `InvalidPrice` at resolution (registration already rejects
+    /// `threshold_decimals > MAX_THRESHOLD_DECIMALS`; a feed claiming absurd
+    /// `decimals()` can only fail here).
+    fn rescale(
+        price: i128,
+        price_decimals: u32,
+        threshold: i128,
+        threshold_decimals: u32,
+    ) -> Result<(i128, i128), Error> {
+        let target = price_decimals.max(threshold_decimals);
+        let (Some(price_factor), Some(threshold_factor)) = (
+            Self::pow10_i128(target - price_decimals),
+            Self::pow10_i128(target - threshold_decimals),
+        ) else {
+            return Err(Error::InvalidPrice);
+        };
+        let price_scaled = price.checked_mul(price_factor).ok_or(Error::InvalidPrice)?;
+        let threshold_scaled = threshold
+            .checked_mul(threshold_factor)
+            .ok_or(Error::InvalidPrice)?;
+        Ok((price_scaled, threshold_scaled))
+    }
+
+    /// Reads the committed feed on its SEP-40 record grid and validates it.
+    /// The lookup timestamp is `close_time` floored to `resolution()`; SEP-40
+    /// feeds only store records on that grid, so querying `close_time` raw
+    /// would miss every off-boundary close (issue #26). If the aligned record
+    /// is missing the lookback walks the grid back in `resolution()` steps
+    /// while the next candidate could still satisfy `max_staleness`, capped
+    /// at [`MAX_LOOKBACK_RECORDS`] cross-contract calls. A trapping oracle or
+    /// a failing `price` call is `PriceUnavailable`, never a host error; a
+    /// grid with no acceptable record is `StalePrice`; a `resolution()` of 0
+    /// is a broken feed and `InvalidPrice` (it would divide by zero).
+    fn read_feed_on_grid(
+        env: &Env,
+        reflector: &Address,
+        asset: &OracleAsset,
+        max_staleness: u64,
+        close_time: u64,
+    ) -> Result<PriceData, Error> {
+        let client = ReflectorPriceClient::new(env, reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
             return Err(Error::PriceUnavailable);
         };
-        Self::validate_price(config, close_time, &data)?;
-        Ok(data)
+        if resolution == 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let res = resolution as u64;
+        let mut ts = close_time - close_time % res;
+        let mut inspected = 1u32;
+        loop {
+            match client.try_price(asset, &ts) {
+                Ok(Ok(Some(data))) => {
+                    Self::validate_price(max_staleness, close_time, &data)?;
+                    return Ok(data);
+                }
+                Ok(Ok(None)) => {}
+                _ => return Err(Error::PriceUnavailable),
+            }
+            if ts < res
+                || close_time - ts + res > max_staleness
+                || inspected >= MAX_LOOKBACK_RECORDS
+            {
+                return Err(Error::StalePrice);
+            }
+            ts -= res;
+            inspected += 1;
+        }
+    }
+
+    fn read_feed(env: &Env, config: &PriceConfig, close_time: u64) -> Result<PriceData, Error> {
+        Self::read_feed_on_grid(
+            env,
+            &config.reflector,
+            &config.asset,
+            config.max_staleness,
+            close_time,
+        )
     }
 
     /// Rescale a fixed-point price from `from` decimals to `to` decimals with
@@ -2333,7 +3349,7 @@ impl Resolver {
                 _ => break,
             }
         }
-        sorted.insert_at(pos, value);
+        sorted.insert(pos, value);
     }
 
     /// Median of an ascending list: the middle value for an odd count, the
@@ -2522,7 +3538,7 @@ impl Resolver {
         let (data, from_snapshot) = match storage.get::<_, PriceSnapshot>(&key) {
             Some(snapshot) => {
                 storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-                Self::validate_price(config, close_time, &snapshot.data)?;
+                Self::validate_price(config.max_staleness, close_time, &snapshot.data)?;
                 (snapshot.data, true)
             }
             None => (Self::read_feed(env, config, close_time)?, false),
@@ -2532,6 +3548,9 @@ impl Resolver {
 
     /// The price rule of a price or hybrid market. Signer-mode markets are
     /// `WrongMode`; markets with no revealed spec `MarketNotConfigured`.
+    /// Scaled (issue #26) and TWAP (issue #27) markets are `WrongMode` too:
+    /// `snapshot_price`/`preview_price` work on the raw `PriceConfig` shape
+    /// only (issue #37 will extend snapshots).
     fn price_config(env: &Env, market_id: u64) -> Result<PriceConfig, Error> {
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Quorum(market_id)) {
@@ -2544,6 +3563,14 @@ impl Resolver {
         }
         if let Some(hybrid) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(hybrid.price);
+        }
+        if let Some(hybrid) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            return Ok(hybrid.price);
+        }
+        if storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
+        {
+            return Err(Error::WrongMode);
         }
         match Self::signer_authority(env, market_id) {
             Ok(_) => Err(Error::WrongMode),
@@ -2564,6 +3591,8 @@ impl Resolver {
                 .try_resolve(&market_id, &to_core_outcome(outcome)),
         )?;
         Self::set_state(env, market_id, ResolutionState::Finalized);
+        let close_time = Self::market_close_time(env, market_id)?;
+        Self::bump_market_entries(env, market_id, close_time);
         PriceResolution {
             market_id,
             price: data.price,
@@ -2592,12 +3621,15 @@ impl Resolver {
         }
         let storage = env.storage().persistent();
         if storage.has(&DataKey::Price(market_id))
+            || storage.has(&DataKey::PriceScaled(market_id))
+            || storage.has(&DataKey::PriceTwap(market_id))
             || storage.has(&DataKey::Signers(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::CommitteeSpec(market_id))
             || storage.has(&DataKey::Hybrid(market_id))
             || storage.has(&DataKey::Quorum(market_id))
+            || storage.has(&DataKey::HybridV2(market_id))
         {
             return Err(Error::MarketAlreadyConfigured);
         }
@@ -2612,13 +3644,15 @@ impl Resolver {
         commitment: &BytesN<32>,
     ) -> Result<(), Error> {
         Self::assert_unconfigured(env, market_id)?;
-        Self::validate_rule(rule)?;
-        Self::assert_matches_commitment(env, market_id, commitment)?;
-        Self::store_rule(env, market_id, rule);
+        Self::validate_rule(env, rule)?;
+        bounds::validate_spec_bounds(env, rule)?;
+        let close_time = Self::assert_matches_commitment(env, market_id, commitment)?;
+        Self::store_rule(env, market_id, rule, close_time);
+        Self::bump_market_entries(env, market_id, close_time);
         Ok(())
     }
 
-    fn validate_rule(rule: &ResolutionSpec) -> Result<(), Error> {
+    fn validate_rule(env: &Env, rule: &ResolutionSpec) -> Result<(), Error> {
         let valid = match rule {
             ResolutionSpec::Price(cfg) => cfg.threshold >= 0 && cfg.max_staleness != 0,
             ResolutionSpec::Signers(cfg) => {
@@ -2629,7 +3663,13 @@ impl Resolver {
             }
             ResolutionSpec::WeightedKeys(cfg) => Self::weighted_config_is_valid(cfg),
             ResolutionSpec::SignersDisputable(cfg) => Self::disputable_config_is_valid(cfg),
-            ResolutionSpec::Committee(cfg) => cfg.dispute_window != 0,
+            ResolutionSpec::Committee(cfg) => {
+                // #297: the V2/V3 reveal path now validates the committee ref
+                // through validate_committee_ref, shared with
+                // register_committee_spec.
+                Self::validate_committee_ref(env, cfg)?;
+                true
+            }
             ResolutionSpec::Hybrid(cfg) => {
                 cfg.price.threshold >= 0
                     && cfg.price.max_staleness != 0
@@ -2641,6 +3681,9 @@ impl Resolver {
                     && cfg.fallback_after >= cfg.price.max_staleness
             }
             ResolutionSpec::PriceQuorum(cfg) => Self::quorum_config_is_valid(cfg),
+            ResolutionSpec::HybridV2(cfg) => {
+                Self::validate_hybrid_v2(env, cfg).is_ok()
+            }
         };
         if valid {
             Ok(())
@@ -2649,52 +3692,221 @@ impl Resolver {
         }
     }
 
-    fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
-        let storage = env.storage().persistent();
+    fn validate_hybrid_v2(env: &Env, cfg: &HybridConfigV2) -> Result<(), Error> {
+        let price_ok = cfg.price.threshold >= 0
+            && cfg.price.max_staleness != 0
+            && cfg.fallback_after > 0
+            && cfg.fallback_after >= cfg.price.max_staleness;
+        if !price_ok {
+            return Err(Error::InvalidConfig);
+        }
+        match &cfg.fallback {
+            FallbackAuthority::Signers(s) => {
+                if s.signers.is_empty()
+                    || s.threshold == 0
+                    || s.threshold > s.signers.len()
+                    || s.dispute_window == 0
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            FallbackAuthority::WeightedKeys(w) => {
+                if !Self::weighted_config_is_valid(w) {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            FallbackAuthority::Committee(r) => {
+                Self::validate_committee_ref(env, r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a per-market key with the market's close-time-aware TTL.
+    /// Unlike the flat `persist`, this guarantees the entry outlives the
+    /// market's settlement horizon rather than just 60 days from write.
+    fn persist_market<K, V>(env: &Env, key: &K, value: &V, close_time: u64)
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val> + Clone,
+        V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+    {
+        let target = ttl::market_target(env, close_time);
+        env.storage().persistent().set(key, value);
+        ttl::bump_persistent(env, key, target);
+    }
+
+    /// Compile-time exhaustiveness check: every `DataKey` variant must be classified
+    /// here, or the match won't compile. Market-scoped entries use `market_target`;
+    /// instance/global entries use `long_lived_target` or `bump_instance`.
+    #[allow(dead_code)]
+    fn ttl_class(key: &DataKey) -> &'static str {
+        match key {
+            // Non-market (instance/global) — bumped by bump_instance or long_lived_target
+            DataKey::Admin => "global",
+            DataKey::PendingAdmin => "global",
+            DataKey::MarketCore => "global",
+            DataKey::EvidenceConfig => "global",
+            DataKey::NextCommitteeId => "global",
+            // Committee registry — long-lived, not market-scoped
+            DataKey::Committee(_) => "long-lived",
+            DataKey::Rotation(_) => "long-lived",
+            DataKey::MemberAt(_, _) => "long-lived",
+            DataKey::EpochStart(_, _) => "long-lived",
+            // Market-scoped — bumped via persist_market / bump_market_entries
+            DataKey::Price(_) => "market",
+            DataKey::PriceScaled(_) => "market",
+            DataKey::PriceTwap(_) => "market",
+            DataKey::Hybrid(_) => "market",
+            DataKey::Signers(_) => "market",
+            DataKey::WeightedKeys(_) => "market",
+            DataKey::Disputable(_) => "market",
+            DataKey::CommitteeSpec(_) => "market",
+            DataKey::State(_) => "market",
+            DataKey::ProposalV2(_) => "market",
+            DataKey::Proposal(_) => "market",
+            DataKey::AttestationV2(_, _, _) => "market",
+            DataKey::Attestation(_, _, _) => "market",
+            DataKey::CountV2(_, _) => "market",
+            DataKey::Count(_, _) => "market",
+            DataKey::EvidencePolicy(_) => "market",
+            DataKey::EvidenceCount(_) => "market",
+            DataKey::EvidenceUsed(_) => "market",
+            DataKey::Evidence(_, _) => "market",
+            DataKey::Cancels(_) => "market",
+            DataKey::EscalationCount(_, _) => "market",
+            DataKey::EscalationVote(_, _) => "market",
+            DataKey::Dispute(_) => "market",
+            DataKey::Snapshot(_) => "market",
+            DataKey::Round(_) => "market",
+            DataKey::SigSeen(_, _, _) => "market",
+            DataKey::Weight(_, _, _) => "market",
+            DataKey::AttestEpoch(_, _) => "market",
+            DataKey::MarketEpoch(_) => "market",
+            DataKey::HybridV2(_) => "market",
+            DataKey::Quorum(_) => "market",
+        }
+    }
+
+    fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec, close_time: u64) {
         let (key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::Unconfigured)
             }
             ResolutionSpec::Signers(cfg) => {
                 let key = DataKey::Signers(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::WeightedKeys(cfg) => {
                 let key = DataKey::WeightedKeys(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::SignersDisputable(cfg) => {
                 let key = DataKey::Disputable(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::Committee(cfg) => {
                 let key = DataKey::CommitteeSpec(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::Hybrid(cfg) => {
                 let key = DataKey::Hybrid(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
+                (key, ResolutionState::HybridPricePending)
+            }
+            ResolutionSpec::HybridV2(cfg) => {
+                let key = DataKey::HybridV2(market_id);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::HybridPricePending)
             }
             ResolutionSpec::PriceQuorum(cfg) => {
                 let key = DataKey::Quorum(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::Unconfigured)
             }
         };
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
-            storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::persist_market(env, &p_key, &policy, close_time);
         }
         Self::set_state(env, market_id, state);
+    }
+
+    /// Issue #26 counterpart of [`validate_rule`] for the scaled mode, which
+    /// is not a `ResolutionSpec` variant (see
+    /// [`register_scaled_price_spec`]).
+    fn validate_scaled_rule(cfg: &ScaledPriceConfig) -> Result<(), Error> {
+        let valid = cfg.threshold >= 0
+            && cfg.max_staleness != 0
+            && cfg.threshold_decimals <= MAX_THRESHOLD_DECIMALS;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfig)
+        }
+    }
+
+    /// Issue #26 counterpart of [`store_rule`] for the scaled mode: same
+    /// key + TTL + evidence-policy + state bookkeeping, different payload.
+    /// Takes `close_time` so the spec key gets the market-aware TTL (#309).
+    fn store_scaled_rule(env: &Env, market_id: u64, cfg: &ScaledPriceConfig, close_time: u64) {
+        let key = DataKey::PriceScaled(market_id);
+        Self::persist_market(env, &key, cfg, close_time);
+        if let Some((_, policy)) = Self::evidence_config_internal(env) {
+            let p_key = DataKey::EvidencePolicy(market_id);
+            Self::persist_market(env, &p_key, &policy, close_time);
+        }
+        Self::set_state(env, market_id, ResolutionState::Unconfigured);
+    }
+
+    /// Issue #27 counterpart of [`validate_scaled_rule`] for the TWAP mode,
+    /// plus the live feasibility check described in
+    /// [`register_twap_spec`]: the grid period is read from the feed at
+    /// registration, so an infeasible `window`/`min_samples` pair for that
+    /// grid (or an unreachable/zero-period feed) fails before any
+    /// commitment is spent. Static violations and infeasible slot counts
+    /// are `InvalidConfig`; a trapping reflector is `PriceUnavailable`.
+    fn validate_twap_rule(env: &Env, cfg: &TwapConfig) -> Result<(), Error> {
+        let static_ok = cfg.window > 0
+            && cfg.min_samples >= 2
+            && cfg.max_gap > 0
+            && cfg.max_gap <= cfg.window
+            && cfg.threshold >= 0;
+        if !static_ok {
+            return Err(Error::InvalidConfig);
+        }
+        let client = ReflectorPriceClient::new(env, &cfg.reflector);
+        let Ok(Ok(resolution)) = client.try_resolution() else {
+            return Err(Error::PriceUnavailable);
+        };
+        if resolution == 0 {
+            // A zero-period feed divides by zero at resolve time; the market
+            // cannot ever sample it on a grid. Reject at reveal (issue #27
+            // step 2: catch unresolvable markets early).
+            return Err(Error::InvalidConfig);
+        }
+        let slots = cfg.window / resolution as u64;
+        if slots > MAX_TWAP_SAMPLES as u64 || (cfg.min_samples as u64) > slots {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    /// Issue #27 counterpart of [`store_scaled_rule`] for the TWAP mode.
+    /// Takes `close_time` so the spec key gets the market-aware TTL (#309).
+    fn store_twap_rule(env: &Env, market_id: u64, cfg: &TwapConfig, close_time: u64) {
+        let key = DataKey::PriceTwap(market_id);
+        Self::persist_market(env, &key, cfg, close_time);
+        if let Some((_, policy)) = Self::evidence_config_internal(env) {
+            let p_key = DataKey::EvidencePolicy(market_id);
+            Self::persist_market(env, &p_key, &policy, close_time);
+        }
+        Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
 
     fn evidence_config_internal(env: &Env) -> Option<(Address, EvidencePolicy)> {
@@ -2729,6 +3941,174 @@ impl Resolver {
         Ok(comm)
     }
 
+    // ── #297: epoch binding helpers ───────────────────────────────────────
+
+    /// Maximum `max_rotation_delta` a committee market may declare. Bounds the
+    /// `epoch_at` walk-back footprint so a single attestation never reads more
+    /// than `MAX_ROTATION_DELTA + 1` `EpochStart` entries.
+    pub const MAX_ROTATION_DELTA: u32 = 16;
+
+    /// Walk back from `current` epoch to the epoch whose `EpochStart` is <=
+    /// `ts`, at most `max_steps + 1` reads. Returns the epoch in force at `ts`.
+    /// For committees created before this change (no `EpochStart` for epoch 1),
+    /// a missing entry at epoch 1 is treated as "started at creation" (0).
+    fn epoch_at(
+        env: &Env,
+        committee_id: u64,
+        current: u32,
+        ts: u64,
+        max_steps: u32,
+    ) -> Result<u32, Error> {
+        let mut epoch = current;
+        let mut steps = 0u32;
+        loop {
+            let key = DataKey::EpochStart(committee_id, epoch);
+            let started_at = env.storage().persistent().get::<_, u64>(&key);
+            match started_at {
+                Some(t) if t <= ts => return Ok(epoch),
+                Some(_) => {}
+                None => {
+                    // Legacy committee without EpochStart: epoch 1 started at
+                    // creation (treated as 0, which is <= any ts). Other epochs
+                    // without EpochStart are unknown → fall back to current.
+                    if epoch == 1 {
+                        return Ok(1);
+                    }
+                }
+            }
+            if steps >= max_steps || epoch == 0 {
+                return Err(Error::RotationBoundExceeded);
+            }
+            epoch = epoch.saturating_sub(1);
+            steps += 1;
+        }
+    }
+
+    /// Load the member set and threshold for a committee at a specific epoch.
+    fn load_snapshot(env: &Env, committee_id: u64, epoch: u32) -> Result<CommitteeSnapshot, Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok(CommitteeSnapshot {
+            epoch,
+            members,
+            threshold,
+        })
+    }
+
+    /// Compute the epoch that was in force at `close_time` for a committee
+    /// market, without writing. Used by views before pinning.
+    fn compute_pinned_epoch(
+        env: &Env,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<u32, Error> {
+        let comm = Self::load_committee(env, ref_spec.committee_id)?;
+        if ref_spec.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let epoch = Self::epoch_at(
+            env,
+            ref_spec.committee_id,
+            comm.epoch,
+            close_time,
+            ref_spec.max_rotation_delta,
+        )?;
+        if epoch < ref_spec.min_epoch
+            || epoch.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
+        {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(epoch)
+    }
+
+    /// Load or compute the pinned snapshot for a committee market. If the
+    /// market is already pinned, use the stored epoch. If not, compute the
+    /// would-be pin without writing (for views like `has_valid_proposal`).
+    fn committee_snapshot(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        if let Some((committee_id, epoch)) =
+            env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+        {
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        // Not yet pinned: compute the would-be pin.
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        Self::load_snapshot(env, ref_spec.committee_id, epoch)
+    }
+
+    /// Pin the epoch for a committee market: write `MarketEpoch` and bump
+    /// `MemberAt`, `EpochStart`, and `CommitteeSpec` to the market target.
+    fn pin_epoch_for_market(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        let storage = env.storage().persistent();
+        let pin_key = DataKey::MarketEpoch(market_id);
+        if let Some((committee_id, epoch)) = storage.get::<_, (u64, u32)>(&pin_key) {
+            // Already pinned: return the existing snapshot.
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        let snapshot = Self::load_snapshot(env, ref_spec.committee_id, epoch)?;
+
+        // Write the pin.
+        let pin_value = (ref_spec.committee_id, epoch);
+        Self::persist(env, &pin_key, &pin_value);
+
+        // Bump the snapshot and epoch-start entries to the market target so
+        // they survive until the market finalizes.
+        let target = ttl::market_target(env, close_time);
+        let member_key = DataKey::MemberAt(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&member_key) {
+            ttl::bump_persistent(env, &member_key, target);
+        }
+        let epoch_start_key = DataKey::EpochStart(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&epoch_start_key) {
+            ttl::bump_persistent(env, &epoch_start_key, target);
+        }
+        // Bump the CommitteeSpec entry too.
+        let spec_key = DataKey::CommitteeSpec(market_id);
+        if env.storage().persistent().has(&spec_key) {
+            ttl::bump_persistent(env, &spec_key, target);
+        }
+
+        CommitteeEpochPinned {
+            market_id,
+            committee_id: ref_spec.committee_id,
+            epoch,
+        }
+        .publish(env);
+
+        Ok(snapshot)
+    }
+
+    /// #297: Validate a CommitteeRef against the live committee registry.
+    /// Shared between `register_committee_spec` and the V2/V3 reveal path so
+    /// both check existence, min_epoch, and dispute_window consistently.
+    fn validate_committee_ref(env: &Env, cfg: &CommitteeRef) -> Result<(), Error> {
+        if cfg.dispute_window == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if cfg.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let committee = Self::load_committee(env, cfg.committee_id)?;
+        if committee.epoch < cfg.min_epoch {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(())
+    }
+
     fn record_attestation(
         env: &Env,
         market_id: u64,
@@ -2751,17 +4131,27 @@ impl Resolver {
                 (cfg.threshold, None)
             }
             SignerAuthority::Weighted(_) => return Err(Error::WrongMode),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return Err(Error::RotationBoundExceeded);
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: pin the epoch on the first attestation after close.
+                // The snapshot is already loaded; pin it to storage so future
+                // reads use the pinned epoch. The epoch bound check is already
+                // enforced by compute_pinned_epoch inside committee_snapshot.
+                if !env.storage().persistent().has(&DataKey::MarketEpoch(market_id)) {
+                    let close_time = Self::market_close_time(env, market_id)?;
+                    Self::pin_epoch_for_market(env, market_id, ref_spec, close_time)?;
                 }
-                if !Self::contains(&comm.members, &signer) {
+                // Re-read the pinned snapshot to be sure we use the stored pin.
+                let pinned = if let Some((cid, ep)) =
+                    env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+                {
+                    Self::load_snapshot(env, cid, ep)?
+                } else {
+                    snapshot.clone()
+                };
+                if !Self::contains(&pinned.members, &signer) {
                     return Err(Error::NotSigner);
                 }
-                (comm.threshold, Some(current))
+                (pinned.threshold, Some(pinned.epoch))
             }
             SignerAuthority::Hybrid(cfg) => {
                 if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
@@ -2772,6 +4162,27 @@ impl Resolver {
                 }
                 (cfg.fallback.threshold, None)
             }
+            SignerAuthority::HybridV2(cfg, snap) => {
+                if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
+                    return Err(Error::WrongMode);
+                }
+                match &cfg.fallback {
+                    FallbackAuthority::Signers(s) => {
+                        if !Self::contains(&s.signers, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (s.threshold, None)
+                    }
+                    FallbackAuthority::WeightedKeys(_) => return Err(Error::WrongMode),
+                    FallbackAuthority::Committee(_) => {
+                        let snapshot = snap.as_ref().ok_or(Error::WrongMode)?;
+                        if !Self::contains(&snapshot.members, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (snapshot.threshold, Some(snapshot.epoch))
+                    }
+                }
+            }
         };
 
         let storage = env.storage().persistent();
@@ -2781,9 +4192,8 @@ impl Resolver {
             .unwrap_or(EvidencePolicy::Disabled);
 
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
@@ -2801,15 +4211,14 @@ impl Resolver {
             if storage.has(&DataKey::EvidenceUsed(trace_id)) {
                 return Err(Error::EvidenceAlreadyUsed);
             }
-            let trace = match registry_call(
-                RegistryClient::new(env, &registry).try_get_trace(&trace_id),
-            ) {
-                Ok(trace) => trace,
-                // A missing trace (or a registry that cannot be read) is the
-                // same caller-facing condition: the cited evidence is not
-                // available. The registry's own numeric code is never leaked.
-                Err(_) => return Err(Error::EvidenceNotFound),
-            };
+            let trace =
+                match registry_call(RegistryClient::new(env, &registry).try_get_trace(&trace_id)) {
+                    Ok(trace) => trace,
+                    // A missing trace (or a registry that cannot be read) is the
+                    // same caller-facing condition: the cited evidence is not
+                    // available. The registry's own numeric code is never leaked.
+                    Err(_) => return Err(Error::EvidenceNotFound),
+                };
             if trace.agent != signer {
                 return Err(Error::EvidenceAuthorMismatch);
             }
@@ -2849,6 +4258,13 @@ impl Resolver {
             &DataKey::AttestationV2(market_id, outcome, signer.clone()),
             &true,
         );
+        // #16: attestation entries are not enumerable, so each is extended to
+        // the market's close-time-aware target where it is written.
+        ttl::bump_persistent(
+            env,
+            &DataKey::AttestationV2(market_id, outcome, signer.clone()),
+            ttl::market_target(env, market.close_time),
+        );
         if let Some(epoch) = members_opt {
             Self::persist(
                 env,
@@ -2885,6 +4301,7 @@ impl Resolver {
         if quorum_reached && may_propose {
             Self::propose(env, market_id, outcome);
         }
+        Self::bump_market_entries(env, market_id, market.close_time);
         Ok(())
     }
 
@@ -2893,15 +4310,142 @@ impl Resolver {
         env: &Env,
         market_id: u64,
         commitment: &BytesN<32>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         if *commitment != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
-        Ok(())
+        Ok(market.close_time)
+    }
+
+    fn market_close_time(env: &Env, market_id: u64) -> Result<u64, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        Ok(MarketCoreClient::new(env, &market_core)
+            .get_market(&market_id)
+            .close_time)
+    }
+
+    /// Extends every per-market entry to the market's close-time-aware target.
+    /// Called after each mutating entrypoint so an in-progress vote or a
+    /// finalized market cannot archive mid-settlement.
+    ///
+    /// Per-signer and per-round keys (`AttestationV2`, `EscalationVote`,
+    /// `SigSeen`, `Weight`, `AttestEpoch`, `Evidence`) are not enumerable here
+    /// — they are bumped at write time (see `record_attestation`,
+    /// `persist_market_signer`) and by the permissionless `keep_alive`
+    /// entrypoint for long-idle markets.  Absent keys are skipped: `extend_ttl`
+    /// panics on a missing key.
+    fn bump_market_entries(env: &Env, market_id: u64, close_time: u64) {
+        let target = ttl::market_target(env, close_time);
+        let storage = env.storage().persistent();
+        let scalar_keys = [
+            DataKey::Price(market_id),
+            DataKey::Signers(market_id),
+            DataKey::WeightedKeys(market_id),
+            DataKey::Disputable(market_id),
+            DataKey::Proposal(market_id),
+            DataKey::ProposalV2(market_id),
+            DataKey::Snapshot(market_id),
+            DataKey::State(market_id),
+            DataKey::Round(market_id),
+            DataKey::Dispute(market_id),
+            DataKey::Count(market_id, Outcome::Yes),
+            DataKey::Count(market_id, Outcome::No),
+            // #16: `CountV2`/`ProposalV2` are the live tally/proposal keys after
+            // the `AttestedOutcome` migration (ADR 0003); the legacy `Count`/
+            // `Proposal` above are only read during migration, so the close-time
+            // guarantee lives on the V2 variants.
+            DataKey::CountV2(market_id, AttestedOutcome::Yes),
+            DataKey::CountV2(market_id, AttestedOutcome::No),
+            DataKey::CountV2(market_id, AttestedOutcome::Invalid),
+            // #297: committee epoch-binding entries are bumped alongside the
+            // market's other entries so they survive until finalization.
+            DataKey::CommitteeSpec(market_id),
+            DataKey::MarketEpoch(market_id),
+            // #309: spec keys added after the original bump_market_entries list.
+            // A PriceScaled / PriceTwap / Hybrid market written with the old
+            // flat 60-day TTL would archive before its close_time for markets
+            // more than 60 days out.
+            DataKey::PriceScaled(market_id),
+            DataKey::PriceTwap(market_id),
+            DataKey::Hybrid(market_id),
+            // #309: evidence and cancel tracking keys.
+            DataKey::EvidencePolicy(market_id),
+            DataKey::EvidenceCount(market_id),
+            DataKey::EvidenceUsed(market_id),
+            DataKey::Cancels(market_id),
+            // #309: escalation aggregate keys (per-verdict, not per-signer).
+            DataKey::EscalationCount(market_id, Verdict::Yes),
+            DataKey::EscalationCount(market_id, Verdict::No),
+            DataKey::EscalationCount(market_id, Verdict::Invalid),
+            // #314: HybridV2 spec key.
+            DataKey::HybridV2(market_id),
+            DataKey::Quorum(market_id),
+        ];
+        for key in scalar_keys {
+            if storage.has(&key) {
+                ttl::bump_persistent(env, &key, target);
+            }
+        }
+        // #297: also bump the pinned snapshot's MemberAt and EpochStart entries.
+        // These are shared across markets; each market bumping them is idempotent.
+        if let Some((committee_id, epoch)) = storage.get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id)) {
+            let member_key = DataKey::MemberAt(committee_id, epoch);
+            if storage.has(&member_key) {
+                ttl::bump_persistent(env, &member_key, target);
+            }
+            let epoch_start_key = DataKey::EpochStart(committee_id, epoch);
+            if storage.has(&epoch_start_key) {
+                ttl::bump_persistent(env, &epoch_start_key, target);
+            }
+        }
+    }
+
+    /// Bump per-signer keys for a market from an external cursor, up to
+    /// `limit` signers per call (capped at 16 to bound the footprint).
+    ///
+    /// Returns the next cursor position; 0 when the full signer list has been
+    /// covered.  Callers (off-chain keepers or anyone) may paginate by calling
+    /// repeatedly until the return value is 0.  This is the permissionless
+    /// keep-alive path for long-idle markets that would otherwise let their
+    /// per-signer entries archive before resolution.
+    pub fn keep_alive(env: Env, market_id: u64, cursor: u32, limit: u32) -> Result<u32, Error> {
+        ttl::bump_instance(&env);
+        let close_time = Self::market_close_time(&env, market_id)?;
+        let target = ttl::market_target(&env, close_time);
+        let limit = limit.min(16);
+        let storage = env.storage().persistent();
+
+        // Walk the signer list from `cursor`, bumping per-signer attestation
+        // and epoch keys for each address that has them.
+        let signers_opt: Option<SignerConfig> = storage.get(&DataKey::Signers(market_id));
+        let next_cursor = if let Some(cfg) = signers_opt {
+            let signers = &cfg.signers;
+            let total = signers.len();
+            let mut i = cursor;
+            let end = (cursor + limit).min(total);
+            while i < end {
+                if let Some(signer) = signers.get(i) {
+                    for outcome in [AttestedOutcome::Yes, AttestedOutcome::No, AttestedOutcome::Invalid] {
+                        let key = DataKey::AttestationV2(market_id, outcome, signer.clone());
+                        if storage.has(&key) {
+                            ttl::bump_persistent(&env, &key, target);
+                        }
+                    }
+                    let attest_epoch_key = DataKey::AttestEpoch(market_id, signer.clone());
+                    if storage.has(&attest_epoch_key) {
+                        ttl::bump_persistent(&env, &attest_epoch_key, target);
+                    }
+                }
+                i += 1;
+            }
+            if end >= total { 0 } else { end }
+        } else {
+            0
+        };
+        Ok(next_cursor)
     }
 }
 
@@ -2911,7 +4455,10 @@ mod test {
     use market_core::{Category, MarketStatus};
     use soroban_sdk::{
         contract, contractimpl,
-        testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke,
+        },
         token::{self, StellarAssetClient},
         BytesN, IntoVal,
     };
@@ -2993,49 +4540,127 @@ mod test {
     }
 
     #[contract]
-    struct MockReflector;
+    struct Sep40Mock;
+
+    const MOCK_HISTORY: u32 = 0;
+    const MOCK_DECIMALS: u32 = 1;
+    const MOCK_RESOLUTION: u32 = 2;
+    const MOCK_PANIC: u32 = 3;
+    const MOCK_NEAREST: u32 = 4;
 
     #[contractimpl]
-    impl MockReflector {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage()
-                .instance()
-                .set(&0u32, &PriceData { price, timestamp });
+    impl Sep40Mock {
+        pub fn set_config(env: Env, decimals: u32, resolution: u32) {
+            env.storage().instance().set(&MOCK_DECIMALS, &decimals);
+            env.storage().instance().set(&MOCK_RESOLUTION, &resolution);
         }
 
-        /// Quorum tests (#28): toggles `price` to trap, standing in for a
-        /// malicious or broken oracle. `try_price` must classify it `Failed`
-        /// and the resolution must carry on.
-        pub fn set_panic(env: Env, should_panic: bool) {
-            env.storage().instance().set(&1u32, &should_panic);
+        pub fn set_panic(env: Env, on: bool) {
+            env.storage().instance().set(&MOCK_PANIC, &on);
         }
 
-        pub fn price(env: Env, _asset: OracleAsset, _timestamp: u64) -> Option<PriceData> {
-            let should_panic = env
+        /// Deviate from SEP-40 exactness: `price(asset, ts)` then answers
+        /// with the newest stored record at or before `ts` (issue #27's
+        /// "some implementations return the nearest earlier record" edge).
+        pub fn set_nearest(env: Env, on: bool) {
+            env.storage().instance().set(&MOCK_NEAREST, &on);
+        }
+
+        /// Replaces the feed's history for `asset`. Records are only findable
+        /// at their exact timestamps, so a record off the `resolution()` grid
+        /// models a corrupt feed and stays unreachable by the aligned
+        /// lookback.
+        pub fn set_history(env: Env, asset: OracleAsset, history: Vec<PriceData>) {
+            let mut all: soroban_sdk::Map<OracleAsset, Vec<PriceData>> = env
                 .storage()
                 .instance()
-                .get::<_, bool>(&1u32)
-                .unwrap_or(false);
-            if should_panic {
-                panic!("mock reflector trap");
+                .get(&MOCK_HISTORY)
+                .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+            all.set(asset, history);
+            env.storage().instance().set(&MOCK_HISTORY, &all);
+        }
+
+        fn guard(env: &Env) {
+            let on: bool = env.storage().instance().get(&MOCK_PANIC).unwrap_or(false);
+            if on {
+                panic!("sep40 mock feed down");
             }
-            env.storage().instance().get(&0u32)
+        }
+
+        fn records(env: &Env, asset: &OracleAsset) -> Vec<PriceData> {
+            let all: soroban_sdk::Map<OracleAsset, Vec<PriceData>> = env
+                .storage()
+                .instance()
+                .get(&MOCK_HISTORY)
+                .unwrap_or_else(|| soroban_sdk::Map::new(env));
+            all.get(asset.clone()).unwrap_or_else(|| Vec::new(env))
+        }
+
+        /// Defaults to Reflector's public-feed shape: 14 decimals.
+        pub fn decimals(env: Env) -> u32 {
+            Self::guard(&env);
+            env.storage().instance().get(&MOCK_DECIMALS).unwrap_or(14)
+        }
+
+        /// Default 1 s so fixtures written against the old mock keep
+        /// resolving; grid behaviour is set explicitly per test.
+        pub fn resolution(env: Env) -> u32 {
+            Self::guard(&env);
+            env.storage().instance().get(&MOCK_RESOLUTION).unwrap_or(1)
+        }
+
+        /// SEP-40 exactness: `Some` only when `timestamp` names a stored
+        /// record of this asset. Under `set_nearest(true)` the newest
+        /// record at or before `timestamp` answers instead (issue #27's
+        /// duplicate-timestamp edge).
+        pub fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
+            Self::guard(&env);
+            let nearest: bool = env.storage().instance().get(&MOCK_NEAREST).unwrap_or(false);
+            let records = Self::records(&env, &asset);
+            if nearest {
+                let mut best: Option<PriceData> = None;
+                for record in records.iter() {
+                    if record.timestamp <= timestamp
+                        && best.as_ref().is_none_or(|b| record.timestamp > b.timestamp)
+                    {
+                        best = Some(record);
+                    }
+                }
+                return best;
+            }
+            records.iter().find(|record| record.timestamp == timestamp)
+        }
+
+        pub fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData> {
+            Self::guard(&env);
+            let records = Self::records(&env, &asset);
+            let mut newest: Option<PriceData> = None;
+            for record in records.iter() {
+                let replace = match &newest {
+                    Some(current) => record.timestamp >= current.timestamp,
+                    None => true,
+                };
+                if replace {
+                    newest = Some(record);
+                }
+            }
+            newest
         }
     }
 
     const NETWORK_ID: [u8; 32] = [7; 32];
 
-    struct Fixture {
-        env: Env,
-        admin: Address,
-        resolver: ResolverClient<'static>,
-        resolver_id: Address,
-        market_core: MarketCoreClient<'static>,
-        market_id: u64,
-        signer_a: Address,
-        signer_b: Address,
-        reflector_id: Address,
-        spec: ResolutionSpec,
+    pub(crate) struct Fixture {
+        pub(crate) env: Env,
+        pub(crate) admin: Address,
+        pub(crate) resolver: ResolverClient<'static>,
+        pub(crate) resolver_id: Address,
+        pub(crate) market_core: MarketCoreClient<'static>,
+        pub(crate) market_id: u64,
+        pub(crate) signer_a: Address,
+        pub(crate) signer_b: Address,
+        pub(crate) reflector_id: Address,
+        pub(crate) spec: ResolutionSpec,
     }
 
     /// Builds a market whose `resolution_hash` commits to whatever
@@ -3050,10 +4675,28 @@ mod test {
         })
     }
 
+    /// [`fixture`] with a custom market `close_time`, for grid-alignment tests.
+    pub(crate) fn fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
+    ) -> Fixture {
+        fixture_close_with(close_time, spec_fn, |env, spec, _market_core| {
+            legacy_spec_hash(env, spec)
+        })
+    }
+
     /// Like [`fixture`], but `commit` chooses the `resolution_hash` the market
     /// is created with, given the rule and the market-core address, so V2
     /// envelopes can be committed to.
     fn fixture_with(
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
+        commit: impl FnOnce(&Env, &ResolutionSpec, &Address) -> BytesN<32>,
+    ) -> Fixture {
+        fixture_close_with(2_000, spec_fn, commit)
+    }
+
+    fn fixture_close_with(
+        close_time: u64,
         spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
         commit: impl FnOnce(&Env, &ResolutionSpec, &Address) -> BytesN<32>,
     ) -> Fixture {
@@ -3068,7 +4711,7 @@ mod test {
         let signer_b = Address::generate(&env);
         let treasury = Address::generate(&env);
         let resolver_id = Address::generate(&env);
-        let reflector_id = env.register(MockReflector, ());
+        let reflector_id = env.register(Sep40Mock, ());
 
         let collateral = env.register_stellar_asset_contract_v2(admin.clone());
         let token = StellarAssetClient::new(&env, &collateral.address());
@@ -3095,7 +4738,7 @@ mod test {
             &resolution_hash,
             &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
             &Category::Crypto,
-            &2_000,
+            &close_time,
             &(100 * 10_000_000_i128),
             &5000u32,
         );
@@ -3121,13 +4764,204 @@ mod test {
         }
     }
 
+    /// Issue #26 counterpart of [`fixture_close_with`]: the market's
+    /// `resolution_hash` commits to `scaled_spec_hash(cfg)` — a domain-tagged
+    /// `ScaledPriceConfig` preimage, not a `ResolutionSpec` variant (see
+    /// [`register_scaled_price_spec`]). The returned `Fixture.spec` is a
+    /// legacy `Price` placeholder that these tests never register; only the
+    /// revealed scaled config matches this market's commitment.
+    fn scaled_fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ScaledPriceConfig,
+    ) -> (Fixture, ScaledPriceConfig) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(Sep40Mock, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let scaled = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
+        let spec = ResolutionSpec::Price(price_spec(&env, &reflector_id));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                // Protocol keeps the whole fee; resolver tests do no splits.
+                10_000u32,
+            ),
+        );
+        let resolution_hash = scaled_spec_hash(&env, &scaled);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let market_id = market_core.create_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
+            &Category::Crypto,
+            &close_time,
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        (
+            Fixture {
+                env,
+                admin,
+                resolver,
+                resolver_id,
+                market_core,
+                market_id,
+                signer_a,
+                signer_b,
+                reflector_id,
+                spec,
+            },
+            scaled,
+        )
+    }
+
+    /// Issue #27 counterpart of [`scaled_fixture_at`]: the market's
+    /// `resolution_hash` commits to `twap_spec_hash(cfg)`. The returned
+    /// `Fixture.spec` is a legacy `Price` placeholder these tests never
+    /// register; only the revealed TWAP config matches the commitment.
+    fn twap_fixture_at(
+        close_time: u64,
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> TwapConfig,
+    ) -> (Fixture, TwapConfig) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id(NETWORK_ID);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver_id = Address::generate(&env);
+        let reflector_id = env.register(Sep40Mock, ());
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&creator, &(1_000 * 10_000_000_i128));
+
+        let twap_cfg = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
+        let spec = ResolutionSpec::Price(price_spec(&env, &reflector_id));
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury.clone(),
+                resolver_id.clone(),
+                100u32,
+                // Protocol keeps the whole fee; resolver tests do no splits.
+                10_000u32,
+            ),
+        );
+        let resolution_hash = twap_spec_hash(&env, &twap_cfg);
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        let market_id = market_core.create_market(
+            &creator,
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &resolution_hash,
+            &soroban_sdk::String::from_str(&env, "ipfs://resolver-test"),
+            &Category::Crypto,
+            &close_time,
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        );
+
+        env.register_at(
+            &resolver_id,
+            Resolver,
+            ResolverArgs::__constructor(&admin, &market_core_id),
+        );
+        let resolver = ResolverClient::new(&env, &resolver_id);
+
+        (
+            Fixture {
+                env,
+                admin,
+                resolver,
+                resolver_id,
+                market_core,
+                market_id,
+                signer_a,
+                signer_b,
+                reflector_id,
+                spec,
+            },
+            twap_cfg,
+        )
+    }
+
+    /// [`twap_fixture_at`] at the default `close_time` of 2_000.
+    fn twap_fixture(
+        spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> TwapConfig,
+    ) -> (Fixture, TwapConfig) {
+        twap_fixture_at(2_000, spec_fn)
+    }
+
+    fn twap_price_spec(
+        env: &Env,
+        reflector: &Address,
+        threshold: i128,
+        direction: PriceDirection,
+        window: u64,
+        min_samples: u32,
+        max_gap: u64,
+    ) -> TwapConfig {
+        TwapConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            threshold,
+            direction,
+            window,
+            min_samples,
+            max_gap,
+        }
+    }
+
     fn price_spec(env: &Env, reflector: &Address) -> PriceConfig {
+        price_spec_at(env, reflector, 2_000, PriceDirection::Above, 10)
+    }
+
+    fn price_spec_at(
+        env: &Env,
+        reflector: &Address,
+        threshold: i128,
+        direction: PriceDirection,
+        max_staleness: u64,
+    ) -> PriceConfig {
         PriceConfig {
             reflector: reflector.clone(),
             asset: OracleAsset::Other(Symbol::new(env, "XLM")),
-            threshold: 2_000,
-            direction: PriceDirection::Above,
-            max_staleness: 10,
+            threshold,
+            direction,
+            max_staleness,
         }
     }
 
@@ -3178,8 +5012,17 @@ mod test {
     #[test]
     fn price_mode_resolves_from_historical_reflector_price() {
         let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
-        let reflector = MockReflectorClient::new(&f.env, &f.reflector_id);
-        reflector.set_price(&2_500_i128, &1_999_u64);
+        let reflector = Sep40MockClient::new(&f.env, &f.reflector_id);
+        reflector.set_history(
+            &OracleAsset::Other(Symbol::new(&f.env, "XLM")),
+            &Vec::from_array(
+                &f.env,
+                [PriceData {
+                    price: 2_500,
+                    timestamp: 1_999,
+                }],
+            ),
+        );
 
         let ResolutionSpec::Price(spec) = f.spec.clone() else {
             unreachable!()
@@ -3190,7 +5033,7 @@ mod test {
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -3219,7 +5062,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -3444,7 +5287,16 @@ mod test {
         let ResolutionSpec::Price(spec) = f.spec.clone() else {
             unreachable!()
         };
-        MockReflectorClient::new(&f.env, &f.reflector_id).set_price(&price, &price_timestamp);
+        Sep40MockClient::new(&f.env, &f.reflector_id).set_history(
+            &spec.asset,
+            &Vec::from_array(
+                &f.env,
+                [PriceData {
+                    price,
+                    timestamp: price_timestamp,
+                }],
+            ),
+        );
         f.resolver.register_price_spec(&f.market_id, &spec);
         f
     }
@@ -3503,7 +5355,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
@@ -3745,7 +5597,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4226,7 +6078,7 @@ mod test {
         open(&d);
         let treasury = d.f.market_core.get_config().treasury;
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
         assert_eq!(
             d.f.resolver.state(&d.f.market_id),
             ResolutionState::Finalized
@@ -4248,7 +6100,10 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_escrow(&d, 0);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -4308,7 +6163,10 @@ mod test {
         assert_eq!(status(&d), MarketStatus::Open);
         d.f.resolver
             .escalation_attest(&d.f.market_id, &d.members[2], &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
@@ -4461,7 +6319,7 @@ mod test {
                 },
             }])
             .settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     #[test]
@@ -4569,6 +6427,123 @@ mod test {
             .try_guardian_void_market(&f.market_id, &GuardianReason::UnrevealedSpec)
             .is_err());
         let _ = f.admin;
+    }
+
+    // ---- close-time-aware storage TTL (issue #16) --------------------------
+    //
+    // These helpers read back a live entry's remaining TTL so the tests can
+    // prove a tally/instance survives an idle gap longer than the fixed
+    // `BUMP_TO` (60-day) default and therefore needed the write-time
+    // `ttl::market_target` extension, not just `Self::persist`'s bump. After
+    // the `AttestedOutcome` migration (ADR 0003) the live tally is `CountV2`.
+
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    #[test]
+    fn signer_vote_entries_survive_dispute_period() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+
+        // 61 days of silence — past the old 60-day cap and past any default
+        // persistent TTL. Without the write-time extension the tally would be
+        // archived here and the second attest would read `Count` == 0.
+        advance_ledgers(&f.env, 61 * ttl::DAY_SECS);
+        let count_key = DataKey::CountV2(f.market_id, AttestedOutcome::No);
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &count_key) > 0,
+            "vote tally archived during the dispute period"
+        );
+
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
+        let count: Option<u32> = f.env.as_contract(&f.resolver_id, || {
+            f.env.storage().persistent().get(&count_key)
+        });
+        assert_eq!(count, Some(2), "tally silently reset after archival");
+
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + 200);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
+    }
+
+    #[test]
+    fn instance_survives_after_long_idle() {
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+
+        // 25 days idle drains the instance TTL below the 7-day threshold...
+        advance_ledgers(&f.env, 25 * ttl::DAY_SECS);
+        assert!(instance_ttl(&f.env, &f.resolver_id) < ttl::INSTANCE_THRESHOLD);
+
+        // ...and the next entrypoint call re-extends it.
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+    }
+
+    #[test]
+    fn bump_market_entries_skips_missing_keys() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &spec);
+
+        // Price and State exist; Signers, Proposal and both Counts do not.
+        // The sweep must skip absent keys — `extend_ttl` traps on them.
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::bump_market_entries(&f.env, f.market_id, 2_000);
+        });
+
+        let horizon_ledgers = (ttl::SETTLEMENT_HORIZON_SECS / ttl::LEDGER_SECS) as u32;
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::Price(f.market_id)) >= horizon_ledgers
+        );
+        assert!(
+            persistent_ttl(&f.env, &f.resolver_id, &DataKey::State(f.market_id)) >= horizon_ledgers
+        );
+        assert!(!f.env.as_contract(&f.resolver_id, || f
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::Signers(f.market_id))));
     }
 
     // ----- Invalid attestations (committee voids) -------------------------
@@ -4699,7 +6674,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -4818,7 +6793,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4920,6 +6895,8 @@ mod test {
 
     /// SEP-40 feed with bounded history: `price(ts)` returns the newest
     /// record at or before `ts`, but only among the last `retention` pushed.
+    /// Models Reflector's retention window (issue #26's snapshots work); the
+    /// record grid is 10 s.
     #[contract]
     struct RetentionReflector;
 
@@ -4937,6 +6914,29 @@ mod test {
 
         pub fn set_retention(env: Env, n: u32) {
             env.storage().instance().set(&1u32, &n);
+        }
+
+        pub fn decimals(env: Env) -> u32 {
+            let _ = env;
+            14
+        }
+
+        pub fn resolution(env: Env) -> u32 {
+            let _ = env;
+            10
+        }
+
+        pub fn lastprice(env: Env, _asset: OracleAsset) -> Option<PriceData> {
+            let history: Vec<PriceData> = env
+                .storage()
+                .instance()
+                .get(&0u32)
+                .unwrap_or(Vec::new(&env));
+            if history.is_empty() {
+                None
+            } else {
+                history.get(history.len() - 1)
+            }
         }
 
         pub fn price(env: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
@@ -5032,7 +7032,7 @@ mod test {
         assert!(last_price_resolution(&f).from_snapshot);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5054,13 +7054,16 @@ mod test {
     }
 
     #[test]
-    fn resolve_without_snapshot_after_retention_fails_price_unavailable() {
+    fn resolve_without_snapshot_after_retention_fails_stale() {
         let (f, feed) = retention_fixture();
         feed.push(&2_500, &2_000);
         age_out(&feed);
+        // Issue #26: the aligned lookup finds no record on the grid within
+        // `max_staleness`, so exhaustion is `StalePrice` (a live-but-empty
+        // window), not `PriceUnavailable` (which now means a trapping feed).
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
-            Err(Ok(Error::PriceUnavailable))
+            Err(Ok(Error::StalePrice))
         );
     }
 
@@ -5072,7 +7075,7 @@ mod test {
         let caller = Address::generate(&f.env);
         assert_eq!(
             f.resolver.try_snapshot_price(&f.market_id, &caller),
-            Err(Ok(Error::PriceUnavailable))
+            Err(Ok(Error::StalePrice))
         );
         assert_eq!(f.resolver.snapshot(&f.market_id), None);
     }
@@ -5192,7 +7195,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5347,7 +7350,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
         // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
         assert_eq!(
@@ -5356,7 +7362,10 @@ mod test {
             Err(Ok(Error::AlreadyFinalized))
         );
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
@@ -5376,7 +7385,10 @@ mod test {
         f.env.ledger().set_timestamp(2_000);
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
             Err(Ok(Error::AlreadyFinalized))
@@ -5477,7 +7489,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
@@ -5570,9 +7585,13 @@ mod test {
         f.market_core.accept_resolver();
 
         f.env.ledger().set_timestamp(2_000);
-        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core
+            .resolve(&f.market_id, &market_core::Outcome::No);
 
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
         // This resolver saw none of it: no votes, still "pending", and it
         // can no longer move the market (market-core rejects it as resolver).
         assert_eq!(
@@ -5588,7 +7607,10 @@ mod test {
         attest_both(&f, AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
     }
 
     /// Everything observable about market-core through a resolver scenario,
@@ -5602,25 +7624,31 @@ mod test {
         let mut t = std::vec::Vec::new();
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "quote {}",
-            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+            f.market_core
+                .quote_buy(&id, &market_core::Outcome::Yes, &(10 * one))
         ));
         t.push(format!(
             "buy {}",
             f.market_core
-                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+                .buy(&creator, &id, &market_core::Outcome::Yes, &(10 * one), &0)
         ));
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "sell {}",
-            f.market_core
-                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+            f.market_core.sell(
+                &creator,
+                &id,
+                &market_core::Outcome::Yes,
+                &(3 * one),
+                &(100 * one)
+            )
         ));
         t.push(format!(
             "pos {:?}",
@@ -5670,6 +7698,323 @@ mod test {
         model_trace_expire_blocked_by_valid_proposal,
         model_trace_admin_bypass_resolves_without_threshold,
     );
+
+    // ----- spec_kind / trade_status (#273) ----------------------------------
+
+    #[test]
+    fn spec_kind_none_before_reveal() {
+        // A market whose spec is committed to but not yet revealed.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        // An id that does not exist is also None, never a panic.
+        assert_eq!(f.resolver.spec_kind(&9_999), SpecKind::None);
+        let t = f.resolver.trade_status(&f.market_id);
+        assert_eq!(t.spec, SpecKind::None);
+        assert_eq!(t.state, ResolutionState::Unconfigured);
+        assert!(!t.open_proposal);
+        assert_eq!(t.close_time, 2_000);
+        assert_eq!(t.deadline, 2_000 + RESOLUTION_GRACE_SECS);
+    }
+
+    #[test]
+    fn trade_status_of_an_unknown_market_is_an_error_not_a_panic() {
+        let f = signer_fixture();
+        assert!(f.resolver.try_trade_status(&9_999).is_err());
+    }
+
+    #[test]
+    fn spec_kind_for_each_register_path() {
+        // Signers: state() moves to SignersPending on reveal.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Signers);
+
+        // Price: state() stays Unconfigured after the reveal, which is exactly
+        // why spec_kind exists.
+        let f = fixture(|env, r, _a, _b| ResolutionSpec::Price(price_spec(env, r)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::Unconfigured
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Price);
+
+        // Disputable.
+        let d = dispute_fixture(false);
+        assert_eq!(d.f.resolver.spec_kind(&d.f.market_id), SpecKind::Disputable);
+
+        // Weighted keys.
+        let w = weighted_fixture();
+        assert_eq!(w.resolver.spec_kind(&w.market_id), SpecKind::WeightedKeys);
+    }
+
+    #[test]
+    fn spec_kind_for_scaled_and_twap_paths() {
+        let (f, cfg) = scaled_fixture_at(2_000, |env, reflector, _a, _b| ScaledPriceConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            threshold: 2_000,
+            threshold_decimals: 7,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_scaled_price_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::ScaledPrice);
+
+        let (f, cfg) = twap_fixture(|env, reflector, _a, _b| {
+            twap_price_spec(env, reflector, 2_000, PriceDirection::Above, 30, 2, 10)
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_twap_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Twap);
+    }
+
+    #[test]
+    fn spec_kind_for_hybrid_and_committee_paths() {
+        // Hybrid, revealed through the V2 envelope. The kind survives the
+        // fallback opening (the Hybrid entry is never removed).
+        let salt = [5u8; 32];
+        let f = v2_fixture(salt, |env, r, a, b| {
+            ResolutionSpec::Hybrid(HybridConfig {
+                price: price_spec(env, r),
+                fallback: signer_spec(env, a, b),
+                fallback_after: 100,
+            })
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Hybrid);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::HybridPricePending
+        );
+        assert_eq!(
+            f.resolver.trade_status(&f.market_id).state,
+            ResolutionState::HybridPricePending
+        );
+
+        // Committee: the market commits to a reusable committee registry entry.
+        let salt = [6u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 0,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        let id = f
+            .resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        assert_eq!(id, 0, "the fixture committed to the first committee id");
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Committee);
+    }
+
+    #[test]
+    fn trade_status_reports_open_proposal_and_dispute() {
+        let d = dispute_fixture(false);
+        // dispute_fixture leaves a pending proposal (signers attested at 2_000).
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.spec, SpecKind::Disputable);
+        assert_eq!(t.state, ResolutionState::SignersPending);
+        assert!(t.open_proposal);
+        // A dispute moves the state to Disputed; the proposal stays pending.
+        open(&d);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Disputed);
+        assert!(t.open_proposal);
+        // After the ruling the market is final.
+        d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Finalized);
+    }
+
+    // ── #297: committee epoch binding tests ──────────────────────────────────
+
+    /// Helper: builds a committee market fixture with given members and
+    /// threshold, advances time to close, and returns the fixture plus members.
+    fn committee_market(
+        member_count: u32,
+        threshold: u32,
+        max_rotation_delta: u32,
+    ) -> (Fixture, std::vec::Vec<Address>) {
+        let members_cell = std::cell::RefCell::new(std::vec::Vec::new());
+        let f = fixture(|env, _r, _a, _b| {
+            let list: std::vec::Vec<Address> =
+                (0..member_count).map(|_| Address::generate(env)).collect();
+            members_cell.borrow_mut().extend(list.iter().cloned());
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            })
+        });
+        let members: std::vec::Vec<Address> = members_cell.into_inner();
+        let member_vec = Vec::from_slice(&f.env, &members);
+        f.resolver
+            .create_committee(&f.admin, &member_vec, &threshold, &MIN_ROTATION_DELAY);
+        f.resolver
+            .register_committee_spec(&f.market_id, &CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            });
+        (f, members)
+    }
+
+    #[test]
+    fn rotation_after_attestations_does_not_drop_quorum() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &members[0].clone(), &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &members[1].clone(), &AttestedOutcome::Yes);
+
+        let pin = f.resolver.market_committee_epoch(&f.market_id);
+        assert!(pin.is_some());
+        assert_eq!(pin.unwrap().1, 1u32);
+
+        let new_members = Vec::from_array(&f.env, [members[1].clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        // finalize_signers should still succeed — old members' votes count.
+        f.env.ledger().set_timestamp(2_000 + 200);
+        f.resolver.finalize_signers(&f.market_id);
+    }
+
+    #[test]
+    fn rotation_after_close_new_members_cannot_attest() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+
+        let new_member = Address::generate(&f.env);
+        let new_members = Vec::from_array(&f.env, [new_member.clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver.pin_committee_epoch(&f.market_id);
+        let pin = f.resolver.market_committee_epoch(&f.market_id).unwrap();
+        assert_eq!(pin.1, 1u32, "should pin to epoch 1 (in force at close)");
+
+        f.env.ledger().set_timestamp(2_000 + 10);
+        let result = f
+            .resolver
+            .try_attest(&f.market_id, &new_member, &AttestedOutcome::Yes);
+        assert_eq!(result, Err(Ok(Error::NotSigner)));
+    }
+
+    #[test]
+    fn pin_committee_epoch_is_idempotent() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        let first = f.resolver.pin_committee_epoch(&f.market_id);
+        let second = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(first.1, second.1);
+    }
+
+    #[test]
+    fn pin_committee_epoch_rejects_before_close() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(1_000);
+        let result = f.resolver.try_pin_committee_epoch(&f.market_id);
+        assert_eq!(result, Err(Ok(Error::MarketNotClosed)));
+    }
+
+    #[test]
+    fn committee_members_at_returns_snapshot() {
+        let (f, _members) = committee_market(3, 2, 1);
+        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1);
+        assert_eq!(threshold, 2);
+        assert_eq!(returned_members.len(), 3);
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_committee_exists() {
+        let salt = [9u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 99,
+                min_epoch: 1,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::CommitteeNotFound)));
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_max_rotation_delta_bound() {
+        let salt = [10u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta: 99,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        f.resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)));
+    }
+
+    #[test]
+    fn legacy_committee_without_epoch_start_pins_epoch_1() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.storage()
+            .persistent()
+            .remove(&DataKey::EpochStart(0, 1));
+        f.env.ledger().set_timestamp(2_000);
+        let pinned = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(pinned.1, 1u32);
+    }
 }
 
 #[cfg(test)]
@@ -5698,18 +8043,30 @@ mod shared_types {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
         for (shared, imported) in [
-            (oracledesk_types::Category::Crypto, market_core::Category::Crypto),
-            (oracledesk_types::Category::Macro, market_core::Category::Macro),
+            (
+                oracledesk_types::Category::Crypto,
+                market_core::Category::Crypto,
+            ),
+            (
+                oracledesk_types::Category::Macro,
+                market_core::Category::Macro,
+            ),
             (
                 oracledesk_types::Category::Geopolitics,
                 market_core::Category::Geopolitics,
             ),
-            (oracledesk_types::Category::Sports, market_core::Category::Sports),
+            (
+                oracledesk_types::Category::Sports,
+                market_core::Category::Sports,
+            ),
             (
                 oracledesk_types::Category::Culture,
                 market_core::Category::Culture,
             ),
-            (oracledesk_types::Category::Other, market_core::Category::Other),
+            (
+                oracledesk_types::Category::Other,
+                market_core::Category::Other,
+            ),
         ] {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
@@ -5732,6 +8089,8 @@ mod shared_types {
 #[cfg(test)]
 mod golden {
     use super::*;
+    use crate::test::{fixture_at, Fixture};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use std::{format, string::String};
 
     const G1: &str = "GBAKBHXK7SV7C3HGY3DDYB4QWUEGL52SEF6OO77LAD672JVXD4QCYJLF";
@@ -5801,7 +8160,10 @@ mod golden {
         let env = Env::default();
         let declared = hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600));
         let canonical = hex_of(&env, &signers(&env, &[G3, G1, G2], 2, 3_600));
-        assert_eq!(declared, "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee");
+        assert_eq!(
+            declared,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
         assert_ne!(declared, canonical);
     }
 
@@ -5990,5 +8352,233 @@ mod golden {
         let a = DeclaredAlphabetically { alpha: 1, beta: 2 }.to_xdr(&env);
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #133: deployable SEP-40 test-oracle integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oracle_asset_xdr_matches_test_oracle_asset() {
+        let env = Env::default();
+        let sym = Symbol::new(&env, "XLM");
+        let addr = Address::generate(&env);
+
+        assert_eq!(
+            OracleAsset::Other(sym.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Other(sym).to_xdr(&env),
+        );
+        assert_eq!(
+            OracleAsset::Stellar(addr.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Stellar(addr).to_xdr(&env),
+        );
+    }
+
+    #[test]
+    fn price_mode_resolves_with_sep40_test_oracle() {
+        // Off-boundary close_time (2_150) with resolution = 300 => slot = 2_100,
+        // staleness delta = 50 <= max_staleness (300).
+        let f = fixture_at(2_150, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 300,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        // Advance past close_time so both test-oracle's FutureTimestamp check
+        // and resolver's MarketNotClosed check pass.
+        f.env.ledger().set_timestamp(2_200);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let outcome = f.resolver.resolve_price(&f.market_id);
+        assert_eq!(outcome, Outcome::Yes);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes),
+        );
+    }
+
+    #[test]
+    fn price_mode_stale_when_staleness_below_resolution() {
+        // Off-boundary close_time (2_250) with resolution = 300 => aligned slot
+        // is 2_100 (delta = 150s), which exceeds max_staleness = 60s.
+        let f = fixture_at(2_250, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 60,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        f.env.ledger().set_timestamp(2_300);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+        assert_eq!(err.unwrap(), Error::StalePrice);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-40 oracle suite
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_oracle, OracleKind};
+        use adversarial_mocks::{BudgetBurnerOracleClient, ExtremeOracleClient};
+        use soroban_sdk::testutils::Ledger as _;
+
+        fn setup_oracle_fixture(kind: OracleKind) -> (Fixture, Address) {
+            let f = fixture_at(2_100, |env, _, _, _| {
+                let oracle_id = deploy_oracle(env, kind);
+                ResolutionSpec::Price(PriceConfig {
+                    reflector: oracle_id,
+                    asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                    threshold: 2_000,
+                    direction: PriceDirection::Above,
+                    max_staleness: 300,
+                })
+            });
+            let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+                unreachable!()
+            };
+            f.resolver.register_price_spec(&f.market_id, &cfg);
+            f.env.ledger().set_timestamp(2_200);
+            let oracle_id = cfg.reflector.clone();
+            (f, oracle_id)
+        }
+
+        #[test]
+        fn adversarial_resolve_price_rejects_zero_and_negative_price() {
+            for bad_price in [0_i128, -1_i128, i128::MIN] {
+                let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+                ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&bad_price);
+                let state_before = f.resolver.state(&f.market_id);
+                let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+                assert_eq!(err.unwrap(), Error::InvalidPrice);
+                assert_eq!(f.resolver.state(&f.market_id), state_before);
+                assert_eq!(state_before, ResolutionState::Unconfigured);
+            }
+        }
+
+        #[test]
+        fn adversarial_resolve_price_extreme_positive_price_tolerated() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+            ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&i128::MAX);
+            let outcome = f.resolver.resolve_price(&f.market_id);
+            assert_eq!(outcome, Outcome::Yes);
+        }
+
+        #[test]
+        fn adversarial_future_dated_price_is_stale() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Future);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_none_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::None);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_resolve_price_with_panic_oracle_keeps_state_unconfigured() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Panic);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+            assert_eq!(state_before, ResolutionState::Unconfigured);
+        }
+
+        #[test]
+        fn adversarial_budget_burner_oracle_reverts_cleanly() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::BudgetBurner);
+            BudgetBurnerOracleClient::new(&f.env, &oracle_id).set_iterations(&50_000);
+            let state_before = f.resolver.state(&f.market_id);
+            f.env.cost_estimate().budget().reset_default();
+            assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_wrong_shape_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::WrongShape);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_guardian_void_succeeds_after_oracle_failure() {
+            for kind in [
+                OracleKind::Extreme,
+                OracleKind::Future,
+                OracleKind::None,
+                OracleKind::Panic,
+                OracleKind::WrongShape,
+            ] {
+                let (f, oracle_id) = setup_oracle_fixture(kind);
+                if kind == OracleKind::Extreme {
+                    ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&0);
+                }
+                assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+                // Advance past close_time + ORACLE_GRACE_SECS so guardian escape hatch opens.
+                f.env.ledger().set_timestamp(2_100 + ORACLE_GRACE_SECS + 1);
+                f.resolver
+                    .guardian_void_market(&f.market_id, &GuardianReason::OracleUnavailable);
+                assert_eq!(
+                    f.market_core.get_market(&f.market_id).status,
+                    market_core::MarketStatus::Void,
+                );
+                assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+            }
+        }
     }
 }

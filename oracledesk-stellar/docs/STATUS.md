@@ -119,7 +119,7 @@ market-creation risk controls (#47), and Blend lending integration with JIT liqu
 are implemented on `feat/issues-45-46-47-48`.
 Key additions:
 - **Permissionless settlement (#45)**: `settle_market(caller, market_id)` allows anyone to settle resolved markets, recovering positions and LP remainders without hot agent keys. Graceful error handling for `market_core` errors (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`). Emits `MarketSettled`.
-- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
+- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and an automatic drawdown halt when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Since #272 a halt (`Mode::AgentsHalted`) stops agent openings only and is cleared by `resume_agents()`; see the operating-mode state machine below.
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
@@ -293,18 +293,23 @@ anywhere under `oracledesk-stellar/`.
 
 ## Blocked / not attempted
 
-- **Reflector (SEP-40) price-mode resolution on live testnet**: `resolver`'s
-  `PriceThreshold` mode is implemented and unit-tested (with a mock
-  reflector), but no real testnet Reflector contract address was used
-  anywhere — there was no way to look one up and verify it against
-  Reflector's own current docs in this session (no browsing tool was
-  used for this). The demo uses **signer mode** instead, which needs no
-  external oracle. See `docs/wave-issues/05-reflector-feed-discovery.md`.
-- **A real testnet USDC issuer** (e.g. Circle's): not used. `scripts/
-  deploy-testnet.sh` deploys a **self-issued** test "USDC" (a real SEP-41
-  Stellar Asset Contract, 7 decimals, matching the design doc) rather than
-  guessing at a real issuer's address. This is called out as a
-  `TODO(maintainer)` in `scripts/deploy-testnet.sh` and `.env.example`.
+- **Reflector (SEP-40) price-mode resolution on live testnet**: `contracts/test-oracle`
+  is now a workspace member implementing the full SEP-40 read interface with
+  resolution-slot alignment and retention pruning (see `docs/test-oracle.md`).
+  `resolver` price-mode tests execute against the real `test-oracle` contract,
+  `deploy-testnet.sh` deploys `test-oracle` on testnet/local only, and
+  `MODE=price ./scripts/demo.sh` exercises the full commit -> reveal -> aligned
+  `set_price` -> `resolve_price` -> trace flow. Production Reflector testnet
+  feed discovery remains tracked in `docs/wave-issues/05-reflector-feed-discovery.md`.
+- **A real testnet USDC issuer** (Circle's): `scripts/deploy-testnet.sh` now
+  supports `COLLATERAL_MODE=existing` with
+  `COLLATERAL_ASSET=USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+  (verified against Circle's official testnet docs — see `docs/collateral.md`),
+  including pre-deploy SAC verification (`decimals == 7`), Horizon issuer flag
+  checks, idempotent G-account trustlines, `deposit`-based treasury funding and
+  `FORCE_REDEPLOY=1` switch protection. Default remains `COLLATERAL_MODE=self-issued`
+  so zero-faucet local/demo runs still work; live Circle faucet `make demo`
+  execution requires interactive faucet funding.
 - **Actually buying a trace through x402** (payment settlement via a real
   facilitator): not attempted. No x402-on-Stellar facilitator URL is known
   or hardcoded anywhere in this repo; finding and verifying one needs
@@ -359,9 +364,11 @@ markers in the files themselves:
 - `CODE_OF_CONDUCT.md` — a direct contact channel alongside GitHub's
   security-advisory reporting path, if wanted.
 - `CONTRIBUTING.md` — an expected PR review turnaround.
-- `scripts/deploy-testnet.sh` / `.env.example` — whether to switch the
-  testnet collateral token from the self-issued test USDC to Circle's real
-  testnet USDC issuer (needs verifying their current testnet address).
+- `scripts/deploy-testnet.sh` / `.env.example` — Circle's official Stellar
+  testnet USDC issuer (`GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`,
+  verified 2026-11-19) is now supported via `COLLATERAL_MODE=existing` (see
+  `docs/collateral.md`); switching the default testnet deployment remains a
+  maintainer decision (requires faucet funding and `FORCE_REDEPLOY=1`).
 - `.env.example` — the x402-on-Stellar facilitator URL to use for real
   payment settlement (none is hardcoded or guessed anywhere in this repo).
 
@@ -378,6 +385,32 @@ markers in the files themselves:
   risk, not systemic market behavior. `agents/sim` now quantifies this
   (see `docs/simulation.md`, experiment B): with k identical deployments,
   capital at risk grows linearly in k while total profit does not.
+- **Unredeemed shares expire after the redemption window.** Each market
+  snapshots a redemption horizon at creation (default 365 days; the admin
+  default is bounded to 180–1825 days). Once `finalized_at + horizon_secs`
+  has passed, anyone can call `finalize_market`, which sweeps the market's
+  **entire** remaining balance — expired user claims, void rounding dust,
+  any unclaimed LP remainder and accrued fees — to the treasury and closes
+  redemption (`redeem`/`claim_pool_remainder` then revert with
+  `RedemptionClosed`). Redeeming before the deadline always pays the exact
+  `settle_value`; expired claims go to the treasury, not the LP. Markets
+  created before this `SettleState` bookkeeping (issue #14) have no deadline
+  and cannot be finalized (`NotSupported`), and stay redeemable through the
+  old paths. A market waiting on a multi-year deadline can be
+  TTL-archived before it is finalized and needs a restore (or the keeper,
+  `docs/wave-issues/14-storage-ttl-keeper.md`) first; the deadline itself is
+  on-chain state, so a late finalization is still exact.
+- **The TWAP ring keeps only the most recent 16 observations.** Each
+  observation is written per trade timestamp, so 16 distinct-timestamp trades
+  supersede the creation point: `observe`/`twap` windows that reach further
+  back than the surviving ring revert with `ObservationTooOld` rather than
+  returning a value. Windows that extend past the newest observation keep
+  averaging the last traded price (the accumulator extends
+  counterfactually), including past `close_time` until a resolver action.
+  `twap` divides with floor rounding; off-chain mirroring code must floor
+  identically. Markets created before the accumulator (issue #11) return
+  `NotSupported` from `observe`/`twap`/`price_cumulative`, and an archived
+  `Oracle`/`Obs` entry needs a restore like any other entry.
 - **Expiry cannot help an oracle the creator controls.** `expire_market`
   voids unresolvable markets 30 days after close, but a creator who commits
   to a feed they control can still decide the outcome of a *resolvable*
@@ -405,21 +438,27 @@ markers in the files themselves:
   (`--salt`), and `scripts/migrate-market-core-wiring.sh` upgrades a
   pre-handshake deployment.
 - **Multi-step flows are atomic through the router** (ADR 0009):
-  `create_and_reveal_{signers,price}`, `reveal_spec`, and
-  `buy_and_publish_trace`, so a market cannot exist without its rule and a
-  trade cannot drop its reasoning trace.
+  `create_and_reveal_{signers,price}`, `reveal_spec`,
+  `trade_and_publish_trace` and `agent_trade_and_publish_trace`, so a market
+  cannot exist without its rule and a trade cannot drop its reasoning trace.
+  Trades use `buy_v2`/`sell_v2` bounds, a typed `TraceAction`, and optional
+  chaining/signature; the treasury path verifies the supplied treasury is
+  wired to the configured market-core. `buy_and_publish_trace` is a deprecated
+  wrapper with a breaking `action: string` → `TraceAction` change (bindings
+  0.2.0). The router's vendored wasm is pinned, but its registry wasm is stale
+  (pre-#53), so dynamic publish calls need a current deployed registry.
 - **Residual admin blast radius.** The treasury's config, price policy and
   agent registry are timelocked (loosening waits `config_delay`, tightening
   is immediate), which bounds what a compromised admin can unlock for the
   *agents*; it does not cover `set_paused`, `set_successor` +
-  `migrate_market` (which moves positions out of the vault), or any other
+  `migrate_markets` (which moves positions out of the vault), or any other
   contract's admin. Under the deferred timelock default (above) that
   exposure is still live on testnet.
 - **Treasury vault NAV is conservative, not mark-to-market.** Directional
   exposure in open markets counts as zero, so deposits are slightly cheap
   and withdrawals slightly expensive while positions are open; positions
   opened before a lazy migration from the pre-vault layout, or received by
-  a successor treasury via `migrate_market`, are not in the open-market
+  a successor treasury via `migrate_markets`, are not in the open-market
   index and count as zero until redeemed. See
   `docs/adr/0005-treasury-vault.md` for the residual risks (LP floor moved by
   rebalancing trades, fees swept just after a deposit).
@@ -474,3 +513,35 @@ The pinned x402 Stellar package declares Node >=22, so CI and the documented
 minimum now use Node 22. An additional isolated Node 20 smoke run passed the
 HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
 runtime target.
+
+## Treasury operating modes (#272)
+
+The treasury's four pause/drawdown booleans are replaced by an explicit state
+machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `Paused`,
+`Emergency`, plus the admin-set `Unwinding` from #150) and one gate table (`mode::allowed`), documented cell by cell in
+[ADR 0005](adr/0005-treasury-vault.md). What changed for operators:
+
+- A drawdown halt no longer opens `emergency_withdraw`. That exit needs an
+  explicit `declare_emergency`, which only works from an admin pause.
+- Admin pause and drawdown halt are independent: `unpause()` never clears a
+  halt, `resume_agents()` never clears a pause.
+- `resume_agents()` replaces `acknowledge_drawdown()` (now a no-op) plus the
+  unpause, and requires the window PnL to have recovered.
+- `close_trade` is refused while admin-paused (it is an agent reduction).
+- New events: `ModeChanged`. New views: `mode`, `mode_state`, `allowed`. New
+  errors: `EmergencyMode` (83), `NotRecovered` (84). `set_mode` and
+  `set_paused` stay as compatibility entrypoints over the same state.
+- The mode x entrypoint matrix is an in-crate test (`mode_by_entrypoint_matrix`)
+  that fails when a new entrypoint has no row.
+
+## Contributor addendum: declarative testnet deployer (#128)
+
+Added `scripts/deployer/` and `deployments/testnet.manifest.json` providing
+declarative `plan`, `apply`, `verify`, and `migrate-record` workflows against
+live Stellar testnet state, with atomic v2 record checkpointing (preserving all
+v1 top-level keys for `loadDeployments()`, `seed-market.sh`, and `demo.sh`),
+drift and testnet-reset detection, archived-instance restoration, and a hard
+testnet passphrase interlock. `scripts/deploy-testnet.sh` delegates testnet
+runs to the deployer while keeping `NETWORK=local` intact for local E2E runs.
+Verified locally via `scripts/deployer` unit tests (`plan.test.ts` and
+`record.test.ts`). Live testnet apply was not re-run in this session.

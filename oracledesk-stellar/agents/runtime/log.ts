@@ -1,5 +1,7 @@
 /** One structured JSON log line per event (`{ts, level, event, ...fields}`). */
 
+import { redact } from "../core/redact.js";
+
 export type LogFields = Record<string, unknown>;
 
 export interface Logger {
@@ -10,10 +12,14 @@ export interface Logger {
 
 const replacer = (_k: string, v: unknown) =>
   typeof v === "bigint" ? v.toString() : v instanceof Error ? { name: v.name, message: v.message } : v;
+const safeReplacer = (key: string, value: unknown) => {
+  const normalized = replacer(key, value);
+  return redact({ [key]: normalized })[key];
+};
 
 export function jsonLogger(write: (line: string) => void = (l) => console.log(l), base: LogFields = {}): Logger {
   const emit = (level: string) => (event: string, fields: LogFields = {}) =>
-    write(JSON.stringify({ ts: new Date().toISOString(), level, event, ...base, ...fields }, replacer));
+    write(JSON.stringify({ ts: new Date().toISOString(), level, event, ...base, ...fields }, safeReplacer));
   return { info: emit("info"), warn: emit("warn"), error: emit("error") };
 }
 

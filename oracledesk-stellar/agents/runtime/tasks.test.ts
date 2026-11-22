@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { DueDiligenceVerdict } from "../core/due-diligence.js";
 import type { MarketSignal } from "../core/strategy.js";
 import type { TraceStore } from "../core/trace.js";
 import { NoLease } from "./lease.js";
@@ -7,12 +8,24 @@ import { MarketLocks } from "./locks.js";
 import { memoryLogger } from "./log.js";
 import { Runtime, type Task } from "./runtime.js";
 import { MemoryStateStore } from "./state.js";
-import { makerTask, SIGNALS, type MakerDeps } from "./tasks/maker.js";
+import { makerTask, signalId, SIGNALS, type MakerDeps } from "./tasks/maker.js";
 import { TRACES, type PendingTrace } from "./tasks/traces.js";
 import { traderTask, type TraderCandidate, type TraderDeps } from "./tasks/trader.js";
 
 const TREASURY = "CTREASURY";
 const traceStore: TraceStore = { put: async (hash) => ({ cid: `local://${hash}` }) };
+const approved = (marketId: string): DueDiligenceVerdict => ({
+  outcome: "allow",
+  reasons: [],
+  commitments: "verified",
+  metadata: "verified",
+  resolutionPath: "verified",
+  oracleTrust: "not_applicable",
+  signerTrust: "not_applicable",
+  marketId,
+  stateFingerprint: "fixture-state",
+  checkedAt: Date.now(),
+});
 
 async function once(state: MemoryStateStore, task: Task) {
   const rt = new Runtime({
@@ -46,6 +59,7 @@ function traderDeps(adapter: TraderDeps["adapter"], candidates: TraderCandidate[
     adapter,
     traceStore,
     candidates: async () => candidates,
+    dueDiligence: async (marketId) => approved(marketId.toString()),
     treasury: TREASURY,
     minEdgeBps: 500,
     tradeSizeStroops: 100_000_000n,
@@ -111,6 +125,8 @@ function makerDeps(calls: string[], state: MemoryStateStore, mode: "live" | "dry
     traceStore,
     signals: { name: "fixture", poll: async () => [signal] },
     knownQuestionHashes: async () => new Set(),
+    validateProposal: async (signal, question) =>
+      approved(signalId(signal.source, signal.observedAt, question)),
     reveal: async (id) => void calls.push(`reveal(${id})`),
     confidenceThresholdBps: 1_000,
     defaultSeedStroops: 1_500_000_000n,

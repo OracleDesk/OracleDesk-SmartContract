@@ -166,3 +166,10 @@ jobs:
           npm install
           npm run build
           npm test
+
+      - name: governance CLI — install, typecheck, test
+        run: |
+          cd scripts/governance
+          npm install
+          npm run build
+          npm test

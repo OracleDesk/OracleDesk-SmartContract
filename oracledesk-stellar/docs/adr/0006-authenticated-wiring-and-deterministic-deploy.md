@@ -78,3 +78,18 @@ against an already-authenticated deployment is a no-op.
   market-core is born pointing at the real contracts.
 - A stale `deployments/testnet.json` from before this change no longer
   suffices; the migration script (or a redeploy) is required.
+
+## Formal model
+
+The wiring handshake is model-checked in
+[`docs/formal/governance.tla`](../formal/README.md#governance-model). The model
+found that the handshake as written **cannot complete for a contract peer**
+(finding G1): `Resolver::accept_market_core_role` calls `accept_resolver`, which
+calls back into the resolver for `market_core()`, and Soroban rejects that
+re-entry with `Error(Context, InvalidAction)` (replayed against real wasm by
+`model_trace_wiring_callback_reenters`). The treasury has no
+`accept_market_core_role` at all. The model validates the repair: market-core
+drops the callback and relies on `pending.require_auth()`, while the peer
+asserts its own `market_core()` before calling (`WIRING_MODE = "PeerAsserts"`).
+It also found that `PendingResolver` / `PendingTreasury` never expire (G3).
+These are findings, not fixes: no contract behaviour changed.
