@@ -24,7 +24,7 @@
 //!   so the emergency key cannot become an instant admin.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, Env, Symbol,
     TryFromVal, Val, Vec,
 };
 
@@ -32,11 +32,20 @@ const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
 /// Shortest delay anyone can configure (1 day).
+#[cfg(not(feature = "local-short-windows"))]
 pub const MIN_DELAY: u64 = 86_400;
+#[cfg(feature = "local-short-windows")]
+pub const MIN_DELAY: u64 = 30;
 /// Longest delay anyone can configure (30 days).
 pub const MAX_DELAY: u64 = 30 * 86_400;
 /// How long after `eta` a scheduled operation stays executable (7 days).
+#[cfg(not(feature = "local-short-windows"))]
 pub const EXECUTION_GRACE: u64 = 7 * 86_400;
+#[cfg(feature = "local-short-windows")]
+pub const EXECUTION_GRACE: u64 = 30;
+
+#[cfg(feature = "local-short-windows")]
+soroban_sdk::contractmeta!(key = "oracledesk_build", val = "local-short-windows");
 /// How long a pending admin proposal stays acceptable.
 pub const ADMIN_TRANSFER_TTL: u64 = 7 * 24 * 60 * 60;
 
@@ -180,6 +189,14 @@ impl Timelock {
         emergency: Option<Address>,
         default_delay: u64,
     ) {
+        #[cfg(feature = "local-short-windows")]
+        {
+            let standalone =
+                env.crypto().sha256(&Bytes::from_slice(&env, b"Standalone Network ; February 2017"));
+            if env.ledger().network_id() != standalone.to_bytes() {
+                soroban_sdk::panic_with_error!(&env, Error::InvalidConfig);
+            }
+        }
         if !(MIN_DELAY..=MAX_DELAY).contains(&default_delay) {
             soroban_sdk::panic_with_error!(&env, Error::InvalidConfig);
         }

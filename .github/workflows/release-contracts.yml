@@ -1,0 +1,117 @@
+name: Release Attested Contract WASM
+
+on:
+  push:
+    tags:
+      - 'contracts-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag override for dry-run verification (leaves GitHub release skipped unless pushed via tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build reproducible contract WASM (primary)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Build pinned contract build image
+        run: |
+          docker build \
+            -f oracledesk-stellar/docker/contracts-build.Dockerfile \
+            -t oracledesk-contracts-build:primary \
+            oracledesk-stellar
+
+      - name: Run reproducible release build inside pinned container
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace/oracledesk-stellar \
+            -e ORACLEDESK_SOURCE_REV="${GITHUB_SHA}" \
+            oracledesk-contracts-build:primary \
+            ./scripts/build-release.sh --out-dir dist --source-rev "${GITHUB_SHA}"
+
+      - name: Upload primary release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: contract-release-primary
+          path: oracledesk-stellar/dist/*
+          if-no-files-found: error
+
+  rebuild-check:
+    name: Independent rebuild & bit-for-bit SHA256SUMS diff
+    runs-on: ubuntu-22.04
+    needs: [build]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download primary release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: contract-release-primary
+          path: primary-dist
+
+      - name: Build pinned contract build image independently
+        run: |
+          docker build --no-cache \
+            -f oracledesk-stellar/docker/contracts-build.Dockerfile \
+            -t oracledesk-contracts-build:verify \
+            oracledesk-stellar
+
+      - name: Rebuild in a distinct workspace path and compare SHA256SUMS
+        run: |
+          docker run --rm \
+            -v "${PWD}:/alt-workspace" \
+            -w /alt-workspace/oracledesk-stellar \
+            -e ORACLEDESK_SOURCE_REV="${GITHUB_SHA}" \
+            oracledesk-contracts-build:verify \
+            ./scripts/build-release.sh --out-dir dist-verify --source-rev "${GITHUB_SHA}"
+          diff -u primary-dist/SHA256SUMS oracledesk-stellar/dist-verify/SHA256SUMS
+
+  release:
+    name: Attest SLSA provenance & publish GitHub release
+    needs: [build, rebuild-check]
+    runs-on: ubuntu-latest
+    # Least privilege: id-token and attestations permissions are scoped ONLY to this job.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: contract-release-primary
+          path: dist
+
+      - name: Verify SHA256SUMS integrity
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+
+      - name: Generate SLSA build provenance attestations for all WASM artifacts
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: 'dist/*.wasm'
+
+      - name: Publish GitHub Release on contracts-v* tag
+        if: startsWith(github.ref, 'refs/tags/contracts-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" dist/* \
+            --title "Contracts ${TAG}" \
+            --notes "Reproducible, SLSA-attested Soroban contract WASM release for commit ${GITHUB_SHA}. Verify any deployed contract with \`./oracledesk-stellar/scripts/verify-release.sh <contract-id> ${TAG}\`."

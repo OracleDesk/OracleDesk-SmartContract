@@ -1,0 +1,3432 @@
+{
+  "schema": 1,
+  "contract": "market-core",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Runs atomically at deploy time, so nobody can front-run initialization. `protocol_fee_share_bps` is the default protocol/LP split for new markets; 10_000 keeps the whole fee with the protocol (pre-upgrade behaviour). Pass 0 to give all fees to the market creators.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "treasury",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "default_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "protocol_fee_share_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "accept_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "accept_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "accept_treasury": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "accept_treasury",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "breaker_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The market's snapshotted breakers (`None` for legacy markets created before breakers existed — those are never checked).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "breaker_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "option": {
+                  "value_type": {
+                    "udt": {
+                      "name": "BreakerConfig"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "breaker_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The current ledger's band reference, if a band check has run this ledger. `None` means the next trade sets the reference (to its own pre-trade price, which equals the ledger-open price).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "breaker_state",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "option": {
+                  "value_type": {
+                    "udt": {
+                      "name": "BandState"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "buy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Spend `collateral_in` to buy `outcome` shares. Returns shares received. Reverts if fewer than `min_shares_out` would be received. Legacy entrypoint: no deadline and no limit price, so a signed bound can execute at any later time. Prefer `buy_v2`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "buy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "buy_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`buy` plus a deadline (`env.ledger().timestamp()` seconds — network time, not the client clock) and an average-price limit (`limit_price_bps` per share, 1.0 = BPS; 0 = no limit). The average price includes the fee (`fee` is part of `collateral_in`) and, for a NO buy, is compared against the NO price. Because the deadline check runs before `require_auth`, an expired transaction fails cheaply. A limit above BPS can never pass for a buy and is rejected as invalid.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          }
+        ],
+        "name": "buy_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_admin_transfer": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_admin_transfer",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "claim_lp_fees": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The creator (the LP) claims their share of accrued trade fees at any time, including before finality. Returns the amount claimed (0 when nothing is pending, mirroring `sweep_fees`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_lp_fees",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "claim_pool_remainder": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creator (the LP) withdraws whatever the pool still holds once final, plus any unclaimed LP fees. Returns the total paid out.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_pool_remainder",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "claim_pool_remainders": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the LP pool remainder for up to `MAX_BATCH` markets the `creator` owns, with one collateral transfer. Same ordering and skip semantics as `redeem_many`. A market closed by `finalize_market` reports `AlreadyClaimed` — the sweep already took the remainder.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "claim_pool_remainders",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "create_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a market and seeds the pool. `creator` becomes the sole LP. `initial_yes_bps` in [100, 9900] sets the opening YES probability; the creator receives the leftover shares of the likelier outcome.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "create_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "finalize_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Permissionless close-out of a final market after its redemption deadline. Sweeps the market's entire remaining balance — value reserved for shares never redeemed, an unclaimed LP remainder, per-holder rounding dust and accrued fees — to the treasury, and marks the market closed so nothing can ever pay out again. The deadline is `redeem_deadline(market_id)` = `finalized_at + horizon_secs`, the horizon being snapshotted at creation from the admin default. Anyone who redeems before the deadline is paid the exact `settle_value` they would have received without this call; only shares still unredeemed at the deadline are forfeit, and their value goes to the treasury rather than the LP so the LP cannot profit from suppressing redemptions. Returns the amount swept. The swept total is exactly the market's contract balance: sets plus fees minus everything already paid out.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "get_config": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Config"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Market"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          }
+        ],
+        "name": "get_position",
+        "outputs": [
+          {
+            "udt": {
+              "name": "Position"
+            }
+          }
+        ]
+      }
+    },
+    "get_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "name": "get_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "market_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "market_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "max_batch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Largest accepted `market_ids` length for `redeem_many` / `claim_pool_remainders`. Frontends should chunk work into strictly ascending batches of at most this size (see `docs/frontend-integration.md`).",
+        "inputs": [],
+        "name": "max_batch",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "observe": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cumulative YES-price-seconds as of `now - seconds_ago`. The accumulator is piecewise linear in time (the price only moves when a trade lands), so between observations the value is interpolated along the chord, and times after the last trade extrapolate at the last traded price. Fails with `ObservationTooOld` when `seconds_ago` reaches before the oldest surviving observation (the ring keeps the most recent 16), and with `NotSupported` for markets created before the accumulator existed. A missing (archived) ring slot is skipped, never a panic.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seconds_ago",
+            "type_": "u64"
+          }
+        ],
+        "name": "observe",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "pending_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The pending admin proposal, including its expiry, if one exists.",
+        "inputs": [],
+        "name": "pending_admin",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingAdmin"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "price_cumulative": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cumulative `price_bps * seconds` for YES since creation, extrapolated to now: `observe(market_id, 0)`. Ready-made for consumers that store their own checkpoints and compute TWAPs off-chain.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "price_cumulative",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "propose_admin": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Starts a two-step handover of the admin role. The new admin must call `accept_admin` itself, so a typo cannot hand control to an address nobody holds.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "propose_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "propose_treasury": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Affects markets created after the call and the legacy fallback in `sweep_fees`. Markets with a snapshotted `FeeTerms` keep paying their original recipient.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "treasury",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_treasury",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "quote_buy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Shares a `buy` of `collateral_in` would return right now.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "quote_buy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "quote_sell": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Shares a `sell` for exactly `collateral_out` would consume right now.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "quote_sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "redeem": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pays out `holder`'s position for a final market and clears it. Losing positions clear with a payout of 0.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "redeem",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_deadline": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Timestamp after which unredeemed shares are forfeit (see `finalize_market`). `None` while the market is still Open — its deadline is not known yet — and for legacy markets, which have no deadline and cannot be finalized.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "redeem_deadline",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_many": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Redeems `holder`'s positions across up to `MAX_BATCH` final markets with one collateral transfer. `market_ids` must be strictly ascending (`InvalidAmount` otherwise; empty or over-cap is `BatchTooLarge`) so the footprint is deterministic and duplicates are impossible. Markets that cannot pay do not abort the batch; they come back in `items` with a `SkipReason`. In particular an archived `Market` entry is NOT `NotFound` — the transaction fails at footprint time and the market must be restored first (simulation shows this before submission). `holder.require_auth()` covers the whole batch: the signed payload is the `market_ids` vector itself.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "redeem_many",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "resolve": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "name": "resolve",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "sell": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Receive exactly `collateral_out` by selling `outcome` shares. Returns shares sold. Reverts if more than `max_shares_in` would be needed. Clients turn \"sell N shares\" into `collateral_out` off-chain (see `math::calc_sell` docs) and add a slippage margin to `max_shares_in`. Legacy entrypoint: no deadline and no limit price. Prefer `sell_v2`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "sell_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`sell` plus a deadline (ledger timestamp, seconds) and a minimum average execution price (`limit_price_bps` per share, 1.0 = BPS). A zero limit is trivially satisfied for sells — unlike buys, where 0 means \"no limit\" — and a limit above BPS can never pass, so neither needs a special case. The average includes the fee, which the trader pays out of the gross.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          }
+        ],
+        "name": "sell_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "set_default_breaker": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the breaker defaults copied into markets created after the call. `band_bps < max_impact_bps` (both non-zero) is rejected: a single trade that is allowed by the impact cap could then never fit inside the band, locking trading.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "breaker",
+            "type_": {
+              "udt": {
+                "name": "BreakerConfig"
+              }
+            }
+          }
+        ],
+        "name": "set_default_breaker",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_default_fee_bps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Affects markets created after the call; existing markets keep their fee.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "fee_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_default_fee_bps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_default_redeem_horizon": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Affects markets created after the call; existing markets keep the horizon snapshotted at their creation. Must be within [180 days, 1825 days].",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_default_redeem_horizon",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_paused": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "name": "set_paused",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_protocol_fee_share_bps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Affects markets created after the call; existing markets keep the split they snapshotted at creation.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "share_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_protocol_fee_share_bps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "settle_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Outstanding-share accounting for a market (issue #14). `NotSupported` for markets created before this bookkeeping existed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "settle_state",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "SettleState"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "sweep_fees": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Anyone can move accrued protocol fees to the market's fee recipient. Sends to the recipient snapshotted in `FeeTerms` at creation. Markets created before `FeeTerms` existed have none and keep the legacy behaviour: the `DataKey::Treasury` of the moment of the sweep.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "sweep_fees",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "transfer_lp": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Transfers the single LP role (the right to `claim_pool_remainder` and `claim_lp_fees`) to `new_creator`. Only until the remainder has been claimed; after that the role has no remaining value.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "new_creator",
+            "type_": "address"
+          }
+        ],
+        "name": "transfer_lp",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "transfer_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Moves `amount` shares of `outcome` from `from` to `to`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "transfer_position",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "twap": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Time-weighted average YES price in bps over the trailing `window_secs`, floored. Rejects a zero window (`InvalidAmount`). A window reaching before the oldest observation fails with `ObservationTooOld`; a window extending past `close_time` keeps averaging the final price, because the accumulator only moves when trades are possible.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "window_secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "twap",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "void_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Invalid or unresolvable market. Allowed any time before finality.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "void_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "would_trip": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "True when a `buy` of `collateral_in` would be rejected by the market's breakers right now. Read-only: never writes band state, so on a fresh ledger the reference is taken as the current price — the same value a subsequent real trade would use.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "would_trip",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "bool"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "BandState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Temporary (one ledger) band reference for a market.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "ledger_seq",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "ref_price_bps",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "BandState"
+      }
+    },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One market's outcome inside a `BatchResult`, in request order.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "BatchItem"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Result of `redeem_many` / `claim_pool_remainders`: `total` is the single aggregated transfer, `items` has one entry per requested market in the same order.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "The market settled and paid `BatchItem::payout`.",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "The market was skipped; `BatchItem::payout` is 0.",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "Per-market result of a batch settlement. This union stands in for the `Option<SkipReason>` sketched in the issue: a `#[contracttype]` struct field of type `Option<CustomType>` does not compile under the `testutils` feature (on for every `cargo test` build). The derive emits an xdr conversion gated on `CustomType: Into<ScVal>`, but `#[contracttype]` enums only derive `TryFrom`, and the missing impls cannot be supplied from this crate: `From<Enum> for ScVal` collides with the derive's own `TryFrom` through core's blanket impl (E0119), and `TryFrom<&Option<Enum>> for ScVal` violates the orphan rule (E0117). The union carries the same information and surfaces as a discriminated union in the generated TS bindings.",
+        "lib": "",
+        "name": "BatchStatus"
+      }
+    },
+    "BreakerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-market circuit breakers, snapshotted at creation from `DataKey::DefaultBreaker`. 0 disables each check. A market without a `Breaker` entry (created before breakers existed) is never checked.",
+        "fields": [
+          {
+            "doc": "Maximum |post-price - ledger-open price| cumulative movement in bps.",
+            "name": "band_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Maximum |post-price - pre-price| a single trade may move in bps.",
+            "name": "max_impact_bps",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "BreakerConfig"
+      }
+    },
+    "Category": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Crypto"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Culture"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Geopolitics"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Macro"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Other"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sports"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Category"
+      }
+    },
+    "CommitteeRef": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Binds a market to a reusable committee registry subject to rotation bounds.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_rotation_delta",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "min_epoch",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CommitteeRef"
+      }
+    },
+    "Config": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "default_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "paused",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "protocol_fee_share_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "resolver",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "treasury",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "Config"
+      }
+    },
+    "DataKey": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Admin"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Band",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Breaker",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Collateral"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultBreaker"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultFeeBps"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "DefaultRedeemHorizon"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "FeeTerms",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "LpFees",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Market",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NextId"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Obs",
+              "type_": [
+                "u64",
+                "u32"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Oracle",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Paused"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingAdmin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingResolver"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "PendingTreasury"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Position",
+              "type_": [
+                "u64",
+                "address"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ProtocolFeeShareBps"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolver"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Settle",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Treasury"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "DataKey"
+      }
+    },
+    "DisputableSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Attested resolution whose proposal can be challenged with a bond during the dispute window. Hashed as `ResolutionSpec::SignersDisputable`, a separate variant, so existing `Signers` commitments are unaffected.",
+        "fields": [
+          {
+            "doc": "Collateral escrowed by `dispute`; must be positive.",
+            "name": "dispute_bond",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "escalation",
+            "type_": {
+              "udt": {
+                "name": "Escalation"
+              }
+            }
+          },
+          {
+            "doc": "Seconds after a dispute opens before anyone may void it unresolved.",
+            "name": "escalation_timeout",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "DisputableSignerConfig"
+      }
+    },
+    "Escalation": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "`k` of these members, through `escalation_attest`. Must be disjoint from the proposing signers.",
+              "name": "Committee",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "address"
+                  }
+                },
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The resolver admin, through `settle_dispute`.",
+              "name": "Guardian"
+            }
+          }
+        ],
+        "doc": "Who rules on a dispute.",
+        "lib": "",
+        "name": "Escalation"
+      }
+    },
+    "FeeTerms": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Fee destination and split, snapshotted per market at creation as a side entry (`DataKey::FeeTerms`) so `Market`'s XDR shape never changes. Markets created before this entry existed have no `FeeTerms` and keep the legacy behaviour: `sweep_fees` pays whatever `DataKey::Treasury` holds at sweep time, with the protocol keeping 100% of the fee. That fallback is documented in `sweep_fees` and makes the upgrade migration-free.",
+        "fields": [
+          {
+            "doc": "Protocol's share of each trade fee in bps; the rest is the LP's. 0..=BPS. At BPS (the default) the split is exactly today's behaviour.",
+            "name": "protocol_share_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Where the protocol's fee share is swept. Frozen at creation: later `set_treasury` calls never redirect fees already earned.",
+            "name": "recipient",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "FeeTerms"
+      }
+    },
+    "HybridConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Dual-path resolution mode: price feed first, falling back to signers.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "SignerConfig"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfig"
+      }
+    },
+    "Market": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "Unix seconds (ledger timestamp). Trading stops at this time.",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "Snapshot of the fee at creation so later config changes never move it.",
+            "name": "fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Trading fees waiting for `sweep_fees`.",
+            "name": "fees_accrued",
+            "type_": "i128"
+          },
+          {
+            "doc": "Creator has withdrawn the pool remainder after finality.",
+            "name": "lp_claimed",
+            "type_": "bool"
+          },
+          {
+            "doc": "IPFS CID / URI of the question metadata.",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "sha256 of the canonical question JSON stored off-chain (IPFS), so a client can prove the text it shows is the text that was committed.",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "reserve_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "reserve_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "Commitment to how this market will be resolved, fixed at creation so the creator cannot pick favorable resolution rules after seeing trading activity. The resolver contract verifies a revealed spec against this hash before configuring itself for the market. See `docs/adr/0001-resolution-commitment.md`.",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "Complete sets in existence == collateral locked for this market.",
+            "name": "sets_minted",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "MarketStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "Market"
+      }
+    },
+    "MarketStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "Trading allowed until `close_time`, then waiting for the resolver.",
+              "name": "Open"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Final. Winning shares redeem 1:1.",
+              "name": "Resolved",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Invalid market. Every share redeems at 0.5.",
+              "name": "Void"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "MarketStatus"
+      }
+    },
+    "Observation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One point in the TWAP ring buffer. At most one per distinct timestamp.",
+        "fields": [
+          {
+            "doc": "`OracleState::price_cumulative` as of `ts`.",
+            "name": "cumulative",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "ts",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "Observation"
+      }
+    },
+    "OracleAsset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "OracleAsset"
+      }
+    },
+    "OracleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-market TWAP accumulator (issue #11). Lives in its own entry so the `Market` XDR stays unchanged. Semantics: at the start of every trade the price that held since the last trade is folded into `price_cumulative` over the elapsed interval; the post-trade price then becomes `last_price_bps` until the next trade. That is the Uniswap-v2 model, and it is what makes manipulation expensive — moving the average requires holding the price away from fair value across one or more ledger boundaries, not just within a single transaction. Overflow analysis: `last_price_bps <= 10_000` and each interval adds `price * dt` seconds. A 100-year market lifetime accumulates at most `10_000 * 3.2e9 ~ 3.2e13`; even a pathological `dt = u64::MAX` gives `1.8e19 * 1e4 = 1.8e23`. `i128::MAX` is ~1.7e38, so there is no feasible lifetime that overflows — and every step is `checked_*` anyway, so a violation rejects the transaction instead of corrupting the accumulator.",
+        "fields": [
+          {
+            "doc": "YES price in bps as of the most recent trade.",
+            "name": "last_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Timestamp the accumulator was last advanced to (the timestamp of the most recent trade). The last traded price holds from here onward.",
+            "name": "last_ts",
+            "type_": "u64"
+          },
+          {
+            "doc": "Observations written so far, capped at `ORACLE_RING`.",
+            "name": "obs_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "Ring slot of the newest observation, in `0..ORACLE_RING`.",
+            "name": "obs_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "Running sum of `last_price_bps * seconds_elapsed` since creation.",
+            "name": "price_cumulative",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "OracleState"
+      }
+    },
+    "Outcome": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "No"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Yes"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Outcome"
+      }
+    },
+    "PendingAdmin": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A proposed admin handover (#62). Absent when no transfer is pending.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "address",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "expires_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingAdmin"
+      }
+    },
+    "Position": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "yes",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "Position"
+      }
+    },
+    "PriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "direction",
+            "type_": {
+              "udt": {
+                "name": "PriceDirection"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "PriceConfig"
+      }
+    },
+    "PriceData": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PriceData"
+      }
+    },
+    "PriceDirection": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Above"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrAbove"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AtOrBelow"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Below"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "PriceDirection"
+      }
+    },
+    "ResolutionSpec": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Hybrid",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SignersDisputable",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "DisputableSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "The full resolution rule a market's `resolution_hash` commits to. Hashing this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two modes in disjoint hash spaces even if their field encodings could otherwise collide. See `docs/adr/0001-resolution-commitment.md`.",
+        "lib": "",
+        "name": "ResolutionSpec"
+      }
+    },
+    "ResolutionSpecV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the network and the market-core instance, and carries a creator-chosen `salt` that makes a pre-reveal brute-force of the (low-entropy) rule infeasible.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "`sha256(network passphrase)`, i.e. `env.ledger().network_id()`.",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV2"
+      }
+    },
+    "SettleState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-market settlement bookkeeping (issue #14). Lives in its own entry so the `Market` XDR stays unchanged.",
+        "fields": [
+          {
+            "doc": "`finalize_market` has swept the market's remaining balance; no redemption or claim can ever pay out again.",
+            "name": "closed",
+            "type_": "bool"
+          },
+          {
+            "doc": "Timestamp of `resolve` / `void_market`; 0 while the market is Open.",
+            "name": "finalized_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "Redemption window, snapshotted at creation from the admin default. `redeem_deadline = finalized_at + horizon_secs`.",
+            "name": "horizon_secs",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outstanding_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "Outcome shares held outside the pool (user positions), still redeemable. `redeem` decrements the redeeming holder's shares on both sides, so a losing-side redemption (payout 0) still clears here.",
+            "name": "outstanding_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "Collateral already paid to holders and the LP (`redeem` + `claim_pool_remainder` payouts); tracks what has left the market.",
+            "name": "paid_out",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "SettleState"
+      }
+    },
+    "SignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "SignerConfig"
+      }
+    },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          }
+        ],
+        "doc": "Why a market in a batch call did not settle. `Duplicate` is reserved: ids are validated strictly ascending first, so a duplicate is rejected as `InvalidAmount` before the batch runs and never reaches a skip.",
+        "lib": "",
+        "name": "SkipReason"
+      }
+    },
+    "WeightedKey": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "Raw Ed25519 public key. For a `G...` account address this is `StrKey.decodeEd25519PublicKey(address)`; `C...` addresses have none.",
+            "name": "pubkey",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "weight",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKey"
+      }
+    },
+    "WeightedKeyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "WeightedKey"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Total weight that must sign one outcome. Choose it above half the total weight so two outcomes can never both reach it.",
+            "name": "weight_threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "WeightedKeyConfig"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "AlreadyClaimed",
+            "value": 17
+          },
+          {
+            "doc": "A batch call carried no ids or more than `MAX_BATCH` of them.",
+            "name": "BatchTooLarge",
+            "value": 31
+          },
+          {
+            "doc": "Inbound collateral transfer delivered fewer (or different) units than expected, e.g. a fee-on-transfer or under-delivering token (#137).",
+            "name": "CollateralShortfall",
+            "value": 32
+          },
+          {
+            "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
+            "name": "DeadlineExpired",
+            "value": 19
+          },
+          {
+            "doc": "",
+            "name": "InsufficientLiquidity",
+            "value": 14
+          },
+          {
+            "doc": "",
+            "name": "InsufficientShares",
+            "value": 13
+          },
+          {
+            "doc": "",
+            "name": "InvalidAmount",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "InvalidCloseTime",
+            "value": 6
+          },
+          {
+            "doc": "",
+            "name": "InvalidFee",
+            "value": 3
+          },
+          {
+            "doc": "",
+            "name": "InvalidProbability",
+            "value": 5
+          },
+          {
+            "doc": "",
+            "name": "InvalidWiring",
+            "value": 24
+          },
+          {
+            "doc": "`buy_v2` / `sell_v2` average execution price worse than the limit.",
+            "name": "LimitPriceExceeded",
+            "value": 20
+          },
+          {
+            "doc": "",
+            "name": "MarketClosed",
+            "value": 9
+          },
+          {
+            "doc": "",
+            "name": "MarketNotFound",
+            "value": 7
+          },
+          {
+            "doc": "",
+            "name": "MarketNotOpen",
+            "value": 8
+          },
+          {
+            "doc": "",
+            "name": "MarketTooLarge",
+            "value": 15
+          },
+          {
+            "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
+            "name": "NoPendingAdmin",
+            "value": 25
+          },
+          {
+            "doc": "",
+            "name": "NoPendingWiring",
+            "value": 23
+          },
+          {
+            "doc": "",
+            "name": "NotClosedYet",
+            "value": 10
+          },
+          {
+            "doc": "",
+            "name": "NotFinal",
+            "value": 11
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "Legacy market created before `SettleState` existed: outstanding shares cannot be reconstructed on-chain, so it has no deadline and cannot be finalized (still fully redeemable).",
+            "name": "NotSupported",
+            "value": 30
+          },
+          {
+            "doc": "",
+            "name": "NothingToRedeem",
+            "value": 16
+          },
+          {
+            "doc": "`observe` / `twap` asked for a time older than every surviving observation of the market (the ring keeps the most recent 16).",
+            "name": "ObservationTooOld",
+            "value": 27
+          },
+          {
+            "doc": "",
+            "name": "Overflow",
+            "value": 18
+          },
+          {
+            "doc": "",
+            "name": "Paused",
+            "value": 2
+          },
+          {
+            "doc": "A proposed admin handover was not accepted within its `expires_at`.",
+            "name": "PendingAdminExpired",
+            "value": 26
+          },
+          {
+            "doc": "Cumulative same-ledger movement would exceed `band_bps`.",
+            "name": "PriceBandExceeded",
+            "value": 22
+          },
+          {
+            "doc": "A single trade would move the price more than `max_impact_bps`. (Both this and the band reject the whole invocation, so their events, if any, roll back with it — see the note on `BreakerConfig`.)",
+            "name": "PriceImpactTooHigh",
+            "value": 21
+          },
+          {
+            "doc": "Market already closed by `finalize_market`; redemption is over.",
+            "name": "RedemptionClosed",
+            "value": 29
+          },
+          {
+            "doc": "`finalize_market` called before the redemption deadline.",
+            "name": "RedemptionWindowOpen",
+            "value": 28
+          },
+          {
+            "doc": "",
+            "name": "SlippageExceeded",
+            "value": 12
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {
+    "AdminTransferCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferCancelled",
+        "params": [],
+        "prefix_topics": [
+          "admin_transfer_cancelled"
+        ]
+      }
+    },
+    "AdminTransferProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_admin",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transfer_proposed"
+        ]
+      }
+    },
+    "AdminTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "admin_transferred"
+        ]
+      }
+    },
+    "DefaultFeeSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: default fee for new markets changed.",
+        "lib": "",
+        "name": "DefaultFeeSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old_fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_fee_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "default_fee_set"
+        ]
+      }
+    },
+    "FeesSwept": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "FeesSwept",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "fees_swept"
+        ]
+      }
+    },
+    "FeesSweptTo": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Same sweep as `FeesSwept` plus the actual recipient. New event rather than new fields so the existing `FeesSwept` XDR stays stable for indexers; both are emitted on every sweep.",
+        "lib": "",
+        "name": "FeesSweptTo",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "recipient",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "fees_swept_to"
+        ]
+      }
+    },
+    "LpFeesClaimed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "LpFeesClaimed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "lp_fees_claimed"
+        ]
+      }
+    },
+    "LpTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "LpTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "to",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "lp_transferred"
+        ]
+      }
+    },
+    "MarketCreated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketCreated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "market_created"
+        ]
+      }
+    },
+    "MarketFinalized": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketFinalized",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "Everything swept to the treasury: expired user claims, an unclaimed LP remainder, rounding dust and accrued fees.",
+            "location": "data",
+            "name": "swept",
+            "type_": "i128"
+          },
+          {
+            "doc": "The part of `swept` that was reserved for shares never redeemed.",
+            "location": "data",
+            "name": "unclaimed_user",
+            "type_": "i128"
+          },
+          {
+            "doc": "Rounding left over after per-holder void floors were accounted for.",
+            "location": "data",
+            "name": "dust",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "market_finalized"
+        ]
+      }
+    },
+    "MarketResolved": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketResolved",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "None means the market was voided.",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "Outcome"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "market_resolved"
+        ]
+      }
+    },
+    "PausedSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: market pause state changed.",
+        "lib": "",
+        "name": "PausedSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "paused_set"
+        ]
+      }
+    },
+    "PoolRemainderClaimed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PoolRemainderClaimed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "Pool remainder plus any LP fees drained in the same call.",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "pool_remainder_claimed"
+        ]
+      }
+    },
+    "PoolRemainderClaimedV1": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: pool remainder claimed by creator after market finality.",
+        "lib": "",
+        "name": "PoolRemainderClaimedV1",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "pool_remainder_claimed_v1"
+        ]
+      }
+    },
+    "PositionTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Positions moved between holders. Indexers that track balances from `Trade`/`Redeemed` must also apply this event (see docs/architecture.md).",
+        "lib": "",
+        "name": "PositionTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "position_transferred"
+        ]
+      }
+    },
+    "ProtocolFeeShareChanged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ProtocolFeeShareChanged",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "protocol_fee_share_changed"
+        ]
+      }
+    },
+    "Redeemed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "Redeemed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "redeemed"
+        ]
+      }
+    },
+    "ResolverChanged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolverChanged",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "resolver_changed"
+        ]
+      }
+    },
+    "ResolverProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolverProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "resolver",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "resolver_proposed"
+        ]
+      }
+    },
+    "Trade": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "Trade",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "is_buy",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fee",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reserve_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reserve_no",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "trade"
+        ]
+      }
+    },
+    "TreasuryChanged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TreasuryChanged",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "treasury_changed"
+        ]
+      }
+    },
+    "TreasuryProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TreasuryProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "treasury",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "treasury_proposed"
+        ]
+      }
+    }
+  },
+  "type_origins": {},
+  "hash_critical": []
+}

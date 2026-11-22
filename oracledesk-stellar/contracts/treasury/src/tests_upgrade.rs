@@ -121,7 +121,7 @@ fn setup() -> Setup {
     );
     install_price_policy(&env, &treasury, PERMISSIVE);
     Setup {
-        env,
+        env: env.clone(),
         admin,
         agent,
         client: TreasuryClient::new(&env, &treasury),
@@ -235,29 +235,35 @@ fn upgrade_is_admin_gated() {
     let stranger = Address::generate(&s.env);
 
     s.env.set_auths(&[]);
-    let as_stranger = s.client.mock_auths(&[MockAuth {
+    let stranger_invoke_args = (hash.clone(),).into_val(&s.env);
+    let stranger_invoke = MockAuthInvoke {
+        contract: &s.client.address,
+        fn_name: "upgrade",
+        args: stranger_invoke_args,
+        sub_invokes: &[],
+    };
+    let stranger_auth = [MockAuth {
         address: &stranger,
-        invoke: &MockAuthInvoke {
-            contract: &s.client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&s.env),
-            sub_invokes: &[],
-        },
-    }]);
+        invoke: &stranger_invoke,
+    }];
+    let as_stranger = s.client.mock_auths(&stranger_auth);
     assert!(as_stranger.try_upgrade(&hash).is_err());
 
     // The admin gets past the gate and fails later, on the uninstalled hash
     // (next test); the failure mode differs, which is the point.
     s.env.set_auths(&[]);
-    let as_admin = s.client.mock_auths(&[MockAuth {
+    let admin_invoke_args = (hash.clone(),).into_val(&s.env);
+    let admin_invoke = MockAuthInvoke {
+        contract: &s.client.address,
+        fn_name: "upgrade",
+        args: admin_invoke_args,
+        sub_invokes: &[],
+    };
+    let admin_auth = [MockAuth {
         address: &s.admin,
-        invoke: &MockAuthInvoke {
-            contract: &s.client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&s.env),
-            sub_invokes: &[],
-        },
-    }]);
+        invoke: &admin_invoke,
+    }];
+    let as_admin = s.client.mock_auths(&admin_auth);
     assert!(as_admin.try_upgrade(&hash).is_err());
 }
 

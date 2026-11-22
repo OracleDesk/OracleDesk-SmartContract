@@ -11,7 +11,7 @@ publish = false
 # `make budget` depends on `make build`. `cargo test --workspace` stays
 # buildable on a clean checkout without wasm.
 [dependencies]
-soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

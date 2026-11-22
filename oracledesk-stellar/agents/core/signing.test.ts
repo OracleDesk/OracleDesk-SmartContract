@@ -127,9 +127,9 @@ test("trace attestation verifies with real reasoning trace JSON hash offline", (
     networkPassphrase: NETWORK_PASSPHRASE,
     registryId: REGISTRY_ID,
     agent: AGENT_ADDRESS,
-    marketId: BigInt(trace.marketId),
+    marketId: BigInt(trace.marketId!),
     action: trace.action,
-    traceHash: new Uint8Array(traceHash),
+    traceHash: Buffer.from(traceHash, "hex"),
   };
 
   const { publicKey, signature } = signTraceAttestation(kp, ctx);
@@ -141,7 +141,7 @@ test("trace attestation verifies with real reasoning trace JSON hash offline", (
   assert.equal(
     verifyTraceAttestation(publicKey, signature, {
       ...ctx,
-      traceHash: new Uint8Array(modifiedHash),
+      traceHash: Buffer.from(modifiedHash, "hex"),
     }),
     false,
   );

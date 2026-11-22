@@ -23,6 +23,7 @@
 //! Do not merge on the assumption that they pass.
 
 use super::*;
+use crate::market_core::{Category, MarketStatus};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     token::StellarAssetClient,
@@ -209,15 +210,18 @@ fn upgrade_is_admin_gated() {
     let not_admin = Address::generate(&f.env);
 
     f.env.set_auths(&[]);
-    let as_stranger = f.resolver.mock_auths(&[MockAuth {
+    let invoke_payload = (hash.clone(),).into_val(&f.env);
+    let invoke = MockAuthInvoke {
+        contract: &f.resolver_id,
+        fn_name: "upgrade",
+        args: invoke_payload,
+        sub_invokes: &[],
+    };
+    let auth = [MockAuth {
         address: &not_admin,
-        invoke: &MockAuthInvoke {
-            contract: &f.resolver_id,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&f.env),
-            sub_invokes: &[],
-        },
-    }]);
+        invoke: &invoke,
+    }];
+    let as_stranger = f.resolver.mock_auths(&auth);
     assert!(as_stranger.try_upgrade(&hash).is_err());
     // With no auth supplied at all the admin's `require_auth` still refuses.
     f.env.set_auths(&[]);
@@ -369,7 +373,7 @@ fn upgrade_mid_dispute_window_preserves_proposal_count_and_attestation() {
     assert_eq!(f.resolver.finalize_signers(&market), AttestedOutcome::Yes);
     assert_eq!(
         f.market_core.get_market(&market).status,
-        MarketStatus::Resolved(Outcome::Yes)
+        MarketStatus::Resolved(crate::market_core::Outcome::Yes)
     );
 }
 

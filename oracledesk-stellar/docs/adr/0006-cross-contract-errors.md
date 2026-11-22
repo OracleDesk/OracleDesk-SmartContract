@@ -98,3 +98,30 @@ gap.
 - Mapping tests assert the exact caller-facing variant for each mapped failure.
 - A fresh testnet deployment is required: the numeric codes are part of each
   contract's spec.
+
+## Treasury error numbering (#302)
+
+The treasury's `Error` enum currently uses `1..=999` with literal discriminants
+(no base-offset prefix). The ADR table above targets `2001..=2999` as the
+eventual stable range; that migration is a one-time ABI break that will happen
+when treasury is first deployed to mainnet from this branch. Until then, guard
+tests enforce:
+
+1. Every variant lies in `1..=999`.
+2. All discriminants are unique.
+3. `map_market_core_error` and `map_market_core_code` produce the correct
+   `MarketCore*` variant for each market-core failure.
+
+The `MarketCore*` remapping variants occupy `29..=40`. They surface a
+market-core failure under a treasury-owned code so callers never observe a
+raw market-core number. The semantic aliasing rules are:
+
+- `market_core::SlippageExceeded` → `treasury::SlippageExceeded` (via
+  `core_trade`'s numeric path and `CORE_SLIPPAGE_EXCEEDED = 12`).
+- `market_core::NotFinal` → `treasury::MarketNotFinal` (via `settle_market`,
+  `do_redeem` and `do_claim`).
+- `market_core::NothingToRedeem` and `market_core::AlreadyClaimed` → `0`
+  redeemed/claimed, not an error.
+
+Everything else surfaces as the specific `MarketCore*` named variant (allowing
+agents to act on it) or as `MarketCoreCallFailed` for the unmapped long tail.

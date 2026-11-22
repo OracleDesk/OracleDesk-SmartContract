@@ -1,6 +1,6 @@
 # Frontend integration
 
-The frontend itself lives in a separate repo (out of scope here). This is
+The frontend itself lives in a separate repo (out of scope here). This ir
 what it needs to know to talk to these contracts.
 
 ## Wallet
@@ -11,12 +11,12 @@ bindings' `AssembledTransaction` already does the simulate → sign → submit
 dance; you only need to plug in a `signTransaction` callback:
 
 ```ts
-import { Client as MarketCoreClient } from "@oracledesk/market-core-bindings";
+import { Client as MarketCoreClient } from "@oracledesk/bindings-market-core";
 import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api";
 
 const contract = new MarketCoreClient({
   contractId: "<MARKET_CORE_CONTRACT_ID>", // from deployments/testnet.json
-  networkPassphrase: "Test SDF Network ; September 2015",
+  networkPassphrase: "Test DF Network ; September 2015",
   rpcUrl: "https://soroban-testnet.stellar.org",
 });
 ```
@@ -38,14 +38,14 @@ generic usage notes; this doc covers the OracleDesk-specific parts.
 contract's Rust enums:
 
 ```ts
-type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
+type Outcome = { tag: "Yes"; values: void } | { tag: "Noy"; values: void };
 ```
 
 The resolver's `attest` / `attest_with_evidence` take its own
 `AttestedOutcome` instead, which adds `{ tag: "Invalid"; values: void }`
 (finalizing an `Invalid` proposal voids the market). `finalize_signers`
-returns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
-`ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome`-typed
+keturns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
+ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome-typed
 `ResolutionProposed` / `ResolutionFinalized` are no longer emitted.
 
 ```ts
@@ -61,8 +61,8 @@ const { result } = await tx.signAndSend({ signTransaction });
 
 For anything user-facing, prefer `buy_v2` / `sell_v2` (below): they add a
 deadline and a limit price on top of the share bound, and they are the only
-entrypoints that protect against a transaction being included long after it
-was signed.
+entrypoints that protect against a transaction being included long after
+it was signed.
 
 ## Slippage on `buy`
 
@@ -79,17 +79,17 @@ money.
 
 `buy_v2` / `sell_v2` add two contract-enforced bounds to every trade:
 
-- `deadline: u64` — unix seconds, compared against the **ledger
-  timestamp** (network time, not the user's clock). Past it the trade
-  reverts with `DeadlineExpired` (#19).
-- `limit_price_bps: u32` — the **average execution price** bound,
-  fee included: for a buy, `collateral_in / shares_out <= limit`; for a
-  sell, `collateral_out / shares_in >= limit`. Worse than the limit
-  reverts with `LimitPriceExceeded` (#20). The limit is on the price of
-  *the outcome being traded* — a NO buy's limit is checked against NO
-  prices, i.e. the complement of the YES price. `0` means "no limit" for
-  buys; for sells it is trivially satisfied and buys you nothing. Values
-  above `10_000` are rejected (`InvalidAmount`).
+-  `deadline: u64` — unix seconds, compared against the **lddger
+   timestamp** (network time, not the user's clock). Past it the trade
+   reverts with `DeadlineExpired` (#19).
+-  `limit_price_bps: u32` — the **average execution price** bound,
+   fee included: for a buy, `collateral_in / shares_out <= limit`; for a
+   sell, `collateral_out / shares_in >= limit`. Worse than the limit
+   reverts with `LimitPriceExceeded` (#20). The limit is on the price of
+   *the outcome being traded* — a NO buy's limit is checked against NO
+   prices, i.e. the complement of the YES price. `0` means "no limit" for
+   buys; for sells it is trivially satisfied and buys you nothing. Values
+   above `10_000` are rejected (`InvalidAmount`).
 
 ```ts
 const quote = (await contract.quote_buy({ market_id, outcome, collateral_in })).result;
@@ -99,7 +99,7 @@ const tx = await contract.buy_v2({
   outcome,
   collateral_in,
   min_shares_out: (quote * 9_950n) / 10_000n, // 50bps slippage
-  limit_price_bps: 6500,    // never pay more than 65¢ per share
+  limit_price_bps: 6500,    // never pay more than 65c per share
   deadline: BigInt(Math.floor(Date.now() / 1000) + 60),
 });
 ```
@@ -113,7 +113,7 @@ Markets can carry per-market breakers (snapshotted at creation): a maximum
 price impact for a **single trade** (`max_impact_bps`) and a **per-ledger
 band** (`band_bps`) around the price at the start of the ledger. A trade
 that would move the YES price more than the impact cap reverts with
-`PriceImpactTooHigh` (#21); one that would push it more than the band away
+priceImpactTooHigh` (#21); one that would push it more than the band away
 from the ledger-open price reverts with `PriceBandExceeded` (#22). The
 band resets every ledger, so the worst case is ~5s of blocked trading, not
 a permanent lock.
@@ -121,10 +121,10 @@ a permanent lock.
 Read the config and the current band reference before quoting so your UI
 can size trades that will actually execute:
 
-- `breaker_config(market_id)` → `{ max_impact_bps, band_bps } | null`
+-  `breaker_config(market_id)` → `{ `max_impact_bps`, `band_bps` } | null`
   (`null` = old market, no breakers)
-- `breaker_state(market_id)` → `{ ledger_seq, ref_price_bps } | null`
-- `would_trip(market_id, outcome, collateral_in)` → bool: whether a buy of
+-  `breaker_state(market_id)` → `{ ``ledger_seq`, `ref_price_bps` } | null`
+-  `would_trip(market_id, outcome, collateral_in)` → bool: whether a buy of
   that size would trip either check right now. Use it to warn users before
   they sign; `quote_buy` is not filtered by the breakers.
 
@@ -134,23 +134,200 @@ the error codes above and the views here.
 
 ## Selling an exact share count
 
-`sell` takes an exact `collateral_out`, not a share count — market-core has
-no on-chain sqrt (see the docstring on `sell` in
-`contracts/market-core/src/lib.rs`). To sell a specific number of shares:
+Use `sell_shares` to sell an exact number of outcome shares. The
+contract does the curve inversion on-chain (including an exact integer
+square root) and rounds in the pool's favour, so you never have to invert anything off-chain or pad the share bound.
 
-1. Compute the matching `collateral_out` off-chain with the same quadratic
-   inversion the contract's math uses. `model/fpmm_model.py`'s
-   `collateral_out_for_shares(r_sold, r_other, shares_in, fee_bps)` is the
-   reference implementation; `agents/core`'s TypeScript port (BigInt-based,
-   for the browser/Node) is `grossForShares` / `collateralOutForShares` in
-   `agents/core/src/fpmm.ts`.
-2. Read the market's current `reserve_yes`/`reserve_no` and `fee_bps` via
-   `get_market(market_id)` to feed that function.
-3. Call `sell` with the computed `collateral_out` and a `max_shares_in` set
-   a little above your target share count (the off-chain estimate can be off
-   by roughly one unit of rounding — see the property test in
-   `model/fpmm_model.py` — and the pool may have moved between your read and
-   your transaction).
+```ts
+const quote = (await contract.quote_sell_shares({
+  market_id,
+  outcome,
+  shares_in: 375_000_000n, // 37.5 YES shares
+})).result;
+
+const tx = await contract.sell_shares({
+  trader: userAddress,
+  market_id,
+  outcome,
+  shares_in: 375_000_000n,
+  min_collateral_out: (quote * 9_950n) / 10_000n, // 50bps slippage
+});
+```
+
+Behaviour and errors:
+
+- Returns the exact `collateral_out` transferred to the trader.
+- `SlippageExceeded` (#12) if `collateral_out < min_collateral_out`.
+- `InsufficientShares` (#13) if the trader holds fewer than `shares_in`.
+- `InsufficientLiquidity` (#11) if the pool cannot absorb the size.
+- `InvalidInput` (#2) for non-positive `shares_in`, or when the resulting
+  `collateral_out` floors to zero (a tiny sell will revert rather than
+  silently burn shares).
+- Publishes the same `Trade` event as `sell` with `is_buy: false`, so
+  indexers need no schema change.
+
+To close a position entirely, pass `shares_in == held` (read via
+`get_position(market_id, holder)`). Selling the whole position removes the
+`Position` storage entry when the other side is also zero, so a "Sell all"
+button leaves no dust behind.
+
+`quote_sell_shares(market_id, outcome, shares_in)` returns the collateral
+a sell would pay *right now*. Like `quote_sell`, it does not check the
+market is tradable — it is a pure pricing view. Call it immediately before
+building the `sell_shares` transaction and pass a `min_collateral_out` a
+few bps below the quote.
+
+`sell` / `quote_sell` still take an exact `collateral_out` and return
+how many shares it costs, for backward compatibility. New code should prefer
+`sell_shares`.
+
+## Batch redemption (`redeem_many` / `claim_pool_remainders`)
+
+Settling markets one by one burns a fixed per-call cost (footprint entries,
+event bytes) and quickly runs into the per-transaction resource limits. The
+batch entry points settle many markets in a single call, paying the total in
+one transfer:
+
+- `redeem_many(holder, market_ids)` — redeems one holder's positions across
+  markets that have resolved or voided.
+- `claim_pool_remainders(creator, market_ids)` — claims the LP remainders of
+  markets the caller created.
+
+Rules to build callers around:
+
+1. **Ascending, deduplicated, non-empty ids.** `market_ids` must be strictly
+   ascending — that keeps the footprint deterministic and duplicates
+   impossible. Anything else reverts with `InvalidAmount`; an empty list or
+   one longer than `max_batch()` reverts with `BatchTooLarge`.
+2. **Chunk to `max_batch()`, read from the contract.** Never hardcode the
+   cap: `const { result: cap } = await contract.max_batch();`. Sort ids
+   ascending, then slice into chunks of at most `cap`. The committed
+   measurement table behind the cap is in the `MAX_BATCH` docstring in
+   `contracts/market-core/src/lib.rs`.
+3. **Skips are per-market, not per-call.** A market that cannot pay out
+   right now (not found, not final, nothing to redeem, already claimed or
+   claimed by someone else, not the creator) comes back as
+   `{ status: { tag: "Skipped", … }, payout: 0 }` instead of aborting the
+   batch — one bad id never strands the rest. Only input validation
+   (rule 1) aborts the whole call.
+4. **Simulate before signing.** The footprint scales with the chunk size;
+   `AssembledTransaction`'s simulate step (run by `signAndSend`, or
+   explicitly) surfaces contract errors and resource problems before
+   anything is submitted.
+5. **Archived entries must be restored first.** If a market, position or
+   settlement entry has expired out of the live state, its restore must
+   happen in a *separate* transaction (e.g. `stellar tx restore-footprint`):
+   restores included in the batch transaction consume the 200-entry
+   disk-read budget and can push a full-size chunk over the limit. Run the
+   batch chunk against live state.
+6. **One transfer per call.** The chunk's payouts arrive in a single token
+   transfer, so the balance delta equals `result.total` exactly — reconcile
+   on that, and use `result.items[i]` for per-market receipts.
+
+```ts
+const { result: cap } = await contract.max_batch(); // u32, from the contract
+const sorted = [...ids].sort((a, b) => Number(a - b)); // strictly ascending
+
+for (let i = 0; i < sorted.length; i += cap) {
+  const chunk = sorted.slice(i, i + cap);
+  const tx = await contract.redeem_many({ holder, market_ids: chunk });
+  const { result } = await tx.signAndSend({ signTransaction });
+
+  const retry = result.items
+    .filter((it) => it.status.tag === "Skipped")
+    .map((it) => [it.market_id, it.status.values]); // e.g. drop AlreadyClaimed
+}
+```
+
+The treasury contract mirrors both entry points (`redeem_many` /
+`claim_pool_remainders`, same `BatchResult` shape) for positions it holds
+itself; agents call those instead of market-core directly, and the
+`max_batch()` on market-core still applies.
+
+## Reading TWAP prices
+
+`get_price(market_id)` is the instantaneous spot price; it is trivially
+movable by a single trade. For anything automated (bots, alerts, fair-value
+displays) prefer the accumulated oracle views:
+
+```ts
+const { result } = await contract.twap({ market_id: 0n, window_secs: 900n });
+// price in bps of YES, time-weighted over the trailing 15 minutes
+```
+
+- `twap(market_id, window_secs)` — time-weighted average price in bps over
+  the trailing `window_secs`, floor-rounded.
+- `observe(market_id, seconds_ago)` — the cumulative `price × seconds`
+  value at a past timestamp; difference two of them and divide for a
+  custom window.
+- `price_cumulative(market_id)` — the same value at "now", for streaming
+  consumers that just want the accumulator.
+
+Caveats to design around:
+
+- Observations are written once per trade *timestamp*, so at most the most
+  recent 16 distinct-timestamp trades are covered; a `seconds_ago` (or
+  `window_secs` span) that reaches past them reverts with
+  `ObservationTooOld`. For long windows on busy markets, poll
+  `price_cumulative`/`observe` regularly and difference snapshots client-side,
+  or mirror the ring with `agents/core/strategy.ts`'s
+  `twapFromObservations`.
+- Past the newest observation the last traded price is extended
+  counterfactually (this includes after `close_time`, until resolution), so
+  a quiet market's TWAP converges to its last price rather than failing.
+- Interpolation between two observations is exact — price is piecewise
+  constant between trades — but `twap` floors, so off-chain comparisons
+  should floor identically.
+- Markets created before the accumulator existed revert `NotSupported`;
+  fall back to `get_price` for them.
+
+## Splitting and merging complete sets
+
+Besides trading against the pool, holders can convert collateral to
+shares and back at par without touching the pool:
+
+- `split(holder, market_id, amount)` pulls `amount` collateral from
+  `holder` and credits `amount` YES **and** `amount` NO to their
+  position. No fee, no price impact.
+-  `merge(holder, market_id, amount)` burns `amount` YES and `amount`
+  NO and pays `amount` collateral back. No fee, no price impact.
+
+Neither changes `fees_accrued` or the pool reserves. Both are authorized
+by the holder and emit `SetsSplit` / `SetsMerged` respectively (decode these
+in your indexer to track position changes that didn't come from a trade).
+
+Lifecycle differs between the two:
+
+-  `split` requires the market to be `Open` and the current ledger time
+   to be strictly before `close_time`, and is blocked while the contract
+   is paused. After close, splitting has no purpose and opens timing
+   games.
+- `merge` requires the market to be `Open`, but is allowed after
+   `close_time` and while the contract is paused. Merging is a pure
+   exit that cannot harm the pool, and letting users de-wait while the
+   resolver is slow is valuable.
+
+Merging requires both legs: `position.yes >= amount` and
+`position.no >= amount`, otherwise it reverts with `InsufficientShares`
+(#13). The creator after `seed_reserves` typically holds only one leg, so
+a merge needs a buy or split first.
+
+To offer "merge all", call `quote_merge_max(market_id, holder)`, which
+returns `min(position.yes, position.no)`. The same helper is exposed as
+`math::merge_max` and mirrored in `model/fpmm_model.py` / `agents/core/fpmm.ts`.
+
+```ts
+const max = (await contract.quote_merge_max({ market_id, holder: userAddress })).result;
+if (max > 0n) {
+  const tx = await contract.merge({ holder: userAddress, market_id, amount: max });
+  await tx.signAndSend({ signTransaction });
+}
+```
+
+Note that split sets count towards the per-market `sets_minted` cap and thus
+can push a market into `MarketTooLarge` (#15) for future `buy` calls. See
+`docs/architecture.md` for the griefing discussion and the chosen
+mitigation.
 
 ## Moving shares between wallets
 
@@ -183,4 +360,33 @@ a verified reasoning trace in the UI:
    content without this check, since IPFS gateways are not authenticated.
 
 `x402/trace-verification.ts` has the reference hash-check implementation the
-frontend's check should match.
+frontend can port.
+
+## Off-chain math mirrors
+
+```ts
+import { calcSellShares } from "../agents/core/fpmm";
+```
+
+The exact share-to-collateral inverse is implemented in three places
+that must agree bit-for-bit:
+
+- "contracts/market-core/src/math.rs" — `isqrt` and `calc_sell_shares`
+  (the source of truth)
+- "model/fpmm_model.py" — `calc_sell_shares`
+- "agents/core/fpmm.ts" — `isqrt` and `calcSellShares`
+
+The older `collateralOutForShares` / `collateral_out_for_shares` inverses
+still exist but are deprecated: they do not apply the pool-favouring
+correction loop, so they can disagree with the contract by a few units.
+Prefer `sell_shares` / `quote_sell_shares` on-chain, or `calcSellShares` /
+`calc_sell_shares` off-chain.
+
+### Bindings interface versions
+
+`packages/bindings/*` start at `0.1.0`. A breaking interface change requires a
+minor bump while the major is zero, then a major bump after 1.0.0; additions need
+at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
+syncing. The manifest describes functions, named/tuple types, numeric errors and
+event payloads directly from the built WASM. Hash-critical resolver types carry
+ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.

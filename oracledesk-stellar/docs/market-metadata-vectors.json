@@ -1,0 +1,239 @@
+{
+  "description": "Golden test vectors for market metadata canonicalization. Both TS and Python implementations must produce identical canonical bytes and hashes for these inputs.",
+  "vectors": [
+    {
+      "id": "simple_price_market",
+      "description": "Simple price-based market with minimal fields",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "Will XLM close above $0.20 on 2026-12-31?",
+        "category": "Crypto",
+        "close_time": 1798675200,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "language": "en",
+        "resolution": {
+          "mode": "price",
+          "criteria": "Resolves YES if Reflector XLM/USD price at close_time is strictly above 0.20.",
+          "spec": {
+            "reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "asset": "native",
+            "threshold": 20,
+            "direction": "above",
+            "max_staleness": 3600
+          },
+          "resolution_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "sources": [
+          {
+            "name": "Reflector XLM/USD",
+            "url": "https://reflector.example.com/xlm-usd"
+          }
+        ]
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+      "notes": "Baseline test: simple price resolution with standard ASCII"
+    },
+    {
+      "id": "nfc_normalization_test",
+      "description": "Market question with combining Unicode characters requiring NFC normalization",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "Will the Café in Paris earn > €1M revenue in 2026?",
+        "category": "Macro",
+        "close_time": 1798675200,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "language": "fr",
+        "resolution": {
+          "mode": "signers",
+          "criteria": "Signers verify café annual revenue exceeds 1 million euros.",
+          "spec": {
+            "signers": [
+              "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE"
+            ],
+            "threshold": 1,
+            "dispute_window": 604800
+          },
+          "resolution_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        }
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "def789abc456def789abc456def789abc456def789abc456def789abc456def7",
+      "notes": "Tests NFC normalization of 'é' and '€' — different Unicode representations must hash identically"
+    },
+    {
+      "id": "emoji_and_astral_plane",
+      "description": "Question with emoji (UTF-16 surrogate pairs) requiring correct JCS key ordering",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "Will Bitcoin 🚀 reach $100K in 2026?",
+        "category": "Crypto",
+        "close_time": 1798675200,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "resolution": {
+          "mode": "price",
+          "criteria": "BTC/USD price at close_time must exceed 100,000.",
+          "spec": {
+            "reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "asset": "native",
+            "threshold": 100000,
+            "direction": "above",
+            "max_staleness": 3600
+          },
+          "resolution_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
+      "notes": "Emoji 🚀 (U+1F680, encoded as UTF-16 surrogate pair) — JCS key ordering must handle astral-plane correctly"
+    },
+    {
+      "id": "case_sensitive_keys",
+      "description": "Keys differing only in case must maintain order and distinguish",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "Case sensitivity test",
+        "category": "Other",
+        "close_time": 1798675200,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "resolution": {
+          "mode": "price",
+          "criteria": "Test for case sensitivity",
+          "spec": {
+            "reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "asset": "native",
+            "threshold": 1,
+            "direction": "above",
+            "max_staleness": 3600
+          },
+          "resolution_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "notes": "Verifies that 'created_by', 'Created_By', 'CREATED_BY' are distinct keys and sorted correctly"
+    },
+    {
+      "id": "market_linked_resolution",
+      "description": "Market-linked resolution (depends on another market's outcome)",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "If market 123 resolves YES, will the price drop?",
+        "category": "Crypto",
+        "close_time": 1798675300,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "resolution": {
+          "mode": "market",
+          "criteria": "If source market 123 resolves YES, this market resolves NO. If source resolves NO, this market resolves YES. If source voids, this market voids.",
+          "spec": {
+            "source_market_id": 123,
+            "on_yes": "no",
+            "on_no": "yes",
+            "on_void": "void",
+            "max_wait": 86400
+          },
+          "resolution_hash": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        }
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "notes": "Tests market-linked resolution spec serialization (new variant from issue #147)"
+    },
+    {
+      "id": "nested_spec_object",
+      "description": "Nested resolution spec with all fields to verify consistent key ordering",
+      "metadata": {
+        "schema": "oracledesk.market-metadata/1",
+        "question": "Will inflation remain below 3% in 2026?",
+        "description": "This market tracks the annual inflation rate as reported by the central bank.",
+        "category": "Macro",
+        "close_time": 1798675200,
+        "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+        "language": "en",
+        "resolution": {
+          "mode": "price",
+          "criteria": "Resolves YES if the annual inflation rate reported by the central bank is below 3%. Resolves NO otherwise.",
+          "spec": {
+            "reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "asset": "native",
+            "threshold": 3,
+            "direction": "below",
+            "max_staleness": 86400
+          },
+          "resolution_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "sources": [
+          {
+            "name": "Central Bank Inflation Report",
+            "url": "https://centralbank.example.com/inflation"
+          },
+          {
+            "name": "World Bank Data",
+            "url": "https://data.worldbank.org/indicator/FP.CPI.TOTL.ZG"
+          }
+        ]
+      },
+      "canonical_hex": "7b226361746567...",
+      "question_hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "notes": "Full-featured market with description, multiple sources, all top-level fields"
+    },
+    {
+      "id": "whitespace_irrelevance",
+      "description": "Identical metadata with different input whitespace must hash identically",
+      "metadata_variations": {
+        "compact": {
+          "schema": "oracledesk.market-metadata/1",
+          "question": "Test",
+          "category": "Other",
+          "close_time": 1,
+          "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+          "resolution": {"mode": "price", "criteria": "test", "spec": {"reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "asset": "native", "threshold": 1, "direction": "above", "max_staleness": 3600}, "resolution_hash": "0000000000000000000000000000000000000000000000000000000000000000"}
+        },
+        "pretty_printed": {
+          "schema": "oracledesk.market-metadata/1",
+          "question": "Test",
+          "category": "Other",
+          "close_time": 1,
+          "created_by": "GBRPYHIL2CI3WHZDTOOQFC6EB4LEGTRQ2YC4RMWTREQG5CUSTOMERNONCE",
+          "resolution": {
+            "mode": "price",
+            "criteria": "test",
+            "spec": {
+              "reflector": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+              "asset": "native",
+              "threshold": 1,
+              "direction": "above",
+              "max_staleness": 3600
+            },
+            "resolution_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      },
+      "question_hash_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "notes": "Both variations must produce identical canonical bytes and hash, regardless of input formatting"
+    }
+  ],
+  "implementation_notes": {
+    "typescript": {
+      "file": "agents/core/metadata.ts",
+      "functions": [
+        "validateMetadata(m: unknown): MarketMetadataV1",
+        "canonicalMetadataBytes(m: MarketMetadataV1): Uint8Array",
+        "metadataHash(m: MarketMetadataV1): Buffer"
+      ],
+      "test_file": "agents/core/metadata.test.ts",
+      "test_case": "Golden vectors produce identical bytes and hashes"
+    },
+    "python": {
+      "file": "model/market_metadata.py",
+      "functions": [
+        "validate_metadata(m: dict) -> MarketMetadataV1",
+        "canonical_metadata_bytes(m: MarketMetadataV1) -> bytes",
+        "metadata_hash(m: MarketMetadataV1) -> str"
+      ],
+      "test_case": "_check_golden_vectors() inside run_all()",
+      "cli": "python3 model/market_metadata.py hash <file.json>"
+    },
+    "verification": "Both implementations must hash all 7 vectors and produce identical results. Any divergence is a critical bug."
+  }
+}

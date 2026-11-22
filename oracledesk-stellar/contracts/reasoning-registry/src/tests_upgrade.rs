@@ -220,30 +220,32 @@ fn upgrade_is_admin_gated() {
     let stranger = Address::generate(&s.env);
 
     s.env.set_auths(&[]);
-    let as_stranger = s.client.mock_auths(&[MockAuth {
+    let stranger_invoke = MockAuthInvoke {
+        contract: &s.client.address,
+        fn_name: "upgrade",
+        args: (hash.clone(),).into_val(&s.env),
+        sub_invokes: &[],
+    };
+    let stranger_auth = [MockAuth {
         address: &stranger,
-        invoke: &MockAuthInvoke {
-            contract: &s.client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&s.env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(as_stranger.try_upgrade(&hash).is_err());
+        invoke: &stranger_invoke,
+    }];
+    assert!(s.client.mock_auths(&stranger_auth).try_upgrade(&hash).is_err());
 
     // The admin gets past the gate and fails later, on the uninstalled hash
     // (next test); the failure mode differs, which is the point.
     s.env.set_auths(&[]);
-    let as_admin = s.client.mock_auths(&[MockAuth {
+    let admin_invoke = MockAuthInvoke {
+        contract: &s.client.address,
+        fn_name: "upgrade",
+        args: (hash.clone(),).into_val(&s.env),
+        sub_invokes: &[],
+    };
+    let admin_auth = [MockAuth {
         address: &s.admin,
-        invoke: &MockAuthInvoke {
-            contract: &s.client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&s.env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(as_admin.try_upgrade(&hash).is_err());
+        invoke: &admin_invoke,
+    }];
+    assert!(s.client.mock_auths(&admin_auth).try_upgrade(&hash).is_err());
 }
 
 /// `upgrade` takes a wasm *hash*, not bytes: the target must already be

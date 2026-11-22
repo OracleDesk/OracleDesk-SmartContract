@@ -38,7 +38,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
     token::StellarAssetClient,
     Address, BytesN, Env, IntoVal, String,
 };
@@ -193,30 +193,32 @@ fn upgrade_is_admin_gated() {
     // different address, so `require_admin` must reject it (mirrors
     // `propose_resolver_requires_admin`'s shape).
     env.set_auths(&[]);
-    let as_trader = client.mock_auths(&[MockAuth {
+    let trader_invoke = MockAuthInvoke {
+        contract: &client.address,
+        fn_name: "upgrade",
+        args: (hash.clone(),).into_val(&env),
+        sub_invokes: &[],
+    };
+    let trader_auth = [MockAuth {
         address: &trader,
-        invoke: &MockAuthInvoke {
-            contract: &client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(as_trader.try_upgrade(&hash).is_err());
+        invoke: &trader_invoke,
+    }];
+    assert!(client.mock_auths(&trader_auth).try_upgrade(&hash).is_err());
 
     // And the admin reaches the wasm-lookup step instead (see the next test:
     // the hash below was never installed, so this still fails — just later).
     env.set_auths(&[]);
-    let as_admin = client.mock_auths(&[MockAuth {
+    let admin_invoke = MockAuthInvoke {
+        contract: &client.address,
+        fn_name: "upgrade",
+        args: (hash.clone(),).into_val(&env),
+        sub_invokes: &[],
+    };
+    let admin_auth = [MockAuth {
         address: &admin,
-        invoke: &MockAuthInvoke {
-            contract: &client.address,
-            fn_name: "upgrade",
-            args: (hash.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(as_admin.try_upgrade(&hash).is_err());
+        invoke: &admin_invoke,
+    }];
+    assert!(client.mock_auths(&admin_auth).try_upgrade(&hash).is_err());
 }
 
 /// `upgrade` takes a wasm *hash*, not bytes: the target must already be
@@ -277,7 +279,7 @@ fn migrate_on_a_current_instance_is_idempotent() {
     assert_eq!(first.processed, 0);
     assert_eq!(client.market_count(), 3);
     assert_eq!(client.get_market(&2), before);
-    assert_eq!(env.events().all().events().len(), 1);
+    assert_eq!(env.events().all().events().len(), 0);
 }
 
 // ---------------------------------------------------------------------------

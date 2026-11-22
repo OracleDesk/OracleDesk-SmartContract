@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "_comment": "Topologically ordered wasm-sync manifest (issue #311). Each entry defines one artifact: where it is built, every vendored copy it must be synced to, and its current sha256 pin. Update pins with sync-vendored-wasm.sh after rebuilding the contract.",
+  "version": 2,
+  "artifacts": [
+    {
+      "name": "market_core",
+      "build_output": "target/wasm32v1-none/release/market_core.wasm",
+      "topo_order": 1,
+      "copies": [
+        {
+          "destination": "oracledesk-stellar/contracts/resolver/market_core.wasm",
+          "pin_file": "oracledesk-stellar/contracts/resolver/market_core.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/treasury/market_core.wasm",
+          "pin_file": "oracledesk-stellar/contracts/treasury/market_core.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/router/market_core.wasm",
+          "pin_file": "oracledesk-stellar/contracts/router/market_core.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/integration-tests/wasm/market_core.wasm",
+          "pin_file": "oracledesk-stellar/contracts/integration-tests/wasm/market_core.wasm.sha256"
+        }
+      ]
+    },
+    {
+      "name": "reasoning_registry",
+      "build_output": "target/wasm32v1-none/release/reasoning_registry.wasm",
+      "topo_order": 1,
+      "copies": [
+        {
+          "destination": "oracledesk-stellar/contracts/resolver/reasoning_registry.wasm",
+          "pin_file": "oracledesk-stellar/contracts/resolver/reasoning_registry.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/router/reasoning_registry.wasm",
+          "pin_file": "oracledesk-stellar/contracts/router/reasoning_registry.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/integration-tests/wasm/reasoning_registry.wasm",
+          "pin_file": "oracledesk-stellar/contracts/integration-tests/wasm/reasoning_registry.wasm.sha256"
+        }
+      ]
+    },
+    {
+      "name": "resolver",
+      "build_output": "target/wasm32v1-none/release/resolver.wasm",
+      "topo_order": 2,
+      "depends_on": ["market_core", "reasoning_registry"],
+      "copies": [
+        {
+          "destination": "oracledesk-stellar/contracts/treasury/resolver.wasm",
+          "pin_file": "oracledesk-stellar/contracts/treasury/resolver.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/router/resolver.wasm",
+          "pin_file": "oracledesk-stellar/contracts/router/resolver.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/integration-tests/wasm/resolver.wasm",
+          "pin_file": "oracledesk-stellar/contracts/integration-tests/wasm/resolver.wasm.sha256"
+        }
+      ]
+    },
+    {
+      "name": "treasury",
+      "build_output": "target/wasm32v1-none/release/treasury.wasm",
+      "topo_order": 3,
+      "depends_on": ["market_core", "resolver"],
+      "copies": [
+        {
+          "destination": "oracledesk-stellar/contracts/router/treasury.wasm",
+          "pin_file": "oracledesk-stellar/contracts/router/treasury.wasm.sha256"
+        },
+        {
+          "destination": "oracledesk-stellar/contracts/integration-tests/wasm/treasury.wasm",
+          "pin_file": "oracledesk-stellar/contracts/integration-tests/wasm/treasury.wasm.sha256"
+        }
+      ]
+    },
+    {
+      "name": "timelock",
+      "build_output": "target/wasm32v1-none/release/timelock.wasm",
+      "topo_order": 4,
+      "depends_on": [],
+      "copies": [
+        {
+          "destination": "oracledesk-stellar/contracts/integration-tests/wasm/timelock.wasm",
+          "pin_file": "oracledesk-stellar/contracts/integration-tests/wasm/timelock.wasm.sha256"
+        }
+      ]
+    }
+  ]
+}

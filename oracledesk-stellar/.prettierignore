@@ -1,0 +1,11 @@
+packages/bindings/
+**/dist/
+**/node_modules/
+target/
+coverage/
+docs/book/
+docs/wave-issues/
+docs/reference/
+package-lock.json
+**/package-lock.json
+Cargo.lock
