@@ -112,10 +112,10 @@ pass it to a production deployment.
 
 ## Treasury migration
 
-The treasury has no upgrade path or config setters — fixing a bug, changing
-caps, or rotating the agent means deploying a **new** treasury. Deploying
-one strands nothing: the old treasury's positions and LP ownership can be
-handed to a successor market by market:
+The treasury has no upgrade path, so fixing a bug still means deploying a
+**new** treasury. Deploying one strands nothing: the old treasury's positions
+and LP ownership can be handed to a successor in one bounded batch through
+the delayed admin-op flow:
 
 ```bash
 make build                        # treasury wasm must be current
@@ -124,10 +124,11 @@ scripts/migrate-treasury.sh      # deploys a successor + migrates every market
 
 The script reads `deployments/testnet.json` and the old treasury's live
 config, deploys a new treasury with the same agent/collateral/caps, records
-it as the old treasury's successor (`set_successor`, admin), then calls
-`migrate_market(i)` for every `i` in `0..market_count`. Both steps are
-admin-gated — the agent cannot invoke them — and the destination is fixed
-to the recorded successor, so migration cannot send value anywhere else.
+it as the old treasury's successor (`set_successor`, admin), then queues one
+`migrate_markets([0..market_count])` op, waits `config_delay`, and calls
+`execute_op(3)`. Both steps are admin-gated — the agent cannot invoke them —
+and the destination is fixed to the recorded successor, so migration cannot
+send value anywhere else.
 Re-running is safe. It deliberately does **not** rewire market-core
 (`propose_treasury` + the treasury's `accept_market_core_role`); that cutover
 changes the fee recipient for future markets

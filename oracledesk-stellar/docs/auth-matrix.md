@@ -67,8 +67,8 @@ therefore look different:
 | Contract | Positive rows | Notable negative / role cases |
 | --- | --- | --- |
 | market-core | admin setters, create, buy, sell, resolve/void via resolver, redeem, claim remainder/fees, sweep, position/LP transfers | wrong admin, creator-only claim, wrong signer on buy/sell |
-| resolver | admin actions, spec registration, attest, finalize, price resolution, guardian void | non-admin admin actions, non-signer attest, wrong signer |
-| treasury | admin actions, deposit/withdraw, agent create/buy/sell, settle, redeem, claim, fee collection | wrong admin, non-agent trade, agent-role separation |
+| resolver | admin actions, spec registration, attest, finalize, price resolution, guardian void, committee epoch pin | non-admin admin actions, non-signer attest, wrong signer |
+| treasury | admin actions, deposit/request_withdraw, agent create/buy/sell, unwind modes/floors, agent_halt, settle, redeem, claim, fee collection, delayed ops, correlation/token caps | wrong admin, non-agent trade, non-unwinder unwind, agent-role separation |
 | reasoning-registry | admin actions, register/unregister agent, publish trace, consumer path | non-agent publish, wrong admin |
 
 ## Adding an entrypoint

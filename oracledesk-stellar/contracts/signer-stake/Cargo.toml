@@ -1,0 +1,33 @@
+[package]
+name = "signer-stake"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "27.0.6"
+oracledesk-types = { path = "../oracledesk-types" }
+
+[dev-dependencies]
+# testutils is test-only; enabling it for the wasm build breaks the contract build.
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
+
+[profile.dev.package."*"]
+opt-level = 3

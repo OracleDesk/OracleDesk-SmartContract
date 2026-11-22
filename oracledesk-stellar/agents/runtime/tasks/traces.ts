@@ -14,6 +14,8 @@ export interface PendingTrace {
   action: string;
   traceHash: string;
   cid: string;
+  decisionHash?: string;
+  traceId?: bigint;
   status: "pending" | "published";
   attempts: number;
 }
@@ -23,24 +25,44 @@ export function recordPendingTrace(ctx: TaskContext, t: Omit<PendingTrace, "stat
 }
 
 export async function publishPendingTraces(
-  adapter: Pick<StellarAdapter, "agent" | "publishTrace">,
+  adapter: Pick<StellarAdapter, "agent" | "publishTrace">
+    & Partial<Pick<StellarAdapter, "publishDecisionTrace">>,
   ctx: TaskContext,
 ): Promise<void> {
   for (const [key, t] of ctx.state.entries<PendingTrace>(TRACES)) {
     if (t.status !== "pending" || ctx.signal.aborted) continue;
     try {
+      if (t.decisionHash && typeof adapter.publishDecisionTrace !== "function") {
+        throw new Error("adapter cannot publish decision traces");
+      }
       const res = await ctx.submit(
         () =>
-          adapter.publishTrace({
-            agent: adapter.agent,
-            market_id: t.marketId,
-            action: t.action,
-            trace_hash: Buffer.from(t.traceHash, "hex"),
-            ipfs_cid: t.cid,
-          }),
+          t.decisionHash
+            ? adapter.publishDecisionTrace!({
+                agent: adapter.agent,
+                marketId: t.marketId,
+                action: t.action,
+                traceHash: t.traceHash,
+                ipfsCid: t.cid,
+                decisionHash: t.decisionHash!,
+              })
+            : adapter.publishTrace({
+                agent: adapter.agent,
+                market_id: t.marketId,
+                action: t.action,
+                trace_hash: Buffer.from(t.traceHash, "hex"),
+                ipfs_cid: t.cid,
+              }),
         `trace:${key}`,
       );
-      ctx.state.set<PendingTrace>(TRACES, key, { ...t, status: "published", attempts: t.attempts + 1 });
+      const updated: PendingTrace = { ...t, status: "published", attempts: t.attempts + 1 };
+      if (t.decisionHash) {
+        if (!res || typeof (res as { traceId?: unknown }).traceId !== "bigint") {
+          throw new Error("publishDecisionTrace did not return a trace id");
+        }
+        updated.traceId = (res as { traceId: bigint }).traceId;
+      }
+      ctx.state.set<PendingTrace>(TRACES, key, updated);
       ctx.log.info("TRACE_PUBLISHED", { key, res });
     } catch (err) {
       ctx.state.set<PendingTrace>(TRACES, key, { ...t, attempts: t.attempts + 1 });

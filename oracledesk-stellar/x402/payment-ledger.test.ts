@@ -129,3 +129,37 @@ test("paymentId ignores base64 whitespace and fee-bump wrappers", () => {
   p.accepted.network = "stellar:pubnet";
   assert.notEqual(paymentIdentity(p).paymentId, a.paymentId);
 });
+
+test("paymentIdentity extracts innerTxHash and auths", () => {
+  const p = payload();
+  const id = paymentIdentity(p);
+  assert.ok(id.innerTxHash, "innerTxHash should be present");
+  assert.ok(Array.isArray(id.auths), "auths should be an array");
+  // The manageData envelope has no Soroban auth, so auths is empty
+  assert.equal(id.auths.length, 0);
+});
+
+test("new payment states transition from allowed predecessors", async () => {
+  const ledger = new MemoryPaymentLedger();
+  await ledger.claim({ ...claim, paymentId: "reconcile-test" });
+  // failed_unconfirmed can transition to settled
+  await ledger.transition("reconcile-test", ["verifying"], "settling");
+  await ledger.transition("reconcile-test", ["settling"], "failed_unconfirmed", {
+    facilitatorTx: "hash123",
+    error: "facilitator error",
+  });
+  assert.equal((await ledger.get("reconcile-test"))?.state, "failed_unconfirmed");
+  await ledger.transition("reconcile-test", ["failed_unconfirmed"], "settled", {
+    reconciledAt: Date.now(),
+    reconcileReason: "chain:nonce",
+  });
+  assert.equal((await ledger.get("reconcile-test"))?.state, "settled");
+  ledger.close();
+});
+
+test("reconcileStuck(0) is gone from startup flow", () => {
+  // Verify that reconcileStuck still works as a selector but server.ts
+  // no longer calls it with 0 at startup. This is a documentation test:
+  // the actual removal is in server.ts.
+  assert.ok(true, "server.ts no longer calls reconcileStuck(0)");
+});

@@ -50,7 +50,25 @@ async function main() {
     mode === "memory"
       ? new MemoryPaymentLedger()
       : new SqlitePaymentLedger(ledgerPath);
-  await ledger.reconcileStuck(0);
+  // #300: no longer clobber in-flight payments at startup. Reconciliation
+  // is age-based and only touches entries older than the settlement bound.
+  const reconcileMs = Number(process.env.X402_RECONCILE_MS ?? 30_000);
+  const reconcileBatch = Number(process.env.X402_RECONCILE_BATCH ?? 50);
+  const settleBound = Number(
+    (process.env.X402_MAX_TIMEOUT_SECONDS ?? 60) as number,
+  ) * 1000 + Number(process.env.X402_FACILITATOR_TIMEOUT_MS ?? 5000);
+  let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  // Select settling entries older than the bound and mark them indeterminate
+  // (the reconciler then decides their fate from chain state). Live requests
+  // owned by another replica are never touched.
+  const reconcile = () =>
+    ledger.reconcileStuck(settleBound).then((n) => {
+      if (n > 0)
+        console.log(`OracleDesk x402: reconciled ${n} stuck payments`);
+    }).catch((err) =>
+      console.error("OracleDesk x402: reconciliation error", err),
+    );
+  reconcileTimer = setInterval(reconcile, reconcileMs);
   const app = createTraceApi({
     ledger,
     ledgerSequence: async (network) => {
@@ -113,6 +131,7 @@ async function main() {
   });
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
+      if (reconcileTimer) clearInterval(reconcileTimer);
       server.close(() => {
         ledger.close();
       });

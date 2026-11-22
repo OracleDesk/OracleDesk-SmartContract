@@ -17,12 +17,19 @@ yarn-error.log*
 # should be committed for reproducible installs, so this repo un-ignores its
 # own.
 !package-lock.json
-!x402/package-lock.json
+docs/book/
 
 # Environment variables — never commit real secrets, only the template.
 .env
 .env.*
 !.env.example
+
+# Agent event-trigger checkpoints and dead letters (EVENTS_STATE_DIR, #105)
+.events/
+# Arbitrage execution journal (ARB_JOURNAL_FILE, #108)
+.arb/
+.risk/
+.journal/
 
 # Stellar / Soroban CLI local state (funded testnet identities, RPC caches)
 .soroban/
@@ -56,3 +63,6 @@ agents/sim/results/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Incident logs (sensitive operational data)
+incidents/

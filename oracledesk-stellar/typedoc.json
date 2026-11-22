@@ -1,0 +1,15 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPointStrategy": "packages",
+  "entryPoints": [
+    "x402",
+    "agents",
+    "packages/bindings/market-core",
+    "packages/bindings/resolver",
+    "packages/bindings/treasury",
+    "packages/bindings/reasoning-registry"
+  ],
+  "out": "docs/book/typedoc",
+  "exclude": ["**/*.test.ts", "**/dist/**", "**/node_modules/**"],
+  "skipErrorChecking": true
+}

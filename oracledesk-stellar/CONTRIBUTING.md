@@ -83,8 +83,12 @@ about 2 minutes on 8 cores, `TREASURY_SEARCH_DEPTH=5` for a quick run).
 ## Code style
 
 - Rust: `cargo fmt` (rustfmt defaults) and a clean `clippy -D warnings`.
-- TypeScript: no linter is configured yet (see `docs/wave-issues/`) —
-  follow the style already in the file you're editing.
+- TypeScript: managed as a single npm workspace at `oracledesk-stellar/` with a
+  shared `tsconfig.base.json`, type-aware `typescript-eslint` (`eslint.config.js`),
+  and Prettier (`.prettierrc.json`, 2-space indent, `printWidth: 100`). Run
+  `npm run lint`, `npm run format:check`, and `npm run typecheck` from
+  `oracledesk-stellar/` (or `make lint`). Generated bindings under
+  `packages/bindings/` are excluded from linting and formatting.
 - Doc comments explain *why*, not *what* — see the existing contract source
   for the level of comment density we're going for (sparse, but present at
   every non-obvious invariant).
@@ -161,3 +165,7 @@ an initial changelog, not an artificial breaking-change report. CI compares
 against the PR base branch and also rejects stale generated manifests. GitHub
 runs the workflow at the repository root; the nested workflow is retained for
 standalone use of `oracledesk-stellar/`.
+
+## Supply-chain security
+
+All PRs run automated supply-chain checks (`cargo-deny`, production `npm audit` gate, `gitleaks`, and CycloneDX SBOM generation). See [`docs/security-ci.md`](docs/security-ci.md) for policy details and exception rules.

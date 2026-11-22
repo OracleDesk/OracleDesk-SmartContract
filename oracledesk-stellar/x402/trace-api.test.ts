@@ -574,3 +574,34 @@ test("response encoding failure never verifies or settles", async () => {
     await f.close();
   }
 });
+
+test("#299: KeyCompromised trace returns 410 before any payment is verified", async () => {
+  const f = await fixture({
+    repository: new MapTraceRepository(
+      new Map([
+        [
+          "1",
+          {
+            traceId: "1",
+            traceHash: hash,
+            ipfsCid: "fixture",
+            verdict: { tag: "KeyCompromised", values: [1n] },
+          },
+        ],
+      ]),
+    ),
+  });
+  try {
+    const r = await request(f.app).get("/traces/1");
+    assert.equal(r.status, 410);
+    assert.deepEqual(r.body, {
+      error: "trace_not_valid",
+      verdict: { tag: "KeyCompromised", values: [1n] },
+    });
+    // No facilitator calls should have happened.
+    assert.equal(f.a.calls.filter((c) => c.kind !== "supported").length, 0);
+    assert.equal(f.b.calls.filter((c) => c.kind !== "supported").length, 0);
+  } finally {
+    await f.close();
+  }
+});

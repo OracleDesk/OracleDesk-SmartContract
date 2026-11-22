@@ -1,0 +1,140 @@
+# Curated caller/auth and storage metadata for market-core.
+# Validated against packages/bindings/market-core/interface.json by scripts/gen-contract-docs/generate.mjs.
+
+[functions.__constructor]
+caller = "deployer (constructor)"
+notes = "Initializes admin, collateral, treasury, resolver, default fee, and protocol fee share atomically at deploy."
+
+[functions.accept_admin]
+caller = "pending admin (require_auth)"
+
+[functions.accept_resolver]
+caller = "pending resolver contract (require_auth)"
+
+[functions.accept_treasury]
+caller = "pending treasury contract (require_auth)"
+
+[functions.admin]
+caller = "anyone (read-only)"
+
+[functions.breaker_config]
+caller = "anyone (read-only)"
+
+[functions.breaker_state]
+caller = "anyone (read-only)"
+
+[functions.buy]
+caller = "trader (require_auth)"
+
+[functions.buy_v2]
+caller = "trader (require_auth)"
+notes = "Enforces deadline and average execution limit_price_bps in addition to min_shares_out."
+
+[functions.cancel_admin_transfer]
+caller = "admin (require_auth)"
+
+[functions.claim_lp_fees]
+caller = "LP holder (require_auth)"
+
+[functions.claim_pool_remainder]
+caller = "LP holder / creator (require_auth)"
+
+[functions.create_market]
+caller = "creator (require_auth)"
+notes = "Commits resolution_hash before trading opens; creator becomes initial LP."
+
+[functions.get_config]
+caller = "anyone (read-only)"
+
+[functions.get_market]
+caller = "anyone (read-only)"
+
+[functions.get_position]
+caller = "anyone (read-only)"
+
+[functions.get_price]
+caller = "anyone (read-only)"
+
+[functions.market_count]
+caller = "anyone (read-only)"
+
+[functions.pending_admin]
+caller = "anyone (read-only)"
+
+[functions.propose_admin]
+caller = "admin (require_auth)"
+
+[functions.propose_resolver]
+caller = "admin (require_auth)"
+notes = "Two-step authenticated wiring; pending resolver must call accept_resolver."
+
+[functions.propose_treasury]
+caller = "admin (require_auth)"
+notes = "Two-step authenticated wiring; pending treasury must call accept_treasury."
+
+[functions.quote_buy]
+caller = "anyone (read-only)"
+
+[functions.quote_sell]
+caller = "anyone (read-only)"
+
+[functions.redeem]
+caller = "position holder (require_auth)"
+
+[functions.resolve]
+caller = "resolver contract (require_auth)"
+
+[functions.sell]
+caller = "trader (require_auth)"
+
+[functions.sell_v2]
+caller = "trader (require_auth)"
+notes = "Enforces deadline and average execution limit_price_bps in addition to max_shares_in."
+
+[functions.set_default_breaker]
+caller = "admin (require_auth)"
+
+[functions.set_default_fee_bps]
+caller = "admin (require_auth)"
+
+[functions.set_paused]
+caller = "admin (require_auth)"
+
+[functions.set_protocol_fee_share_bps]
+caller = "admin (require_auth)"
+
+[functions.sweep_fees]
+caller = "anyone (permissionless)"
+notes = "Transfers accrued protocol fees to the configured treasury."
+
+[functions.transfer_lp]
+caller = "LP holder (require_auth)"
+
+[functions.transfer_position]
+caller = "position holder (require_auth)"
+
+[functions.void_market]
+caller = "resolver contract (require_auth)"
+
+[functions.would_trip]
+caller = "anyone (read-only)"
+
+[storage.Admin]
+durability = "instance"
+ttl = "extended with contract instance TTL"
+
+[storage.Collateral]
+durability = "instance"
+ttl = "extended with contract instance TTL"
+
+[storage.Market]
+durability = "persistent"
+ttl = "extended on load/save to BUMP_TO"
+
+[storage.Position]
+durability = "persistent"
+ttl = "extended on trade/transfer/redeem"
+
+[storage.Band]
+durability = "temporary"
+ttl = "per-ledger circuit breaker reference"

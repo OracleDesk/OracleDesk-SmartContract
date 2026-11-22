@@ -1,0 +1,534 @@
+{
+  "schema": 1,
+  "contract": "test-oracle",
+  "functions": {
+    "__constructor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Initializes the SEP-40 test oracle. `resolution` is the slot cadence in seconds (e.g. `300` for 5 minutes). `period` is the retention horizon in seconds (e.g. `86400` for 24 hours).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "admin",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "base",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "decimals",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "resolution",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "period",
+            "type_": "u64"
+          }
+        ],
+        "name": "__constructor",
+        "outputs": []
+      }
+    },
+    "add_asset": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Registers an asset so prices may be posted for it. Idempotent.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          }
+        ],
+        "name": "add_asset",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "assets": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Supported assets registered via `add_asset`.",
+        "inputs": [],
+        "name": "assets",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": {
+                "udt": {
+                  "name": "Asset"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "base": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Base asset that prices are quoted in (for example `Asset::Other(\"USD\")`).",
+        "inputs": [],
+        "name": "base",
+        "outputs": [
+          {
+            "udt": {
+              "name": "Asset"
+            }
+          }
+        ]
+      }
+    },
+    "decimals": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Fixed-point decimal places for returned prices.",
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "lastprice": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Returns the newest recorded price for `asset`, if any.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          }
+        ],
+        "name": "lastprice",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PriceData"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "period": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Retention period in seconds. Records older than `latest_slot - period` are pruned on subsequent writes.",
+        "inputs": [],
+        "name": "period",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Returns the price record for `asset` at `timestamp`, rounded down to the resolution slot `timestamp - (timestamp % resolution)`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "name": "price",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PriceData"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "prices": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Returns up to `records` most recent price records for `asset`, ordered newest-first. Returns `None` if `asset` has no stored prices or `records == 0`. Capped at [`MAX_PRICES_RECORDS`].",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "records",
+            "type_": "u32"
+          }
+        ],
+        "name": "prices",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "vec": {
+                  "element_type": {
+                    "udt": {
+                      "name": "PriceData"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "resolution": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Feed cadence in seconds. Timestamps align to multiples of `resolution`.",
+        "inputs": [],
+        "name": "resolution",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "set_period": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Updates the retention horizon in seconds.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "period",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_period",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Posts a single price observation for a registered `asset` at `timestamp`. `timestamp` must be aligned to `resolution()` and must not exceed the current ledger timestamp (`FutureTimestamp`). Note that `price <= 0` is deliberately permitted so resolver validation of invalid prices can be tested against a deployed oracle.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "Asset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_prices": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Posts a batch of `(asset, price)` observations for the same `timestamp`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "entries",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "tuple": {
+                    "value_types": [
+                      {
+                        "udt": {
+                          "name": "Asset"
+                        }
+                      },
+                      "i128"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_prices",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "types": {
+    "Asset": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Stellar",
+              "type_": [
+                "address"
+              ]
+            }
+          }
+        ],
+        "doc": "SEP-40 Asset identifier. Variant names and order match `resolver::OracleAsset`.",
+        "lib": "",
+        "name": "Asset"
+      }
+    },
+    "DataKey": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Admin"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Assets"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Base"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Decimals"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "LastSlot",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "Asset"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "OldestSlot",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "Asset"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Period"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Price",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "Asset"
+                  }
+                },
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolution"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "DataKey"
+      }
+    },
+    "PriceData": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "SEP-40 price record returned by `price`, `prices`, and `lastprice`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "timestamp",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PriceData"
+      }
+    }
+  },
+  "errors": {
+    "Error": {
+      "kind": "udt_error_enum_v0",
+      "spec": {
+        "cases": [
+          {
+            "doc": "",
+            "name": "FutureTimestamp",
+            "value": 5
+          },
+          {
+            "doc": "",
+            "name": "InvalidConfig",
+            "value": 7
+          },
+          {
+            "doc": "",
+            "name": "MisalignedTimestamp",
+            "value": 4
+          },
+          {
+            "doc": "",
+            "name": "NotInitialized",
+            "value": 1
+          },
+          {
+            "doc": "",
+            "name": "TooManyAssets",
+            "value": 8
+          },
+          {
+            "doc": "",
+            "name": "TooManyRecords",
+            "value": 6
+          },
+          {
+            "doc": "",
+            "name": "Unauthorized",
+            "value": 2
+          },
+          {
+            "doc": "",
+            "name": "UnknownAsset",
+            "value": 3
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Error"
+      }
+    }
+  },
+  "events": {},
+  "type_origins": {},
+  "hash_critical": []
+}

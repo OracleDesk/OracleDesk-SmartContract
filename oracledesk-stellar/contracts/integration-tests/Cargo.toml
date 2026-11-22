@@ -9,6 +9,13 @@ description = "Cross-contract and bounded-exhaustive tests; ships no contract."
 doctest = false
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
 treasury = { path = "../treasury" }
 market-core = { path = "../market-core" }
+resolver-contract = { package = "resolver", path = "../resolver" }
+reasoning-registry = { path = "../reasoning-registry" }
+wasmparser = "0.116"
+stellar-xdr = { version = "27.0.0", features = ["std"] }
+proptest = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -157,3 +157,27 @@ parses.
 - Signers can void an unanswerable market without the admin key.
 - One more persistent entry family per outcome, and bindings consumers
   must handle a third outcome tag on the resolver.
+
+## Addendum: epoch binding (#297)
+
+Committee markets now pin the epoch in force at `close_time` and use that
+epoch's `MemberAt` snapshot for all attestations and quorum checks. This
+prevents rotations executed between attestation and finalization from
+changing the outcome. `AttestEpoch(market, signer)` continues to be written
+with the pinned epoch.
+
+New keys: `EpochStart(committee_id, epoch)` holding the timestamp at which
+each epoch started, and `MarketEpoch(market_id)` holding the pinned
+`(committee_id, epoch)`. `epoch_at` walks back at most `max_rotation_delta + 1`
+entries (capped at 17). Legacy committees without `EpochStart` for epoch 1
+are treated as having started at creation (timestamp 0).
+
+The pin is written lazily on the first attestation after close, or
+permissionlessly through `pin_committee_epoch(market_id)`. `CommitteeSpec`,
+`MemberAt`, `EpochStart`, and `MarketEpoch` are bumped to the market's
+close-time-aware target in `bump_market_entries` and at pin time, so a
+snapshot shared by many markets survives until each finalizes.
+
+`validate_committee_ref` is shared between `register_committee_spec` and
+the V2/V3 reveal path (`validate_rule`), so both check committee existence,
+`min_epoch`, `dispute_window != 0`, and `max_rotation_delta <= 16`.

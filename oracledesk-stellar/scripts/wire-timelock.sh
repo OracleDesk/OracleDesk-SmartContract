@@ -17,9 +17,10 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-NETWORK=testnet
-DEPLOYER_KEY=oracledesk-deployer
-OUT=deployments/testnet.json
+NETWORK=${NETWORK:-testnet}
+IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
+DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
+OUT=${OUT:-deployments/$NETWORK.json}
 
 log() { printf '==> %s\n' "$*"; }
 json_get() { jq -r "$1 // empty" "$OUT"; }

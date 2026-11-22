@@ -5,7 +5,7 @@
     "__constructor": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Registers `agent` as the first agent with every role and the global caps as its own. `max_net_exposure` caps capital deployed in open positions across all markets at once (see `net_exposure`); it must be at least `max_trade`. `config_delay` (seconds, at least `MIN_CONFIG_DELAY`) is the timelock on every loosening change. Any collateral the treasury already holds is minted as shares to `admin`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -79,7 +79,7 @@
     "acknowledge_drawdown": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Deprecated no-op, kept so existing callers and bindings keep working: acknowledging is no longer a separate step. Use `resume_agents`.",
         "inputs": [],
         "name": "acknowledge_drawdown",
         "outputs": [
@@ -116,7 +116,7 @@
     "agent_buy": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Buys `outcome` shares in an existing market using treasury capital (`ROLE_TRADE`). Price-checked, see `do_agent_buy`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -159,10 +159,71 @@
         ]
       }
     },
+    "agent_buy_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Buys with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_buy_traced",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "agent_buy_v2": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`agent_buy` with a per-share limit price (`limit_price_bps`, 0 = none) and a deadline (unix seconds, network time). market-core's `buy_v2` enforces both; an expired or out-of-limit trade reverts the whole invocation, so the treasury's caps are never consumed by a reverted trade.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -218,7 +279,7 @@
     "agent_claim_lp_fees": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Claims the market's LP fee share for a market the treasury created (`ROLE_SETTLE`). The LP portion accrues separately on market-core (see its `claim_lp_fees`).",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -245,7 +306,7 @@
     "agent_count": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Agents ever registered (removed ones included).",
+        "doc": "",
         "inputs": [],
         "name": "agent_count",
         "outputs": [
@@ -256,7 +317,7 @@
     "agent_create_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Creates and seeds a market using treasury capital (`ROLE_CREATE`). The treasury becomes the market's creator/LP. `initial_yes_bps` must lie within the price policy's `[min_sell, max_buy]` band, so the treasury never seeds a market whose creator side is near worthless.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -325,7 +386,7 @@
     "agent_create_market_and_reveal": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Like [`Treasury::agent_create_market`], but reveals the resolution rule in the same transaction (#64). The market is created with the commitment derived from `spec_v2` itself, so the follow-up reveal necessarily matches and the market can never be left unresolvable. `resolver` is the deployed resolver contract; it must be configured for this treasury's market-core. The router cannot serve this path: seeding pulls collateral from the treasury contract (not the end user) via a contract self-authorization, which only this contract can perform — a stateless router between the agent and market-core would not be authorized on the token.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -396,10 +457,153 @@
         ]
       }
     },
+    "agent_create_market_collateral": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "collateral",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_create_market_collateral",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "agent_create_market_reveal_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "agent_create_market_reveal_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "agent_daily_usage": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`agent`'s own sliding-window usage, counted against its `max_daily`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -422,10 +626,37 @@
         ]
       }
     },
+    "agent_halt": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_halt",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "agent_sell": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Sells `outcome` shares back into the pool for exactly `collateral_out` (`ROLE_TRADE`). This returns capital to the treasury (market-core pays out of its own balance), so it is not capped and does not need the nested-transfer pre-authorization that buying does. It frees net headroom (`collateral_out` is recorded) but never lifetime headroom. Price-checked, see `do_agent_sell`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -468,10 +699,71 @@
         ]
       }
     },
+    "agent_sell_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sells with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_sell_traced",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "agent_sell_v2": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`agent_sell` with a per-share limit price (`limit_price_bps`, 0 = no limit) and a deadline (unix seconds, network time), both enforced by market-core's `sell_v2`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -546,10 +838,61 @@
         ]
       }
     },
+    "allowed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Whether `op` is permitted in the current mode: the gate's answer, for agents and frontends to pre-check.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "Op"
+              }
+            }
+          }
+        ],
+        "name": "allowed",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "audit_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "audit_mark",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "MarkRecord"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "available_capital": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Total capital deployable: liquid collateral balance plus supplied yield value.",
+        "doc": "",
         "inputs": [],
         "name": "available_capital",
         "outputs": [
@@ -559,6 +902,50 @@
               "ok_type": "i128"
             }
           }
+        ]
+      }
+    },
+    "available_capital_of": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          }
+        ],
+        "name": "available_capital_of",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "bucket_exposure": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "bucket",
+            "type_": "u64"
+          }
+        ],
+        "name": "bucket_exposure",
+        "outputs": [
+          "i128"
         ]
       }
     },
@@ -600,6 +987,60 @@
         ]
       }
     },
+    "cancel_correlation_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_correlation_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_op": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "kind",
+            "type_": "u32"
+          }
+        ],
+        "name": "cancel_op",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "cancel_price_policy": {
       "kind": "function_v0",
       "spec": {
@@ -616,10 +1057,42 @@
         ]
       }
     },
+    "cancel_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_resolvability_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "capital_breakdown": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Breakdown of treasury capital across liquid, yield principal, and yield value.",
+        "doc": "",
         "inputs": [],
         "name": "capital_breakdown",
         "outputs": [
@@ -636,10 +1109,32 @@
         ]
       }
     },
+    "category_exposure": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "idx",
+            "type_": "u32"
+          }
+        ],
+        "name": "category_exposure",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
     "claim_pool_remainder": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Claims the LP pool remainder for a market the treasury created (`ROLE_SETTLE`).",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -663,10 +1158,45 @@
         ]
       }
     },
+    "claim_pool_remainders": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "claim_pool_remainders",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "claim_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Pays the ticket at the head of the queue as far as idle collateral allows. Permissionless: the money always goes to the ticket's owner. Only the head ticket can be paid (`NothingToPay` for later ones).",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -688,7 +1218,7 @@
     "close_trade": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Marks a market's exposure as exited (`ROLE_SETTLE`). Pure bookkeeping (see `MarketExposure`) for the future exposure dashboard; it does not move funds or free either the cumulative per-market cap or net headroom.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -715,7 +1245,7 @@
     "collect_market_fees": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Pulls accrued **protocol** fees from a configured market-core contract. Only the protocol's share of each market's fees: the LP portion accrues separately on market-core and belongs to the market's creator — for agent-created markets that is the treasury itself, via `agent_claim_lp_fees`. Fees raise NAV for every shareholder at the moment they arrive.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -745,6 +1275,55 @@
         ]
       }
     },
+    "correlation_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "correlation_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "CorrelationCaps"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "correlation_headroom": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "correlation_headroom",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "tuple": {
+                  "value_types": [
+                    "i128",
+                    "i128"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "creation_usage": {
       "kind": "function_v0",
       "spec": {
@@ -764,7 +1343,7 @@
     "daily_headroom": {
       "kind": "function_v0",
       "spec": {
-        "doc": "How much more the agents together may deploy right now before `max_daily` (`max_daily - window sum`, floored at 0).",
+        "doc": "",
         "inputs": [],
         "name": "daily_headroom",
         "outputs": [
@@ -780,7 +1359,7 @@
     "daily_usage": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Usage over the sliding window as of now: `amount` sums every bucket still counted against `max_daily`, `day_start` is the start of the oldest of them. Side-effect free (it advances a copy), so repeated reads without trades in between return the same value.",
+        "doc": "",
         "inputs": [],
         "name": "daily_usage",
         "outputs": [
@@ -800,7 +1379,7 @@
     "daily_usage_detail": {
       "kind": "function_v0",
       "spec": {
-        "doc": "The hourly buckets behind `daily_usage`, advanced to now (not stored).",
+        "doc": "",
         "inputs": [],
         "name": "daily_usage_detail",
         "outputs": [
@@ -817,10 +1396,32 @@
         ]
       }
     },
+    "declare_emergency": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Declares an emergency: opens `emergency_withdraw` (the idle-only, position-forfeiting exit) and closes new withdrawal requests. Only from `AdminPaused`, so one admin call cannot flip straight into the forfeiting exit; with the timelock as admin the extra step is delayed too.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "declare_emergency",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "deposit": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Deposits `amount` of collateral and mints shares to `from` at the NAV as it was before the deposit. Returns the shares minted.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -834,6 +1435,38 @@
           }
         ],
         "name": "deposit",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "deposit_token": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "deposit_token",
         "outputs": [
           {
             "result": {
@@ -883,7 +1516,7 @@
     "emergency_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "While paused only: burns `shares` for their pro-rata part of the free idle collateral, without reading market-core (for when it is the thing that broke). The owner forfeits their part of open positions, which stays with the remaining shareholders.",
+        "doc": "`Mode::Emergency` only (`declare_emergency`, itself only from an admin pause): burns `shares` for their pro-rata part of the free idle collateral, without reading market-core (for when it is the thing that broke). The owner forfeits their part of open positions, which stays with the remaining shareholders. A drawdown halt or an ordinary admin pause never opens it: the normal queued exit pays at NAV (ADR 0005).",
         "inputs": [
           {
             "doc": "",
@@ -907,10 +1540,26 @@
         ]
       }
     },
+    "end_emergency": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Ends the emergency. The admin pause stands (`AdminPaused`); `unpause` then resumes. In production route it through `timelock.schedule`.",
+        "inputs": [],
+        "name": "end_emergency",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "execute_agent": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Applies `agent`'s pending policy once its delay has passed. Permissionless: the delay is the protection.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -932,9 +1581,63 @@
     "execute_config": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Applies the pending config once its delay has passed. Permissionless, so execution never depends on the admin being available. A `market_core` change records the old core as legacy: its positions stay where they are (recover them with `legacy_redeem` / `legacy_claim_pool_remainder`), and exposure for the new core is kept under keys namespaced by core so market ids cannot collide. The new core must be pointed at this treasury with its own `set_treasury`.",
+        "doc": "",
         "inputs": [],
         "name": "execute_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_correlation_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_correlation_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_op": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "kind",
+            "type_": "u32"
+          }
+        ],
+        "name": "execute_op",
         "outputs": [
           {
             "result": {
@@ -948,7 +1651,7 @@
     "execute_price_policy": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Applies the pending price policy once its delay has passed. Permissionless.",
+        "doc": "",
         "inputs": [],
         "name": "execute_price_policy",
         "outputs": [
@@ -958,6 +1661,55 @@
               "ok_type": "void"
             }
           }
+        ]
+      }
+    },
+    "execute_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Applies the pending resolvability policy once its delay has passed. Permissionless.",
+        "inputs": [],
+        "name": "execute_resolvability_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "exit_floor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "exit_floor",
+        "outputs": [
+          "u32"
         ]
       }
     },
@@ -989,7 +1741,7 @@
     "get_config": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Deprecated compatibility view in the pre-registry `RiskConfig` shape: `agent` is the first registered agent (whatever its current policy). Use `get_global` and `get_agent` instead.",
+        "doc": "",
         "inputs": [],
         "name": "get_config",
         "outputs": [
@@ -1049,7 +1801,7 @@
     "get_net_cap": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`max_net_exposure`.",
+        "doc": "",
         "inputs": [],
         "name": "get_net_cap",
         "outputs": [
@@ -1077,10 +1829,25 @@
         ]
       }
     },
+    "get_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_resolvability_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ResolvabilityPolicy"
+            }
+          }
+        ]
+      }
+    },
     "legacy_claim_pool_remainder": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`claim_pool_remainder` against a legacy market-core.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1112,7 +1879,7 @@
     "legacy_redeem": {
       "kind": "function_v0",
       "spec": {
-        "doc": "`redeem` against a market-core this treasury was switched away from (see `execute_config`), so positions there are never stranded.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1144,7 +1911,7 @@
     "liquid_capital": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Liquid collateral balance held directly in the treasury.",
+        "doc": "",
         "inputs": [],
         "name": "liquid_capital",
         "outputs": [
@@ -1181,7 +1948,7 @@
     "market_valuation": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Conservative valuation of the treasury's holdings in `market_id` (see [`Valuation`]). Two cross-contract reads (`get_market`, `get_position`); a view only, never on the trading path.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1204,18 +1971,33 @@
         ]
       }
     },
-    "migrate_market": {
+    "max_mark_age_ledgers": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Moves the treasury's position in `market_id` — and the LP role, when the treasury is the market's creator and has not claimed the remainder yet — to the successor set via `set_successor`, then closes the local exposure. Admin-only: relocating capital is not an agent trading action, and the agent key must not be able to drain positions. market-core's `transfer_position` / `transfer_lp` require the treasury itself to authorize. Because the treasury is their *direct* caller here, the implicit invoker authorization covers both — no `authorize_as_current_contract` entry is needed (unlike the nested token transfer in `agent_buy`, see `docs/adr/0002-treasury-nested-auth.md`).",
+        "doc": "",
+        "inputs": [],
+        "name": "max_mark_age_ledgers",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "migrate_markets": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
         "inputs": [
           {
             "doc": "",
-            "name": "market_id",
-            "type_": "u64"
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
           }
         ],
-        "name": "migrate_market",
+        "name": "migrate_markets",
         "outputs": [
           {
             "result": {
@@ -1226,10 +2008,67 @@
         ]
       }
     },
+    "migrate_marks": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "migrate_marks",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "mode": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The effective operating mode.",
+        "inputs": [],
+        "name": "mode",
+        "outputs": [
+          {
+            "udt": {
+              "name": "Mode"
+            }
+          }
+        ]
+      }
+    },
+    "mode_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Each stored reason (drawdown halt, admin pause, emergency) with when it began and, for the admin's, why.",
+        "inputs": [],
+        "name": "mode_state",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ModeState"
+            }
+          }
+        ]
+      }
+    },
     "nav": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Net asset value: idle collateral plus, for every market in the open- market index, what the holdings are worth whatever the outcome (complete sets and the LP's `min` reserve while open, the exact settlement value once final), minus what queued withdrawals are owed. Directional exposure is valued at zero, so no trade against a pool can raise NAV.",
+        "doc": "",
         "inputs": [],
         "name": "nav",
         "outputs": [
@@ -1242,10 +2081,25 @@
         ]
       }
     },
+    "nav_detail": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "nav_detail",
+        "outputs": [
+          {
+            "udt": {
+              "name": "NavDetail"
+            }
+          }
+        ]
+      }
+    },
     "net_exposure": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Capital currently deployed across all markets: `sum(max(0, collateral_in - collateral_out))`, the figure `max_net_exposure` is enforced against.",
+        "doc": "",
         "inputs": [],
         "name": "net_exposure",
         "outputs": [
@@ -1256,7 +2110,7 @@
     "net_position": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Net position in `market_id` of the current market-core.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1315,6 +2169,28 @@
         ]
       }
     },
+    "pause": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin pause: no deposits and no agent trading (settlement, queued withdrawals and recalls stay open). Idempotent.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "pause",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "pending_agent": {
       "kind": "function_v0",
       "spec": {
@@ -1359,6 +2235,69 @@
         ]
       }
     },
+    "pending_correlation_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_correlation_caps",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingCorrelation"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pending_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_max_mark_age",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingMarkAge"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pending_op": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "kind",
+            "type_": "u32"
+          }
+        ],
+        "name": "pending_op",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingAdminOp"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "pending_price_policy": {
       "kind": "function_v0",
       "spec": {
@@ -1378,10 +2317,29 @@
         ]
       }
     },
+    "pending_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_resolvability_policy",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingResolvability"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "propose_config": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Proposes `config` as the global config (admin). Tighten-only proposals apply at once and leave any pending proposal and its timer as they are; anything else is queued.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1404,10 +2362,102 @@
         ]
       }
     },
+    "propose_correlation_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          }
+        ],
+        "name": "propose_correlation_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "propose_op": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          }
+        ],
+        "name": "propose_op",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "propose_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "propose_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "queue_bounds": {
       "kind": "function_v0",
       "spec": {
-        "doc": "The ticket `claim_withdraw` pays next, and the id the next one gets.",
+        "doc": "",
         "inputs": [],
         "name": "queue_bounds",
         "outputs": [
@@ -1425,7 +2475,7 @@
     "queue_reserved": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Collateral owed to queued withdrawals; agents cannot spend it.",
+        "doc": "",
         "inputs": [],
         "name": "queue_reserved",
         "outputs": [
@@ -1525,10 +2575,71 @@
         ]
       }
     },
+    "redeem_many": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "redeem_many",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "refresh_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "refresh_mark",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "remove_agent": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Deactivates `agent` at once, keeping its usage history. At least one active agent with `ROLE_SETTLE` must remain, so open positions can always be settled.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1550,7 +2661,7 @@
     "request_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket (FIFO, paid by `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1597,10 +2708,26 @@
         ]
       }
     },
+    "resume_agents": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Clears a drawdown halt. Allowed only once the realized window PnL is back above `-max_drawdown` (waiting for old losses to leave the window, or an explicit `reset_pnl_window`), so an admin cannot simply wave a real loss through. Leaves any admin pause or emergency untouched. Replaces `acknowledge_drawdown` + `set_paused(false)`.",
+        "inputs": [],
+        "name": "resume_agents",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_agent": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Adds or updates `agent`. Validation: `roles` non-empty and known, `0 < max_trade <= max_daily`, both within the global caps, `active`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1676,6 +2803,28 @@
         ]
       }
     },
+    "set_default_exit_floor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "price_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_default_exit_floor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_drawdown_config": {
       "kind": "function_v0",
       "spec": {
@@ -1703,10 +2852,85 @@
         ]
       }
     },
-    "set_paused": {
+    "set_exit_floor": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_exit_floor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_mode": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin mode transition kept from #150: `Normal` clears an admin pause and an unwind (a drawdown halt stands: `resume_agents`), `Paused` is `pause`, `Unwinding` replaces an admin pause with an orderly wind-down. `Emergency` and `AgentsHalted` have their own entrypoints (`declare_emergency`, the drawdown trip) and are refused here.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "mode",
+            "type_": {
+              "udt": {
+                "name": "Mode"
+              }
+            }
+          }
+        ],
+        "name": "set_mode",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_paused": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`set_paused(true)` is `pause(admin)`, `set_paused(false)` is `unpause()`. Kept for the timelock's emergency path (ADR 0008), which calls `set_paused(true)`.",
         "inputs": [
           {
             "doc": "",
@@ -1728,7 +2952,7 @@
     "set_price_policy": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Sets the price limits on agent trades (admin). Like the caps, tightening (lower `max_buy`/`max_impact`/`max_slippage`, higher `min_sell`) applies at once and anything else waits `config_delay`.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1751,10 +2975,36 @@
         ]
       }
     },
+    "set_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin only. Tightening (a flag to `true`, a larger `min_secs_to_close`, fewer `allowed_specs` bits) applies at once; anything that loosens a knob waits `config_delay` (`execute_resolvability_policy`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_resolvability_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_successor": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Sets the successor treasury that `migrate_market` hands positions and the LP role to. Admin-only; overwrites any previous successor (the `SuccessorSet` events are the audit trail).",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1763,6 +3013,63 @@
           }
         ],
         "name": "set_successor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_token_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "TokenCaps"
+              }
+            }
+          }
+        ],
+        "name": "set_token_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_unwinder": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "unwinder",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "set_unwinder",
         "outputs": [
           {
             "result": {
@@ -1803,7 +3110,7 @@
     "settle_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Permissionless settlement of a resolved or voided market's position and LP remainder. Operates even when the treasury is paused. Idempotent on retry.",
+        "doc": "",
         "inputs": [
           {
             "doc": "",
@@ -1848,12 +3155,101 @@
         ]
       }
     },
+    "token_caps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          }
+        ],
+        "name": "token_caps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TokenCaps"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "total_shares": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
         "inputs": [],
         "name": "total_shares",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
+    "trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "trace_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "TracePolicyConfig"
+            }
+          }
+        ]
+      }
+    },
+    "unpause": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Clears the admin pause only. A drawdown halt, if any, stands, so the agents stay halted; clear it with `resume_agents`. Refused while an emergency is declared (`end_emergency` first).",
+        "inputs": [],
+        "name": "unpause",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "unwinder": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "unwinder",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "unwound": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "unwound",
         "outputs": [
           "i128"
         ]
@@ -1870,33 +3266,6 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
-            }
-          }
-        ]
-      }
-    },
-    "withdraw": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "to",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "name": "amount",
-            "type_": "i128"
-          }
-        ],
-        "name": "withdraw",
-        "outputs": [
-          {
-            "result": {
-              "error_type": "error",
-              "ok_type": "void"
             }
           }
         ]
@@ -1929,10 +3298,103 @@
     }
   },
   "types": {
+    "AdminOp": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "AllocateToYield",
+              "type_": [
+                "i128"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "MigrateMarkets",
+              "type_": [
+                {
+                  "vec": {
+                    "element_type": "u64"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ResetPnlWindow"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetCorrelationCaps",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CorrelationCaps"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetCreationPolicy",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CreationPolicy"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetDrawdownConfig",
+              "type_": [
+                "i128",
+                "u32"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetSuccessor",
+              "type_": [
+                "address"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "SetYieldVenue",
+              "type_": [
+                "address",
+                "i128"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "AdminOp"
+      }
+    },
     "AgentPolicy": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "One registered agent. `max_trade` / `max_daily` sit under the global caps; both are checked on every spend.",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -1957,6 +3419,92 @@
         ],
         "lib": "",
         "name": "AgentPolicy"
+      }
+    },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "BatchItem"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "BatchStatus"
       }
     },
     "CapitalBreakdown": {
@@ -2060,6 +3608,35 @@
         "name": "CommitteeRef"
       }
     },
+    "CorrelationCaps": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "bucket_secs",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "max_per_bucket",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_per_category",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "CorrelationCaps"
+      }
+    },
     "CreationPolicy": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2103,7 +3680,7 @@
     "DailyUsage": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Summary of the sliding daily window, returned by `daily_usage`. `day_start` is the start of the oldest hour still counted and `amount` the usage summed over the whole window (see [`UsageWindow`]).",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -2226,7 +3803,7 @@
     "GlobalConfig": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Treasury-wide caps, enforced on top of every agent's own policy.",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -2249,7 +3826,7 @@
             "type_": "i128"
           },
           {
-            "doc": "Cap on capital deployed in open positions across all markets at once (see `net_exposure`).",
+            "doc": "",
             "name": "max_net_exposure",
             "type_": "i128"
           },
@@ -2296,6 +3873,66 @@
         "name": "HybridConfig"
       }
     },
+    "MarkRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "contribution",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "lp",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "lp_floor",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "pos_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "pos_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "refreshed_ledger",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "status_final",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "MarkRecord"
+      }
+    },
     "MarketPnl": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2321,10 +3958,139 @@
         "name": "MarketPnl"
       }
     },
+    "Mode": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "A drawdown tripped: agents may not open or add exposure, but may reduce it. Depositors keep their normal exit (queued withdrawals at NAV).",
+              "name": "AgentsHalted"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The admin declared an emergency (only from `Paused`): the in-kind/idle `emergency_withdraw` exit opens, and queueing new withdrawals closes.",
+              "name": "Emergency"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Everything runs.",
+              "name": "Normal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The admin paused the treasury: no deposits and no agent trading.",
+              "name": "Paused"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The admin chose an orderly wind-down (`set_mode(Unwinding)`, #150): agents may not open or add exposure, but may sell (see `unwind_sell` and the per-market exit floors), and everything else runs as in `Normal`.",
+              "name": "Unwinding"
+            }
+          }
+        ],
+        "doc": "What the treasury is doing right now, derived from [`ModeState`] with the priority `Emergency > Paused > AgentsHalted > Unwinding > Normal`.",
+        "lib": "",
+        "name": "Mode"
+      }
+    },
+    "ModeState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Why the treasury is not in `Normal`. Each reason is stored independently, so clearing one never clears another.",
+        "fields": [
+          {
+            "doc": "Ledger time of the admin pause. Cleared by `unpause` / `set_paused(false)`.",
+            "name": "admin_pause_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "The reason the admin gave (`admin` for `set_paused(true)`; `legacy` for a pause read from the pre-#272 flags). Set with `admin_pause_at`.",
+            "name": "admin_pause_reason",
+            "type_": {
+              "option": {
+                "value_type": "symbol"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time a drawdown halted the agents. Cleared by `resume_agents`.",
+            "name": "drawdown_halt",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time the admin declared an emergency. Cleared by `end_emergency`.",
+            "name": "emergency_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "The reason the admin gave. Set with `emergency_at`.",
+            "name": "emergency_reason",
+            "type_": {
+              "option": {
+                "value_type": "symbol"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time the admin set `Unwinding`. Cleared by `set_mode(Normal)`.",
+            "name": "unwinding_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "ModeState"
+      }
+    },
+    "NavDetail": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "holdings",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "oldest_refresh",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "stale_lp_markets",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "NavDetail"
+      }
+    },
     "NetPosition": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Collateral the treasury has sent into (`collateral_in`) and received back from (`collateral_out`) one market. Accounting starts when this code was deployed: a missing entry reads as zero.",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -2341,10 +4107,86 @@
         "name": "NetPosition"
       }
     },
+    "Op": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "`agent_create_market`, `agent_create_market_and_reveal`, `agent_buy`, `agent_buy_v2`: anything that opens or adds exposure.",
+              "name": "AgentOpen"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`agent_sell`, `agent_sell_v2`, `close_trade`: anything that reduces it.",
+              "name": "AgentReduce"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`redeem`, `claim_pool_remainder`, the batch variants and `agent_claim_lp_fees`: bringing collateral home after resolution.",
+              "name": "AgentSettle"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`claim_withdraw` (pays a ticket that already exists).",
+              "name": "ClaimWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`deposit`.",
+              "name": "Deposit"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`emergency_withdraw`.",
+              "name": "EmergencyWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`migrate_market`.",
+              "name": "Migrate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`settle_market`, `realize`, `collect_market_fees`: permissionless settlement.",
+              "name": "PermissionlessSettle"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`request_withdraw`.",
+              "name": "RequestWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`allocate_to_yield`.",
+              "name": "YieldAllocate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`recall_from_yield`.",
+              "name": "YieldRecall"
+            }
+          }
+        ],
+        "doc": "A class of state-changing entrypoint. Every one the treasury exposes maps to exactly one `Op` (or is pure admin configuration, which is never gated; see the `matrix` test in `lib.rs`).",
+        "lib": "",
+        "name": "Op"
+      }
+    },
     "OpenMarket": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "An entry of the open-market index `nav()` walks.",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -2411,6 +4253,40 @@
         "name": "Outcome"
       }
     },
+    "PendingAdminOp": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "expires_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingAdminOp"
+      }
+    },
     "PendingAgent": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2469,6 +4345,55 @@
         "name": "PendingConfig"
       }
     },
+    "PendingCorrelation": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingCorrelation"
+      }
+    },
+    "PendingMarkAge": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "PendingMarkAge"
+      }
+    },
     "PendingPricePolicy": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2496,6 +4421,35 @@
         ],
         "lib": "",
         "name": "PendingPricePolicy"
+      }
+    },
+    "PendingResolvability": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingResolvability"
       }
     },
     "PriceConfig": {
@@ -2578,25 +4532,25 @@
     "PricePolicy": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Price limits on every agent trade, in bps of the outcome's spot price.",
+        "doc": "",
         "fields": [
           {
-            "doc": "Never buy an outcome priced above this.",
+            "doc": "",
             "name": "max_buy_price_bps",
             "type_": "u32"
           },
           {
-            "doc": "Largest `|p_after - p_before|` a single trade may cause.",
+            "doc": "",
             "name": "max_impact_bps",
             "type_": "u32"
           },
           {
-            "doc": "Tolerance applied to the same-transaction quote to derive the effective `min_shares_out` / `max_shares_in`.",
+            "doc": "",
             "name": "max_slippage_bps",
             "type_": "u32"
           },
           {
-            "doc": "Never sell an outcome priced below this.",
+            "doc": "",
             "name": "min_sell_price_bps",
             "type_": "u32"
           }
@@ -2765,10 +4719,45 @@
         "name": "ResolutionSpecV2"
       }
     },
+    "ResolvabilityPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Pre-trade resolvability policy for `agent_buy` / `agent_buy_v2` (#273): the treasury will not put depositor capital into a market that cannot be resolved, whatever the agent believes. Sells, redemptions and settlement are never gated by it (the treasury must always be able to exit or settle). Tightening is immediate (a flag set to `true`, a larger `min_secs_to_close`, fewer `allowed_specs` bits); everything else waits `config_delay`, like the other policies. The default is fully permissive, so an upgraded deployment behaves as before until the admin tightens it.",
+        "fields": [
+          {
+            "doc": "Bitmask over `resolver::SpecKind`: kinds that may be bought into.",
+            "name": "allowed_specs",
+            "type_": "u32"
+          },
+          {
+            "doc": "No buys while the resolver reports `Disputed` (finalization frozen).",
+            "name": "block_when_disputed",
+            "type_": "bool"
+          },
+          {
+            "doc": "No buys while a signer proposal is pending. Off by default: opening a proposal needs a signer, but a quorum can still use it to freeze buys.",
+            "name": "block_with_open_proposal",
+            "type_": "bool"
+          },
+          {
+            "doc": "Minimum seconds between now and `close_time` for a buy (0 = none). Does not apply to seed-and-reveal creation, which happens far from close.",
+            "name": "min_secs_to_close",
+            "type_": "u64"
+          },
+          {
+            "doc": "The market's resolution spec must have been revealed to its resolver.",
+            "name": "require_revealed",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "ResolvabilityPolicy"
+      }
+    },
     "RiskConfig": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Legacy single-agent configuration. Still the shape returned by the deprecated `get_config` view; live state is [`GlobalConfig`] plus the agent registry.",
+        "doc": "",
         "fields": [
           {
             "doc": "",
@@ -2859,13 +4848,136 @@
         "name": "SignerConfig"
       }
     },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "SkipReason"
+      }
+    },
+    "TokenCaps": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_market",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_trade",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "TokenCaps"
+      }
+    },
+    "TracePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Off"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TracePolicy"
+      }
+    },
+    "TracePolicyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TracePolicyConfig"
+      }
+    },
     "UsageWindow": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400 bytes that every call loads anyway, so it costs no extra ledger-entry read (a persistent entry would add one per trade). Per-agent windows have the same shape but live in persistent storage.",
+        "doc": "",
         "fields": [
           {
-            "doc": "Always `BUCKETS` long. `amounts[i]` is the usage of hour `head_hour - ((head_idx - i) mod BUCKETS)`.",
+            "doc": "",
             "name": "amounts",
             "type_": {
               "vec": {
@@ -2874,7 +4986,7 @@
             }
           },
           {
-            "doc": "Hour index (`timestamp / BUCKET_SECONDS`) of the newest bucket.",
+            "doc": "",
             "name": "head_hour",
             "type_": "u64"
           },
@@ -2891,10 +5003,10 @@
     "Valuation": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "`market_valuation` result. Only `cost_basis` is enforced (by `max_net_exposure`); the others are informational.",
+        "doc": "",
         "fields": [
           {
-            "doc": "`max(0, cost_basis - floor_value)`.",
+            "doc": "",
             "name": "at_risk",
             "type_": "i128"
           },
@@ -2904,12 +5016,12 @@
             "type_": "i128"
           },
           {
-            "doc": "What the treasury gets back whatever the outcome, from state a price move cannot raise: complete sets `min(yes, no)` plus, as the unclaimed LP, `min(reserve_yes, reserve_no)`. After finality, the settlement value.",
+            "doc": "",
             "name": "floor_value",
             "type_": "i128"
           },
           {
-            "doc": "Holdings at the pool's spot price. Manipulable by any trader, so it is never used for enforcement.",
+            "doc": "",
             "name": "spot_value",
             "type_": "i128"
           }
@@ -3012,9 +5124,14 @@
             "value": 13
           },
           {
-            "doc": "Close-date bucket exposure would exceed its cap (#49).",
+            "doc": "",
+            "name": "BelowExitFloor",
+            "value": 80
+          },
+          {
+            "doc": "",
             "name": "BucketCapExceeded",
-            "value": 30
+            "value": 60
           },
           {
             "doc": "",
@@ -3022,9 +5139,9 @@
             "value": 19
           },
           {
-            "doc": "Category exposure would exceed its correlation cap (#49).",
+            "doc": "",
             "name": "CategoryCapExceeded",
-            "value": 29
+            "value": 59
           },
           {
             "doc": "",
@@ -3040,6 +5157,11 @@
             "doc": "",
             "name": "CloseTimeTooSoon",
             "value": 51
+          },
+          {
+            "doc": "",
+            "name": "CollateralNotAllowed",
+            "value": 82
           },
           {
             "doc": "",
@@ -3060,6 +5182,11 @@
             "doc": "",
             "name": "DrawdownTripped",
             "value": 46
+          },
+          {
+            "doc": "The treasury is in `Mode::Emergency`: only settlement, claiming existing withdrawal tickets and `emergency_withdraw` are open (#272).",
+            "name": "EmergencyMode",
+            "value": 83
           },
           {
             "doc": "",
@@ -3088,13 +5215,18 @@
           },
           {
             "doc": "",
+            "name": "InvalidExitFloor",
+            "value": 81
+          },
+          {
+            "doc": "",
             "name": "InvalidPricePolicy",
             "value": 26
           },
           {
-            "doc": "`agent_create_market_and_reveal` was given a malformed resolution envelope or a rule outside the two primary modes (#64).",
+            "doc": "",
             "name": "InvalidResolution",
-            "value": 33
+            "value": 63
           },
           {
             "doc": "",
@@ -3103,13 +5235,83 @@
           },
           {
             "doc": "",
+            "name": "MarkBatchTooLarge",
+            "value": 76
+          },
+          {
+            "doc": "",
             "name": "MarketCapExceeded",
             "value": 6
           },
           {
             "doc": "",
+            "name": "MarketCoreAlreadyClaimed",
+            "value": 35
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreCallFailed",
+            "value": 40
+          },
+          {
+            "doc": "",
             "name": "MarketCoreError",
             "value": 45
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientLiquidity",
+            "value": 33
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientShares",
+            "value": 34
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInvalidAmount",
+            "value": 37
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketClosed",
+            "value": 32
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotFound",
+            "value": 29
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotOpen",
+            "value": 31
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNotFinal",
+            "value": 30
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNothingToRedeem",
+            "value": 36
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreOverflow",
+            "value": 38
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreSlippageExceeded",
+            "value": 39
+          },
+          {
+            "doc": "The market is `Disputed`: finalization is frozen (#273).",
+            "name": "MarketDisputed",
+            "value": 88
           },
           {
             "doc": "",
@@ -3127,14 +5329,19 @@
             "value": 12
           },
           {
-            "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
+            "doc": "",
             "name": "NoPendingAdmin",
-            "value": 31
+            "value": 61
           },
           {
             "doc": "",
             "name": "NoPendingConfig",
             "value": 16
+          },
+          {
+            "doc": "",
+            "name": "NoPendingOp",
+            "value": 79
           },
           {
             "doc": "",
@@ -3157,9 +5364,29 @@
             "value": 28
           },
           {
+            "doc": "`resume_agents`: the realized window PnL has not recovered above `-max_drawdown` (reset the window or wait for old losses to expire) (#272).",
+            "name": "NotRecovered",
+            "value": 84
+          },
+          {
             "doc": "",
             "name": "NothingToPay",
             "value": 23
+          },
+          {
+            "doc": "",
+            "name": "OpExpired",
+            "value": 78
+          },
+          {
+            "doc": "",
+            "name": "OpNotReady",
+            "value": 77
+          },
+          {
+            "doc": "Past `close_time + RESOLUTION_GRACE_SECS`: the market can already be voided (#273).",
+            "name": "PastResolutionDeadline",
+            "value": 90
           },
           {
             "doc": "",
@@ -3167,9 +5394,9 @@
             "value": 10
           },
           {
-            "doc": "A proposed admin handover was not accepted within its `expires_at`.",
+            "doc": "",
             "name": "PendingAdminExpired",
-            "value": 32
+            "value": 62
           },
           {
             "doc": "",
@@ -3187,9 +5414,19 @@
             "value": 24
           },
           {
+            "doc": "A signer proposal is pending and the policy blocks buys then (#273).",
+            "name": "ProposalOpen",
+            "value": 89
+          },
+          {
             "doc": "",
             "name": "ProposalPending",
             "value": 14
+          },
+          {
+            "doc": "A call to the resolver failed (#273).",
+            "name": "ResolverCallFailed",
+            "value": 92
           },
           {
             "doc": "",
@@ -3202,6 +5439,21 @@
             "value": 27
           },
           {
+            "doc": "The market's spec kind is not in `allowed_specs` (#273).",
+            "name": "SpecKindNotAllowed",
+            "value": 87
+          },
+          {
+            "doc": "The market's resolution spec was never revealed to its resolver, or a resolver accepted `register_spec_v2` and stored nothing (#273).",
+            "name": "SpecNotRevealed",
+            "value": 86
+          },
+          {
+            "doc": "",
+            "name": "StaleMarks",
+            "value": 75
+          },
+          {
             "doc": "",
             "name": "TicketNotFound",
             "value": 22
@@ -3212,9 +5464,69 @@
             "value": 15
           },
           {
+            "doc": "Closer to `close_time` than `min_secs_to_close` (#273).",
+            "name": "TooCloseToClose",
+            "value": 91
+          },
+          {
             "doc": "",
             "name": "TooManyOpenMarkets",
             "value": 18
+          },
+          {
+            "doc": "",
+            "name": "TraceAgentMismatch",
+            "value": 67
+          },
+          {
+            "doc": "",
+            "name": "TraceConsumed",
+            "value": 70
+          },
+          {
+            "doc": "",
+            "name": "TraceDecisionMismatch",
+            "value": 65
+          },
+          {
+            "doc": "",
+            "name": "TraceFlagged",
+            "value": 68
+          },
+          {
+            "doc": "",
+            "name": "TraceMismatch",
+            "value": 66
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyNotPending",
+            "value": 73
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyPending",
+            "value": 72
+          },
+          {
+            "doc": "",
+            "name": "TraceRegistryCallFailed",
+            "value": 71
+          },
+          {
+            "doc": "",
+            "name": "TraceRequired",
+            "value": 64
+          },
+          {
+            "doc": "",
+            "name": "TraceStale",
+            "value": 69
+          },
+          {
+            "doc": "",
+            "name": "TraceTimelockActive",
+            "value": 74
           },
           {
             "doc": "",
@@ -3254,6 +5566,124 @@
     }
   },
   "events": {
+    "AdminOpCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminOpCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "kind",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "admin_op_cancelled"
+        ]
+      }
+    },
+    "AdminOpExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminOpExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "kind",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "admin_op_executed"
+        ]
+      }
+    },
+    "AdminOpProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AdminOpProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "kind",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "AdminOp"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "admin_op_proposed"
+        ]
+      }
+    },
+    "AgentHalted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentHalted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "roles_after",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "agent_halted"
+        ]
+      }
+    },
     "AgentPolicyCancelled": {
       "kind": "event_v0",
       "spec": {
@@ -3455,7 +5885,7 @@
             }
           },
           {
-            "doc": "`true` for a tighten-only change applied at proposal time.",
+            "doc": "",
             "location": "data",
             "name": "immediate",
             "type_": "bool"
@@ -3503,6 +5933,123 @@
         ],
         "prefix_topics": [
           "config_proposed"
+        ]
+      }
+    },
+    "CorrelatedExposureUpdated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CorrelatedExposureUpdated",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "category",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "bucket",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "category_total",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "bucket_total",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "correlated_exposure_updated"
+        ]
+      }
+    },
+    "CorrelationCapsCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CorrelationCapsCancelled",
+        "params": [],
+        "prefix_topics": [
+          "correlation_caps_cancelled"
+        ]
+      }
+    },
+    "CorrelationCapsExecuted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CorrelationCapsExecuted",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "correlation_caps_executed"
+        ]
+      }
+    },
+    "CorrelationCapsProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CorrelationCapsProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "caps",
+            "type_": {
+              "udt": {
+                "name": "CorrelationCaps"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "correlation_caps_proposed"
         ]
       }
     },
@@ -3567,7 +6114,7 @@
             "type_": "i128"
           },
           {
-            "doc": "NAV before the deposit.",
+            "doc": "",
             "location": "data",
             "name": "nav",
             "type_": "i128"
@@ -3575,6 +6122,50 @@
         ],
         "prefix_topics": [
           "deposited"
+        ]
+      }
+    },
+    "DrawdownConfigSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "DrawdownConfigSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old_max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_max_drawdown",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old_window_days",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new_window_days",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "drawdown_config_set"
         ]
       }
     },
@@ -3639,6 +6230,38 @@
         ],
         "prefix_topics": [
           "emergency_withdrawn"
+        ]
+      }
+    },
+    "ExitFloorSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ExitFloorSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "is_default",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "exit_floor_set"
         ]
       }
     },
@@ -3750,11 +6373,57 @@
         ]
       }
     },
+    "ModeChanged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Every change to the operating mode's reasons (#272). `from`/`to` are the effective modes; they are equal when a reason was added or cleared under a higher-priority one (e.g. a drawdown trips while the admin pause stands).",
+        "lib": "",
+        "name": "ModeChanged",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "from",
+            "type_": {
+              "udt": {
+                "name": "Mode"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "to",
+            "type_": {
+              "udt": {
+                "name": "Mode"
+              }
+            }
+          },
+          {
+            "doc": "`drawdown`, `resume`, `admin`, `unpause`, `legacy`, `emergency`, `end_emerg`, or the admin's own reason for `pause` / `declare_emergency`.",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "mode_changed"
+        ]
+      }
+    },
     "NetExposureUpdated": {
       "kind": "event_v0",
       "spec": {
         "data_format": "map",
-        "doc": "Net exposure after any treasury money movement in `market_id`.",
+        "doc": "",
         "lib": "",
         "name": "NetExposureUpdated",
         "params": [
@@ -3970,6 +6639,110 @@
         ]
       }
     },
+    "ResolvabilityPolicyCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicyCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_cancelled"
+        ]
+      }
+    },
+    "ResolvabilityPolicyProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicyProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_proposed"
+        ]
+      }
+    },
+    "ResolvabilityPolicySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_set"
+        ]
+      }
+    },
     "SuccessorSet": {
       "kind": "event_v0",
       "spec": {
@@ -4000,6 +6773,38 @@
         ]
       }
     },
+    "TokenDeposited": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TokenDeposited",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "token",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "token_deposited"
+        ]
+      }
+    },
     "TradeAuthorized": {
       "kind": "event_v0",
       "spec": {
@@ -4015,7 +6820,7 @@
             "type_": "u64"
           },
           {
-            "doc": "The acting agent.",
+            "doc": "",
             "location": "topic_list",
             "name": "agent",
             "type_": "address"
@@ -4041,6 +6846,54 @@
         ],
         "prefix_topics": [
           "trade_authorized"
+        ]
+      }
+    },
+    "UnwindSell": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "UnwindSell",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "unwind_sell"
         ]
       }
     },
@@ -4103,7 +6956,7 @@
             "type_": "i128"
           },
           {
-            "doc": "0 when everything was paid at once.",
+            "doc": "",
             "location": "data",
             "name": "ticket_id",
             "type_": "u64"

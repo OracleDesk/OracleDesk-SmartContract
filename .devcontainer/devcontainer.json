@@ -1,0 +1,40 @@
+{
+  "name": "OracleDesk SmartContract (Hermetic Dev)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/OracleDesk-SmartContract",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    }
+  },
+  "mounts": [
+    "source=oracledesk-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=oracledesk-cargo-git,target=/usr/local/cargo/git,type=volume",
+    "source=oracledesk-npm-cache,target=/home/vscode/.npm,type=volume"
+  ],
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always"
+  },
+  "postCreateCommand": "cd oracledesk-stellar && make doctor && make setup",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "timonwong.shellcheck"
+      ],
+      "settings": {
+        "rust-analyzer.linkedProjects": [
+          "oracledesk-stellar/Cargo.toml",
+          "oracledesk-stellar/scripts/interface-manifest/Cargo.toml",
+          "oracledesk-stellar/scripts/spec-hash/Cargo.toml"
+        ]
+      }
+    }
+  }
+}

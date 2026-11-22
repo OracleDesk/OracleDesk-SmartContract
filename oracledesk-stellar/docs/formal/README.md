@@ -6,7 +6,7 @@ proof artifact: each action mirrors one entrypoint of
 `contracts/resolver/src/lib.rs` or `contracts/market-core/src/lib.rs`.
 
 ```bash
-make formal            # runs every config, checks each outcome is the expected one
+make formal            # runs every config of both models, checks each outcome is the expected one
 TLA2TOOLS=/path/to/tla2tools.jar make formal
 ```
 
@@ -177,9 +177,8 @@ is trusted. Replayed by `model_trace_admin_bypass_resolves_without_threshold`.
   on a second resolver in the unit-test environment failed with
   `Error(Context, InvalidAction)` (market-core's `accept_resolver` calls back
   into the same resolver for `market_core()`, which Soroban treats as
-  re-entry). This was not investigated further and is not covered by the model;
-  worth checking against the testnet deploy flow in
-  `scripts/deploy-testnet.sh`.
+  re-entry). This was not investigated here; it is now modelled and confirmed
+  in the [Governance model](#governance-model) below (finding G1).
 
 No contract behaviour was changed by this work.
 
@@ -208,3 +207,201 @@ java -cp tla2tools.jar tlc2.TLC -config resolver_cancel.cfg resolver.tla -worker
 ```
 
 `-workers 1` gives the shortest trace (breadth-first).
+
+---
+
+# Governance model
+
+[`governance.tla`](governance.tla) models the three protocols that decide who
+can change OracleDesk's money-moving configuration: **two-step admin transfer**
+(ADR 0007), **authenticated wiring** (ADR 0006) and the **governance timelock**
+(ADR 0008). It runs under the same `make formal` as the resolver model.
+
+## What is modelled
+
+Contracts `Core` (market-core), `Res` (resolver), `Tre` (treasury), `TL`
+(timelock) and a `Wrong` peer (has `accept_market_core_role` but is wired to a
+different market-core, i.e. a misconfigured deploy). Keys `k1` (proposer),
+`k2` (canceller/watchdog and emergency), `k3` (every admin). `Actors` restricts
+which keys may act: most configs let anyone act, and the attack configs let
+exactly one **compromised** key act while the honest keys stay idle.
+
+**The call stack.** Soroban forbids calling a contract that is already
+executing, and rolls an invocation back on any error. `PeerAccept` builds the
+stack of the whole transaction (`lastStack`) and the transaction *reverts* when
+it would invoke a contract already on it (`Invoke(stack, c) == c \notin
+Range(stack)`); a reverted attempt changes nothing but `lastResult`. Contract
+auth is modelled as "the invoker, or a signer of the key", never "any signer".
+
+| TLA+ action | Rust entrypoint |
+|---|---|
+| `ProposeAdmin(c, k, n)` | `propose_admin` (market-core, resolver, registry, timelock): `require_admin`, `PendingAdmin{address, expires_at = now + TTL}` |
+| `AcceptAdmin(c, k)` | `accept_admin`: rejects `now > expires_at`, then `pending.require_auth()` |
+| `CancelAdmin(c, k)` | `cancel_admin_transfer` |
+| `ProposeWiring(r, p, k)` | market-core `propose_resolver` / `propose_treasury` (admin; no expiry; overwrites silently) |
+| `PeerAccept(p, r, k)` | the peer's `accept_market_core_role()` -> market-core `accept_resolver` / `accept_treasury`; mode `Callback` adds the callback `peer.market_core()` |
+| `Schedule(k, fn, a)` | timelock `schedule` (proposer auth; `eta = now + max(floor, override)`; `expires = eta + EXECUTION_GRACE`) |
+| `Execute(i, k)` | `execute` (executor or anyone; `eta <= now <= expires`; one self-call today, `set_default_delay`) |
+| `Cancel(i, k)` | `cancel` (canceller auth) |
+| `Emergency(k, t, fn)` | `emergency` (emergency auth; only `set_paused(true)` and `cancel_proposal`, on **any** target) |
+| `SetRoles`, `SetDelay`, `LowerDefaultDelay` | admin-instant `set_roles`, `set_delay`, `set_default_delay` (lowering) |
+| `Tick` | ledger time (saturates at `MaxTime`; a pending operation records whether the watchdog held the canceller role through a tick) |
+
+Each contract's own expiry variant is modelled (`NotExpired(c)`): all four
+accept at `now == expires_at` and reject from `expires_at + 1`.
+
+**Abstractions.** One configuration change on a core contract is one opaque
+`cfg` operation. Operation arguments are fixed except for `set_roles` and
+`set_default_delay`. Violations are recorded as flags set by the offending
+action (not as a growing history), so the state space stays tiny. Bounds: 3
+keys, `MaxTime = 6`, `AdminTTL = 2`, `MinDelay = 1`, `MaxDelay = 2`,
+`Grace = 2`, at most 2 operations. Symmetry over keys is not used: every config
+finishes in well under a second, and symmetry is unsound for the liveness
+configs anyway. Not modelled: the operation-hash/batch timelock extension, a
+*lying* peer (the core admin chooses which peer to propose, so a contract that
+lies about `market_core()` is already inside the trusted set), and treasury caps.
+
+**Switches.** `AdminExpiry` (`"Code"` = accept at `<=`, `"Adr"` = `<`),
+`WIRING_MODE` (`"Callback"` today, `"PeerAsserts"` proposed), `TIMELOCK_SELF_ADMIN`
+(execute also handles `accept_admin` / `set_roles` self-calls),
+`START_HANDED_OVER` (the timelock is its own admin), `WatchdogVigilant` (the
+watchdog cancels whatever a compromised key scheduled), `Mutation` (a
+deliberate bug).
+
+## Properties
+
+| Name | Meaning | Kind |
+|---|---|---|
+| `NoUnauthorisedAdminChange` | admin changes only by the address the then-admin proposed, authorised by that address | invariant |
+| `NoExpiredAccept` | ADR 0007: an accept needs `now < expires_at` | invariant |
+| `NoWiringToUnconsentingPeer` | `wiring[role]` changes only to a peer wired to this core that initiated the accept | invariant |
+| `WiringLiveness` | an honest proposal followed by the peer's accept eventually updates wiring | temporal (weak fairness on honest actions only) |
+| `StalePendingWiring` | witness: a pending wiring proposal is never accepted after the admin TTL | invariant (expected to fail) |
+| `NoExecuteBeforeEta`, `NoExecuteAfterExpiry` | an operation executes inside `[eta, expires]` | invariants |
+| `CancelWinsBeforeExecute` | a cancelled operation never executes | invariant |
+| `EmergencyAllowListOnly` | emergency runs only `set_paused(true)` / `cancel_proposal` | invariant |
+| `NoInstantPowerFromSingleKey` | no single compromised key changes a core configuration without `MinDelay` passing and a tick in which the honest watchdog held the canceller role | invariant (expected to fail for the timelock admin) |
+
+## Results
+
+| Config | Expected | Result | Distinct states | Time |
+|---|---|---|---|---|
+| `governance_admin.cfg` | `NoExpiredAccept` fails (ADR vs code) | **violated** (exit 12) | ~300 | < 1 s |
+| `governance_admin_aligned.cfg` (`AdminExpiry = "Adr"`) | all hold | **No error** | 6,111 | ~1 s |
+| `governance_wiring_callback.cfg` | `WiringLiveness` fails | **violated** (exit 13) | 609 | ~1 s |
+| `governance_wiring_peer_asserts.cfg` | all hold | **No error** | 3,426 | ~2 s |
+| `governance_wiring_safety.cfg` (every peer proposable) | all hold | **No error** | 23,898 | ~2 s |
+| `governance_stale_wiring.cfg` | `StalePendingWiring` fails | **violated** (exit 12) | ~400 | < 1 s |
+| `governance_timelock.cfg` (honest roles) | all hold | **No error** | 1,428 | ~1 s |
+| `governance_single_key.cfg` (compromised timelock admin) | `NoInstantPowerFromSingleKey` fails | **violated** (exit 12) | ~1,000 | < 1 s |
+| `governance_selfadmin.cfg` (timelock is its own admin) | all hold | **No error** | 14,567 | ~2 s |
+
+All finish in a few seconds on a laptop (target was < 60 s on CI). Violated
+configs stop at the first counterexample, so their state counts vary run to run.
+
+## Findings
+
+### G1. The authenticated-wiring handshake cannot succeed for any contract peer (confirmed; matches the resolver README's note)
+
+`governance_wiring_callback.cfg`, `WiringLiveness` violated; the cycle is
+`ProposeWiring("resolver", resolver)`, then `PeerAccept(resolver, "resolver")`
+with `lastStack = <<resolver, core, resolver>>` and `lastResult = "reverted"`,
+forever. `Resolver::accept_market_core_role` calls market-core's
+`accept_resolver`, which calls back into the resolver for `market_core()` to
+check consent. The resolver is already executing, so the host raises
+`Error(Context, InvalidAction)` and rolls the whole transaction back. This is
+the failure the earlier resolver README recorded and did not investigate.
+`pending.require_auth()` is satisfied by the direct invoker, so only the
+callback is the problem. Replayed against real wasm by
+`model_trace_wiring_callback_reenters`.
+
+Consequences: the wiring step of `deploy-testnet.sh` can never have completed
+through this path on `develop`, and the treasury has no `accept_market_core_role`
+at all (`HasAccept[Tre] = FALSE`), so `accept_treasury` (and `wire-timelock.sh`
+for the treasury) cannot work either.
+
+**Fix validated by the model** (`WIRING_MODE = "PeerAsserts"`): market-core drops
+the callback and relies on `pending.require_auth()`, and the peer's
+`accept_market_core_role` first asserts its own `market_core()` equals the
+caller's core. `governance_wiring_peer_asserts.cfg` passes `WiringLiveness`, and
+`governance_wiring_safety.cfg` shows the misconfigured peer (`Wrong`) can still
+never be wired, because it fails its own assertion.
+
+### G2. ADR 0007 and the code disagree by one second (confirmed)
+
+`governance_admin.cfg`, trace `ProposeAdmin(timelock, k3, k1)`, `Tick`, `Tick`,
+`AcceptAdmin(timelock, k1)`: accepted at `now == expires_at`. Every
+implementation (market-core, resolver, registry, timelock) rejects only
+`now > expires_at`, while ADR 0007 says a proposal is inert once
+`expires_at <= now`. `governance_admin_aligned.cfg` (the ADR's boundary) holds.
+Replayed by `model_trace_admin_accept_at_expiry_boundary`. Fix by changing
+either side; then flip that test and the config's expected exit code.
+
+### G3. `PendingResolver` / `PendingTreasury` never expire (confirmed)
+
+`governance_stale_wiring.cfg`: a wiring proposal made long ago is still
+pending and acceptable. Unlike admin transfer there is no `expires_at`, and a
+second proposal silently overwrites the first. Replayed (at the storage level)
+by `model_trace_pending_wiring_never_expires`.
+
+### G4. The timelock admin holds instant power (confirmed, trust assumption)
+
+`governance_single_key.cfg`: `SetRoles(k3, k3, k1)`, `Schedule(k3, "cfg")`,
+`Tick`, `Execute`. A single compromised timelock admin key makes itself
+proposer, moves the canceller to a key the watchdog does not control (so
+`WatchdogVigilant` cannot save it: the role change is instant and same-tick),
+schedules a change and executes it after only `MinDelay`. `set_delay` and
+`set_default_delay` (lowering) are instant too. Replayed by
+`model_trace_timelock_admin_set_roles_instant`.
+
+`governance_selfadmin.cfg` shows the alternative: with the timelock as its own
+admin and execute handling the `set_roles` / `accept_admin` self-calls
+(`TIMELOCK_SELF_ADMIN`), a compromised proposer cannot change anything the
+watchdog does not have a tick to cancel. Today `execute` supports exactly one
+self-call (`set_default_delay`), so the timelock can never accept its own admin
+role (`model_trace_timelock_cannot_accept_its_own_admin`); until that changes,
+the residual trust is exactly: the timelock admin key, the watchdog staying
+honest and online, and the watchdog holding the canceller role.
+
+### Other observations
+
+- `emergency` allows `set_paused(true)` and `cancel_proposal` on any target
+  address (`model_trace_emergency_any_target`); the allow-list is on the
+  function and argument, not the target.
+- `execute` removes the operation before invoking it, then returns an error for
+  an expired or unsupported operation. The error rolls the removal back, so such
+  operations stay in storage (harmless, but never cleaned up).
+
+## Mutation checks
+
+Each deliberate bug must be caught by a property; `make formal` runs them
+(`FORMAL_MUTATIONS=0` skips):
+
+| Mutation | Caught by |
+|---|---|
+| `accept_no_auth`: `accept_admin` without `require_auth` | `NoUnauthorisedAdminChange` |
+| `execute_ignores_eta`: `execute` ignores `eta` | `NoExecuteBeforeEta` |
+| `cancel_skips_removal`: `cancel` leaves the operation in storage | `CancelWinsBeforeExecute` |
+| `emergency_allows_all`: allow-list widened to everything | `EmergencyAllowListOnly` |
+
+## Conformance tests
+
+`cargo test -p integration-tests --test governance_model` (after `make build`)
+replays the traces against the real wasm of market-core, resolver and timelock,
+with no `mock_all_auths`:
+
+| Test | Model trace |
+|---|---|
+| `model_trace_wiring_callback_reenters` | `governance_wiring_callback.cfg` (G1) |
+| `model_trace_admin_accept_at_expiry_boundary` | `governance_admin.cfg` (G2) |
+| `model_trace_admin_accept_requires_the_pending_address` | `governance_admin_aligned.cfg` |
+| `model_trace_pending_wiring_never_expires` | `governance_stale_wiring.cfg` (G3) |
+| `model_trace_timelock_cancel_before_execute` | `CancelWinsBeforeExecute` |
+| `model_trace_execute_before_eta_rejected` | `NoExecuteBeforeEta` |
+| `model_trace_emergency_any_target` | `EmergencyAllowListOnly` |
+| `model_trace_timelock_admin_set_roles_instant` | `governance_single_key.cfg` (G4) |
+| `model_trace_timelock_cannot_accept_its_own_admin` | `TIMELOCK_SELF_ADMIN = FALSE` |
+
+Each test that is expected to change when a finding is fixed says so in its doc
+comment, and names the config whose expected exit code in `scripts/formal.sh`
+must change with it. No contract behaviour was changed by this work.

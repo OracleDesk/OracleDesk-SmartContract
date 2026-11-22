@@ -20,10 +20,11 @@ import {
 } from "../../core/due-diligence.js";
 import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { Task, TaskContext } from "../runtime.js";
+import { openingsAllowed } from "./mode.js";
 import { publishPendingTraces, recordPendingTrace } from "./traces.js";
 
 export interface MakerDeps {
-  adapter: Pick<StellarAdapter, "mode" | "agent" | "agentCreateMarket" | "publishTrace">;
+  adapter: Pick<StellarAdapter, "mode" | "agent" | "agentCreateMarket" | "publishTrace"> & Partial<Pick<StellarAdapter, "treasuryMode">>;
   traceStore: TraceStore;
   signals: SignalSource;
   /** Question hashes that already have a market on-chain. */
@@ -50,6 +51,8 @@ export function signalId(source: string, observedAt: number, question: string): 
 export async function makerTick(deps: MakerDeps, ctx: TaskContext): Promise<void> {
   const live = deps.adapter.mode === "live";
   if (live) await publishPendingTraces(deps.adapter, ctx);
+  // Creating a market opens exposure: skip the tick unless the treasury is Normal.
+  if (!(await openingsAllowed(deps.adapter, ctx, "MAKER"))) return;
   const known = (await deps.knownQuestionHashes?.()) ?? new Set<string>();
   const signals = await deps.signals.poll();
   for (const signal of signals) {

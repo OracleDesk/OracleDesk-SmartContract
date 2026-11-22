@@ -16,6 +16,7 @@ import "dotenv/config";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { redactString } from "../core/redact.js";
 import type { TraceRepository } from "../../x402/trace-api.js";
 
 export interface AuditEntry {
@@ -286,6 +287,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("audit failed:", err);
+  console.error("audit failed:", redactString(err instanceof Error ? err.message : String(err)));
   process.exit(1);
 });
