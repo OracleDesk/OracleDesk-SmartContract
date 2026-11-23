@@ -433,14 +433,14 @@ pub enum Error {
     CollateralShortfall = 32,
     /// `create_market` used a token missing from, or disabled in, the
     /// admin collateral allow-list (#151).
-    CollateralNotAllowed = 32,
+    CollateralNotAllowed = 33,
     /// Allow-list parameters failed validation (decimals, seed bounds).
-    InvalidCollateralParams = 33,
-    ResolverMismatch = 34,
-    NoPendingMarketResolver = 35,
-    MarketResolverNotReady = 36,
-    MarketResolverExpired = 37,
-    OldResolverConsentRequired = 38,
+    InvalidCollateralParams = 34,
+    ResolverMismatch = 35,
+    NoPendingMarketResolver = 36,
+    MarketResolverNotReady = 37,
+    MarketResolverExpired = 38,
+    OldResolverConsentRequired = 39,
 }
 
 impl From<MathError> for Error {
@@ -2248,6 +2248,8 @@ impl MarketCore {
             return Err(Error::CollateralShortfall);
         }
         Ok(())
+    }
+
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {

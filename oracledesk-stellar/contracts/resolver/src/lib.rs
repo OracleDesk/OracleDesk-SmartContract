@@ -98,9 +98,9 @@ fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
 // them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
 // keep working.
 pub use oracledesk_types::{
-    CommitteeRef, DisputableSignerConfig, Escalation, FallbackAuthority, HybridConfig,
-    HybridConfigV2, OracleAsset, Outcome, PriceConfig, PriceData, PriceDirection, ResolutionSpec,
-    ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
+    CommitteeRef, DisputableSignerConfig, Escalation, FallbackAuthority, FeedRef, HybridConfig,
+    HybridConfigV2, OracleAsset, Outcome, PriceConfig, PriceData, PriceDirection, QuorumPriceConfig,
+    ResolutionSpec, ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -155,6 +155,23 @@ pub const MAX_CANCELS_PER_MARKET: u32 = 2;
 /// `max_staleness` would still allow it, because resolution is only known at
 /// resolve time and the cap cannot be validated at registration.
 pub const MAX_LOOKBACK_RECORDS: u32 = 12;
+
+/// Most feeds a quorum spec may commit. Reasoned, not measured on the PR
+/// host (it cannot build this workspace): each feed is one `try_price`
+/// sub-call plus `O(n)` bookkeeping in an `O(n^2)` insert-sorted median, and
+/// the issue's budget note puts the worst case (`n - 1` trapping feeds)
+/// under 60% of the instruction limit for `n` in 5..7; 5 is the conservative
+/// end of that band. Residual risk, unavoidable at this layer: Soroban gives
+/// sub-calls no isolated budget, so a committed malicious feed can burn the
+/// whole transaction budget — at worst resolution fails and retries (or is
+/// voided past the deadline), it can never produce a wrong outcome.
+pub const MAX_FEEDS: u32 = 5;
+/// Fixed-point scale ceiling enforced on every `FeedRef::decimals` and on
+/// `QuorumPriceConfig::threshold_decimals`.
+pub const MAX_DECIMALS: u32 = 18;
+/// Largest acceptable `max_deviation_bps` (100%): above it the disagreement
+/// guard is decoration. The issue's bound, kept as-is.
+pub const MAX_DEVIATION_BPS: u32 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -608,6 +625,14 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    /// Fewer feeds produced a usable price than `min_responses` requires.
+    /// Returned, never fatal: nothing is written, so the resolution is
+    /// retryable once feeds recover. Liveness-to-void is not this path's job.
+    QuorumNotReached = 44,
+    /// Accepted feeds disagree beyond `max_deviation_bps`. Retryable like
+    /// `QuorumNotReached`: a later call re-reads every feed from scratch.
+    FeedsDisagree = 45,
+
     // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
     MarketCoreMarketNotFound      = 1044,
     MarketCoreNotFinal            = 1045,
@@ -625,6 +650,7 @@ pub enum Error {
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -669,29 +695,15 @@ pub enum DataKey {
     CountV2(u64, AttestedOutcome),
     ProposalV2(u64),
     Snapshot(u64),
-    /// Appended last: union discriminants are positional, so earlier keys
-    /// keep their encoding and live markets' stored data still decodes.
-    /// A new key (not `Price` under a wrapper enum) because values already
-    /// stored under `DataKey::Price` are bare `PriceConfig` XDR and must not
-    /// be reinterpreted (issue #26).
     PriceScaled(u64),
-    /// Appended last (after `PriceScaled`, same positional-discriminant
-    /// discipline, issue #27): a revealed TWAP rule's `TwapConfig` lives
-    /// under its own key so no stored payload is ever reinterpreted.
     PriceTwap(u64),
-    /// #297: timestamp at which an epoch of a committee started. Written in
-    /// `create_committee` (epoch 1) and `execute_rotation` (new epoch). Used
-    /// by `epoch_at` to walk back from the current epoch to the one in force
-    /// at a market's close_time.
     EpochStart(u64, u32),
-    /// #297: the pinned (committee_id, epoch) for a committee market, set on
-    /// the first attestation after close or through `pin_committee_epoch`.
-    /// Absent until pinned, so pre-attestation views compute the would-be pin
-    /// without writing.
     MarketEpoch(u64),
-    /// #314: extended hybrid spec with richer fallback authority.
-    /// Appended last to preserve existing discriminant positions.
     HybridV2(u64),
+    /// Committed [`QuorumPriceConfig`] of a multi-oracle market (#28).
+    /// Appended at the tail: `DataKey` is an XDR union with positional
+    /// discriminants, so no existing key shifts.
+    Quorum(u64),
 }
 
 /// #297: A committee member set snapshotted at a specific epoch. Loaded from
@@ -998,6 +1010,54 @@ pub struct AdminTransferred {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferCancelled {}
 
+/// Why a feed was dropped from a quorum resolution (`FeedRejected::reason`).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedRejectionReason {
+    /// The call succeeded but the feed has no record for `close_time`
+    /// (`try_price` returned `Ok(None)`).
+    Unavailable,
+    /// A price exists but fails the committed staleness rule — the same
+    /// `StalePrice` condition single-feed resolution surfaces.
+    Stale,
+    /// A fresh price whose committed decimals cannot be normalised to the
+    /// target scale (absurd `decimals`, or a checked rescale that overflowed).
+    Invalid,
+    /// The sub-call trapped or the feed contract errored (`Err` from
+    /// `try_price`, outer or inner): isolated, never propagated.
+    Failed,
+}
+
+/// Emitted once per non-`Ok` feed of a quorum resolution, before any
+/// `QuorumResolution`. Indexable by feed so an operator can see which oracle
+/// the quorum rejected without decoding the median.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedRejected {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub reflector: Address,
+    pub asset: OracleAsset,
+    pub reason: FeedRejectionReason,
+}
+
+/// The aggregate result of a quorum resolution. `median` is scaled by
+/// `decimals` (the committed target scale, `max(threshold_decimals,
+/// max feed decimals)` capped at 18). Emitted alongside the existing
+/// `PriceResolution`/`PriceResolutionV2` pair from `settle_price`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumResolution {
+    #[topic]
+    pub market_id: u64,
+    pub median: i128,
+    pub decimals: u32,
+    pub accepted: u32,
+    pub rejected: u32,
+    pub outcome: Outcome,
+}
+
 /// SEP-40 Oracle Consumer interface, as implemented by Reflector feeds.
 /// `decimals` and `resolution` are the feed's fixed-point scale and record
 /// grid; `price` returns a record only for a timestamp exactly on one
@@ -1010,6 +1070,16 @@ pub trait ReflectorPrice {
     fn resolution(env: Env) -> u32;
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
     fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData>;
+}
+
+/// Per-feed classification inside a quorum resolution. `Failed` absorbs every
+/// call-level fault (trap, contract error, decode error) exactly the way
+/// `read_feed` already absorbs a single feed's panic into
+/// `PriceUnavailable`: no feed can abort the transaction.
+enum FeedState {
+    /// Accepted, normalised to the target decimal scale.
+    Ok(i128),
+    Rejected(FeedRejectionReason),
 }
 
 #[contract]
@@ -1074,7 +1144,7 @@ impl Resolver {
     /// The market-core migration only succeeds while this resolver's address
     /// authorizes the market-core call, so this entrypoint provides governance
     /// acknowledgement from the resolver admin.
-    pub fn consent_market_resolver_migration(
+    pub fn consent_resolver_migration(
         env: Env,
         _market_id: u64,
         _new_resolver: Address,
@@ -1251,6 +1321,20 @@ impl Resolver {
     /// Registers a hybrid resolution specification (price feed with attested fallback).
     pub fn register_hybrid_spec(env: Env, market_id: u64, spec: HybridConfig) -> Result<(), Error> {
         let rule = ResolutionSpec::Hybrid(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
+    /// See `register_price_spec` — same commit/reveal rule, multi-oracle
+    /// quorum mode (#28). The whole [`QuorumPriceConfig`] — feed set,
+    /// per-feed decimals, quorum and deviation bounds — is inside the hashed
+    /// rule, so the resolution reads exactly the oracle set the creator
+    /// committed to; `validate_rule` gates it before storage is touched.
+    pub fn register_quorum_spec(
+        env: Env,
+        market_id: u64,
+        spec: QuorumPriceConfig,
+    ) -> Result<(), Error> {
+        let rule = ResolutionSpec::PriceQuorum(spec);
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
     }
 
@@ -1745,6 +1829,12 @@ impl Resolver {
             }
             let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
             return Self::settle_scaled(&env, &market_core, market_id, &scaled);
+        }
+        // Quorum markets carry their config under `DataKey::Quorum`
+        // (`assert_unconfigured` keeps the modes exclusive); everything else
+        // follows the single-feed and hybrid paths unchanged.
+        if let Ok(config) = Self::load::<QuorumPriceConfig>(&env, DataKey::Quorum(market_id)) {
+            return Self::resolve_quorum(&env, market_id, &config);
         }
         let (config, is_hybrid) = if let Ok(cfg) =
             Self::load::<PriceConfig>(&env, DataKey::Price(market_id))
@@ -3049,11 +3139,6 @@ impl Resolver {
     }
 
     /// The single rule for whether a feed read may settle a market, shared by
-    /// `snapshot_price` and every resolution path (legacy and scaled) so a
-    /// snapshot can never pin a price resolution would reject. A non-positive
-    /// price is `InvalidPrice` (issue #26): a broken or zeroed feed must never
-    /// settle a "below" market YES, and SEP-40 prices are fixed-point values
-    /// whose zero or sign flip is never a valid observation.
     fn validate_price(max_staleness: u64, close_time: u64, data: &PriceData) -> Result<(), Error> {
         if data.price <= 0 {
             return Err(Error::InvalidPrice);
@@ -3064,9 +3149,20 @@ impl Resolver {
         Ok(())
     }
 
+    /// The committed freshness rule itself, factored out of `validate_price`
+    /// so the quorum path classifies per-feed staleness through the same
+    /// predicate instead of duplicating it.
+    fn staleness_ok(max_staleness: u64, close_time: u64, data: &PriceData) -> bool {
+        data.timestamp <= close_time && close_time - data.timestamp <= max_staleness
+    }
+
     /// Applies the committed comparison.
     fn outcome_for(config: &PriceConfig, price: i128) -> Outcome {
         Self::compare_price(&config.direction, price, config.threshold)
+    }
+
+    fn outcome_at(direction: PriceDirection, threshold: i128, price: i128) -> Outcome {
+        Self::compare_price(&direction, price, threshold)
     }
 
     fn compare_price(direction: &PriceDirection, price: i128, threshold: i128) -> Outcome {
@@ -3172,6 +3268,262 @@ impl Resolver {
         )
     }
 
+    /// Rescale a fixed-point price from `from` decimals to `to` decimals with
+    /// checked arithmetic only; `None` stands for "cannot be represented",
+    /// which the quorum path surfaces as `Invalid`, never an overflow panic.
+    /// Down-scaling truncates toward zero, so at worst it rounds each feed
+    /// toward 0 by less than one target unit — too small to manufacture an
+    /// agreement the raw prices did not have.
+    fn normalize_price(value: i128, from: u32, to: u32) -> Option<i128> {
+        if from == to {
+            return Some(value);
+        }
+        if to > from {
+            let factor = 10i128.checked_pow(to - from)?;
+            value.checked_mul(factor)
+        } else {
+            let factor = 10i128.checked_pow(from - to)?;
+            value.checked_div(factor)
+        }
+    }
+
+    /// The scale every quorum price is normalised to before the median:
+    /// `max(threshold_decimals, max feed decimals)` capped at `MAX_DECIMALS`.
+    /// Registration validates each component `<= MAX_DECIMALS`, so the cap is
+    /// belt-and-braces against a config that predates validation.
+    fn quorum_target_decimals(config: &QuorumPriceConfig) -> u32 {
+        let mut target = config.threshold_decimals;
+        for feed in config.feeds.iter() {
+            if feed.decimals > target {
+                target = feed.decimals;
+            }
+        }
+        if target > MAX_DECIMALS {
+            MAX_DECIMALS
+        } else {
+            target
+        }
+    }
+
+    /// One feed's classified contribution to a quorum resolution. Isolation
+    /// and freshness reuse the exact predicates `read_feed`/`validate_price`
+    /// apply to a single feed; only the *reporting* differs — quorum needs to
+    /// tell a trap (`Failed`) from a missing record (`Unavailable`) so the
+    /// rejection events are honest.
+    fn classify_feed(
+        env: &Env,
+        feed: &FeedRef,
+        max_staleness: u64,
+        close_time: u64,
+        target_dec: u32,
+    ) -> FeedState {
+        if feed.decimals > MAX_DECIMALS {
+            return FeedState::Rejected(FeedRejectionReason::Invalid);
+        }
+        let call =
+            ReflectorPriceClient::new(env, &feed.reflector).try_price(&feed.asset, &close_time);
+        let data = match call {
+            Ok(Ok(Some(data))) => data,
+            Ok(Ok(None)) => return FeedState::Rejected(FeedRejectionReason::Unavailable),
+            // Outer `Err` = trap/invocation failure, inner `Err` = the feed
+            // contract's own error; a host-side decode/`ConversionError`
+            // lands here too. All of them `Failed`, none a panic.
+            _ => return FeedState::Rejected(FeedRejectionReason::Failed),
+        };
+        if !Self::staleness_ok(max_staleness, close_time, &data) {
+            return FeedState::Rejected(FeedRejectionReason::Stale);
+        }
+        match Self::normalize_price(data.price, feed.decimals, target_dec) {
+            Some(price) => FeedState::Ok(price),
+            None => FeedState::Rejected(FeedRejectionReason::Invalid),
+        }
+    }
+
+    /// Insert `value` into an ascending `sorted` list (O(n) scan, O(n^2) to
+    /// build n feeds, n <= MAX_FEEDS: no sort algorithm, no Vec sort feature).
+    fn insert_sorted(sorted: &mut Vec<i128>, value: i128) {
+        let mut pos = sorted.len();
+        while pos > 0 {
+            match sorted.get(pos - 1) {
+                Some(prev) if prev > value => pos -= 1,
+                _ => break,
+            }
+        }
+        sorted.insert(pos, value);
+    }
+
+    /// Median of an ascending list: the middle value for an odd count, the
+    /// floored average of the two middle values for an even count (checked
+    /// addition; `None` only on absurd overflowing inputs, surfaced as
+    /// `InvalidPrice`, never a panic).
+    fn median(sorted: &Vec<i128>) -> Option<i128> {
+        let count = sorted.len();
+        if count == 0 {
+            return None;
+        }
+        if count % 2 == 1 {
+            return sorted.get(count / 2);
+        }
+        let low = sorted.get(count / 2 - 1)?;
+        let high = sorted.get(count / 2)?;
+        Some(low.checked_add(high)?.div_euclid(2))
+    }
+
+    /// `(max - min) * 10_000 / median > max_deviation_bps` -> `FeedsDisagree`.
+    /// Deliberately the full accepted spread, not distance-from-median: one
+    /// outlier among otherwise-quorate feeds is a disagreement a median would
+    /// hide. Any nonzero spread around a median of 0 is an unbounded relative
+    /// deviation, so it disagrees too.
+    fn assert_spread(
+        sorted: &Vec<i128>,
+        median: i128,
+        max_deviation_bps: u32,
+    ) -> Result<(), Error> {
+        let min = sorted.get(0).ok_or(Error::InvalidPrice)?;
+        let max = sorted.get(sorted.len() - 1).ok_or(Error::InvalidPrice)?;
+        let spread = max.checked_sub(min).ok_or(Error::FeedsDisagree)?;
+        if spread == 0 {
+            return Ok(());
+        }
+        if median <= 0 {
+            return Err(Error::FeedsDisagree);
+        }
+        let deviation_bps = spread
+            .checked_mul(10_000)
+            .ok_or(Error::FeedsDisagree)?
+            .checked_div(median)
+            .ok_or(Error::FeedsDisagree)?;
+        if deviation_bps > max_deviation_bps as i128 {
+            return Err(Error::FeedsDisagree);
+        }
+        Ok(())
+    }
+
+    /// Registration-time gate for the quorum rule, inside the commitment:
+    /// every condition a resolution would otherwise hit mid-flight is decided
+    /// here (bounds, strict majority, duplicate `(reflector, asset)` pairs,
+    /// absurd decimals, threshold normalisation, deviation cap).
+    fn quorum_config_is_valid(config: &QuorumPriceConfig) -> bool {
+        let count = config.feeds.len();
+        if count == 0 || count > MAX_FEEDS {
+            return false;
+        }
+        if config.min_responses == 0 || config.min_responses > count {
+            return false;
+        }
+        // Strict majority: two disjoint feed subsets can never both reach
+        // quorum, so a retry cannot legitimise a second conflicting answer.
+        if config.min_responses * 2 <= count {
+            return false;
+        }
+        if config.max_staleness == 0 || config.threshold < 0 {
+            return false;
+        }
+        if config.max_deviation_bps > MAX_DEVIATION_BPS || config.threshold_decimals > MAX_DECIMALS
+        {
+            return false;
+        }
+        for (index, feed) in config.feeds.iter().enumerate() {
+            if feed.decimals > MAX_DECIMALS {
+                return false;
+            }
+            let duplicate =
+                config.feeds.iter().take(index).any(|earlier| {
+                    earlier.reflector == feed.reflector && earlier.asset == feed.asset
+                });
+            if duplicate {
+                return false;
+            }
+        }
+        let target = Self::quorum_target_decimals(config);
+        Self::normalize_price(config.threshold, config.threshold_decimals, target).is_some()
+    }
+
+    /// The quorum path of `resolve_price`. Every committed feed is classified
+    /// through the existing per-feed rules (`try_price` isolation, the
+    /// `staleness_ok` freshness check) into
+    /// `Ok(normalized) | Unavailable | Stale | Invalid | Failed`; rejected
+    /// feeds emit `FeedRejected`, survivors are normalised to the target
+    /// scale and medianed, the spread guard runs, and the median settles
+    /// through `settle_price` so market-core finalisation and the
+    /// `PriceResolution` events stay identical to single-feed resolution.
+    /// Too few usable feeds is `QuorumNotReached` — a plain return with
+    /// nothing written, so retrying after feeds recover always works. Nothing
+    /// per-feed is persisted: the whole resolution computes in one call.
+    fn resolve_quorum(
+        env: &Env,
+        market_id: u64,
+        config: &QuorumPriceConfig,
+    ) -> Result<Outcome, Error> {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        if Self::resolution_state(env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let target_dec = Self::quorum_target_decimals(config);
+        let mut accepted = Vec::<i128>::new(env);
+        let mut rejected: u32 = 0;
+        for feed in config.feeds.iter() {
+            match Self::classify_feed(
+                env,
+                &feed,
+                config.max_staleness,
+                market.close_time,
+                target_dec,
+            ) {
+                FeedState::Ok(price) => Self::insert_sorted(&mut accepted, price),
+                FeedState::Rejected(reason) => {
+                    rejected += 1;
+                    FeedRejected {
+                        market_id,
+                        reflector: feed.reflector.clone(),
+                        asset: feed.asset.clone(),
+                        reason,
+                    }
+                    .publish(env);
+                }
+            }
+        }
+        if accepted.len() < config.min_responses {
+            return Err(Error::QuorumNotReached);
+        }
+        let median = Self::median(&accepted).ok_or(Error::InvalidPrice)?;
+        Self::assert_spread(&accepted, median, config.max_deviation_bps)?;
+        let threshold =
+            Self::normalize_price(config.threshold, config.threshold_decimals, target_dec)
+                .ok_or(Error::InvalidPrice)?;
+        let outcome = Self::outcome_at(config.direction, threshold, median);
+        QuorumResolution {
+            market_id,
+            median,
+            decimals: target_dec,
+            accepted: accepted.len(),
+            rejected,
+            outcome: outcome.clone(),
+        }
+        .publish(env);
+        // The median at `close_time` stands in for the single feed read:
+        // `PriceResolution::price` is then the value the market actually
+        // settled on, at the committed target scale (`decimals` on
+        // `QuorumResolution` gives its unit).
+        Self::settle_price(
+            env,
+            &market_core,
+            market_id,
+            &outcome,
+            &PriceData {
+                price: median,
+                timestamp: market.close_time,
+            },
+            false,
+        )?;
+        Ok(outcome)
+    }
+
     /// The outcome the market's price rule gives, from its stored snapshot
     /// when there is one (re-validated, no oracle call), else from a live
     /// read. The flag reports whether the snapshot was used.
@@ -3201,6 +3553,11 @@ impl Resolver {
     /// only (issue #37 will extend snapshots).
     fn price_config(env: &Env, market_id: u64) -> Result<PriceConfig, Error> {
         let storage = env.storage().persistent();
+        if storage.has(&DataKey::Quorum(market_id)) {
+            // Quorum markets have no single feed to pin a snapshot against;
+            // `snapshot_price` is a single-oracle recovery tool.
+            return Err(Error::WrongMode);
+        }
         if let Some(cfg) = storage.get(&DataKey::Price(market_id)) {
             return Ok(cfg);
         }
@@ -3271,6 +3628,7 @@ impl Resolver {
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::CommitteeSpec(market_id))
             || storage.has(&DataKey::Hybrid(market_id))
+            || storage.has(&DataKey::Quorum(market_id))
             || storage.has(&DataKey::HybridV2(market_id))
         {
             return Err(Error::MarketAlreadyConfigured);
@@ -3322,6 +3680,7 @@ impl Resolver {
                     && cfg.fallback_after > 0
                     && cfg.fallback_after >= cfg.price.max_staleness
             }
+            ResolutionSpec::PriceQuorum(cfg) => Self::quorum_config_is_valid(cfg),
             ResolutionSpec::HybridV2(cfg) => {
                 Self::validate_hybrid_v2(env, cfg).is_ok()
             }
@@ -3424,6 +3783,7 @@ impl Resolver {
             DataKey::AttestEpoch(_, _) => "market",
             DataKey::MarketEpoch(_) => "market",
             DataKey::HybridV2(_) => "market",
+            DataKey::Quorum(_) => "market",
         }
     }
 
@@ -3463,6 +3823,11 @@ impl Resolver {
                 let key = DataKey::HybridV2(market_id);
                 Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::HybridPricePending)
+            }
+            ResolutionSpec::PriceQuorum(cfg) => {
+                let key = DataKey::Quorum(market_id);
+                Self::persist_market(env, &key, cfg, close_time);
+                (key, ResolutionState::Unconfigured)
             }
         };
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
@@ -3797,6 +4162,27 @@ impl Resolver {
                 }
                 (cfg.fallback.threshold, None)
             }
+            SignerAuthority::HybridV2(cfg, snap) => {
+                if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
+                    return Err(Error::WrongMode);
+                }
+                match &cfg.fallback {
+                    FallbackAuthority::Signers(s) => {
+                        if !Self::contains(&s.signers, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (s.threshold, None)
+                    }
+                    FallbackAuthority::WeightedKeys(_) => return Err(Error::WrongMode),
+                    FallbackAuthority::Committee(_) => {
+                        let snapshot = snap.as_ref().ok_or(Error::WrongMode)?;
+                        if !Self::contains(&snapshot.members, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (snapshot.threshold, Some(snapshot.epoch))
+                    }
+                }
+            }
         };
 
         let storage = env.storage().persistent();
@@ -3991,10 +4377,12 @@ impl Resolver {
             DataKey::EvidenceUsed(market_id),
             DataKey::Cancels(market_id),
             // #309: escalation aggregate keys (per-verdict, not per-signer).
-            DataKey::EscalationCount(market_id, Verdict::Valid),
+            DataKey::EscalationCount(market_id, Verdict::Yes),
+            DataKey::EscalationCount(market_id, Verdict::No),
             DataKey::EscalationCount(market_id, Verdict::Invalid),
             // #314: HybridV2 spec key.
             DataKey::HybridV2(market_id),
+            DataKey::Quorum(market_id),
         ];
         for key in scalar_keys {
             if storage.has(&key) {
@@ -4262,17 +4650,17 @@ mod test {
 
     const NETWORK_ID: [u8; 32] = [7; 32];
 
-    struct Fixture {
-        env: Env,
-        admin: Address,
-        resolver: ResolverClient<'static>,
-        resolver_id: Address,
-        market_core: MarketCoreClient<'static>,
-        market_id: u64,
-        signer_a: Address,
-        signer_b: Address,
-        reflector_id: Address,
-        spec: ResolutionSpec,
+    pub(crate) struct Fixture {
+        pub(crate) env: Env,
+        pub(crate) admin: Address,
+        pub(crate) resolver: ResolverClient<'static>,
+        pub(crate) resolver_id: Address,
+        pub(crate) market_core: MarketCoreClient<'static>,
+        pub(crate) market_id: u64,
+        pub(crate) signer_a: Address,
+        pub(crate) signer_b: Address,
+        pub(crate) reflector_id: Address,
+        pub(crate) spec: ResolutionSpec,
     }
 
     /// Builds a market whose `resolution_hash` commits to whatever
@@ -4288,7 +4676,7 @@ mod test {
     }
 
     /// [`fixture`] with a custom market `close_time`, for grid-alignment tests.
-    fn fixture_at(
+    pub(crate) fn fixture_at(
         close_time: u64,
         spec_fn: impl FnOnce(&Env, &Address, &Address, &Address) -> ResolutionSpec,
     ) -> Fixture {
@@ -7701,6 +8089,8 @@ mod shared_types {
 #[cfg(test)]
 mod golden {
     use super::*;
+    use crate::test::{fixture_at, Fixture};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use std::{format, string::String};
 
     const G1: &str = "GBAKBHXK7SV7C3HGY3DDYB4QWUEGL52SEF6OO77LAD672JVXD4QCYJLF";
@@ -7809,6 +8199,62 @@ mod golden {
         for (spec, expected) in vectors {
             assert_eq!(hex_of(&env, &spec), expected);
         }
+    }
+
+    /// Issue #28 appends `ResolutionSpec::PriceQuorum` at the tail of the
+    /// union. A `#[contracttype]` enum XDR-encodes per-variant by case name,
+    /// so an append cannot reindex or re-encode `Price`/`Signers`/...: these
+    /// are the pre-append golden vectors re-checked *after* the append, plus a
+    /// proof the new variant lives in its own hash space (no collision with
+    /// any legacy spec). Stranding a legacy `resolution_hash` would change one
+    /// of the constants above, which must never be "fixed" by editing them.
+    #[test]
+    fn legacy_specs_hash_unchanged_by_price_quorum_append() {
+        let env = Env::default();
+        let xlm = OracleAsset::Other(Symbol::new(&env, "XLM"));
+        assert_eq!(
+            hex_of(
+                &env,
+                &price(&env, xlm.clone(), 2_000, PriceDirection::Above, 10)
+            ),
+            "b6f2458326d5f76bd9b53a93a103ea6c0fed7129c5496e91e3faef9a9a23d469"
+        );
+        assert_eq!(
+            hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600)),
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
+        let quorum = ResolutionSpec::PriceQuorum(QuorumPriceConfig {
+            feeds: Vec::from_array(
+                &env,
+                [
+                    FeedRef {
+                        reflector: Address::from_str(&env, C1),
+                        asset: xlm.clone(),
+                        decimals: 8,
+                    },
+                    FeedRef {
+                        reflector: Address::from_str(&env, C2),
+                        asset: xlm.clone(),
+                        decimals: 8,
+                    },
+                ],
+            ),
+            min_responses: 2,
+            threshold: 2_000,
+            threshold_decimals: 8,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+            max_deviation_bps: 1_000,
+        });
+        let quorum_hash = hex_of(&env, &quorum);
+        assert_ne!(
+            quorum_hash,
+            "b6f2458326d5f76bd9b53a93a103ea6c0fed7129c5496e91e3faef9a9a23d469"
+        );
+        assert_ne!(
+            quorum_hash,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
     }
 
     /// V2 golden vector, re-derived independently from raw XDR (no Soroban) in
@@ -8018,6 +8464,7 @@ mod golden {
         use super::*;
         use adversarial_mocks::harness::{deploy_oracle, OracleKind};
         use adversarial_mocks::{BudgetBurnerOracleClient, ExtremeOracleClient};
+        use soroban_sdk::testutils::Ledger as _;
 
         fn setup_oracle_fixture(kind: OracleKind) -> (Fixture, Address) {
             let f = fixture_at(2_100, |env, _, _, _| {
