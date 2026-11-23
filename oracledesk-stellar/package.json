@@ -10,7 +10,7 @@
     "scripts/governance"
   ],
   "scripts": {
-    "build": "npm run build -w packages/bindings --if-present && tsc -b",
+    "build": "node init && npm run build -w packages/bindings --if-present && tsc -b",
     "typecheck": "tsc -b --pretty",
     "lint": "eslint .",
     "format:check": "prettier --check .",

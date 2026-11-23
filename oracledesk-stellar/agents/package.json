@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "node init && tsc --noEmit",
     "test": "tsx --test core/*.test.ts core/events/*.test.ts core/outcomes/*.test.ts core/strategies/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts runtime/tasks/*.test.ts sim/*.test.ts",
     "market-maker": "tsx bin/market-maker.ts",
     "trader": "tsx bin/trader.ts",

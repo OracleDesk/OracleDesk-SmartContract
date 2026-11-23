@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "node init && tsc --noEmit",
     "test": "tsx --test *.test.ts",
     "cli": "tsx timelock-cli.ts"
   },

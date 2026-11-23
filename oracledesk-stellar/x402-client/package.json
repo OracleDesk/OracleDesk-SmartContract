@@ -15,9 +15,11 @@
       "types": "./dist/verify.d.ts"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "node init && tsc",
     "test": "node --test --experimental-vm-modules dist/**/*.test.js",
     "clean": "rm -rf dist"
   },

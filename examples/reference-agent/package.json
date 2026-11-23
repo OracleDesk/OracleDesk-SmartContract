@@ -5,8 +5,8 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc",
-    "start": "npm run build && node dist/main.js",
+    "build": "node init && tsc",
+    "start": "node init && npm run build && node dist/main.js",
     "test": "npm run build",
     "e2e": "npm run build && node dist/main.js"
   },

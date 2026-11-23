@@ -19,7 +19,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node init && tsc",
     "test": "node --test dist/**/*.test.js",
     "clean": "rm -rf dist"
   },

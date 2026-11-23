@@ -3,7 +3,17 @@ name: CI
 on:
   push:
     branches: [develop, main]
+    paths: ["oracledesk-stellar/**", ".github/workflows/ci.yml"]
   pull_request:
+    branches: [develop, main]
+    paths: ["oracledesk-stellar/**", ".github/workflows/ci.yml"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 defaults:
   run:

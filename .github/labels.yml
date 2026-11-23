@@ -1,0 +1,55 @@
+# Labels applied to this repository by .github/workflows/label-sync.yml
+# on push to develop (when this file changes) and via workflow_dispatch.
+# delete-other-labels is false, so labels created manually are kept.
+
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or request
+
+- name: good-first-issue
+  color: "7057ff"
+  description: Good for newcomers
+
+- name: documentation
+  color: "0075ca"
+  description: Improvements or additions to documentation
+
+- name: security
+  color: "b60205"
+  description: Security-relevant change or report
+
+- name: complexity/small
+  color: "c2e0c6"
+  description: Small change, a few hours of work
+
+- name: complexity/medium
+  color: "fef2c0"
+  description: Medium change, a day or two of work
+
+- name: complexity/large
+  color: "f9d0c4"
+  description: Large change, spans multiple components
+
+- name: contracts
+  color: "5319e7"
+  description: Soroban smart contracts (resolver, treasury, market core)
+
+- name: agents
+  color: "1d76db"
+  description: Agent suite (agents/)
+
+- name: x402
+  color: "0e8a16"
+  description: x402 payment layer (x402/)
+
+- name: bindings
+  color: "bfd4f2"
+  description: Generated TypeScript bindings (packages/bindings)
+
+- name: infra
+  color: "795548"
+  description: CI, tooling, and repository infrastructure
