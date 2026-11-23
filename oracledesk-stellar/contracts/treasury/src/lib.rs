@@ -116,17 +116,73 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// market-core call must go through this (or [`Treasury::core_trade`] for the
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
-fn core_call<T>(
-    result: Result<
+trait MapCoreResult<T> {
+    fn map_core(self) -> Result<T, Error>;
+}
+
+impl<T> MapCoreResult<T>
+    for Result<
         Result<T, market_core::Error>,
         Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
-    >,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+    >
+{
+    fn map_core(self) -> Result<T, Error> {
+        match self {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_market_core_error(error)),
+            Err(_) => Err(Error::MarketCoreCallFailed),
+        }
     }
+}
+
+impl<T> MapCoreResult<T>
+    for Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    >
+{
+    fn map_core(self) -> Result<T, Error> {
+        match self {
+            Ok(Ok(value)) => Ok(value),
+            Err(Ok(error)) => Err(map_market_core_code(error)),
+            _ => Err(Error::MarketCoreCallFailed),
+        }
+    }
+}
+
+impl<T> MapCoreResult<T>
+    for Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >
+{
+    fn map_core(self) -> Result<T, Error> {
+        match self {
+            Ok(Ok(value)) => Ok(value),
+            Err(Ok(error)) => Err(map_market_core_error(error)),
+            _ => Err(Error::MarketCoreCallFailed),
+        }
+    }
+}
+
+impl<T> MapCoreResult<T>
+    for Result<
+        Result<T, soroban_sdk::Error>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >
+{
+    fn map_core(self) -> Result<T, Error> {
+        match self {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_market_core_code(error)),
+            Err(Ok(error)) => Err(map_market_core_error(error)),
+            _ => Err(Error::MarketCoreCallFailed),
+        }
+    }
+}
+
+fn core_call<T>(result: impl MapCoreResult<T>) -> Result<T, Error> {
+    result.map_core()
 }
 
 /// Agent role bits (`AgentPolicy.roles`). A bitmask rather than a
@@ -705,6 +761,21 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
+    // Typed market-core failures (`map_market_core_error`). These occupy the
+    // reserved 29..=40 range so the treasury ABI never leaks market-core
+    // numeric codes. `MarketCoreError` below is the legacy collapse code.
+    MarketCoreMarketNotFound = 29,
+    MarketCoreNotFinal = 30,
+    MarketCoreMarketNotOpen = 31,
+    MarketCoreMarketClosed = 32,
+    MarketCoreInsufficientLiquidity = 33,
+    MarketCoreInsufficientShares = 34,
+    MarketCoreAlreadyClaimed = 35,
+    MarketCoreNothingToRedeem = 36,
+    MarketCoreInvalidAmount = 37,
+    MarketCoreOverflow = 38,
+    MarketCoreSlippageExceeded = 39,
+    MarketCoreCallFailed = 40,
     MarketNotFinal = 44,
     MarketCoreError = 45,
     DrawdownTripped = 46,
@@ -744,6 +815,11 @@ pub enum Error {
     TraceTimelockActive = 74,
     StaleMarks = 75,
     MarkBatchTooLarge = 76,
+    /// market-core's `OperatingMode` (#20) forbids the action the agent
+    /// asked for. Reported here rather than bubbling market-core's code,
+    /// which would collide with treasury's own numbering (market-core's
+    /// `Paused` is 2, the same number as treasury's `Unauthorized`).
+    MarketCoreRestricted = 77,
 }
 
 #[contractevent]
@@ -2309,7 +2385,7 @@ impl Treasury {
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2385,7 +2461,7 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2451,7 +2527,7 @@ impl Treasury {
         collateral_in: i128,
         min_shares_out: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2481,7 +2557,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2509,7 +2585,7 @@ impl Treasury {
         collateral_out: i128,
         max_shares_in: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -2537,7 +2613,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -4151,7 +4227,7 @@ impl Treasury {
         let holdings = if Self::marks_migrated(env) {
             Self::nav_holdings(env)
         } else {
-            let mut total = 0;
+            let mut total: i128 = 0;
             for i in 0..Self::open_count(env) {
                 let key = DataKey::OpenMarketAt(i);
                 let entry: OpenMarket = env
@@ -4929,11 +5005,15 @@ impl Treasury {
             return Ok(());
         };
         let args = vec![env, agent.clone().into_val(env)];
-        let record: Option<AgentRecord> =
-            match env.try_invoke_contract(&registry, &Symbol::new(env, "get_agent"), args) {
-                Ok(Ok(v)) => v,
-                _ => return Err(Error::TraceRegistryCallFailed),
-            };
+        let record: Option<AgentRecord> = match env
+            .try_invoke_contract::<Option<AgentRecord>, soroban_sdk::Error>(
+                &registry,
+                &Symbol::new(env, "get_agent"),
+                args,
+            ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(Error::TraceRegistryCallFailed),
+        };
         match record {
             Some(r) if matches!(r.status, AgentStatus::Active) => Ok(()),
             _ => Err(Error::Unauthorized),
@@ -5025,13 +5105,14 @@ impl Treasury {
             action.clone().into_val(env),
             cfg.max_trace_age_ledgers.into_val(env),
         ];
-        let info: TraceConsumeInfo = match env.try_invoke_contract(
-            &registry,
-            &Symbol::new(env, "consume_trace_for"),
-            args,
-        ) {
+        let info: TraceConsumeInfo = match env
+            .try_invoke_contract::<TraceConsumeInfo, soroban_sdk::Error>(
+                &registry,
+                &Symbol::new(env, "consume_trace_for"),
+                args,
+            ) {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(Self::map_registry_trace_error(e)),
+            Ok(Err(e)) => return Err(Self::map_registry_trace_error(e.into())),
             Err(Ok(e)) => return Err(Self::map_registry_trace_error(e)),
             Err(Err(_)) => return Err(Error::TraceRegistryCallFailed),
         };
@@ -6547,6 +6628,28 @@ mod test {
             env.storage().instance().set(&1u32, &(calls + 1));
             collateral_in
         }
+
+        pub fn get_market(env: Env, _market_id: u64) -> market_core::Market {
+            market_core::Market {
+                creator: env.current_contract_address(),
+                question_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+                resolution_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+                meta_uri: soroban_sdk::String::from_str(&env, ""),
+                category: market_core::Category::Crypto,
+                close_time: 10_000,
+                fee_bps: 100,
+                status: market_core::MarketStatus::Open,
+                reserve_yes: 1000,
+                reserve_no: 1000,
+                sets_minted: 1000,
+                fees_accrued: 0,
+                lp_claimed: false,
+            }
+        }
+
+        pub fn get_position(_env: Env, _market_id: u64, _holder: Address) -> market_core::Position {
+            market_core::Position { yes: 0, no: 0 }
+        }
     }
 
     #[test]
@@ -6616,7 +6719,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_net_cap_below_max_trade() {
         fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
     }
@@ -7109,13 +7212,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_invalid_caps_panics_with_contract_error_3() {
         fixture_with_caps(20 * USDC, 10 * USDC, 60 * USDC);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_config_delay_below_minimum() {
         let default_policy = CreationPolicy {
             max_seed: USDC,
@@ -7618,6 +7721,7 @@ mod test {
             .agent_buy(&f.agent, &f.market_id, &Outcome::No, &(10 * USDC), &0);
         f.env.ledger().set_timestamp(MARKET_CLOSE);
         f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury.refresh_mark(&soroban_sdk::vec![&f.env, f.market_id]);
         let nav = f.treasury.nav();
         assert_eq!(f.treasury.open_market_count(), 1);
         f.treasury.redeem(&f.agent, &f.market_id);
@@ -9370,6 +9474,12 @@ mod test {
             }
         }
 
+        fn market_exposure(f: &Fixture, market_id: u64) -> MarketExposure {
+            f.env.as_contract(&f.treasury_id, || {
+                Treasury::market_exposure(&f.env, &f.market_core.address, market_id)
+            })
+        }
+
         #[test]
         fn adversarial_treasury_agent_buy_revert_keeps_daily_usage() {
             let f = fixture_hostile(TokenKind::Short);
@@ -9381,7 +9491,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    market_exposure(&f, f.market_id),
                 ),
             );
             assert!(f
@@ -9400,7 +9510,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    market_exposure(&f, f.market_id),
                 ),
             );
             assert_eq!(before, after);
@@ -9456,7 +9566,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    market_exposure(&f, f.market_id),
                 ),
             );
             assert!(f
@@ -9475,7 +9585,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    market_exposure(&f, f.market_id),
                 ),
             );
             assert_eq!(before, after);
