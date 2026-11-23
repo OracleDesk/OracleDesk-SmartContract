@@ -1,4 +1,4 @@
-﻿{
+{
     "version":  "0.1.0",
     "name":  "@oracledesk/bindings-test-oracle",
     "type":  "module",
@@ -12,6 +12,6 @@
                          "buffer":  "6.0.3"
                      },
     "devDependencies":  {
-                            "typescript":  "^5.6.2"
+                            "typescript":  "^7.0.2"
                         }
 }
