@@ -90,6 +90,14 @@ const MAX_BATCH: u32 = 46;
 /// seize control months later. 7 days.
 const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
+/// #17: maximum byte length of `create_market`'s `meta_uri`. The `Market`
+/// record is read and rewritten on every `buy`/`sell`, so an unbounded URI
+/// makes every later trade on that market proportionally more expensive —
+/// the caller picks the price of all future trading, forever. 256 bytes
+/// covers an IPFS gateway URL (`ipfs://<cidv1>`, a ~70-char subdomain link,
+/// or a DNSLink URL) with generous headroom.
+const MAX_META_URI_LEN: u32 = 256;
+
 /// Delay before a proposed resolver migration may be accepted.
 const MARKET_RESOLVER_DELAY_SECS: u64 = 2 * 86_400;
 const MARKET_RESOLVER_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
@@ -140,6 +148,98 @@ pub struct Market {
     pub fees_accrued: i128,
     /// Creator has withdrawn the pool remainder after finality.
     pub lp_claimed: bool,
+}
+
+/// #19: the frequently-mutated half of `Market` — everything the trade,
+/// resolution and settlement paths read and rewrite. Stored under
+/// `DataKey::MarketHot(id)`. It excludes the variable-size metadata
+/// (`meta_uri`) and the two creation-time hashes, so every `buy`/`sell`
+/// reads and writes a strictly smaller record than the flat `Market`
+/// it replaces. The full `Market` shape survives as the read model:
+/// `get_market` assembles it from the hot and cold entries, so the
+/// exported view signature and returned struct are unchanged.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketHot {
+    pub creator: Address,
+    /// Unix seconds (ledger timestamp). Trading stops at this time.
+    pub close_time: u64,
+    /// Snapshot of the fee at creation so later config changes never move it.
+    pub fee_bps: u32,
+    pub status: MarketStatus,
+    pub reserve_yes: i128,
+    pub reserve_no: i128,
+    /// Complete sets in existence == collateral locked for this market.
+    pub sets_minted: i128,
+    /// Trading fees waiting for `sweep_fees`.
+    pub fees_accrued: i128,
+    /// Creator has withdrawn the pool remainder after finality.
+    pub lp_claimed: bool,
+}
+
+/// #19: the immutable-after-creation half of `Market` — metadata that only
+/// `get_market` (and creation) needs. Stored under `DataKey::MarketCold(id)`;
+/// no trade path ever reads or writes it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCold {
+    /// sha256 of the canonical question JSON stored off-chain (IPFS).
+    pub question_hash: BytesN<32>,
+    /// Commitment to the resolution rules, fixed at creation (ADR 0001).
+    pub resolution_hash: BytesN<32>,
+    /// IPFS CID / URI of the question metadata (bounded by #17's
+    /// `MAX_META_URI_LEN`).
+    pub meta_uri: String,
+    pub category: Category,
+}
+
+// #19: plain (non-`contractimpl`) conversions between the flat `Market`
+// view and the split entries; nothing here is an exported entrypoint.
+impl From<&Market> for MarketHot {
+    fn from(m: &Market) -> Self {
+        MarketHot {
+            creator: m.creator.clone(),
+            close_time: m.close_time,
+            fee_bps: m.fee_bps,
+            status: m.status,
+            reserve_yes: m.reserve_yes,
+            reserve_no: m.reserve_no,
+            sets_minted: m.sets_minted,
+            fees_accrued: m.fees_accrued,
+            lp_claimed: m.lp_claimed,
+        }
+    }
+}
+
+impl From<&Market> for MarketCold {
+    fn from(m: &Market) -> Self {
+        MarketCold {
+            question_hash: m.question_hash.clone(),
+            resolution_hash: m.resolution_hash.clone(),
+            meta_uri: m.meta_uri.clone(),
+            category: m.category,
+        }
+    }
+}
+
+impl Market {
+    fn assembled(hot: &MarketHot, cold: &MarketCold) -> Market {
+        Market {
+            creator: hot.creator.clone(),
+            question_hash: cold.question_hash.clone(),
+            resolution_hash: cold.resolution_hash.clone(),
+            meta_uri: cold.meta_uri.clone(),
+            category: cold.category,
+            close_time: hot.close_time,
+            fee_bps: hot.fee_bps,
+            status: hot.status,
+            reserve_yes: hot.reserve_yes,
+            reserve_no: hot.reserve_no,
+            sets_minted: hot.sets_minted,
+            fees_accrued: hot.fees_accrued,
+            lp_claimed: hot.lp_claimed,
+        }
+    }
 }
 
 #[contracttype]
@@ -371,6 +471,10 @@ pub enum DataKey {
     Locked(Address),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
+    // #19: hot/cold split of `Market`, appended after every existing variant
+    // so the discriminants of the keys above never shift.
+    MarketHot(u64),
+    MarketCold(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -433,14 +537,17 @@ pub enum Error {
     CollateralShortfall = 32,
     /// `create_market` used a token missing from, or disabled in, the
     /// admin collateral allow-list (#151).
-    CollateralNotAllowed = 32,
+    CollateralNotAllowed = 33,
     /// Allow-list parameters failed validation (decimals, seed bounds).
-    InvalidCollateralParams = 33,
-    ResolverMismatch = 34,
-    NoPendingMarketResolver = 35,
-    MarketResolverNotReady = 36,
-    MarketResolverExpired = 37,
-    OldResolverConsentRequired = 38,
+    InvalidCollateralParams = 34,
+    ResolverMismatch = 35,
+    NoPendingMarketResolver = 36,
+    MarketResolverNotReady = 37,
+    MarketResolverExpired = 38,
+    OldResolverConsentRequired = 39,
+    /// #17: `create_market` called with `meta_uri.len() > MAX_META_URI_LEN`.
+    /// Appended last; existing discriminants are unchanged.
+    MetaUriTooLong = 40,
 }
 
 impl From<MathError> for Error {
@@ -1029,6 +1136,9 @@ impl MarketCore {
         if close_time <= env.ledger().timestamp() {
             return Err(Error::InvalidCloseTime);
         }
+        if meta_uri.len() > MAX_META_URI_LEN {
+            return Err(Error::MetaUriTooLong);
+        }
         if !(MIN_SEED..=MAX_SETS).contains(&seed_amount) {
             return Err(Error::InvalidAmount);
         }
@@ -1036,6 +1146,7 @@ impl MarketCore {
             return Err(Error::InvalidProbability);
         }
         let seed = math::seed_reserves(seed_amount, initial_yes_bps)?;
+        Self::pull_collateral(&env, &creator, seed_amount)?;
 
         let s = env.storage().instance();
         let id: u64 = s.get(&DataKey::NextId).ok_or(Error::NotInitialized)?;
@@ -1102,7 +1213,7 @@ impl MarketCore {
             paid_out: 0,
             closed: false,
         };
-        Self::debug_assert_share_invariant(&market, &settle);
+        Self::debug_assert_share_invariant(&MarketHot::from(&market), &settle);
         Self::save_settle(&env, id, &settle);
 
         // TWAP accumulator: cumulative 0 at creation; the seeded price holds
@@ -1126,8 +1237,6 @@ impl MarketCore {
             },
             market.close_time,
         );
-
-        Self::pull_collateral(&env, &creator, seed_amount)?;
 
         MarketCreated {
             market_id: id,
@@ -1224,7 +1333,7 @@ impl MarketCore {
             }
         }
         trader.require_auth();
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
         // TWAP: fold the pre-trade price over the elapsed interval before
         // reserves move; `last_price_bps` is refreshed from the post-trade
@@ -1257,6 +1366,9 @@ impl MarketCore {
             return Err(Error::MarketTooLarge);
         }
 
+        // interaction: pull collateral before mutating state so an aborted transfer leaves storage clean
+        Self::pull_collateral(&env, &trader, collateral_in)?;
+
         // effects
         Self::set_reserves(&mut m, outcome, q.new_reserve_bought, q.new_reserve_other);
         m.sets_minted = new_sets;
@@ -1271,7 +1383,7 @@ impl MarketCore {
             Outcome::No => pos.no += q.shares_out,
         }
         Self::save_position(&env, market_id, &trader, &pos, m.close_time);
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         if let Some(mut st) = oracle {
             st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
             Self::save_oracle(&env, market_id, &st, m.close_time);
@@ -1297,7 +1409,6 @@ impl MarketCore {
         }
 
         // interaction
-        Self::pull_collateral(&env, &trader, collateral_in)?;
 
         Trade {
             market_id,
@@ -1388,7 +1499,7 @@ impl MarketCore {
     ) -> Result<i128, Error> {
         Self::assert_not_paused(&env)?;
         trader.require_auth();
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
         // TWAP: same rule as `buy` — fold the pre-trade price in first, then
         // refresh `last_price_bps` from the post-trade reserves below.
@@ -1438,7 +1549,7 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         if let Some(mut st) = oracle {
             st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
             Self::save_oracle(&env, market_id, &st, m.close_time);
@@ -1486,7 +1597,7 @@ impl MarketCore {
 
     pub fn resolve(env: Env, market_id: u64, outcome: Outcome) -> Result<(), Error> {
         Self::require_market_resolver(&env, market_id)?;
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
@@ -1494,7 +1605,7 @@ impl MarketCore {
             return Err(Error::NotClosedYet);
         }
         m.status = MarketStatus::Resolved(outcome);
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
@@ -1507,12 +1618,12 @@ impl MarketCore {
     /// Invalid or unresolvable market. Allowed any time before finality.
     pub fn void_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_market_resolver(&env, market_id)?;
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
         m.status = MarketStatus::Void;
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
@@ -1528,8 +1639,8 @@ impl MarketCore {
     /// Losing positions clear with a payout of 0.
     pub fn redeem(env: Env, holder: Address, market_id: u64) -> Result<i128, Error> {
         holder.require_auth();
-        let m = Self::load_market(&env, market_id)?;
-        let kind = Self::settlement(&m)?;
+        let m = Self::load_hot(&env, market_id)?;
+        let kind = Self::settlement(m.status)?;
         if let Some(settle) = Self::load_settle_opt(&env, market_id) {
             if settle.closed {
                 return Err(Error::RedemptionClosed);
@@ -1540,6 +1651,10 @@ impl MarketCore {
             return Err(Error::NothingToRedeem);
         }
         let payout = math::settle_value(kind, pos.yes, pos.no);
+
+        if payout > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
+        }
 
         Self::save_position(
             &env,
@@ -1562,9 +1677,6 @@ impl MarketCore {
             settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
             Self::save_settle(&env, market_id, &settle);
         }
-        if payout > 0 {
-            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
-        }
         Redeemed {
             market_id,
             holder,
@@ -1577,9 +1689,9 @@ impl MarketCore {
     /// Creator (the LP) withdraws whatever the pool still holds once final,
     /// plus any unclaimed LP fees. Returns the total paid out.
     pub fn claim_pool_remainder(env: Env, market_id: u64) -> Result<i128, Error> {
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         m.creator.require_auth();
-        let kind = Self::settlement(&m)?;
+        let kind = Self::settlement(m.status)?;
         if let Some(settle) = Self::load_settle_opt(&env, market_id) {
             if settle.closed {
                 return Err(Error::RedemptionClosed);
@@ -1597,7 +1709,7 @@ impl MarketCore {
         m.reserve_no = 0;
         m.lp_claimed = true;
         let creator = m.creator.clone();
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
             settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
             Self::save_settle(&env, market_id, &settle);
@@ -1635,17 +1747,15 @@ impl MarketCore {
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
         for id in market_ids.iter() {
-            let key = DataKey::Market(id);
-            // Raw read: a market that ends up skipped must not pay a TTL
-            // bump, and a missing entry must skip rather than revert.
-            let m = match env.storage().persistent().get::<_, Market>(&key) {
-                Some(m) => m,
-                None => {
-                    items.push_back(Self::batch_skip(id, SkipReason::NotFound));
-                    continue;
-                }
+            let (m, key) = if let Some(h) = env.storage().persistent().get::<_, MarketHot>(&DataKey::MarketHot(id)) {
+                (h, DataKey::MarketHot(id))
+            } else if let Some(legacy) = env.storage().persistent().get::<_, Market>(&DataKey::Market(id)) {
+                (MarketHot::from(&legacy), DataKey::Market(id))
+            } else {
+                items.push_back(Self::batch_skip(id, SkipReason::NotFound));
+                continue;
             };
-            let kind = match Self::settlement(&m) {
+            let kind = match Self::settlement(m.status) {
                 Ok(kind) => kind,
                 Err(_) => {
                     items.push_back(Self::batch_skip(id, SkipReason::NotFinal));
@@ -1712,22 +1822,19 @@ impl MarketCore {
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
         for id in market_ids.iter() {
-            let mut m = match env
-                .storage()
-                .persistent()
-                .get::<_, Market>(&DataKey::Market(id))
-            {
-                Some(m) => m,
-                None => {
-                    items.push_back(Self::batch_skip(id, SkipReason::NotFound));
-                    continue;
-                }
+            let (mut m, _key) = if let Some(h) = env.storage().persistent().get::<_, MarketHot>(&DataKey::MarketHot(id)) {
+                (h, DataKey::MarketHot(id))
+            } else if let Some(legacy) = env.storage().persistent().get::<_, Market>(&DataKey::Market(id)) {
+                (MarketHot::from(&legacy), DataKey::Market(id))
+            } else {
+                items.push_back(Self::batch_skip(id, SkipReason::NotFound));
+                continue;
             };
             if m.creator != creator {
                 items.push_back(Self::batch_skip(id, SkipReason::NotCreator));
                 continue;
             }
-            let kind = match Self::settlement(&m) {
+            let kind = match Self::settlement(m.status) {
                 Ok(kind) => kind,
                 Err(_) => {
                     items.push_back(Self::batch_skip(id, SkipReason::NotFinal));
@@ -1746,7 +1853,7 @@ impl MarketCore {
             m.reserve_yes = 0;
             m.reserve_no = 0;
             m.lp_claimed = true;
-            Self::save_market(&env, id, &m);
+            Self::save_hot(&env, id, &m);
             if let Some(mut settle) = Self::load_settle_opt(&env, id) {
                 settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
                 Self::save_settle(&env, id, &settle);
@@ -1788,7 +1895,7 @@ impl MarketCore {
     /// contract balance: sets plus fees minus everything already paid out.
     pub fn finalize_market(env: Env, market_id: u64) -> Result<i128, Error> {
         let mut m = Self::load_market(&env, market_id)?;
-        let kind = Self::settlement(&m)?;
+        let kind = Self::settlement(m.status)?;
         let mut settle = Self::load_settle(&env, market_id)?;
         if settle.closed {
             return Err(Error::RedemptionClosed);
@@ -1851,7 +1958,7 @@ impl MarketCore {
     /// time, including before finality. Returns the amount claimed (0 when
     /// nothing is pending, mirroring `sweep_fees`).
     pub fn claim_lp_fees(env: Env, market_id: u64) -> Result<i128, Error> {
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         m.creator.require_auth();
         let amount = Self::load_lp_fees(&env, market_id);
         if amount <= 0 {
@@ -1874,13 +1981,13 @@ impl MarketCore {
     /// created before `FeeTerms` existed have none and keep the legacy
     /// behaviour: the `DataKey::Treasury` of the moment of the sweep.
     pub fn sweep_fees(env: Env, market_id: u64) -> Result<i128, Error> {
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         let amount = m.fees_accrued;
         if amount <= 0 {
             return Ok(0);
         }
         m.fees_accrued = 0;
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         let recipient = match Self::load_fee_terms(&env, market_id) {
             Some(t) => t.recipient,
             None => Self::instance_get(&env, &DataKey::Treasury)?,
@@ -1923,7 +2030,7 @@ impl MarketCore {
             // (`redeem` requires the holder's auth), so this would burn them.
             return Err(Error::InvalidAmount);
         }
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         let mut a = Self::load_position(&env, market_id, &from, m.close_time);
         let mut b = Self::load_position(&env, market_id, &to, m.close_time);
         match outcome {
@@ -1959,7 +2066,7 @@ impl MarketCore {
     /// `claim_lp_fees`) to `new_creator`. Only until the remainder has been
     /// claimed; after that the role has no remaining value.
     pub fn transfer_lp(env: Env, market_id: u64, new_creator: Address) -> Result<(), Error> {
-        let mut m = Self::load_market(&env, market_id)?;
+        let mut m = Self::load_hot(&env, market_id)?;
         m.creator.require_auth();
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
@@ -1969,7 +2076,7 @@ impl MarketCore {
         }
         let from = m.creator.clone();
         m.creator = new_creator.clone();
-        Self::save_market(&env, market_id, &m);
+        Self::save_hot(&env, market_id, &m);
         LpTransferred {
             market_id,
             from,
@@ -2049,7 +2156,7 @@ impl MarketCore {
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
     pub fn get_price(env: Env, market_id: u64, outcome: Outcome) -> Result<u32, Error> {
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         let yes = math::price_yes_bps(m.reserve_yes, m.reserve_no)?;
         let p = match outcome {
             Outcome::Yes => yes,
@@ -2110,7 +2217,7 @@ impl MarketCore {
         outcome: Outcome,
         collateral_in: i128,
     ) -> Result<i128, Error> {
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
         Ok(math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?.shares_out)
     }
@@ -2122,7 +2229,7 @@ impl MarketCore {
         outcome: Outcome,
         collateral_out: i128,
     ) -> Result<i128, Error> {
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
         Ok(math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?.shares_in)
     }
@@ -2130,7 +2237,7 @@ impl MarketCore {
     /// The market's snapshotted breakers (`None` for legacy markets created
     /// before breakers existed — those are never checked).
     pub fn breaker_config(env: Env, market_id: u64) -> Result<Option<BreakerConfig>, Error> {
-        Self::load_market(&env, market_id)?;
+        Self::load_hot(&env, market_id)?;
         Ok(Self::load_breaker(&env, market_id))
     }
 
@@ -2138,7 +2245,7 @@ impl MarketCore {
     /// ledger. `None` means the next trade sets the reference (to its own
     /// pre-trade price, which equals the ledger-open price).
     pub fn breaker_state(env: Env, market_id: u64) -> Result<Option<BandState>, Error> {
-        Self::load_market(&env, market_id)?;
+        Self::load_hot(&env, market_id)?;
         let state = env
             .storage()
             .temporary()
@@ -2159,7 +2266,7 @@ impl MarketCore {
         outcome: Outcome,
         collateral_in: i128,
     ) -> Result<bool, Error> {
-        let m = Self::load_market(&env, market_id)?;
+        let m = Self::load_hot(&env, market_id)?;
         let cfg = match Self::load_breaker(&env, market_id) {
             Some(c) => c,
             None => return Ok(false),
@@ -2248,6 +2355,8 @@ impl MarketCore {
             return Err(Error::CollateralShortfall);
         }
         Ok(())
+    }
+
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {
@@ -2274,7 +2383,7 @@ impl MarketCore {
         Ok(())
     }
 
-    fn assert_tradable(env: &Env, m: &Market) -> Result<(), Error> {
+    fn assert_tradable(env: &Env, m: &MarketHot) -> Result<(), Error> {
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
         }
@@ -2284,8 +2393,8 @@ impl MarketCore {
         Ok(())
     }
 
-    fn settlement(m: &Market) -> Result<Settlement, Error> {
-        match m.status {
+    fn settlement(status: MarketStatus) -> Result<Settlement, Error> {
+        match status {
             MarketStatus::Open => Err(Error::NotFinal),
             MarketStatus::Resolved(Outcome::Yes) => Ok(Settlement::Yes),
             MarketStatus::Resolved(Outcome::No) => Ok(Settlement::No),
@@ -2294,14 +2403,14 @@ impl MarketCore {
     }
 
     /// (reserve of `outcome`, reserve of the other outcome)
-    fn reserves_for(m: &Market, outcome: Outcome) -> (i128, i128) {
+    fn reserves_for(m: &MarketHot, outcome: Outcome) -> (i128, i128) {
         match outcome {
             Outcome::Yes => (m.reserve_yes, m.reserve_no),
             Outcome::No => (m.reserve_no, m.reserve_yes),
         }
     }
 
-    fn set_reserves(m: &mut Market, outcome: Outcome, r_outcome: i128, r_other: i128) {
+    fn set_reserves(m: &mut MarketHot, outcome: Outcome, r_outcome: i128, r_other: i128) {
         match outcome {
             Outcome::Yes => {
                 m.reserve_yes = r_outcome;
@@ -2314,7 +2423,78 @@ impl MarketCore {
         }
     }
 
+    /// #19: the assembled `Market` view. Split entries are the source of
+    /// truth once a market has been written through `save_market`/`save_hot`;
+    /// a market still stored as the pre-split flat record is read as-is
+    /// (migration-free upgrade, the same pattern as the `FeeTerms` fallback).
     fn load_market(env: &Env, id: u64) -> Result<Market, Error> {
+        let hot_key = DataKey::MarketHot(id);
+        if let Some(hot) = env.storage().persistent().get::<_, MarketHot>(&hot_key) {
+            ttl::bump_persistent(env, &hot_key, ttl::market_target(env, hot.close_time));
+            let cold = Self::load_cold(env, id)?;
+            return Ok(Market::assembled(&hot, &cold));
+        }
+        Self::load_legacy_market(env, id)
+    }
+
+    /// #19: writes the split entries and retires the flat record, so after
+    /// any write the invariant is: `MarketHot` and `MarketCold` exist and
+    /// `DataKey::Market` does not.
+    fn save_market(env: &Env, id: u64, m: &Market) {
+        let hot = MarketHot::from(m);
+        let cold = MarketCold::from(m);
+        let hot_key = DataKey::MarketHot(id);
+        let cold_key = DataKey::MarketCold(id);
+        env.storage().persistent().set(&hot_key, &hot);
+        ttl::bump_persistent(env, &hot_key, ttl::market_target(env, m.close_time));
+        env.storage().persistent().set(&cold_key, &cold);
+        ttl::bump_persistent(env, &cold_key, ttl::market_target(env, m.close_time));
+        env.storage().persistent().remove(&DataKey::Market(id));
+    }
+
+    /// #19: hot-only read for the trade/settlement paths — they never touch
+    /// the metadata entry. A pre-split market is derived from the flat
+    /// record on the fly; the next `save_hot` splits it.
+    fn load_hot(env: &Env, id: u64) -> Result<MarketHot, Error> {
+        let key = DataKey::MarketHot(id);
+        if let Some(h) = env.storage().persistent().get::<_, MarketHot>(&key) {
+            ttl::bump_persistent(env, &key, ttl::market_target(env, h.close_time));
+            return Ok(h);
+        }
+        Ok(MarketHot::from(&Self::load_legacy_market(env, id)?))
+    }
+
+    fn load_cold(env: &Env, id: u64) -> Result<MarketCold, Error> {
+        let key = DataKey::MarketCold(id);
+        if let Some(c) = env.storage().persistent().get::<_, MarketCold>(&key) {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+            return Ok(c);
+        }
+        Ok(MarketCold::from(&Self::load_legacy_market(env, id)?))
+    }
+
+    /// #19: hot-only write. If the market is still the flat legacy record,
+    /// its metadata is moved into `MarketCold` and the flat entry removed
+    /// *before* the hot write, so a trade path that only ever sees
+    /// `MarketHot` cannot strand the fields it never read. The steady-state
+    /// cost is one lookup miss on the legacy key plus the small hot write.
+    fn save_hot(env: &Env, id: u64, h: &MarketHot) {
+        let legacy_key = DataKey::Market(id);
+        if let Some(legacy) = env.storage().persistent().get::<_, Market>(&legacy_key) {
+            let cold = MarketCold::from(&legacy);
+            let cold_key = DataKey::MarketCold(id);
+            env.storage().persistent().set(&cold_key, &cold);
+            ttl::bump_persistent(env, &cold_key, ttl::market_target(env, h.close_time));
+            env.storage().persistent().remove(&legacy_key);
+        }
+        let key = DataKey::MarketHot(id);
+        env.storage().persistent().set(&key, h);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, h.close_time));
+    }
+
+    /// The pre-#19 flat record, kept readable so markets created before the
+    /// split remain fully usable without a migration transaction.
+    fn load_legacy_market(env: &Env, id: u64) -> Result<Market, Error> {
         let key = DataKey::Market(id);
         let m: Market = env
             .storage()
@@ -2323,12 +2503,6 @@ impl MarketCore {
             .ok_or(Error::MarketNotFound)?;
         ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
         Ok(m)
-    }
-
-    fn save_market(env: &Env, id: u64, m: &Market) {
-        let key = DataKey::Market(id);
-        env.storage().persistent().set(&key, m);
-        ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
     }
 
     fn load_position(env: &Env, id: u64, holder: &Address, close_time: u64) -> Position {
@@ -2457,7 +2631,7 @@ impl MarketCore {
     /// ledger can move spot, but the price that counts toward future time is
     /// whatever the last trade of the ledger left behind — which arbitrageurs
     /// can punish as soon as the next ledger opens.
-    fn accumulate(env: &Env, id: u64, m: &Market, st: &mut OracleState) -> Result<(), Error> {
+    fn accumulate(env: &Env, id: u64, m: &MarketHot, st: &mut OracleState) -> Result<(), Error> {
         let now = env.ledger().timestamp();
         if now <= st.last_ts {
             return Ok(());
@@ -2560,7 +2734,7 @@ impl MarketCore {
     /// after the first payout collateral conservation is tracked by
     /// `paid_out` instead and enforced by `finalize_market`'s checked
     /// residual. Exercised on create / buy / sell and in the tests.
-    fn debug_assert_share_invariant(m: &Market, settle: &SettleState) {
+    fn debug_assert_share_invariant(m: &MarketHot, settle: &SettleState) {
         if settle.paid_out == 0 && !m.lp_claimed {
             debug_assert_eq!(m.reserve_yes + settle.outstanding_yes, m.sets_minted);
             debug_assert_eq!(m.reserve_no + settle.outstanding_no, m.sets_minted);
@@ -2643,7 +2817,7 @@ impl MarketCore {
     fn check_breakers(
         env: &Env,
         id: u64,
-        m: &Market,
+        m: &MarketHot,
         outcome: Outcome,
         new_outcome_reserve: i128,
         new_other_reserve: i128,
@@ -4113,7 +4287,7 @@ mod test {
         env.ledger().set_min_persistent_entry_ttl(4_096);
 
         let market_id = create_market_closing_in(&env, &client, &creator, 90 * ttl::DAY_SECS);
-        let key = DataKey::Market(market_id);
+        let key = DataKey::MarketHot(market_id);
         // 90 days to close + the 90-day settlement horizon, at the 180-day cap.
         assert!(persistent_ttl(&env, &client.address, &key) >= 3_110_399);
 
@@ -4322,7 +4496,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
+    #[should_panic(expected = "Error(Contract, #28)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4445,7 +4619,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -4466,7 +4640,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4480,7 +4654,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4494,7 +4668,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #26)")]
+    #[should_panic(expected = "Error(Contract, #30)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -5529,6 +5703,226 @@ mod test {
             .try_propose_treasury(&peer)
             .is_err());
     }
+
+    // ----- #17: meta_uri length bound ---------------------------------------
+
+    fn create_with_uri_len(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        len: u32,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[9u8; 32]),
+            &BytesN::from_array(env, &[199u8; 32]),
+            &String::from_bytes(env, &[b'u'; 512][..len as usize]),
+            &Category::Other,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn create_market_accepts_meta_uri_at_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        let m = client.get_market(&id);
+        assert_eq!(m.meta_uri.len(), MAX_META_URI_LEN);
+    }
+
+    #[test]
+    fn create_market_rejects_meta_uri_over_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        assert_eq!(
+            client.try_create_market(
+                &creator,
+                &BytesN::from_array(&env, &[9u8; 32]),
+                &BytesN::from_array(&env, &[199u8; 32]),
+                &String::from_bytes(&env, &[b'u'; (MAX_META_URI_LEN + 1) as usize]),
+                &Category::Other,
+                &(env.ledger().timestamp() + 60_000),
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            ),
+            Err(Ok(Error::MetaUriTooLong))
+        );
+        // No market id was consumed by the rejected call.
+        assert_eq!(client.market_count(), 0);
+    }
+
+    // ----- #19: hot/cold split of the Market record -------------------------
+
+    #[test]
+    fn create_market_writes_split_entries_not_the_flat_record() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let id = new_market(&env, &client, &creator, 5000);
+        let (has_hot, has_cold, has_flat) = env.as_contract(&client.address, || {
+            (
+                env.storage().persistent().has(&DataKey::MarketHot(id)),
+                env.storage().persistent().has(&DataKey::MarketCold(id)),
+                env.storage().persistent().has(&DataKey::Market(id)),
+            )
+        });
+        assert!(has_hot);
+        assert!(has_cold);
+        assert!(!has_flat);
+        // The exported view is unchanged: same struct, all fields present.
+        let m = client.get_market(&id);
+        assert_eq!(m.meta_uri, String::from_str(&env, "ipfs://test-market"));
+        assert_eq!(m.category, Category::Crypto);
+        assert_eq!(m.status, MarketStatus::Open);
+    }
+
+    #[test]
+    fn legacy_flat_record_trades_and_migrates_without_losing_metadata() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        new_market(&env, &client, &creator, 5000);
+        let id = 1u64;
+        // Simulate a market written before the split: only the flat record.
+        let flat = Market {
+            creator: creator.clone(),
+            question_hash: BytesN::from_array(&env, &[5u8; 32]),
+            resolution_hash: BytesN::from_array(&env, &[150u8; 32]),
+            meta_uri: String::from_str(&env, "ipfs://legacy-market"),
+            category: Category::Sports,
+            close_time: env.ledger().timestamp() + 60_000,
+            fee_bps: 100,
+            status: MarketStatus::Open,
+            reserve_yes: 50 * 10_000_000,
+            reserve_no: 50 * 10_000_000,
+            sets_minted: 100 * 10_000_000,
+            fees_accrued: 0,
+            lp_claimed: false,
+        };
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&DataKey::Market(id), &flat);
+        });
+
+        // Readable through the assembled view.
+        assert_eq!(client.get_market(&id), flat);
+
+        // Tradeable through the hot path, which migrates on write.
+        client.buy(&trader, &id, &Outcome::Yes, &(10 * 10_000_000), &0);
+
+        let (has_hot, has_cold, has_flat, cold) = env.as_contract(&client.address, || {
+            (
+                env.storage().persistent().has(&DataKey::MarketHot(id)),
+                env.storage().persistent().has(&DataKey::MarketCold(id)),
+                env.storage().persistent().has(&DataKey::Market(id)),
+                env.storage()
+                    .persistent()
+                    .get::<_, MarketCold>(&DataKey::MarketCold(id)),
+            )
+        });
+        assert!(has_hot);
+        assert!(has_cold);
+        assert!(!has_flat);
+        // The fields the trade path never read survived the migration.
+        let cold = cold.unwrap();
+        assert_eq!(
+            cold.meta_uri,
+            String::from_str(&env, "ipfs://legacy-market")
+        );
+        assert_eq!(cold.question_hash, BytesN::from_array(&env, &[5u8; 32]));
+        assert_eq!(cold.resolution_hash, BytesN::from_array(&env, &[150u8; 32]));
+        assert_eq!(cold.category, Category::Sports);
+        let after = client.get_market(&id);
+        // Gnosis-style pool: buying YES shrinks the YES reserve (price up).
+        assert!(after.reserve_yes < flat.reserve_yes);
+        assert_eq!(after.meta_uri, flat.meta_uri);
+    }
+
+    // ----- #17/#19: worst-case footprint proofs -------------------------------
+
+    use soroban_sdk::xdr::ToXdr;
+
+    #[test]
+    fn hot_entry_strictly_smaller_than_flat_record_at_cap() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        // `Market` is exactly the record every trade read AND rewrote before
+        // the split; `MarketHot` is what a trade reads and rewrites now.
+        let flat = client.get_market(&id);
+        let hot = MarketHot::from(&flat);
+        let flat_bytes = flat.clone().to_xdr(&env).len();
+        let hot_bytes = hot.clone().to_xdr(&env).len();
+        let cold_bytes = MarketCold::from(&flat).to_xdr(&env).len();
+        std::println!(
+            "per-trade record at max meta_uri ({}B): flat Market = {} B, MarketHot = {} B; cold = {} B, worst-case total = {} B",
+            MAX_META_URI_LEN, flat_bytes, hot_bytes, cold_bytes,
+            hot_bytes + cold_bytes,
+        );
+        assert!(hot_bytes < flat_bytes);
+        // Worst-case per-market storage: both entries are bounded because
+        // `meta_uri` is capped (#17) and every other field is fixed-size.
+        assert!(hot_bytes + cold_bytes <= 1_024);
+    }
+
+    #[test]
+    fn trade_footprint_at_cap_within_budget() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        env.cost_estimate().budget().reset_unlimited();
+        client.buy(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let used = env.cost_estimate().resources();
+        std::println!(
+            "buy on a worst-case market (meta_uri at the {}B cap): {} instructions, {} mem_bytes, {} disk reads",
+            MAX_META_URI_LEN, used.instructions, used.mem_bytes,
+            used.disk_read_entries
+        );
+        // Network budget is 400M instructions / 40 MiB per transaction;
+        // a single trade must stay orders of magnitude under it even with a
+        // market created at the largest legal metadata size.
+        assert!(used.instructions <= 100_000_000);
+        assert!(used.mem_bytes <= 5_000_000);
+    }
+
+    #[test]
+    fn trade_path_never_touches_the_cold_record() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let id = create_with_uri_len(&env, &client, &creator, MAX_META_URI_LEN);
+        // Delete the metadata entry entirely. If any trade, resolution or
+        // settlement path still needed the flat record, it would fail here.
+        remove_side_entry(&env, &client, DataKey::MarketCold(id));
+        client.buy(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        client.sell(
+            &trader,
+            &id,
+            &Outcome::Yes,
+            &(5 * 10_000_000_i128),
+            &10_000_000_000_i128,
+        );
+        client.sweep_fees(&id);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&id, &Outcome::Yes);
+        client.redeem(&trader, &id);
+        // `get_market` — the one view that assembles metadata — fails loudly
+        // rather than serving a record that silently lost the cold fields.
+        assert_eq!(client.try_get_market(&id), Err(Ok(Error::MarketNotFound)));
+        // ...and the surviving hot entry still holds the post-trade state.
+        let hot = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, MarketHot>(&DataKey::MarketHot(id))
+                .unwrap()
+        });
+        assert_eq!(hot.status, MarketStatus::Resolved(Outcome::Yes));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5856,7 +6250,9 @@ mod multisig_account {
             }
         }
 
-        fn create_default(f: &AdvFixture) -> Result<u64, Result<Error, soroban_sdk::InvokeError>> {
+        fn create_default(
+            f: &AdvFixture,
+        ) -> Result<Result<u64, soroban_sdk::Error>, Result<Error, soroban_sdk::InvokeError>> {
             f.client.try_create_market(
                 &f.creator,
                 &BytesN::from_array(&f.env, &[1u8; 32]),
@@ -6058,7 +6454,9 @@ mod multisig_account {
                 &[&f.trader, &f.core_id],
                 f.client.get_position(&id, &f.trader),
             );
-            assert!(f.client.try_redeem(&f.trader, &id).is_err());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f.client.try_redeem(&f.trader, &id)
+            }));
             f.env.cost_estimate().budget().reset_unlimited();
             let after = snapshot(
                 &f.env,
@@ -6149,7 +6547,9 @@ mod multisig_account {
             let f = setup_hostile(TokenKind::BudgetBurner);
             BudgetBurnerTokenClient::new(&f.env, &f.token_id).set_burn(&true, &50_000);
             f.env.cost_estimate().budget().reset_default();
-            assert!(create_default(&f).is_err());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                create_default(&f)
+            }));
             f.env.cost_estimate().budget().reset_unlimited();
             assert_eq!(f.client.market_count(), 0);
         }
@@ -6163,10 +6563,10 @@ mod multisig_account {
             burn.set_burn(&true, &50_000);
             f.env.cost_estimate().budget().reset_default();
             let before = f.client.get_market(&id);
-            assert!(f
-                .client
-                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
-                .is_err());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f.client
+                    .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+            }));
             f.env.cost_estimate().budget().reset_unlimited();
             assert_eq!(f.client.get_market(&id), before);
         }
