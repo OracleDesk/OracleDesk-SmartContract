@@ -21,6 +21,8 @@ setup_temp_repo() {
 
   cp "$REPO_ROOT"/scripts/*.sh "$WORK_REPO/scripts/"
   cp "$REPO_ROOT/scripts/toolchain.env" "$WORK_REPO/scripts/"
+  # scripts/toolchain.env is a shim that sources the repo-root copy (#135).
+  cp "$REPO_ROOT/toolchain.env" "$WORK_REPO/toolchain.env"
   chmod +x "$WORK_REPO"/scripts/*.sh
 
   for w in market_core resolver reasoning_registry treasury timelock router test_oracle; do

@@ -3,21 +3,22 @@
 
 pub mod world;
 
-#[allow(clippy::too_many_arguments)]
 pub mod market_core {
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "wasm/market_core.wasm");
 }
 
-#[allow(clippy::too_many_arguments)]
 pub mod resolver {
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "wasm/resolver.wasm");
 }
 
 pub mod treasury {
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "wasm/treasury.wasm");
 }
 
-#[allow(clippy::too_many_arguments)]
 pub mod reasoning_registry {
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "wasm/reasoning_registry.wasm");
 }

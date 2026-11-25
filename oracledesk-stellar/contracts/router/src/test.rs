@@ -3,6 +3,7 @@ use market_core::MarketStatus;
 // Test-only import of the vendored registry. Kept out of the crate root: the
 // contract import's spec types would collide with the router's own event types.
 mod reasoning_registry {
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
 }
 use reasoning_registry::Client as RegistryClient;
@@ -69,8 +70,7 @@ fn fixture() -> Fixture {
     let token = StellarAssetClient::new(&env, &collateral.address());
     token.mint(&creator, &(1_000 * 10_000_000_i128));
 
-    let registry_id = env.register(reasoning_registry::WASM, (admin.clone(),));
-    let registry = RegistryClient::new(&env, &registry_id);
+    let registry_id = Address::generate(&env);
 
     // market-core first needs a resolver address; deploy the real resolver
     // against a placeholder core, then deploy market-core, then re-point the
@@ -93,6 +93,14 @@ fn fixture() -> Fixture {
         resolver::WASM,
         (admin.clone(), market_core_id.clone()),
     );
+    // The registry constructor binds both the admin and the market-core it
+    // validates traces against, so it can only be deployed once core exists.
+    env.register_at(
+        &registry_id,
+        reasoning_registry::WASM,
+        (admin.clone(), market_core_id.clone()),
+    );
+    let registry = RegistryClient::new(&env, &registry_id);
 
     let router_id = env.register(
         Router,

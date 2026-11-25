@@ -9,8 +9,8 @@
 use soroban_sdk::Env;
 
 use crate::{
-    DisputableConfig, Error, FallbackAuthority, HybridConfigV2, PriceConfig, ResolutionSpec,
-    SignersConfig, WeightedKeyConfig,
+    DisputableSignerConfig, Error, FallbackAuthority, HybridConfigV2, PriceConfig, ResolutionSpec,
+    SignerConfig, WeightedKeyConfig,
 };
 
 /// Minimum `dispute_window` / `escalation_timeout` / `fallback_after` (1 minute).
@@ -25,7 +25,7 @@ pub const MIN_STALENESS_SECS: u64 = 1;
 /// Returns `Err(InvalidConfig)` if `window` is outside `[MIN_WINDOW_SECS,
 /// MAX_WINDOW_SECS]`.
 fn check_window(window: u64) -> Result<(), Error> {
-    if window < MIN_WINDOW_SECS || window > MAX_WINDOW_SECS {
+    if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&window) {
         Err(Error::InvalidConfig)
     } else {
         Ok(())
@@ -35,7 +35,7 @@ fn check_window(window: u64) -> Result<(), Error> {
 /// Returns `Err(InvalidConfig)` if `staleness` is outside `[MIN_STALENESS_SECS,
 /// MAX_STALENESS_SECS]`.
 fn check_staleness(staleness: u64) -> Result<(), Error> {
-    if staleness < MIN_STALENESS_SECS || staleness > MAX_STALENESS_SECS {
+    if !(MIN_STALENESS_SECS..=MAX_STALENESS_SECS).contains(&staleness) {
         Err(Error::InvalidConfig)
     } else {
         Ok(())
@@ -46,18 +46,17 @@ fn validate_price_bounds(cfg: &PriceConfig) -> Result<(), Error> {
     check_staleness(cfg.max_staleness)
 }
 
-fn validate_signers_bounds(cfg: &SignersConfig) -> Result<(), Error> {
+fn validate_signers_bounds(cfg: &SignerConfig) -> Result<(), Error> {
     check_window(cfg.dispute_window)
 }
 
-fn validate_disputable_bounds(cfg: &DisputableConfig) -> Result<(), Error> {
+fn validate_disputable_bounds(cfg: &DisputableSignerConfig) -> Result<(), Error> {
     check_window(cfg.dispute_window)?;
     check_window(cfg.escalation_timeout)
 }
 
 fn validate_weighted_bounds(cfg: &WeightedKeyConfig) -> Result<(), Error> {
-    check_window(cfg.dispute_window)?;
-    check_window(cfg.escalation_timeout)
+    check_window(cfg.dispute_window)
 }
 
 fn validate_hybrid_bounds(cfg: &crate::HybridConfig) -> Result<(), Error> {
@@ -71,10 +70,7 @@ fn validate_hybrid_v2_bounds(cfg: &HybridConfigV2) -> Result<(), Error> {
     check_window(cfg.fallback_after)?;
     match &cfg.fallback {
         FallbackAuthority::Signers(s) => check_window(s.dispute_window),
-        FallbackAuthority::WeightedKeys(w) => {
-            check_window(w.dispute_window)?;
-            check_window(w.escalation_timeout)
-        }
+        FallbackAuthority::WeightedKeys(w) => check_window(w.dispute_window),
         FallbackAuthority::Committee(_) => Ok(()),
     }
 }
@@ -91,5 +87,7 @@ pub fn validate_spec_bounds(_env: &Env, rule: &ResolutionSpec) -> Result<(), Err
         ResolutionSpec::Committee(_) => Ok(()),
         ResolutionSpec::Hybrid(cfg) => validate_hybrid_bounds(cfg),
         ResolutionSpec::HybridV2(cfg) => validate_hybrid_v2_bounds(cfg),
+        ResolutionSpec::CategoricalSigners(cfg) => check_window(cfg.dispute_window),
+        ResolutionSpec::Scalar(cfg) => check_staleness(cfg.max_staleness),
     }
 }

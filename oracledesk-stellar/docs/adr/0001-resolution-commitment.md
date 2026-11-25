@@ -56,6 +56,15 @@ The commitment format is extended by [ADR 0004](0004-spec-versioning.md): a
 salted, versioned, domain-separated `ResolutionSpecV2` envelope accepted
 alongside the legacy format described above.
 
+The `ResolutionSpec` enum gains two **appended** variants —
+`CategoricalSigners` (tag 7, for n-outcome markets) and `Scalar` (tag 8, a
+price spec that resolves to a payout in basis points rather than an
+outcome). They are appended *after* `HybridV2` (tag 6) so develop's deployed
+discriminants never move, and appending preserves the disjointness argument
+above: existing variants keep their tags, so every already-committed hash is
+unchanged, and each new rule lives in its own hash space. See
+[ADR 0006](0006-market-kind-storage-split.md).
+
 ## Price threshold units
 
 A SEP-40 feed (Reflector included) reports `price` as a decimal-scaled integer:

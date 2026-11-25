@@ -58,6 +58,28 @@
         ]
       }
     },
+    "accept_market_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "accept_market_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "accept_resolver": {
       "kind": "function_v0",
       "spec": {
@@ -212,6 +234,48 @@
         ]
       }
     },
+    "buy_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical-market counterpart of `buy`: spend `collateral_in` on `outcome_index` shares. Returns shares received; reverts if fewer than `min_shares_out` would be received. No v2 (deadline/limit) variant yet — see the categorical notes in `docs/architecture.md`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "buy_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "buy_v2": {
       "kind": "function_v0",
       "spec": {
@@ -284,10 +348,32 @@
         ]
       }
     },
+    "cancel_market_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel_market_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "claim_lp_fees": {
       "kind": "function_v0",
       "spec": {
-        "doc": "The creator (the LP) claims their share of accrued trade fees at any time, including before finality. Returns the amount claimed (0 when nothing is pending, mirroring `sweep_fees`).",
+        "doc": "The creator (the LP) claims their share of accrued trade fees at any time, including before finality. Returns the amount claimed (0 when nothing is pending, mirroring `sweep_fees`). Works for both market kinds (the fee side-entries are keyed by the shared market id).",
         "inputs": [
           {
             "doc": "",
@@ -318,6 +404,28 @@
           }
         ],
         "name": "claim_pool_remainder",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "claim_pool_remainder_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical-market counterpart of `claim_pool_remainder`: the creator (the LP) withdraws the settled pool value plus any unclaimed LP fees.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "claim_pool_remainder_cat",
         "outputs": [
           {
             "result": {
@@ -363,10 +471,83 @@
         ]
       }
     },
+    "create_categorical_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a categorical market with 2..=8 outcomes and seeds the pool. `creator` becomes the sole LP and receives the leftover shares of the likelier outcomes. `probs_bps` must have one entry per outcome with every probability in `math::MIN_PROB_BPS..=math::MAX_PROB_BPS` and the entries summing to exactly BPS. Collateral, id space, pause switch, fee snapshot and `resolution_hash` commitment are shared with `create_market`; the pool is the same FPMM with the reserve-product invariant generalised to n outcomes (see `math_categorical`). Per-market circuit breakers are price-based and binary-only, so categorical markets are not snapshotted with them — nor with a `FeeSchedule`: they always charge their flat `fee_bps`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "probs_bps",
+            "type_": {
+              "vec": {
+                "element_type": "u32"
+              }
+            }
+          }
+        ],
+        "name": "create_categorical_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "create_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Creates a market and seeds the pool. `creator` becomes the sole LP. `initial_yes_bps` in [100, 9900] sets the opening YES probability; the creator receives the leftover shares of the likelier outcome.",
+        "doc": "Creates a market and seeds the pool. `creator` becomes the sole LP. `initial_yes_bps` in [100, 9900] sets the opening YES probability; the creator receives the leftover shares of the likelier outcome. When a default dynamic fee schedule is set it is snapshotted for this market (see `set_default_fee_schedule`); otherwise the market charges the flat `DefaultFeeBps`.",
         "inputs": [
           {
             "doc": "",
@@ -432,6 +613,215 @@
         ]
       }
     },
+    "create_market_with_fees": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "`create_market` with an explicit per-market `FeeSchedule`. Validated against `MAX_FEE_BPS` and the current default schedule's `max_bps` (creators can undercut protocol policy, never exceed it), then snapshotted for this market's lifetime.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "schedule",
+            "type_": {
+              "udt": {
+                "name": "FeeSchedule"
+              }
+            }
+          }
+        ],
+        "name": "create_market_with_fees",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "create_scalar_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a scalar (range) market: the binary pool with LONG = YES and SHORT = NO, whose final status carries a fractional payout (`MarketStatus::ResolvedScalar`) instead of a side. Everything else matches `create_market`; `[lower, upper]` is display metadata stored under `DataKey::Scalar` (the authoritative range is inside the `ResolutionSpec` committed through `resolution_hash`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "name": "create_scalar_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "current_fee_bps": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The fee bps this ledger's next trade on `market_id` pays: the dynamic effective fee for binary markets with a schedule, the flat snapshot for legacy and categorical markets. Under a ramping schedule the value changes with the ledger timestamp; use `quote_buy_at` to price expected inclusion latency.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "current_fee_bps",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "fee_schedule": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The market's snapshotted dynamic fee schedule (`None` for legacy and categorical markets, which charge the flat `Market::fee_bps`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "fee_schedule",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "option": {
+                  "value_type": {
+                    "udt": {
+                      "name": "FeeSchedule"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "finalize_market": {
       "kind": "function_v0",
       "spec": {
@@ -449,6 +839,63 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "get_cat_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_cat_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "CatMarket"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_cat_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "A holder's categorical position, zero-filled to the market's outcome count when they never traded. Errors if the market does not exist.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          }
+        ],
+        "name": "get_cat_position",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "CatPosition"
+                }
+              }
             }
           }
         ]
@@ -500,7 +947,6 @@
         ]
       }
     },
-<<<<<<< HEAD
     "get_market_view": {
       "kind": "function_v0",
       "spec": {
@@ -527,8 +973,6 @@
         ]
       }
     },
-=======
->>>>>>> upstream/develop
     "get_position": {
       "kind": "function_v0",
       "spec": {
@@ -586,7 +1030,58 @@
         ]
       }
     },
-<<<<<<< HEAD
+    "get_prices_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Spot prices of all outcomes in bps, same order as the reserves. Each price is floored, so they sum to at most BPS and at least BPS - n; clients should treat the slack as display rounding, never as a mispricing (prices do not enter trade math).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_prices_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "vec": {
+                  "element_type": "u32"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_scalar_meta": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Display metadata (the staked range) of a scalar market. Absent for binary and categorical markets.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_scalar_meta",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "ScalarMeta"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "is_closed": {
       "kind": "function_v0",
       "spec": {
@@ -604,8 +1099,6 @@
         ]
       }
     },
-=======
->>>>>>> upstream/develop
     "market_count": {
       "kind": "function_v0",
       "spec": {
@@ -614,6 +1107,54 @@
         "name": "market_count",
         "outputs": [
           "u64"
+        ]
+      }
+    },
+    "market_kind": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Whether a market id is a binary (`Market`) or categorical (`CatMarket`) market. `MarketNotFound` for unknown ids.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_kind",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "MarketKind"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "market_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
         ]
       }
     },
@@ -718,6 +1259,33 @@
         ]
       }
     },
+    "propose_market_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "new_resolver",
+            "type_": "address"
+          }
+        ],
+        "name": "propose_market_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "propose_resolver": {
       "kind": "function_v0",
       "spec": {
@@ -796,7 +1364,7 @@
     "quote_buy": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Shares a `buy` of `collateral_in` would return right now.",
+        "doc": "Shares a `buy` of `collateral_in` would return right now, at the effective (possibly dynamic) fee for this ledger's timestamp.",
         "inputs": [
           {
             "doc": "",
@@ -829,10 +1397,83 @@
         ]
       }
     },
+    "quote_buy_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Shares a `buy` of `collateral_in` would return at ledger timestamp `at_timestamp`. Under a ramping schedule the fee rises with time, so clients expecting inclusion latency can quote the worst case here (see `docs/frontend-integration.md`). No other state is simulated: the reserves are the current ones.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "at_timestamp",
+            "type_": "u64"
+          }
+        ],
+        "name": "quote_buy_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "quote_buy_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Shares a `buy_cat` of `collateral_in` would return right now.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "quote_buy_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "quote_sell": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Shares a `sell` for exactly `collateral_out` would consume right now.",
+        "doc": "Shares a `sell` for exactly `collateral_out` would consume right now, at the effective (possibly dynamic) fee for this ledger's timestamp.",
         "inputs": [
           {
             "doc": "",
@@ -882,6 +1523,33 @@
           }
         ],
         "name": "redeem",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical-market counterpart of `redeem`. Winning balances pay 1:1, a void pays `floor(Σ balances / n)` — both floored, so the total paid across all holders never exceeds `sets_minted`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "holder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "redeem_cat",
         "outputs": [
           {
             "result": {
@@ -979,6 +1647,60 @@
         ]
       }
     },
+    "resolve_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical-market counterpart of `resolve`. Same resolver-only gate and close-time rule.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          }
+        ],
+        "name": "resolve_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "resolve_scalar": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Scalar-market counterpart of `resolve`. `payout_long_bps` is the final LONG payout in basis points of 1.0 (0..=10_000); the SHORT side pays the complement. Same resolver-only gate and close-time rule.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout_long_bps",
+            "type_": "u32"
+          }
+        ],
+        "name": "resolve_scalar",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "sell": {
       "kind": "function_v0",
       "spec": {
@@ -1015,6 +1737,48 @@
           }
         ],
         "name": "sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "sell_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical-market counterpart of `sell`: receive exactly `collateral_out` by selling `outcome_index` shares. Returns shares sold; reverts if more than `max_shares_in` would be needed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          }
+        ],
+        "name": "sell_cat",
         "outputs": [
           {
             "result": {
@@ -1129,6 +1893,32 @@
         ]
       }
     },
+    "set_default_fee_schedule": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the dynamic fee schedule snapshotted into binary markets created after the call. Bounded by `MAX_FEE_BPS` and the ramp/skew caps; existing markets keep their schedule. A creator can pick a stricter schedule through `create_market_with_fees`, never a looser one (its `max_bps` is capped by this default's `max_bps`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "schedule",
+            "type_": {
+              "udt": {
+                "name": "FeeSchedule"
+              }
+            }
+          }
+        ],
+        "name": "set_default_fee_schedule",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_default_redeem_horizon": {
       "kind": "function_v0",
       "spec": {
@@ -1221,10 +2011,32 @@
         ]
       }
     },
+    "snapshot_legacy_resolver": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "snapshot_legacy_resolver",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "address"
+            }
+          }
+        ]
+      }
+    },
     "sweep_fees": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Anyone can move accrued protocol fees to the market's fee recipient. Sends to the recipient snapshotted in `FeeTerms` at creation. Markets created before `FeeTerms` existed have none and keep the legacy behaviour: the `DataKey::Treasury` of the moment of the sweep.",
+        "doc": "Anyone can move accrued protocol fees to the market's fee recipient. Sends to the recipient snapshotted in `FeeTerms` at creation. Markets created before `FeeTerms` existed have none and keep the legacy behaviour: the `DataKey::Treasury` of the moment of the sweep. Works for both market kinds.",
         "inputs": [
           {
             "doc": "",
@@ -1346,7 +2158,7 @@
     "void_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Invalid or unresolvable market. Allowed any time before finality.",
+        "doc": "Invalid or unresolvable market. Allowed any time before finality. Dispatches on the market kind: binary markets emit `MarketResolved` with `None`, categorical markets `CatMarketResolved`.",
         "inputs": [
           {
             "doc": "",
@@ -1529,6 +2341,180 @@
         "name": "BreakerConfig"
       }
     },
+    "CatMarket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Categorical market state. Stored under `DataKey::CatMarket(u64)`, sharing the id space with binary markets (`DataKey::NextId`), so `get_market` on a categorical id is `MarketNotFound` and callers must read `market_kind`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "fees_accrued",
+            "type_": "i128"
+          },
+          {
+            "doc": "Creator has withdrawn the pool remainder after finality.",
+            "name": "lp_claimed",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "Same commitment scheme as the binary `Market` (see there).",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "One reserve per outcome; `len()` is the outcome count n.",
+            "name": "reserves",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "resolution_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "Complete sets in existence == collateral locked for this market. Each outcome's shares (reserve + all holder balances) sum to this.",
+            "name": "sets_minted",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "CatStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "CatMarket"
+      }
+    },
+    "CatPosition": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-holder categorical position: one balance per outcome, same order as `CatMarket::reserves`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "balances",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "CatPosition"
+      }
+    },
+    "CatSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Categorical counterpart of [`SignerConfig`]: signers attest an outcome *index* of a categorical market instead of Yes/No. `outcome_count` binds the market's outcome set to the commitment (2..=8, mirroring market-core's cap), so a reveal cannot silently change how many outcomes signers are voting on.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CatSignerConfig"
+      }
+    },
+    "CatStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Open"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Final. Winning shares redeem 1:1.",
+              "name": "Resolved",
+              "type_": [
+                "u32"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Invalid market. Every share redeems at 1/n.",
+              "name": "Void"
+            }
+          }
+        ],
+        "doc": "Lifecycle of a categorical market: same three states as `MarketStatus` with the winning index instead of a two-way outcome.",
+        "lib": "",
+        "name": "CatStatus"
+      }
+    },
     "Category": {
       "kind": "udt_union_v0",
       "spec": {
@@ -1679,9 +2665,37 @@
             }
           },
           {
+            "tuple_v0": {
+              "doc": "",
+              "name": "CatMarket",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "CatPosition",
+              "type_": [
+                "u64",
+                "address"
+              ]
+            }
+          },
+          {
             "void_v0": {
               "doc": "",
               "name": "Collateral"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "CollateralParams",
+              "type_": [
+                "address"
+              ]
             }
           },
           {
@@ -1698,8 +2712,23 @@
           },
           {
             "void_v0": {
+              "doc": "Instance storage, but appended here anyway: the XDR tag is the variant position, so even instance keys must only ever be appended.",
+              "name": "DefaultFeeSchedule"
+            }
+          },
+          {
+            "void_v0": {
               "doc": "",
               "name": "DefaultRedeemHorizon"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Dynamic fee schedule snapshotted at creation; absent for legacy and categorical markets, which charge the flat `Market::fee_bps`.",
+              "name": "FeeSchedule",
+              "type_": [
+                "u64"
+              ]
             }
           },
           {
@@ -1708,6 +2737,24 @@
               "name": "FeeTerms",
               "type_": [
                 "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Only written for categorical markets; absent means binary.",
+              "name": "Kind",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Locked",
+              "type_": [
+                "address"
               ]
             }
           },
@@ -1724,6 +2771,24 @@
             "tuple_v0": {
               "doc": "",
               "name": "Market",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "MarketCollateral",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "MarketResolver",
               "type_": [
                 "u64"
               ]
@@ -1767,6 +2832,15 @@
             }
           },
           {
+            "tuple_v0": {
+              "doc": "",
+              "name": "PendingMarketResolver",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
             "void_v0": {
               "doc": "",
               "name": "PendingResolver"
@@ -1798,6 +2872,21 @@
             "void_v0": {
               "doc": "",
               "name": "Resolver"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ResolverSnapshotFrom"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Display metadata of a scalar market, written by `create_scalar_market`; absent for binary and categorical markets.",
+              "name": "Scalar",
+              "type_": [
+                "u64"
+              ]
             }
           },
           {
@@ -1899,6 +2988,85 @@
         "name": "Escalation"
       }
     },
+    "FallbackAuthority": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "A committee registered in the resolver's registry.",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "A simple threshold of well-known signers.",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "An explicit set of pubkeys with per-key weights.",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "Richer fallback authority for `HybridV2`: any attested resolution mode that can produce a quorum, not just bare signers. Variants are intentionally additive and appended after `Signers` so that existing discriminant positions are stable (Soroban encodes as positional).",
+        "lib": "",
+        "name": "FallbackAuthority"
+      }
+    },
+    "FeeSchedule": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Dynamic fee schedule, snapshotted per binary market at creation as a side entry (`DataKey::FeeSchedule`) so `Market`'s XDR shape never changes. The effective rate of a trade is `math::effective_fee_bps(schedule, now, close_time, r_yes, r_no)`: a base rate that ramps up towards `max_bps` as `close_time` approaches and grows with the pool's distance from 50/50, protecting the single LP from informed flow near expiry and from one-sided pools. Markets created before this existed (and categorical markets, which still charge their flat `Market::fee_bps`) have no `FeeSchedule` entry and keep a flat fee. The schedule is immutable after creation; only `set_default_fee_schedule` (the default for *new* markets) can change. Field order is part of the XDR — keep `base_bps`, `max_bps`, `ramp_secs`, `skew_mult_bps` stable.",
+        "fields": [
+          {
+            "doc": "Fee far from close with the pool at 50/50.",
+            "name": "base_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "Hard ceiling for this market, `<= MAX_FEE_BPS`.",
+            "name": "max_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "The time ramp starts this many seconds before `close_time` (0 = no ramp, `<= math::MAX_RAMP_SECS`).",
+            "name": "ramp_secs",
+            "type_": "u64"
+          },
+          {
+            "doc": "Extra bps per 1_000 bps of distance from a 5_000 price (`<= math::MAX_SKEW_MULT_BPS`).",
+            "name": "skew_mult_bps",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "FeeSchedule"
+      }
+    },
     "FeeTerms": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1950,6 +3118,134 @@
         ],
         "lib": "",
         "name": "HybridConfig"
+      }
+    },
+    "HybridConfigV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Extended hybrid mode: price feed first, falling back to any attested authority after `fallback_after` seconds past `close_time`. A separate struct (not an in-place update to `HybridConfig`) because `HybridConfig` is consensus-critical — existing commitment hashes must continue to verify.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "FallbackAuthority"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfigV2"
+      }
+    },
+    "Leg": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One leg of an atomic multi-leg trade bundle. Duplicate `(market_id, outcome, kind)` triples are rejected with `Error::DuplicateLeg` to prevent circumventing `max_market` caps and to keep the auth tree unambiguous.",
+        "fields": [
+          {
+            "doc": "Collateral in (BuyExactIn) or collateral out (SellExactOut).",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "Min shares out (BuyExactIn) or max shares in (SellExactOut).",
+            "name": "bound",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "kind",
+            "type_": {
+              "udt": {
+                "name": "LegKind"
+              }
+            }
+          },
+          {
+            "doc": "Slippage ceiling; 0 means no limit.",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "Leg"
+      }
+    },
+    "LegKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "Spend exactly `amount` collateral, receive at least `bound` shares.",
+              "name": "BuyExactIn"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Receive exactly `amount` collateral, spend at most `bound` shares.",
+              "name": "SellExactOut"
+            }
+          }
+        ],
+        "doc": "Direction of a single leg in an atomic multi-leg trade bundle.",
+        "lib": "",
+        "name": "LegKind"
+      }
+    },
+    "LegResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Per-leg result returned by `execute_legs` / `agent_execute_legs`.",
+        "fields": [
+          {
+            "doc": "Net collateral flow for this leg (positive = received, negative = spent).",
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "LegResult"
       }
     },
     "Lifecycle": {
@@ -2005,7 +3301,7 @@
             "type_": "address"
           },
           {
-            "doc": "Snapshot of the fee at creation so later config changes never move it.",
+            "doc": "Snapshot of the flat fee at creation so later config changes never move it. Charged as-is by categorical markets and by binary markets without a `FeeSchedule` side entry (legacy / flat-fee markets).",
             "name": "fee_bps",
             "type_": "u32"
           },
@@ -2071,6 +3367,31 @@
         "name": "Market"
       }
     },
+    "MarketKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Binary"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Outcome count, 2..=MAX_MARKET_OUTCOMES.",
+              "name": "Categorical",
+              "type_": [
+                "u32"
+              ]
+            }
+          }
+        ],
+        "doc": "Which pool a market id refers to. Absent for markets created before categorical markets existed, hence `market_kind` reports `Binary` for a stored `Market(u64)` and a `Kind` entry is only written for categorical ids (which store a `CatMarket` instead of a `Market`).",
+        "lib": "",
+        "name": "MarketKind"
+      }
+    },
     "MarketStatus": {
       "kind": "udt_union_v0",
       "spec": {
@@ -2091,6 +3412,15 @@
                     "name": "Outcome"
                   }
                 }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Scalar (range) market, final: LONG shares pay `payout_long_bps / 10_000` and SHORT shares the complement. Appended last so stored `Resolved`/`Void` values keep their encoding; readers compiled against older bindings fail to decode this one (see the release note).",
+              "name": "ResolvedScalar",
+              "type_": [
+                "u32"
               ]
             }
           },
@@ -2268,6 +3598,31 @@
         "name": "PendingAdmin"
       }
     },
+    "PendingMarketResolver": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "eta",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "expires_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "new_resolver",
+            "type_": "address"
+          }
+        ],
+        "lib": "",
+        "name": "PendingMarketResolver"
+      }
+    },
     "Position": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2391,6 +3746,19 @@
         "cases": [
           {
             "tuple_v0": {
+              "doc": "Categorical counterpart of `Signers` (appended, tag 7, after `HybridV2` so develop's deployed discriminants never move).",
+              "name": "CategoricalSigners",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CatSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
               "doc": "",
               "name": "Committee",
               "type_": [
@@ -2417,12 +3785,38 @@
           },
           {
             "tuple_v0": {
+              "doc": "Extended hybrid with richer fallback authority (issue #314). Appended last to preserve discriminant positions of existing variants.",
+              "name": "HybridV2",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfigV2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
               "doc": "",
               "name": "Price",
               "type_": [
                 {
                   "udt": {
                     "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Scalar counterpart of `Price` (appended, tag 8): the binary pool settles at a fractional LONG payout instead of a side.",
+              "name": "Scalar",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "ScalarPriceConfig"
                   }
                 }
               ]
@@ -2520,6 +3914,122 @@
         "name": "ResolutionSpecV2"
       }
     },
+    "ResolutionSpecV3": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "V3 commitment envelope. Commitment domain: `sha256(\"oracledesk:resolution-spec-v3\" || XDR(ResolutionSpecV3))`. The domain prefix differs from V2 (`\"oracledesk:resolution-spec\"`) so a V3 preimage with `invalid_threshold = 0` cannot collide with the corresponding V2 hash. Fields `version`, `network_id`, `market_core`, `salt` and `rule` carry identical semantics to [`ResolutionSpecV2`]. The additions are the two Invalid-policy fields below.",
+        "fields": [
+          {
+            "doc": "Only meaningful when `invalid_threshold > 0`; must be `false` otherwise. When `false`, an Invalid quorum can never displace a pending Yes/No proposal. When `true`, at most one displacement is permitted per market (tracked by `DataKey::InvalidDisplaced`).",
+            "name": "invalid_allow_displacement",
+            "type_": "bool"
+          },
+          {
+            "doc": "Minimum Invalid-attestation count (address count, committee members, or weight threshold) for an Invalid quorum. `0` means no Invalid policy: legacy V2 semantics, where Invalid uses the Yes/No threshold and displacement is unrestricted. A real policy threshold is always at least 1, so `0` is an unambiguous sentinel. When non-zero it must be strictly greater than the Yes/No threshold of `rule` and at most the member count (enforced by `validate_invalid_policy`). Price / WeightedKeys rules reject a non-zero value (`InvalidConfig`).",
+            "name": "invalid_threshold",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
+          },
+          {
+            "doc": "`sha256(network passphrase)`, i.e. `env.ledger().network_id()`.",
+            "name": "network_id",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpec"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "salt",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "Must be 3; `register_spec_v3` rejects any other value.",
+            "name": "version",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "ResolutionSpecV3"
+      }
+    },
+    "ScalarMeta": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Display metadata of a scalar market: the `[lower, upper]` range of the committed resolution spec, in the feed's raw units. Stored under `DataKey::Scalar(u64)` at creation; the resolver's revealed spec is the authoritative copy, this entry only tells UIs what to display.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ScalarMeta"
+      }
+    },
+    "ScalarPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Scalar (range) counterpart of [`PriceConfig`]. The market settles on the fractional position of `price` inside `[lower, upper]`: `payout_long_bps = (clamped_price - lower) / (upper - lower)`, and the SHORT side pays the complement. A reading below the range clamps to `lower` (LONG pays 0), above to `upper` (LONG pays 1.0); a non-positive reading is an invalid price, never a clamp.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "Bottom of the staked range. Validated `0 <= lower < upper`, with `upper` capped so `upper * BPS` cannot overflow.",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ScalarPriceConfig"
+      }
+    },
     "SettleState": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2551,7 +4061,7 @@
             "type_": "i128"
           },
           {
-            "doc": "Collateral already paid to holders and the LP (`redeem` + `claim_pool_remainder` payouts); tracks what has left the market.",
+            "doc": "Share/pool collateral already paid to holders and the LP (`redeem` payouts + the pool value of `claim_pool_remainder`); tracks what of `sets_minted` has left the market. LP fees paid alongside the pool remainder are **not** counted here: they never entered `sets_minted` (issue #276, see docs/formal-verification.md \"Settlement\").",
             "name": "paid_out",
             "type_": "i128"
           }
@@ -2715,14 +4225,16 @@
             "value": 31
           },
           {
-<<<<<<< HEAD
-=======
+            "doc": "`create_market` used a token missing from, or disabled in, the admin collateral allow-list (#151).",
+            "name": "CollateralNotAllowed",
+            "value": 39
+          },
+          {
             "doc": "Inbound collateral transfer delivered fewer (or different) units than expected, e.g. a fee-on-transfer or under-delivering token (#137).",
             "name": "CollateralShortfall",
             "value": 32
           },
           {
->>>>>>> upstream/develop
             "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
             "name": "DeadlineExpired",
             "value": 19
@@ -2748,9 +4260,19 @@
             "value": 6
           },
           {
+            "doc": "Allow-list parameters failed validation (decimals, seed bounds).",
+            "name": "InvalidCollateralParams",
+            "value": 33
+          },
+          {
             "doc": "",
             "name": "InvalidFee",
             "value": 3
+          },
+          {
+            "doc": "`outcome_index` is not a valid outcome of this categorical market.",
+            "name": "InvalidOutcomeIndex",
+            "value": 41
           },
           {
             "doc": "",
@@ -2775,7 +4297,7 @@
           {
             "doc": "The market was closed out and its remaining value swept.",
             "name": "MarketClosedOut",
-            "value": 32
+            "value": 40
           },
           {
             "doc": "",
@@ -2789,6 +4311,16 @@
           },
           {
             "doc": "",
+            "name": "MarketResolverExpired",
+            "value": 37
+          },
+          {
+            "doc": "",
+            "name": "MarketResolverNotReady",
+            "value": 36
+          },
+          {
+            "doc": "",
             "name": "MarketTooLarge",
             "value": 15
           },
@@ -2796,6 +4328,11 @@
             "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
             "name": "NoPendingAdmin",
             "value": 25
+          },
+          {
+            "doc": "",
+            "name": "NoPendingMarketResolver",
+            "value": 35
           },
           {
             "doc": "",
@@ -2834,6 +4371,11 @@
           },
           {
             "doc": "",
+            "name": "OldResolverConsentRequired",
+            "value": 38
+          },
+          {
+            "doc": "",
             "name": "Overflow",
             "value": 18
           },
@@ -2866,6 +4408,11 @@
             "doc": "`finalize_market` called before the redemption deadline.",
             "name": "RedemptionWindowOpen",
             "value": 28
+          },
+          {
+            "doc": "",
+            "name": "ResolverMismatch",
+            "value": 34
           },
           {
             "doc": "",
@@ -2936,6 +4483,160 @@
         ],
         "prefix_topics": [
           "admin_transferred"
+        ]
+      }
+    },
+    "CatMarketCreated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CatMarketCreated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "Requested opening probabilities, one per outcome, summing to BPS.",
+            "location": "data",
+            "name": "probs_bps",
+            "type_": {
+              "vec": {
+                "element_type": "u32"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "cat_market_created"
+        ]
+      }
+    },
+    "CatMarketResolved": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CatMarketResolved",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "None means the market was voided.",
+            "location": "data",
+            "name": "outcome_index",
+            "type_": {
+              "option": {
+                "value_type": "u32"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "cat_market_resolved"
+        ]
+      }
+    },
+    "CatTrade": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "CatTrade",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "is_buy",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fee",
+            "type_": "i128"
+          },
+          {
+            "doc": "Post-trade reserves, same order as `CatMarket::reserves`.",
+            "location": "data",
+            "name": "reserves",
+            "type_": {
+              "vec": {
+                "element_type": "i128"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "cat_trade"
         ]
       }
     },
@@ -3216,6 +4917,102 @@
         ],
         "prefix_topics": [
           "market_resolved"
+        ]
+      }
+    },
+    "MarketResolvedScalar": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketResolvedScalar",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "LONG payout per complete set, 0..=BPS; the SHORT leg pays the complement. `MarketResolved` is never emitted for scalar markets.",
+            "location": "data",
+            "name": "payout_long_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "market_resolved_scalar"
+        ]
+      }
+    },
+    "MarketResolverChanged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketResolverChanged",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "market_resolver_changed"
+        ]
+      }
+    },
+    "MarketResolverProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketResolverProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "eta",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "market_resolver_proposed"
         ]
       }
     },
@@ -3562,6 +5359,84 @@
         ],
         "prefix_topics": [
           "trade"
+        ]
+      }
+    },
+    "TradeV2": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Same trade as `Trade` plus the realised fee rate. New event rather than a new field so the existing `Trade` XDR stays stable for indexers (the `FeesSweptTo` convention); both are emitted on every binary trade. `fee_bps` is the effective dynamic rate applied, already snapshotted into `fee` — indexers can recover it from `fee / collateral` but not exactly, because `fee` carries the ceiling rounding.",
+        "lib": "",
+        "name": "TradeV2",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trader",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "is_buy",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "collateral",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fee",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "fee_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reserve_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reserve_no",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "trade_v2"
         ]
       }
     },

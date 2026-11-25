@@ -37,8 +37,8 @@ jobs:
       - name: Read pinned toolchain versions
         id: pinned
         run: |
-          echo "rust=$(grep '^channel' oracledesk-stellar/rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')" >> "$GITHUB_OUTPUT"
-          echo "stellar=$(cat oracledesk-stellar/stellar-cli.version)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(grep '^channel' rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.pinned.outputs.rust }}
@@ -126,8 +126,8 @@ jobs:
       - name: Read pinned toolchain versions
         id: pinned-node
         run: |
-          echo "rust=$(grep '^channel' oracledesk-stellar/rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')" >> "$GITHUB_OUTPUT"
-          echo "stellar=$(cat oracledesk-stellar/stellar-cli.version)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(grep '^channel' rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')" >> "$GITHUB_OUTPUT"
+          echo "stellar=$(cat stellar-cli.version)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.pinned-node.outputs.rust }}

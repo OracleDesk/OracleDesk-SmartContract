@@ -107,6 +107,11 @@ export function fairValueSources(
  * traded (#331): the old `market.yesBps` fallback had zero edge by
  * construction. `FAIR_VALUE_BPS` remains a test/dry-run override only (the
  * config rejects it in live mode).
+ *
+ * `#9`: when `effectiveFeeBps` is supplied, each candidate's flat
+ * `Market.fee_bps` is replaced with the contract's time-dependent
+ * `current_fee_bps`, so off-chain impact/edge estimates match on-chain
+ * reality near close.
  */
 export function chainCandidates(
   t: Tunables,
@@ -114,6 +119,7 @@ export function chainCandidates(
   adapter: TraderDeps["adapter"],
   sources: readonly MarketFairValueSource[] = [],
   nowSecs: () => number = () => Math.floor(Date.now() / 1000),
+  effectiveFeeBps?: (marketId: bigint) => Promise<number>,
   onEstimateError?: (source: string, error: unknown) => void,
 ): () => Promise<TraderCandidate[]> {
   const reader = stateReader(t.rpcUrl, deployments);
@@ -168,7 +174,8 @@ export function chainCandidates(
         setsMinted: m.setsMinted,
       };
     }));
-    return candidates.filter((c): c is TraderCandidate => c !== undefined);
+    const sized = candidates.filter((c): c is TraderCandidate => c !== undefined);
+    return effectiveFeeBps ? applyEffectiveFees(sized, effectiveFeeBps) : sized;
   };
 }
 
@@ -230,6 +237,25 @@ export function traderRiskCheck(
   };
 }
 
+/**
+ * A dynamic `FeeSchedule` (#9) is deliberately invisible in
+ * `Market.fee_bps`, so quoting off that snapshot understates the fee near
+ * close. Replace it with `current_fee_bps` — the fee the contract actually
+ * charges at the current ledger time — so every off-chain impact estimate
+ * matches on-chain reality.
+ */
+export async function applyEffectiveFees(
+  candidates: TraderCandidate[],
+  feeBps: (marketId: bigint) => Promise<number>,
+): Promise<TraderCandidate[]> {
+  return Promise.all(
+    candidates.map(async (c) => ({
+      ...c,
+      market: { ...c.market, feeBps: await feeBps(BigInt(c.market.marketId)) },
+    })),
+  );
+}
+
 export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
   const reader = stateReader(t.rpcUrl, deployments);
   return {
@@ -247,6 +273,18 @@ export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Dep
  * Trader deps. With deployments, markets come from chain state; without
  * (tests, an adapter not bound to a deployment) from the demo fixture.
  */
+/**
+ * `#9`: only a live adapter that implements the read can supply the
+ * effective fee. Dry-run and fake adapters keep the flat snapshot.
+ */
+function effectiveFeeReader(
+  adapter: TraderDeps["adapter"],
+): ((marketId: bigint) => Promise<number>) | undefined {
+  const read = adapter.currentFeeBps;
+  if (adapter.mode !== "live" || !read) return undefined;
+  return (marketId) => read.call(adapter, { market_id: marketId });
+}
+
 export function traderDeps(
   t: Tunables,
   adapter: TraderDeps["adapter"],
@@ -265,6 +303,7 @@ export function traderDeps(
           adapter,
           hasEstimatorReads(adapter) ? fairValueSources(t, adapter) : [],
           nowSecs,
+          effectiveFeeReader(adapter),
         )
       : () => fixtureCandidates(nowSecs()),
     treasury: deployments?.contracts.treasury,

@@ -1,4 +1,8 @@
 #![no_std]
+// SEP-41 event topics are emitted through the deprecated tuple helper so the
+// on-chain shape matches the standard; migrating to #[contractevent] would
+// rename the topics.
+#![allow(deprecated)]
 
 //! SEP-41 outcome token (#146): one token per `(market, outcome)`, backed
 //! one-for-one by this contract's own position in market-core.
@@ -233,9 +237,7 @@ impl OutcomeToken {
             return Err(Error::InvalidAmount);
         }
         ensure_not_redeemed(&env)?;
-        let new_supply = supply(&env)
-            .checked_add(amount)
-            .ok_or(Error::Overflow)?;
+        let new_supply = supply(&env).checked_add(amount).ok_or(Error::Overflow)?;
         let new_balance = balance_of(&env, &to)
             .checked_add(amount)
             .ok_or(Error::Overflow)?;
@@ -275,9 +277,7 @@ impl OutcomeToken {
             .ok_or(Error::Overflow)?
             / state.supply_at_redeem;
         set_balance(&env, &holder, 0);
-        let new_supply = supply(&env)
-            .checked_sub(balance)
-            .ok_or(Error::Overflow)?;
+        let new_supply = supply(&env).checked_sub(balance).ok_or(Error::Overflow)?;
         set_supply(&env, new_supply);
         if payout > 0 {
             token::TokenClient::new(&env, &collateral(&env)).transfer(
@@ -445,8 +445,10 @@ fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) -> Result
         set_balance(env, from, from_balance - amount);
         set_balance(env, to, to_balance);
     }
-    env.events()
-        .publish((Symbol::new(env, "transfer"), from.clone(), to.clone()), amount);
+    env.events().publish(
+        (Symbol::new(env, "transfer"), from.clone(), to.clone()),
+        amount,
+    );
     Ok(())
 }
 
@@ -501,7 +503,10 @@ fn settle(env: &Env) -> RedemptionState {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Env,
+    };
 
     /// Registers a token as if the factory had deployed it. Returns the
     /// token's address and the factory's address.
@@ -553,12 +558,12 @@ mod test {
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
         client.mint(&alice, &100);
-        client.transfer(&alice, &bob.clone().into(), &30);
+        client.transfer(&alice, &bob, &30);
         assert_eq!(client.balance(&alice), 70);
         assert_eq!(client.balance(&bob), 30);
         assert_eq!(client.total_supply(), 100);
         assert_eq!(
-            client.try_transfer(&alice, &bob.clone().into(), &71),
+            client.try_transfer(&alice, &bob, &71),
             Err(Ok(Error::InsufficientBalance))
         );
     }

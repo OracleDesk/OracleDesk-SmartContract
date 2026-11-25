@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    Address, Env, Symbol,
 };
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
@@ -107,6 +107,7 @@ pub struct SignerStakeContract;
 
 #[contractimpl]
 impl SignerStakeContract {
+    #[allow(clippy::too_many_arguments)]
     pub fn __constructor(
         env: Env,
         admin: Address,
@@ -145,9 +146,7 @@ impl SignerStakeContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage()
-            .instance()
-            .extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
     }
 
     pub fn bond(env: Env, signer: Address, amount: i128) {
@@ -160,7 +159,7 @@ impl SignerStakeContract {
         let config = Self::get_config(&env);
         let token_client = token::Client::new(&env, &config.token);
 
-        token_client.transfer(&signer, &env.current_contract_address(), &amount);
+        token_client.transfer(&signer, env.current_contract_address(), &amount);
 
         let mut bond = Self::get_bond(&env, &signer);
         bond.amount = bond.amount.checked_add(amount).unwrap_or_else(|| {
@@ -170,9 +169,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         Bonded { signer, amount }.publish(&env);
     }
@@ -186,12 +187,9 @@ impl SignerStakeContract {
 
         let mut bond = Self::get_bond(&env, &signer);
 
-        let available = bond
-            .amount
-            .checked_sub(bond.locked)
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, Error::UnbondingStaked);
-            });
+        let available = bond.amount.checked_sub(bond.locked).unwrap_or_else(|| {
+            panic_with_error!(&env, Error::UnbondingStaked);
+        });
 
         if amount > available {
             panic_with_error!(&env, Error::UnbondingStaked);
@@ -201,30 +199,34 @@ impl SignerStakeContract {
             panic_with_error!(&env, Error::UnbondingStaked);
         });
 
-        bond.unbond_amount = bond
-            .unbond_amount
-            .checked_add(amount)
+        bond.unbond_amount = bond.unbond_amount.checked_add(amount).unwrap_or_else(|| {
+            panic_with_error!(&env, Error::SlashAmountTooLarge);
+        });
+
+        let config = Self::get_config(&env);
+        bond.unbond_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(config.unbond_delay)
             .unwrap_or_else(|| {
                 panic_with_error!(&env, Error::SlashAmountTooLarge);
             });
 
-        let config = Self::get_config(&env);
-        bond.unbond_at = env.ledger().timestamp().checked_add(config.unbond_delay).unwrap_or_else(|| {
-            panic_with_error!(&env, Error::SlashAmountTooLarge);
-        });
-
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         UnbondRequested {
-                signer,
-                amount,
-                unbond_at: bond.unbond_at,
-            }.publish(&env);
+            signer,
+            amount,
+            unbond_at: bond.unbond_at,
+        }
+        .publish(&env);
     }
 
     pub fn withdraw(env: Env, signer: Address) {
@@ -247,9 +249,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         let config = Self::get_config(&env);
         let token_client = token::Client::new(&env, &config.token);
@@ -277,23 +281,28 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         env.storage()
             .persistent()
             .set(&DataKey::Lock(signer.clone(), market_id), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Lock(signer.clone(), market_id), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Lock(signer.clone(), market_id),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
-        let locked_amount = bond.amount.checked_sub(bond.locked).unwrap_or_else(|| 0i128);
+        let locked_amount = bond.amount.checked_sub(bond.locked).unwrap_or(0i128);
         Locked {
-                signer,
-                market_id,
-                amount: locked_amount,
-            }.publish(&env);
+            signer,
+            market_id,
+            amount: locked_amount,
+        }
+        .publish(&env);
     }
 
     pub fn unlock(env: Env, signer: Address, market_id: u64) {
@@ -309,10 +318,11 @@ impl SignerStakeContract {
 
         let bond = Self::get_bond(&env, &signer);
         Unlocked {
-                signer,
-                market_id,
-                amount: bond.amount.checked_sub(bond.locked).unwrap_or_else(|| 0i128),
-            }.publish(&env);
+            signer,
+            market_id,
+            amount: bond.amount.checked_sub(bond.locked).unwrap_or(0i128),
+        }
+        .publish(&env);
     }
 
     pub fn slash(env: Env, signer: Address, bps: u32, reporter: Option<Address>) -> i128 {
@@ -350,9 +360,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         let token_client = token::Client::new(&env, &config.token);
         token_client.transfer(
@@ -363,11 +375,12 @@ impl SignerStakeContract {
 
         let reason = Symbol::new(&env, "slashed");
         Slashed {
-                signer: signer.clone(),
-                amount: slash_amount,
-                reason,
-                reporter: reporter.clone(),
-            }.publish(&env);
+            signer: signer.clone(),
+            amount: slash_amount,
+            reason,
+            reporter: reporter.clone(),
+        }
+        .publish(&env);
 
         slash_amount
     }
@@ -380,7 +393,7 @@ impl SignerStakeContract {
         let config = Self::get_config(&env);
         let bond = Self::get_bond(&env, &signer);
 
-        let available = bond.amount.checked_sub(bond.unbond_amount).unwrap_or_else(|| 0i128);
+        let available = bond.amount.checked_sub(bond.unbond_amount).unwrap_or(0i128);
         available >= config.min_stake
     }
 
@@ -407,87 +420,117 @@ impl SignerStakeContract {
 }
 
 #[cfg(test)]
+#[soroban_sdk::contractclient(name = "SignerStakeClient")]
+pub trait SignerStakeInterface {
+    fn bond(env: Env, signer: Address, amount: i128);
+    fn request_unbond(env: Env, signer: Address, amount: i128);
+    fn withdraw(env: Env, signer: Address);
+    fn lock(env: Env, signer: Address, market_id: u64);
+    fn bond_of(env: Env, signer: Address) -> Bond;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
 
-    #[test]
-    fn test_bond_and_withdraw_after_delay() {
+    const MIN_STAKE: i128 = 1_000;
+    const UNBOND_DELAY: u64 = 100;
+    const MINTED: i128 = 10_000;
+
+    struct Fixture {
+        env: Env,
+        client: SignerStakeClient<'static>,
+        token: Address,
+        signer: Address,
+    }
+
+    fn setup() -> Fixture {
         let env = Env::default();
-        let signer = Address::generate(&env);
+        env.mock_all_auths();
         let admin = Address::generate(&env);
-        let token = Address::generate(&env);
+        let signer = Address::generate(&env);
         let resolver = Address::generate(&env);
         let slash_recipient = Address::generate(&env);
 
-        env.mock_all_auths();
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(&env, &token).mint(&signer, &MINTED);
 
-        let contract = SignerStakeContract;
-        contract.__constructor(
-            env.clone(),
-            admin.clone(),
-            token.clone(),
-            resolver,
-            1_000i128,
-            100,
-            100,
-            100,
-            100,
-            slash_recipient,
+        let contract_id = env.register(
+            SignerStakeContract,
+            (
+                admin,
+                token.clone(),
+                resolver,
+                MIN_STAKE,
+                UNBOND_DELAY,
+                100u32,
+                100u32,
+                100u32,
+                slash_recipient,
+            ),
         );
+        let client = SignerStakeClient::new(&env, &contract_id);
 
-        contract.bond(env.clone(), signer.clone(), 2_000i128);
-        let bond = contract.bond_of(env.clone(), signer.clone());
-        assert_eq!(bond.amount, 2_000i128);
-
-        contract.request_unbond(env.clone(), signer.clone(), 1_000i128);
-        let bond = contract.bond_of(env.clone(), signer.clone());
-        assert_eq!(bond.amount, 1_000i128);
-        assert_eq!(bond.unbond_amount, 1_000i128);
-
-        env.ledger().set_timestamp(100);
-        contract.withdraw(env.clone(), signer.clone());
-        let bond = contract.bond_of(env.clone(), signer);
-        assert_eq!(bond.unbond_amount, 0);
+        Fixture {
+            env,
+            client,
+            token,
+            signer,
+        }
     }
 
     #[test]
-    fn test_cannot_withdraw_locked_stake() {
-        let env = Env::default();
-        let signer = Address::generate(&env);
-        let admin = Address::generate(&env);
-        let token = Address::generate(&env);
-        let resolver = Address::generate(&env);
-        let slash_recipient = Address::generate(&env);
+    fn test_bond_and_withdraw_after_delay() {
+        let f = setup();
+        let token = TokenClient::new(&f.env, &f.token);
 
-        env.mock_all_auths();
+        f.client.bond(&f.signer, &2_000i128);
+        assert_eq!(token.balance(&f.signer), MINTED - 2_000);
+        assert_eq!(f.client.bond_of(&f.signer).amount, 2_000i128);
 
-        let contract = SignerStakeContract;
-        contract.__constructor(
-            env.clone(),
-            admin,
-            token,
-            resolver.clone(),
-            1_000i128,
-            100,
-            100,
-            100,
-            100,
-            slash_recipient,
-        );
+        f.client.request_unbond(&f.signer, &1_000i128);
+        let bond = f.client.bond_of(&f.signer);
+        assert_eq!(bond.amount, 1_000i128);
+        assert_eq!(bond.unbond_amount, 1_000i128);
+        assert_eq!(bond.unbond_at, UNBOND_DELAY);
 
-        contract.bond(env.clone(), signer.clone(), 2_000i128);
-        contract.lock(env.clone(), signer.clone(), 1u64);
+        f.env.ledger().set_timestamp(UNBOND_DELAY);
+        f.client.withdraw(&f.signer);
 
-        let bond = contract.bond_of(env.clone(), signer.clone());
-        assert!(bond.locked > 0);
+        let bond = f.client.bond_of(&f.signer);
+        assert_eq!(bond.unbond_amount, 0);
+        assert_eq!(bond.unbond_at, 0);
+        assert_eq!(token.balance(&f.signer), MINTED - 1_000);
+    }
 
-        contract.request_unbond(env.clone(), signer.clone(), 500i128);
-        env.ledger().set_timestamp(100);
+    #[test]
+    fn test_cannot_withdraw_before_unbond_delay() {
+        let f = setup();
+        f.client.bond(&f.signer, &2_000i128);
+        f.client.request_unbond(&f.signer, &1_000i128);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            contract.withdraw(env.clone(), signer.clone());
-        }));
-        assert!(result.is_err());
+        let err = f.client.try_withdraw(&f.signer);
+        assert!(err.is_err(), "withdraw before unbond_at must be rejected");
+        assert_eq!(f.client.bond_of(&f.signer).unbond_amount, 1_000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_cannot_unbond_locked_stake() {
+        let f = setup();
+        f.client.bond(&f.signer, &2_000i128);
+        f.client.lock(&f.signer, &1u64);
+
+        // `lock` locks the signer's whole bond, and `request_unbond` caps the
+        // request at `amount - locked`, so any amount over zero is rejected.
+        let bond = f.client.bond_of(&f.signer);
+        assert_eq!(bond.locked, 2_000i128);
+        assert_eq!(bond.amount, 2_000i128);
+
+        f.client.request_unbond(&f.signer, &500i128);
     }
 }

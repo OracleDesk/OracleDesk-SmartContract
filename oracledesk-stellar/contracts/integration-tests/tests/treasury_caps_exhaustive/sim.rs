@@ -466,14 +466,14 @@ impl Sim {
                     (e.amount, e.open)
                 })
                 .collect();
-            // An admin pause is one of the independent reasons in `ModeState`
-            // (issue #272); a drawdown halt is not modelled by this search.
+            // An admin pause is one of the independent reasons a trade can be
+            // refused (issue #272); a drawdown halt is not modelled by this
+            // search, so only the admin flag is observed.
             let paused = self
                 .env
                 .storage()
                 .instance()
-                .get::<_, treasury::ModeState>(&DataKey::ModeState)
-                .map(|m| m.admin_pause_at.is_some())
+                .get::<_, bool>(&DataKey::AdminPaused)
                 .unwrap_or(false);
             (exposures, paused)
         });

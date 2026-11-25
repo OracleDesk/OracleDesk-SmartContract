@@ -8,12 +8,18 @@ description = "Cross-contract and bounded-exhaustive tests; ships no contract."
 [lib]
 doctest = false
 
-[dev-dependencies]
+# The lib target itself registers the four production contracts from their
+# wasm and builds a world on top of them, so these are real dependencies (not
+# test-only): `cargo clippy --workspace --all-targets` compiles the plain lib
+# with normal dependencies only.
+[dependencies]
 soroban-sdk = { version = "=27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
 treasury = { path = "../treasury" }
 market-core = { path = "../market-core" }
 resolver-contract = { package = "resolver", path = "../resolver" }
 reasoning-registry = { path = "../reasoning-registry" }
+
+[dev-dependencies]
 wasmparser = "0.116"
 stellar-xdr = { version = "27.0.0", features = ["std"] }
 proptest = { version = "1", features = ["std"] }

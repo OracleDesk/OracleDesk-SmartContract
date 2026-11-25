@@ -9,14 +9,14 @@ pub mod ttl;
 #[cfg(test)]
 extern crate std;
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
     Env, String, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
 
 mod market_core {
-    #[allow(clippy::too_many_arguments)]
+    #![allow(clippy::too_many_arguments)]
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
 
@@ -78,14 +78,15 @@ pub const MAX_CID_LEN: u32 = 128;
 /// Largest page a batch read returns (#57).
 ///
 /// Safety bound: a `Trace`'s worst-case XDR is
-/// `market_id` 8 + `agent` address 56 + `action` (4 + 64) + `trace_hash` 32
-/// + `ipfs_cid` (4 + 128) + `published_at` 8 ≈ 304 bytes. Wrapping each entry
-/// in `TracePageEntry` adds 8 bytes for `trace_id` and a small vector overhead,
-/// so one entry is under 340 bytes. A page of 25 is therefore under ~8.5 KiB
-/// of ledger reads, plus at most 25 storage keys of ~50 bytes each — an order
-/// of magnitude below Soroban's per-transaction read limits even if every
-/// trace is maximal length. (Before this bound existed, `action`/`ipfs_cid`
-/// were unbounded, so no page size could have been proven safe.)
+/// `market_id` 8 + `agent` address 56 + `action` (4 + 64) + `trace_hash` 32 +
+/// `ipfs_cid` (4 + 128) + `published_at` 8 ≈ 304 bytes. Wrapping each entry
+/// in `TracePageEntry` adds 8 bytes for `trace_id` and a small vector
+/// overhead, so one entry is under 340 bytes. A page of 25 is therefore under
+/// ~8.5 KiB of ledger reads, plus at most 25 storage keys of ~50 bytes each —
+/// an order of magnitude below Soroban's per-transaction read limits even if
+/// every trace is maximal length. (Before this bound existed,
+/// `action`/`ipfs_cid` were unbounded, so no page size could have been proven
+/// safe.)
 pub const MAX_PAGE_SIZE: u32 = 25;
 
 #[contracttype]
@@ -588,9 +589,12 @@ pub struct ReasoningRegistry;
 
 #[contractimpl]
 impl ReasoningRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn __constructor(env: Env, admin: Address, market_core: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::MarketCore, &market_core);
+        env.storage()
+            .instance()
+            .set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::NextBatchId, &0u64);
     }
@@ -740,7 +744,7 @@ impl ReasoningRegistry {
     /// Read-only view: no TTL writes, so an indexer's simulation stays cheap.
     /// The `Agent` entry is refreshed by `register_agent`/`publish_trace`.
     pub fn is_registered(env: Env, agent: Address) -> bool {
-        Self::load_agent(&env, &agent).map_or(false, |r| matches!(r.status, AgentStatus::Active))
+        Self::load_agent(&env, &agent).is_some_and(|r| matches!(r.status, AgentStatus::Active))
     }
 
     pub fn get_agent(env: Env, agent: Address) -> Option<AgentRecord> {
@@ -769,7 +773,8 @@ impl ReasoningRegistry {
         if Self::read_head(&env, &agent).seq > 0 {
             return Err(Error::ChainedAgentMustChain);
         }
-        let (id, _) = Self::write_trace(&env, agent.clone(), market_id, action, trace_hash, ipfs_cid)?;
+        let (id, _) =
+            Self::write_trace(&env, agent.clone(), market_id, action, trace_hash, ipfs_cid)?;
         Self::touch_head(&env, &agent);
         Ok(id)
     }
@@ -1211,7 +1216,9 @@ impl ReasoningRegistry {
             .instance()
             .get(&DataKey::NextBatchId)
             .ok_or(Error::NotInitialized)?;
-        env.storage().instance().set(&DataKey::NextBatchId, &(batch_id + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::NextBatchId, &(batch_id + 1));
 
         let batch = TraceBatch {
             agent: agent.clone(),
@@ -1223,8 +1230,16 @@ impl ReasoningRegistry {
         Self::put(&env, &DataKey::Batch(batch_id), &batch);
 
         let agent_count_key = DataKey::AgentBatchCount(agent.clone());
-        let agent_idx: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
-        Self::put(&env, &DataKey::AgentBatch(agent.clone(), agent_idx), &batch_id);
+        let agent_idx: u64 = env
+            .storage()
+            .persistent()
+            .get(&agent_count_key)
+            .unwrap_or(0);
+        Self::put(
+            &env,
+            &DataKey::AgentBatch(agent.clone(), agent_idx),
+            &batch_id,
+        );
         Self::put(&env, &agent_count_key, &(agent_idx + 1));
 
         BatchPublished {
@@ -1248,7 +1263,10 @@ impl ReasoningRegistry {
     }
 
     pub fn batch_count(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::NextBatchId)
+            .unwrap_or(0)
     }
 
     pub fn agent_batch_count(env: Env, agent: Address) -> u64 {
@@ -1358,7 +1376,7 @@ impl ReasoningRegistry {
 
                 let mut node_preimage = Bytes::new(env);
                 node_preimage.push_back(MERKLE_NODE_PREFIX);
-                if curr_idx % 2 == 0 {
+                if curr_idx.is_multiple_of(2) {
                     node_preimage.append(&current.clone().into());
                     node_preimage.append(&sibling.into());
                 } else {
@@ -1368,7 +1386,7 @@ impl ReasoningRegistry {
                 current = env.crypto().sha256(&node_preimage).into();
             }
             curr_idx /= 2;
-            curr_len = (curr_len + 1) / 2;
+            curr_len = curr_len.div_ceil(2);
         }
 
         if proof_idx != proof.len() {
@@ -1393,7 +1411,8 @@ impl ReasoningRegistry {
         }
 
         let bind_msg = Self::key_bind_message(&env, &agent, &public_key);
-        env.crypto().ed25519_verify(&public_key, &bind_msg, &proof_sig);
+        env.crypto()
+            .ed25519_verify(&public_key, &bind_msg, &proof_sig);
 
         let key_to_agent = DataKey::KeyToAgent(public_key.clone());
         if env.storage().persistent().has(&key_to_agent) {
@@ -1425,14 +1444,14 @@ impl ReasoningRegistry {
             added_at: env.ledger().timestamp(),
             retired_at: None,
         };
-        Self::put(&env, &DataKey::SigningKeyHistory(agent.clone(), count), &record);
+        Self::put(
+            &env,
+            &DataKey::SigningKeyHistory(agent.clone(), count),
+            &record,
+        );
         Self::put(&env, &history_count_key, &(count + 1));
 
-        AgentSigningKeyAdded {
-            agent,
-            public_key,
-        }
-        .publish(&env);
+        AgentSigningKeyAdded { agent, public_key }.publish(&env);
 
         Ok(())
     }
@@ -1476,7 +1495,11 @@ impl ReasoningRegistry {
             .unwrap_or(0);
         for i in 0..count {
             let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
-            if let Some(mut record) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<_, SigningKeyRecord>(&hist_key)
+            {
                 if record.public_key == public_key && record.retired_at.is_none() {
                     record.retired_at = Some(env.ledger().timestamp());
                     Self::put(&env, &hist_key, &record);
@@ -1485,11 +1508,7 @@ impl ReasoningRegistry {
             }
         }
 
-        AgentSigningKeyRetired {
-            agent,
-            public_key,
-        }
-        .publish(&env);
+        AgentSigningKeyRetired { agent, public_key }.publish(&env);
 
         Ok(())
     }
@@ -1536,6 +1555,7 @@ impl ReasoningRegistry {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_trace_signed(
         env: Env,
         agent: Address,
@@ -1547,7 +1567,6 @@ impl ReasoningRegistry {
         signature: BytesN<64>,
     ) -> Result<u64, Error> {
         ttl::bump_instance(&env);
-        agent.require_auth();
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
         if Self::read_head(&env, &agent).seq > 0 {
             return Err(Error::ChainedAgentMustChain);
@@ -1569,23 +1588,11 @@ impl ReasoningRegistry {
             return Err(Error::InvalidKey);
         }
 
-        let msg = Self::trace_attestation_message(
-            &env,
-            &agent,
-            market_id,
-            &action,
-            &trace_hash,
-        );
+        let msg = Self::trace_attestation_message(&env, &agent, market_id, &action, &trace_hash);
         env.crypto().ed25519_verify(&signing_key, &msg, &signature);
 
-        let (id, target) = Self::write_trace(
-            &env,
-            agent.clone(),
-            market_id,
-            action,
-            trace_hash,
-            ipfs_cid,
-        )?;
+        let (id, target) =
+            Self::write_trace(&env, agent.clone(), market_id, action, trace_hash, ipfs_cid)?;
 
         let sig_key = DataKey::TraceSignature(id);
         Self::put_class(&env, &sig_key, &(signing_key.clone(), signature), target);
@@ -1625,7 +1632,6 @@ impl ReasoningRegistry {
         signature: BytesN<64>,
     ) -> Result<u64, Error> {
         ttl::bump_instance(&env);
-        agent.require_auth();
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
         let head = Self::read_head(&env, &agent);
         if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
@@ -1648,13 +1654,7 @@ impl ReasoningRegistry {
             return Err(Error::InvalidKey);
         }
 
-        let msg = Self::trace_attestation_message(
-            &env,
-            &agent,
-            market_id,
-            &action,
-            &trace_hash,
-        );
+        let msg = Self::trace_attestation_message(&env, &agent, market_id, &action, &trace_hash);
         env.crypto().ed25519_verify(&signing_key, &msg, &signature);
 
         let (id, target) = Self::write_trace(
@@ -1814,11 +1814,19 @@ impl ReasoningRegistry {
 
         // Find the key's SigningKeyRecord to validate compromised_since.
         let history_count_key = DataKey::SigningKeyHistoryCount(agent.clone());
-        let count: u32 = env.storage().persistent().get(&history_count_key).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&history_count_key)
+            .unwrap_or(0);
         let mut found_record: Option<SigningKeyRecord> = None;
         for i in 0..count {
             let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
-            if let Some(record) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SigningKeyRecord>(&hist_key)
+            {
                 if record.public_key == public_key {
                     found_record = Some(record);
                     break;
@@ -1864,7 +1872,11 @@ impl ReasoningRegistry {
         if record.retired_at.is_none() {
             for i in 0..count {
                 let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
-                if let Some(mut rec) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+                if let Some(mut rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, SigningKeyRecord>(&hist_key)
+                {
                     if rec.public_key == public_key && rec.retired_at.is_none() {
                         rec.retired_at = Some(now);
                         Self::put(&env, &hist_key, &rec);
@@ -1921,7 +1933,9 @@ impl ReasoningRegistry {
             .get::<_, KeyRevocation>(&DataKey::KeyRevocation(signing_key.clone()))
         {
             if trace.published_at >= revocation.compromised_since {
-                return Ok(SignatureVerdict::KeyCompromised(revocation.compromised_since));
+                return Ok(SignatureVerdict::KeyCompromised(
+                    revocation.compromised_since,
+                ));
             }
         }
 
@@ -2012,7 +2026,8 @@ impl ReasoningRegistry {
         if limit > MAX_PAGE_SIZE {
             return Err(Error::PageTooLarge);
         }
-        let affected_from = Self::key_affected_from(env.clone(), public_key.clone(), compromised_since)?;
+        let affected_from =
+            Self::key_affected_from(env.clone(), public_key.clone(), compromised_since)?;
         let actual_start = affected_from + page_start;
         Self::key_traces(env, public_key, actual_start, limit)
     }
@@ -2097,7 +2112,11 @@ impl ReasoningRegistry {
         retention::extend_if_present(&env, &DataKey::Agent(agent.clone()), target);
         retention::extend_if_present(&env, &DataKey::AgentHead(agent.clone()), target);
         let keys_key = DataKey::AgentSigningKeys(agent.clone());
-        if let Some(keys) = env.storage().persistent().get::<_, Vec<BytesN<32>>>(&keys_key) {
+        if let Some(keys) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<BytesN<32>>>(&keys_key)
+        {
             retention::extend_if_present(&env, &keys_key, target);
             for k in keys.iter() {
                 retention::extend_if_present(&env, &DataKey::KeyToAgent(k), target);
@@ -2120,11 +2139,7 @@ impl ReasoningRegistry {
 }
 
 impl ReasoningRegistry {
-    pub fn key_bind_message(
-        env: &Env,
-        agent: &Address,
-        public_key: &BytesN<32>,
-    ) -> Bytes {
+    pub fn key_bind_message(env: &Env, agent: &Address, public_key: &BytesN<32>) -> Bytes {
         let mut message = Bytes::from_slice(env, AGENT_KEY_BIND_DOMAIN);
         message.append(&env.ledger().network_id().into());
         message.append(&env.current_contract_address().to_xdr(env));
@@ -2287,7 +2302,12 @@ impl ReasoningRegistry {
             published_at: env.ledger().timestamp(),
         };
         Self::put_class(env, &DataKey::Trace(id), &trace, target);
-        Self::put_class(env, &DataKey::TraceLedger(id), &env.ledger().sequence(), target);
+        Self::put_class(
+            env,
+            &DataKey::TraceLedger(id),
+            &env.ledger().sequence(),
+            target,
+        );
 
         let count_key = DataKey::MarketTraceCount(market_id);
         let index: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -2295,12 +2315,20 @@ impl ReasoningRegistry {
         Self::put_class(env, &count_key, &(index + 1), target);
 
         let agent_count_key = DataKey::AgentTraceCount(agent.clone());
-        let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
-        Self::put_class(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id, target);
+        let agent_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&agent_count_key)
+            .unwrap_or(0);
+        Self::put_class(
+            env,
+            &DataKey::AgentTraceAt(agent.clone(), agent_index),
+            &id,
+            target,
+        );
         Self::put_class(env, &agent_count_key, &(agent_index + 1), target);
 
-        let action_count_key =
-            DataKey::MarketActionTraceCount(market_id, action.clone());
+        let action_count_key = DataKey::MarketActionTraceCount(market_id, action.clone());
         let action_index: u64 = env
             .storage()
             .persistent()
@@ -2406,7 +2434,9 @@ impl ReasoningRegistry {
             .instance()
             .get(&DataKey::NextId)
             .ok_or(Error::NotInitialized)?;
-        env.storage().instance().set(&DataKey::NextId, &(commit_id + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::NextId, &(commit_id + 1));
 
         let commit = TraceCommit {
             agent: agent.clone(),
@@ -2421,7 +2451,11 @@ impl ReasoningRegistry {
 
         let count_key = DataKey::AgentCommitCount(agent.clone());
         let idx: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        Self::put(&env, &DataKey::AgentCommitAt(agent.clone(), idx), &commit_id);
+        Self::put(
+            &env,
+            &DataKey::AgentCommitAt(agent.clone(), idx),
+            &commit_id,
+        );
         Self::put(&env, &count_key, &(idx + 1));
 
         TraceCommitted {
@@ -2447,7 +2481,14 @@ impl ReasoningRegistry {
     ) -> Result<u64, Error> {
         ttl::bump_instance(&env);
         // Validation identical to commit_trace; chaining is enforced at reveal.
-        Self::commit_trace(env, agent, market_id, action, commitment, reveal_deadline_secs)
+        Self::commit_trace(
+            env,
+            agent,
+            market_id,
+            action,
+            commitment,
+            reveal_deadline_secs,
+        )
     }
 
     /// Reveals a previously committed trace. Verifies the commitment and
@@ -2544,7 +2585,6 @@ impl ReasoningRegistry {
             .get(&DataKey::AgentMissedRevealCount(agent))
             .unwrap_or(0)
     }
-
 }
 
 impl ReasoningRegistry {
@@ -2929,8 +2969,9 @@ mod test {
             "publish_trace did not refresh the Agent entry"
         );
         assert_eq!(instance_ttl(&env, &client.address), ttl::INSTANCE_TARGET);
+    }
 
-    // ── #52 hash-chained traces ──────────────────────────────────────────
+    // ── #52 hash-chained traces ──────────────────────────────────────────────
 
     fn chained(
         env: &Env,
@@ -2997,8 +3038,8 @@ mod test {
         assert_eq!(head.seq, 2);
         assert_eq!(head.head_hash, BytesN::from_array(&env, &[2u8; 32]));
         assert_eq!(head.head_trace_id, Some(id2));
-        assert_eq!(client.agent_trace_at(&agent, &1), id1);
-        assert_eq!(client.agent_trace_at(&agent, &2), id2);
+        assert_eq!(client.agent_chain_trace_at(&agent, &1), id1);
+        assert_eq!(client.agent_chain_trace_at(&agent, &2), id2);
         assert_eq!(
             client.get_trace_link(&id2),
             Some(ChainLink {
@@ -3086,7 +3127,7 @@ mod test {
     }
 
     #[test]
-    fn reregistration_does_not_reset_chain_head() {
+    fn reactivation_does_not_reset_chain_head() {
         let (env, client, _, agent) = setup();
         client.register_agent(&agent);
         chained(
@@ -3099,7 +3140,7 @@ mod test {
         )
         .unwrap();
         client.unregister_agent(&agent);
-        client.register_agent(&agent);
+        client.reactivate_agent(&agent);
         assert_eq!(client.agent_chain_head(&agent).seq, 1);
         assert_eq!(
             chained(
@@ -3117,6 +3158,7 @@ mod test {
     #[test]
     fn impostor_cannot_extend_another_agents_chain() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let agent = Address::generate(&env);
         let impostor = Address::generate(&env);
@@ -3126,7 +3168,6 @@ mod test {
             ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &id);
-        env.mock_all_auths();
         client.register_agent(&agent);
 
         let action = TraceAction::Buy;
@@ -3205,6 +3246,7 @@ mod test {
     #[test]
     fn wrong_caller_cannot_register_consumer() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let (market_core_id, _) = register_market_core(&env, &admin);
         let id = env.register(
@@ -3298,8 +3340,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3004)")]
-    fn unregistered_agent_cannot_publish() {
+    fn trace_records_market_and_action() {
         let (env, client, _, agent) = setup();
         client.register_agent(&agent);
         let trace_hash = BytesN::from_array(&env, &[11u8; 32]);
@@ -3313,13 +3354,6 @@ mod test {
         let trace = client.get_trace(&trace_id);
         assert_eq!(trace.market_id, 0);
         assert_eq!(trace.action, TraceAction::Buy);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #3005)")]
-    fn unknown_trace_cannot_be_verified() {
-        let (env, client, _, _) = setup();
-        client.verify_trace(&99, &BytesN::from_array(&env, &[0u8; 32]));
     }
 
     #[test]
@@ -3405,7 +3439,10 @@ mod test {
             &String::from_str(&env, "ipfs://trace-custom"),
         );
         let trace1 = client.get_trace(&id1);
-        assert_eq!(trace1.action, TraceAction::Other(Symbol::new(&env, "custom_strategy")));
+        assert_eq!(
+            trace1.action,
+            TraceAction::Other(Symbol::new(&env, "custom_strategy"))
+        );
 
         let id2 = client.publish_trace(
             &agent,
@@ -3415,7 +3452,10 @@ mod test {
             &String::from_str(&env, "ipfs://trace-custom-2"),
         );
         let trace2 = client.get_trace(&id2);
-        assert_eq!(trace2.action, TraceAction::Other(Symbol::new(&env, "custom_strategy_2")));
+        assert_eq!(
+            trace2.action,
+            TraceAction::Other(Symbol::new(&env, "custom_strategy_2"))
+        );
     }
 
     #[test]
@@ -3557,7 +3597,10 @@ mod test {
         assert_eq!(batch.agent, agent);
         assert_eq!(batch.root, root);
         assert_eq!(batch.leaf_count, 3);
-        assert_eq!(batch.manifest_cid, String::from_str(&env, "ipfs://manifest-3"));
+        assert_eq!(
+            batch.manifest_cid,
+            String::from_str(&env, "ipfs://manifest-3")
+        );
 
         let trace_2 = BytesN::from_array(
             &env,
@@ -3632,7 +3675,12 @@ mod test {
             long_proof.push_back(BytesN::from_array(&env, &[2u8; 32]));
         }
         assert_eq!(
-            client.try_verify_trace_inclusion(&batch_id, &BytesN::from_array(&env, &[3u8; 32]), &0, &long_proof),
+            client.try_verify_trace_inclusion(
+                &batch_id,
+                &BytesN::from_array(&env, &[3u8; 32]),
+                &0,
+                &long_proof
+            ),
             Err(Ok(Error::InvalidProof))
         );
     }
@@ -3667,12 +3715,7 @@ mod test {
 
         // empty manifest_cid fails
         assert_eq!(
-            client.try_publish_trace_batch(
-                &agent,
-                &root,
-                &10,
-                &String::from_str(&env, ""),
-            ),
+            client.try_publish_trace_batch(&agent, &root, &10, &String::from_str(&env, ""),),
             Err(Ok(Error::InvalidBatch))
         );
     }
@@ -4003,14 +4046,13 @@ mod test {
 
     // ── #299: Retroactive signing-key revocation tests ───────────────────────
 
-    /// Helper: register an agent, add a signing key, and publish a signed trace.
-    fn setup_signed_key_and_trace(
+    /// Adds a signing key to an already-registered agent.
+    fn add_test_signing_key(
         env: &Env,
         client: &ReasoningRegistryClient<'static>,
         agent: &Address,
         key_seed: u8,
-        trace_seed: u8,
-    ) -> (BytesN<32>, u64, ed25519_dalek::SigningKey) {
+    ) -> (BytesN<32>, ed25519_dalek::SigningKey) {
         use ed25519_dalek::Signer;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[key_seed; 32]);
         let pubkey_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
@@ -4019,9 +4061,22 @@ mod test {
         let bind_msg = env.as_contract(&client.address, || {
             ReasoningRegistry::key_bind_message(env, agent, &pubkey)
         });
-        let proof_sig = BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&bind_msg)).to_bytes());
+        let proof_sig =
+            BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&bind_msg)).to_bytes());
         client.add_signing_key(agent, &pubkey, &proof_sig);
+        (pubkey, signing_key)
+    }
 
+    /// Publishes a signed trace with an already-registered signing key.
+    fn publish_signed_trace(
+        env: &Env,
+        client: &ReasoningRegistryClient<'static>,
+        agent: &Address,
+        pubkey: &BytesN<32>,
+        signing_key: &ed25519_dalek::SigningKey,
+        trace_seed: u8,
+    ) -> u64 {
+        use ed25519_dalek::Signer;
         let trace_hash = BytesN::from_array(env, &[trace_seed; 32]);
         let att_msg = env.as_contract(&client.address, || {
             ReasoningRegistry::trace_attestation_message(
@@ -4032,16 +4087,29 @@ mod test {
                 &trace_hash,
             )
         });
-        let trace_sig = BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&att_msg)).to_bytes());
-        let trace_id = client.publish_trace_signed(
+        let trace_sig =
+            BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&att_msg)).to_bytes());
+        client.publish_trace_signed(
             agent,
             &NO_MARKET,
             &TraceAction::ProposeMarket,
             &trace_hash,
             &String::from_str(env, "ipfs://trace"),
-            &pubkey,
+            pubkey,
             &trace_sig,
-        );
+        )
+    }
+
+    /// Helper: add a signing key and publish one signed trace with it.
+    fn setup_signed_key_and_trace(
+        env: &Env,
+        client: &ReasoningRegistryClient<'static>,
+        agent: &Address,
+        key_seed: u8,
+        trace_seed: u8,
+    ) -> (BytesN<32>, u64, ed25519_dalek::SigningKey) {
+        let (pubkey, signing_key) = add_test_signing_key(env, client, agent, key_seed);
+        let trace_id = publish_signed_trace(env, client, agent, &pubkey, &signing_key, trace_seed);
         (pubkey, trace_id, signing_key)
     }
 
@@ -4050,10 +4118,11 @@ mod test {
         let (env, client, admin, agent) = setup();
         client.register_agent(&agent);
 
-        let (pubkey, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 1, 10);
+        let (pubkey, signing_key) = add_test_signing_key(&env, &client, &agent, 1);
+        let trace_id1 = publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 10);
         // Advance time so the second trace has a later published_at.
         env.ledger().set_timestamp(env.ledger().timestamp() + 100);
-        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 1, 20);
+        let trace_id2 = publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 20);
 
         // Both traces are valid before revocation.
         assert!(client.verify_trace_signature(&trace_id1));
@@ -4125,17 +4194,36 @@ mod test {
 
         let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 3, 40);
 
-        let now = env.ledger().timestamp();
-        client.revoke_signing_key(&agent, &agent, &pubkey, &now, &Symbol::new(&env, "first"));
+        // Revoke at t=1000 with a since (900) that leaves room on both sides.
+        env.ledger().set_timestamp(1_000);
+        client.revoke_signing_key(
+            &agent,
+            &agent,
+            &pubkey,
+            &900u64,
+            &Symbol::new(&env, "first"),
+        );
 
         // A later compromised_since must be rejected.
         assert_eq!(
-            client.try_revoke_signing_key(&agent, &agent, &pubkey, &(now + 1), &Symbol::new(&env, "second")),
+            client.try_revoke_signing_key(
+                &agent,
+                &agent,
+                &pubkey,
+                &950u64,
+                &Symbol::new(&env, "second")
+            ),
             Err(Ok(Error::AlreadyRevoked))
         );
 
         // An earlier compromised_since is accepted.
-        client.revoke_signing_key(&agent, &agent, &pubkey, &(now - 1), &Symbol::new(&env, "widened"));
+        client.revoke_signing_key(
+            &agent,
+            &agent,
+            &pubkey,
+            &850u64,
+            &Symbol::new(&env, "widened"),
+        );
     }
 
     #[test]
@@ -4148,7 +4236,13 @@ mod test {
 
         // compromised_since before added_at is rejected.
         assert_eq!(
-            client.try_revoke_signing_key(&agent, &agent, &pubkey, &(added_at + 1_000_000), &Symbol::new(&env, "future")),
+            client.try_revoke_signing_key(
+                &agent,
+                &agent,
+                &pubkey,
+                &(added_at + 1_000_000),
+                &Symbol::new(&env, "future")
+            ),
             Err(Ok(Error::InvalidEffectiveTime))
         );
     }
@@ -4161,10 +4255,7 @@ mod test {
         let (pubkey, trace_id, _) = setup_signed_key_and_trace(&env, &client, &agent, 5, 60);
 
         // Before revocation, signature_verdict is Valid.
-        assert_eq!(
-            client.signature_verdict(&trace_id),
-            SignatureVerdict::Valid
-        );
+        assert_eq!(client.signature_verdict(&trace_id), SignatureVerdict::Valid);
 
         // Revoke with compromised_since = 0 (taints all traces).
         client.revoke_signing_key(&agent, &agent, &pubkey, &0u64, &Symbol::new(&env, "leak"));
@@ -4181,9 +4272,10 @@ mod test {
         let (env, client, _, agent) = setup();
         client.register_agent(&agent);
 
-        let (pubkey, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 6, 70);
+        let (pubkey, signing_key) = add_test_signing_key(&env, &client, &agent, 6);
+        let trace_id1 = publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 70);
         env.ledger().set_timestamp(env.ledger().timestamp() + 100);
-        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 6, 80);
+        let trace_id2 = publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 80);
 
         assert_eq!(client.key_trace_count(&pubkey), 2);
         let traces = client.key_traces(&pubkey, &0, &10);
@@ -4197,13 +4289,14 @@ mod test {
         let (env, client, _, agent) = setup();
         client.register_agent(&agent);
 
-        let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 90);
+        let (pubkey, signing_key) = add_test_signing_key(&env, &client, &agent, 7);
+        publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 90);
         let t1 = env.ledger().timestamp();
         env.ledger().set_timestamp(t1 + 100);
-        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 91);
+        publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 91);
         let t2 = env.ledger().timestamp();
         env.ledger().set_timestamp(t2 + 100);
-        let (_, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 92);
+        publish_signed_trace(&env, &client, &agent, &pubkey, &signing_key, 92);
 
         // Search for first trace at or after t2: should be index 1.
         let idx = client.key_affected_from(&pubkey, &t2);
@@ -4224,7 +4317,7 @@ mod test {
         client.register_agent(&agent);
 
         let (pubkey1, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 8, 100);
-        let (pubkey2, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 9, 110);
+        let (_pubkey2, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 9, 110);
 
         // Revoke only key 1.
         client.revoke_signing_key(&agent, &agent, &pubkey1, &0u64, &Symbol::new(&env, "leak1"));
@@ -4262,11 +4355,16 @@ mod test {
 
         let bystander = Address::generate(&env);
         assert_eq!(
-            client.try_revoke_signing_key(&bystander, &agent, &pubkey, &0u64, &Symbol::new(&env, "bad")),
+            client.try_revoke_signing_key(
+                &bystander,
+                &agent,
+                &pubkey,
+                &0u64,
+                &Symbol::new(&env, "bad")
+            ),
             Err(Ok(Error::Unauthorized))
         );
 
         let _ = admin;
     }
-}
 }

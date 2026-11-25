@@ -13,8 +13,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Source toolchain versions for deterministic builds
 source scripts/toolchain.env
 
-# Verify stellar CLI version for deterministic bindings generation
-INSTALLED_VERSION=$(stellar --version 2>/dev/null | awk '{print $2}' || echo "not found")
+# Verify stellar CLI version for deterministic bindings generation.
+# Newer CLIs print the stellar-xdr/xdr versions on following lines, so take
+# the first line only.
+INSTALLED_VERSION=$(stellar --version 2>/dev/null | awk 'NR == 1 {print $2}' || echo "not found")
 if [ "$INSTALLED_VERSION" != "$STELLAR_CLI_VERSION" ]; then
   if [ "${ALLOW_CLI_MISMATCH:-}" = "1" ]; then
     echo "WARNING: stellar CLI version mismatch (expected $STELLAR_CLI_VERSION, got $INSTALLED_VERSION)" >&2

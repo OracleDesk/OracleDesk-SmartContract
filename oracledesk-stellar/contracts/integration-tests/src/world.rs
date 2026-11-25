@@ -57,6 +57,12 @@ impl MockOracle {
             .set(&Symbol::new(&env, "t"), &timestamp);
     }
 
+    // SEP-40 feed cadence. The resolver floors `close_time` to this grid
+    // before reading, so one second keeps every timestamp addressable.
+    pub fn resolution(_env: Env) -> u32 {
+        1
+    }
+
     pub fn price(env: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
         let stored: u64 = env
             .storage()
@@ -109,7 +115,12 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         let env = Env::default();
+        // Registering four contracts uploads ~400 KB of wasm, which is charged
+        // to the budget before any test body runs; the default test budget is
+        // sized for a single top-level call. Fixtures that register contracts
+        // elsewhere in the workspace lift the limits the same way.
         env.cost_estimate().budget().reset_unlimited();
+        env.cost_estimate().disable_resource_limits();
         env.ledger().set_timestamp(START_TIME);
         env.ledger().set_network_id([7u8; 32]);
 
@@ -174,7 +185,7 @@ impl World {
                 &policy,
             ),
         );
-        let registry_id = env.register(reasoning_registry::WASM, (admin.clone(),));
+        let registry_id = env.register(reasoning_registry::WASM, (admin.clone(), core_id.clone()));
 
         let core = market_core::Client::new(&env, &core_id);
         let resolver = resolver::Client::new(&env, &resolver_id);

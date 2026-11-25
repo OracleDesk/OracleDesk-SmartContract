@@ -155,13 +155,8 @@ impl OutcomeTokenFactory {
             return Err(Error::InvalidAmount);
         }
         let token = Self::deploy_token(env.clone(), market_id, outcome);
-        MarketCoreApi::new(&env, &market_core(&env)).transfer_position(
-            &holder,
-            &token,
-            &market_id,
-            &outcome,
-            &amount,
-        );
+        MarketCoreApi::new(&env, &market_core(&env))
+            .transfer_position(&holder, &token, &market_id, &outcome, &amount);
         OutcomeTokenApi::new(&env, &token).mint(&holder, &amount);
         Ok(())
     }
@@ -215,10 +210,7 @@ fn salt(env: &Env, market_id: u64, outcome: Outcome) -> BytesN<32> {
 }
 
 fn market_core(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get(&DataKey::MarketCore)
-        .unwrap()
+    env.storage().instance().get(&DataKey::MarketCore).unwrap()
 }
 
 fn existing_token(env: &Env, market_id: u64, outcome: Outcome) -> Result<Address, Error> {
@@ -289,8 +281,8 @@ mod test {
                 &collateral,
                 &treasury,
                 &resolver,
-                100u32,
-                10_000u32,
+                &100u32,
+                &10_000u32,
             ),
         );
         let core = MarketCoreClient::new(&env, &core_id);
@@ -303,6 +295,22 @@ mod test {
             &CLOSE,
             &SEED,
             &5000u32,
+        );
+        // At a 50/50 split the whole seed lands in the pool, so the creator
+        // holds no shares to wrap; buy a little of each side for them.
+        core.buy(
+            &creator,
+            &market_id,
+            &market_core_native::Outcome::Yes,
+            &(10 * 10_000_000),
+            &0,
+        );
+        core.buy(
+            &creator,
+            &market_id,
+            &market_core_native::Outcome::No,
+            &(10 * 10_000_000),
+            &0,
         );
 
         let factory_id = env.register(
@@ -386,10 +394,7 @@ mod test {
 
         factory(&s).wrap(&s.creator, &s.market_id, &Outcome::Yes, &amount);
         assert_eq!(token_client(&s, &yes_token).balance(&s.creator), amount);
-        assert_eq!(
-            mc(&s).get_position(&s.market_id, &yes_token).yes,
-            amount
-        );
+        assert_eq!(mc(&s).get_position(&s.market_id, &yes_token).yes, amount);
         // Total supply equals the shares the token holds.
         assert_eq!(token_client(&s, &yes_token).total_supply(), amount);
         assert_eq!(

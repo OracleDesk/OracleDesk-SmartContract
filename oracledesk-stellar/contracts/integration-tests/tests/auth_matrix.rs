@@ -8,12 +8,15 @@
 //! This crate contains no `mock_all_auths` call; `scripts/check-no-mock-all-auths.sh`
 //! greps for it in CI. Setup helpers use targeted mocks.
 
+use ::treasury::MIN_CANCEL_DELAY;
 use integration_tests::{
-    market_core, resolver, treasury,
+    market_core,
+    reasoning_registry::TraceAction,
+    resolver, treasury,
     world::{World, MARKET_CLOSE, SEED, USDC},
 };
 use soroban_sdk::{
-    testutils::{AuthorizedFunction, AuthorizedInvocation},
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
     Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
@@ -1201,6 +1204,228 @@ fn auth_treasury_close_trade_redeem_and_remainder_are_agent_actions() {
     assert!(result.is_err());
 }
 
+#[test]
+fn auth_treasury_ticket_transfer_and_cancel_are_owner_actions() {
+    let w = World::new();
+    let alice = Address::generate(&w.env);
+    let bob = Address::generate(&w.env);
+    let deposit = 20 * USDC;
+    w.mint_to(&alice, deposit);
+
+    let pull = soroban_sdk::testutils::MockAuthInvoke {
+        contract: &w.collateral,
+        fn_name: "transfer",
+        args: (alice.clone(), w.treasury_id.clone(), deposit).into_val(&w.env),
+        sub_invokes: &[],
+    };
+    w.env.set_auths(&[]);
+    let shares = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "deposit",
+                args: (alice.clone(), deposit).into_val(&w.env),
+                sub_invokes: core::slice::from_ref(&pull),
+            },
+        }])
+        .deposit(&alice, &deposit);
+    assert!(shares > 0);
+
+    // The agent moves idle capital into market positions and the seeded admin
+    // takes the rest, so Alice's request has to queue.
+    for outcome in [treasury::Outcome::Yes, treasury::Outcome::No] {
+        w.env.set_auths(&[]);
+        w.treasury
+            .mock_auths(&[soroban_sdk::testutils::MockAuth {
+                address: &w.agent,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &w.treasury_id,
+                    fn_name: "agent_buy",
+                    args: (
+                        w.agent.clone(),
+                        w.signer_market,
+                        outcome.clone(),
+                        2 * USDC,
+                        0i128,
+                    )
+                        .into_val(&w.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .agent_buy(&w.agent, &w.signer_market, &outcome, &(2 * USDC), &0i128);
+    }
+    let admin_shares = w.treasury.shares_of(&w.admin);
+    w.env.set_auths(&[]);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "request_withdraw",
+                args: (w.admin.clone(), admin_shares).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .request_withdraw(&w.admin, &admin_shares);
+    w.env.set_auths(&[]);
+    let (_, ticket) = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "request_withdraw",
+                args: (alice.clone(), shares).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .request_withdraw(&alice, &shares);
+    assert!(ticket > 0, "part of Alice's withdrawal must be queued");
+
+    // transfer_ticket moves the ticket on the owner's authority alone.
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (alice.clone(), bob.clone(), ticket).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "transfer_ticket",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_ticket(&alice, &bob, &ticket);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &alice,
+            &w.treasury_id,
+            "transfer_ticket",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    w.env.set_auths(&[]);
+    let stranger = w.random.clone();
+    let rejected = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &stranger,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "transfer_ticket",
+                args: (stranger.clone(), alice.clone(), ticket).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_transfer_ticket(&stranger, &alice, &ticket);
+    assert!(rejected.is_err());
+
+    // cancel_withdraw is the ticket owner's action.
+    let created = w.treasury.withdraw_ticket(&ticket).unwrap().created_at;
+    w.set_time(created + MIN_CANCEL_DELAY);
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (bob.clone(), ticket).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &bob,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "cancel_withdraw",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .cancel_withdraw(&bob, &ticket);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &bob,
+            &w.treasury_id,
+            "cancel_withdraw",
+            args.clone(),
+            vec![],
+        )]
+    );
+}
+
+#[test]
+fn auth_treasury_batch_settlement_is_agent_only() {
+    let w = World::new();
+    let ids = soroban_sdk::vec![&w.env, w.price_market];
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (w.agent.clone(), ids.clone()).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.agent,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "redeem_many",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .redeem_many(&w.agent, &ids);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.treasury_id,
+            "redeem_many",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    w.env.set_auths(&[]);
+    let rejected = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.random,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "redeem_many",
+                args: (w.random.clone(), ids.clone()).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_redeem_many(&w.random, &ids);
+    assert!(rejected.is_err());
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (w.agent.clone(), ids.clone()).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.agent,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "claim_pool_remainders",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .claim_pool_remainders(&w.agent, &ids);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.treasury_id,
+            "claim_pool_remainders",
+            args.clone(),
+            vec![],
+        )]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // reasoning-registry
 // ---------------------------------------------------------------------------
@@ -1292,8 +1517,8 @@ fn auth_registry_publish_trace_is_agent_only() {
     w.env.set_auths(&[]);
     let args: Vec<Val> = (
         w.agent.clone(),
-        7u64,
-        String::from_str(&w.env, "buy"),
+        w.price_market,
+        TraceAction::Buy,
         BytesN::from_array(&w.env, &[9u8; 32]),
         String::from_str(&w.env, "ipfs://trace"),
     )
@@ -1310,8 +1535,8 @@ fn auth_registry_publish_trace_is_agent_only() {
         }])
         .publish_trace(
             &w.agent,
-            &7u64,
-            &String::from_str(&w.env, "buy"),
+            &w.price_market,
+            &TraceAction::Buy,
             &BytesN::from_array(&w.env, &[9u8; 32]),
             &String::from_str(&w.env, "ipfs://trace"),
         );
@@ -1337,8 +1562,8 @@ fn auth_registry_publish_trace_is_agent_only() {
                 fn_name: "publish_trace",
                 args: (
                     w.random.clone(),
-                    7u64,
-                    String::from_str(&w.env, "buy"),
+                    w.price_market,
+                    TraceAction::Buy,
                     BytesN::from_array(&w.env, &[9u8; 32]),
                     String::from_str(&w.env, "ipfs://trace"),
                 )
@@ -1348,8 +1573,8 @@ fn auth_registry_publish_trace_is_agent_only() {
         }])
         .try_publish_trace(
             &w.random,
-            &7u64,
-            &String::from_str(&w.env, "buy"),
+            &w.price_market,
+            &TraceAction::Buy,
             &BytesN::from_array(&w.env, &[9u8; 32]),
             &String::from_str(&w.env, "ipfs://trace"),
         );
@@ -1394,8 +1619,8 @@ fn auth_registry_consumer_path() {
                 fn_name: "publish_trace",
                 args: (
                     w.agent.clone(),
-                    7u64,
-                    String::from_str(&w.env, "buy"),
+                    w.price_market,
+                    TraceAction::Buy,
                     BytesN::from_array(&w.env, &[9u8; 32]),
                     String::from_str(&w.env, "ipfs://trace"),
                 )
@@ -1405,8 +1630,8 @@ fn auth_registry_consumer_path() {
         }])
         .publish_trace(
             &w.agent,
-            &7u64,
-            &String::from_str(&w.env, "buy"),
+            &w.price_market,
+            &TraceAction::Buy,
             &BytesN::from_array(&w.env, &[9u8; 32]),
             &String::from_str(&w.env, "ipfs://trace"),
         );
@@ -1425,7 +1650,7 @@ fn auth_registry_consumer_path() {
             },
         }])
         .consume_trace(&w.treasury_id, &0u64);
-    assert_eq!(trace.market_id, 7);
+    assert_eq!(trace.market_id, w.price_market);
     assert_eq!(
         w.env.auths(),
         vec![invocation(
@@ -1571,6 +1796,10 @@ const MATRIX: &[(&str, &[&str])] = &[
             "receive_collateral",
             "transfer_shares",
             "exit_to_successor",
+            "cancel_withdraw",
+            "transfer_ticket",
+            "redeem_many",
+            "claim_pool_remainders",
         ],
     ),
     (
@@ -1589,10 +1818,13 @@ const MATRIX: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Functions that are deliberately permissionless or views. They still have a
-/// classification row; the `permissionless_functions_record_no_auths` test
-/// exercises the money-moving ones. An entrypoint missing from both tables
-/// fails `every_entrypoint_has_a_matrix_row`.
+/// Entrypoints with no dedicated positive row above: views, permissionless
+/// calls, and gated entrypoints that are only exercised indirectly (through a
+/// wrapper entrypoint or the contract's own unit tests). An entrypoint missing
+/// from both tables fails `every_entrypoint_has_a_matrix_row`, so a newly
+/// exported function must be classified here or covered in `MATRIX`.
+/// `permissionless_functions_record_no_auths` exercises the money-moving
+/// permissionless ones.
 const PERMISSIONLESS: &[(&str, &[&str])] = &[
     (
         "market-core",
@@ -1624,6 +1856,43 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "set_default_fee_bps",
             "set_protocol_fee_share_bps",
             "set_default_breaker",
+            "accept_market_resolver",
+            "buy_cat",
+            "cancel_market_resolver",
+            "claim_pool_remainder_cat",
+            "claim_pool_remainders",
+            "create_categorical_market",
+            "create_market_with_fees",
+            "create_scalar_market",
+            "current_fee_bps",
+            "fee_schedule",
+            "finalize_market",
+            "get_cat_market",
+            "get_cat_position",
+            "get_market_view",
+            "get_prices_cat",
+            "get_scalar_meta",
+            "is_closed",
+            "market_kind",
+            "market_resolver",
+            "max_batch",
+            "observe",
+            "price_cumulative",
+            "propose_market_resolver",
+            "purge_closed_positions",
+            "quote_buy_at",
+            "quote_buy_cat",
+            "redeem_cat",
+            "redeem_deadline",
+            "redeem_many",
+            "resolve_cat",
+            "resolve_scalar",
+            "sell_cat",
+            "set_default_fee_schedule",
+            "set_default_redeem_horizon",
+            "settle_state",
+            "snapshot_legacy_resolver",
+            "twap",
         ],
     ),
     (
@@ -1663,6 +1932,32 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "register_spec_v2",
             "attest_with_evidence",
             "cancel_proposal",
+            "attest_cat",
+            "committee_members_at",
+            "consent_market_resolver_migrate",
+            "finalize_cat",
+            "market_committee_epoch",
+            "pin_committee_epoch",
+            "preview_price",
+            "register_cat_signer_spec",
+            "register_hybrid_v2_spec",
+            "register_scalar_spec",
+            "register_scaled_price_spec",
+            "register_twap_spec",
+            "resolve_scalar_price",
+            "resolve_twap",
+            "rule_kind",
+            "spec_kind",
+            "trade_status",
+            // #149 resolution bounties: auth-gated (fund/reclaim require the
+            // funder, set_bounty_token requires admin, the _for variants wrap
+            // the MATRIX-tested resolve_price/finalize_signers) and exercised
+            // by the resolver's own unit tests.
+            "finalize_signers_for",
+            "fund_bounty",
+            "reclaim_bounty",
+            "resolve_price_for",
+            "set_bounty_token",
         ],
     ),
     (
@@ -1672,6 +1967,9 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "total_shares",
             "queue_reserved",
             "queue_bounds",
+            "queue_page",
+            "queue_position",
+            "estimated_unlock",
             "deposit",
             "request_withdraw",
             "claim_withdraw",
@@ -1743,6 +2041,31 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "withdraw_ticket",
             "redeem",
             "claim_pool_remainder",
+            "agent_buy_cat",
+            "agent_buy_traced",
+            "agent_create_market_reveal_v2",
+            "agent_halt",
+            "agent_sell_traced",
+            "audit_mark",
+            "cancel_data_budget",
+            "cancel_max_mark_age",
+            "cancel_trace_policy",
+            "execute_data_budget",
+            "execute_max_mark_age",
+            "execute_trace_policy",
+            "fund_data_spend",
+            "max_mark_age_ledgers",
+            "migrate_market",
+            "migrate_marks",
+            "nav_detail",
+            "pending_max_mark_age",
+            "propose_trace_policy",
+            "refresh_mark",
+            "set_data_budget",
+            "set_data_global_cap",
+            "set_max_mark_age",
+            "trace_policy",
+            "withdraw",
         ],
     ),
     (
@@ -1764,6 +2087,49 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "get_trace_link",
             "get_trace_ledger",
             "publish_chained_trace",
+            "add_signing_key",
+            "affected_traces",
+            "agent_batch_at",
+            "agent_batch_count",
+            "agent_chain_trace_at",
+            "agent_trace_count",
+            "batch_count",
+            "compute_merkle_root",
+            "extend_agent",
+            "extend_index",
+            "extend_traces",
+            "flag_trace",
+            "get_agent",
+            "get_batch",
+            "get_key_agent",
+            "get_signing_keys",
+            "get_trace_flag",
+            "get_trace_signature",
+            "key_affected_from",
+            "key_trace_count",
+            "key_traces",
+            "market_action_trace_at",
+            "market_action_trace_count",
+            "publish_chained_trace_signed",
+            "publish_trace_batch",
+            "publish_trace_signed",
+            "reactivate_agent",
+            "retire_agent",
+            "retire_self",
+            "retire_signing_key",
+            "revoke_agent",
+            "revoke_signing_key",
+            "signature_verdict",
+            "signing_key_history",
+            "signing_key_history_count",
+            "trace_flags",
+            "trace_verdict",
+            "traces_by_agent",
+            "traces_by_market",
+            "traces_by_market_action",
+            "unflag_trace",
+            "verify_trace_inclusion",
+            "verify_trace_signature",
         ],
     ),
 ];

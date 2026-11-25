@@ -57,8 +57,22 @@ export interface TraderCandidate {
 }
 
 export interface TraderDeps {
-  adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace" | "publishDecisionTrace" | "agentBuyTraced">
-    & Partial<Pick<StellarAdapter, "riskCaps" | "marketExposure" | "treasuryPosition" | "treasuryMode">>;
+  adapter: Pick<
+    StellarAdapter,
+    | "mode"
+    | "agent"
+    | "quoteBuy"
+    | "agentBuyV2"
+    | "publishTrace"
+    | "publishDecisionTrace"
+    | "agentBuyTraced"
+  > &
+    Partial<
+      Pick<
+        StellarAdapter,
+        "currentFeeBps" | "riskCaps" | "marketExposure" | "treasuryPosition" | "treasuryMode"
+      >
+    >;
   traceStore: TraceStore;
   candidates: () => Promise<TraderCandidate[]>;
   /** This deployment's treasury contract id (creator of our own markets). */

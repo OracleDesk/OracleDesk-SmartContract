@@ -24,7 +24,7 @@
 //!   so the emergency key cannot become an instant admin.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, Env, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol,
     TryFromVal, Val, Vec,
 };
 
@@ -191,8 +191,10 @@ impl Timelock {
     ) {
         #[cfg(feature = "local-short-windows")]
         {
-            let standalone =
-                env.crypto().sha256(&Bytes::from_slice(&env, b"Standalone Network ; February 2017"));
+            let standalone = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(
+                &env,
+                b"Standalone Network ; February 2017",
+            ));
             if env.ledger().network_id() != standalone.to_bytes() {
                 soroban_sdk::panic_with_error!(&env, Error::InvalidConfig);
             }

@@ -31,10 +31,79 @@
         "outputs": []
       }
     },
+    "agent_create_and_reveal": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a market with treasury capital and reveals any V2 rule in one transaction. Root authorization is anchored by the agent here; the treasury still applies its role, caps and creation policy checks.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "agent_create_and_reveal",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "agent_trade_and_publish_trace": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Same atomic trade+trace flow, but the trade runs through the caller's treasury (`agent_buy_v2`/`agent_sell_v2`) and the agent is the trace author. The treasury is checked against the router's market-core both ways before any call.",
+        "doc": "Same atomic trade+trace flow, but the trade runs through the caller's treasury (`agent_buy_v2`/`agent_sell_v2`) and the agent is the trace author. The treasury is caller-supplied, so it is checked against the router's market-core both ways before any call is made: a hostile treasury could otherwise make the router publish a trace for a trade that never happened.",
         "inputs": [
           {
             "doc": "",
@@ -182,6 +251,75 @@
                   "name": "RouterConfig"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "create_and_reveal": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Creates a market and reveals any V2 rule in one transaction. The resolver and treasury come from market-core's live configuration, so a resolver swap cannot strand the new market in an untrusted resolver.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "create_and_reveal",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
             }
           }
         ]
@@ -425,263 +563,38 @@
     }
   },
   "types": {
-    "ChainArgs": {
+    "CatSignerConfig": {
       "kind": "udt_struct_v0",
       "spec": {
         "doc": "",
         "fields": [
           {
             "doc": "",
-            "name": "expected_seq",
+            "name": "dispute_window",
             "type_": "u64"
           },
           {
             "doc": "",
-            "name": "prev_trace_hash",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          }
-        ],
-        "lib": "",
-        "name": "ChainArgs"
-      }
-    },
-    "SigArgs": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "",
-        "fields": [
-          {
-            "doc": "",
-            "name": "signature",
-            "type_": {
-              "bytes_n": {
-                "n": 64
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "signing_key",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          }
-        ],
-        "lib": "",
-        "name": "SigArgs"
-      }
-    },
-    "Side": {
-      "kind": "udt_union_v0",
-      "spec": {
-        "cases": [
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Buy"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Sell"
-            }
-          }
-        ],
-        "doc": "",
-        "lib": "",
-        "name": "Side"
-      }
-    },
-    "TraceAction": {
-      "kind": "udt_union_v0",
-      "spec": {
-        "cases": [
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Buy"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "ClaimRemainder"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "CreateMarket"
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "",
-              "name": "Other",
-              "type_": [
-                "symbol"
-              ]
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "ProposeMarket"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Redeem"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Resolve"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Sell"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "Skip"
-            }
-          }
-        ],
-        "doc": "",
-        "lib": "",
-        "name": "TraceAction"
-      }
-    },
-    "TraceArgs": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "",
-        "fields": [
-          {
-            "doc": "",
-            "name": "action",
-            "type_": {
-              "udt": {
-                "name": "TraceAction"
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "chain",
-            "type_": {
-              "option": {
-                "value_type": {
-                  "udt": {
-                    "name": "ChainArgs"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "ipfs_cid",
-            "type_": "string"
-          },
-          {
-            "doc": "",
-            "name": "sig",
-            "type_": {
-              "option": {
-                "value_type": {
-                  "udt": {
-                    "name": "SigArgs"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "trace_hash",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          }
-        ],
-        "lib": "",
-        "name": "TraceArgs"
-      }
-    },
-    "TradeBounds": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "",
-        "fields": [
-          {
-            "doc": "",
-            "name": "amount",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "name": "deadline",
-            "type_": "u64"
-          },
-          {
-            "doc": "",
-            "name": "limit_price_bps",
+            "name": "outcome_count",
             "type_": "u32"
           },
           {
             "doc": "",
-            "name": "limit_shares",
-            "type_": "i128"
-          }
-        ],
-        "lib": "",
-        "name": "TradeBounds"
-      }
-    },
-    "TradeTraceResult": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "",
-        "fields": [
-          {
-            "doc": "",
-            "name": "chain_seq",
+            "name": "signers",
             "type_": {
-              "option": {
-                "value_type": "u64"
+              "vec": {
+                "element_type": "address"
               }
             }
           },
           {
             "doc": "",
-            "name": "shares",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "name": "trace_id",
-            "type_": "u64"
+            "name": "threshold",
+            "type_": "u32"
           }
         ],
         "lib": "",
-        "name": "TradeTraceResult"
+        "name": "CatSignerConfig"
       }
     },
     "Category": {
@@ -838,6 +751,55 @@
         "name": "Escalation"
       }
     },
+    "FallbackAuthority": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "FallbackAuthority"
+      }
+    },
     "HybridConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -869,6 +831,39 @@
         ],
         "lib": "",
         "name": "HybridConfig"
+      }
+    },
+    "HybridConfigV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "FallbackAuthority"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfigV2"
       }
     },
     "OracleAsset": {
@@ -1005,6 +1000,19 @@
           {
             "tuple_v0": {
               "doc": "",
+              "name": "CategoricalSigners",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CatSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
               "name": "Committee",
               "type_": [
                 {
@@ -1031,11 +1039,37 @@
           {
             "tuple_v0": {
               "doc": "",
+              "name": "HybridV2",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfigV2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
               "name": "Price",
               "type_": [
                 {
                   "udt": {
                     "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Scalar",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "ScalarPriceConfig"
                   }
                 }
               ]
@@ -1162,6 +1196,67 @@
         "name": "RouterConfig"
       }
     },
+    "ScalarPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ScalarPriceConfig"
+      }
+    },
+    "Side": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Side"
+      }
+    },
     "SignerConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1189,6 +1284,207 @@
         ],
         "lib": "",
         "name": "SignerConfig"
+      }
+    },
+    "TraceAction": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ClaimRemainder"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CreateMarket"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ProposeMarket"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Redeem"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolve"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Skip"
+            }
+          }
+        ],
+        "doc": "Mirrors reasoning-registry's `TraceAction`. The enum is defined locally so the router can pass a typed action without depending on the stale vendored registry interface; its XDR shape is identical to the registry's.",
+        "lib": "",
+        "name": "TraceAction"
+      }
+    },
+    "TraceArgs": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "chain_expected_seq",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "chain_prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "Chained publish requested. When `false`, `chain_expected_seq` and `chain_prev_trace_hash` are ignored.",
+            "name": "chained",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          },
+          {
+            "doc": "Signed publish requested. When `false`, `signing_key` and `signature` are ignored.",
+            "name": "signed",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TraceArgs"
+      }
+    },
+    "TradeBounds": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "`collateral_in` for a buy, `collateral_out` for a sell.",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "`min_shares_out` for a buy, `max_shares_in` for a sell.",
+            "name": "limit_shares",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "TradeBounds"
+      }
+    },
+    "TradeTraceResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "chain_seq",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "TradeTraceResult"
       }
     },
     "WeightedKey": {
@@ -1255,6 +1551,11 @@
       "spec": {
         "cases": [
           {
+            "doc": "`TraceArgs.action` does not match the trade side.",
+            "name": "ActionMismatch",
+            "value": 6
+          },
+          {
             "doc": "The envelope named a different network or market-core.",
             "name": "DomainMismatch",
             "value": 3
@@ -1270,9 +1571,24 @@
             "value": 4
           },
           {
+            "doc": "The downstream trade returned no positive shares.",
+            "name": "InvalidTradeResult",
+            "value": 7
+          },
+          {
             "doc": "",
             "name": "NotInitialized",
             "value": 1
+          },
+          {
+            "doc": "The resolver did not store the rule kind that was revealed.",
+            "name": "RuleMismatch",
+            "value": 10
+          },
+          {
+            "doc": "The supplied treasury is not wired to this router's market-core.",
+            "name": "TreasuryMismatch",
+            "value": 8
           },
           {
             "doc": "The router was asked to reveal a rule variant it does not support.",
@@ -1280,19 +1596,9 @@
             "value": 5
           },
           {
-            "doc": "`TraceArgs.action` does not match the trade side.",
-            "name": "ActionMismatch",
-            "value": 6
-          },
-          {
-            "doc": "The downstream trade returned no positive shares.",
-            "name": "InvalidTradeResult",
-            "value": 7
-          },
-          {
-            "doc": "The supplied treasury is not wired to this router's market-core.",
-            "name": "TreasuryMismatch",
-            "value": 8
+            "doc": "The resolver and market-core point at different contracts.",
+            "name": "WiringMismatch",
+            "value": 9
           }
         ],
         "doc": "",
@@ -1302,6 +1608,84 @@
     }
   },
   "events": {
+    "AgentMarketRevealed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentMarketRevealed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "spec_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "agent_market_revealed"
+        ]
+      }
+    },
+    "MarketCreatedAndRevealed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MarketCreatedAndRevealed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "spec_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "market_created_and_revealed"
+        ]
+      }
+    },
     "TradeTraced": {
       "kind": "event_v0",
       "spec": {
@@ -1357,42 +1741,6 @@
         ],
         "prefix_topics": [
           "trade_traced"
-        ]
-      }
-    },
-    "MarketCreatedAndRevealed": {
-      "kind": "event_v0",
-      "spec": {
-        "data_format": "map",
-        "doc": "",
-        "lib": "",
-        "name": "MarketCreatedAndRevealed",
-        "params": [
-          {
-            "doc": "",
-            "location": "topic_list",
-            "name": "market_id",
-            "type_": "u64"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "creator",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "spec_hash",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          }
-        ],
-        "prefix_topics": [
-          "market_created_and_revealed"
         ]
       }
     }

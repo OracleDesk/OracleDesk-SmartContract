@@ -107,7 +107,14 @@ fn queued_withdrawal_is_drained_by_settle_market() {
     let admin_paid = w.token.balance(&w.admin) - admin_before;
     assert!(alice_paid > 0, "settle_market must pay the queued ticket");
     assert!(alice_paid <= owed_alice);
-    assert_eq!(w.treasury.queue_reserved(), reserved - alice_paid - admin_paid);
-    let left = w.treasury.withdraw_ticket(&ticket_id).map(|t| t.remaining).unwrap_or(0);
+    assert_eq!(
+        w.treasury.queue_reserved(),
+        reserved - alice_paid - admin_paid
+    );
+    let left = w
+        .treasury
+        .withdraw_ticket(&ticket_id)
+        .map(|t| t.remaining)
+        .unwrap_or(0);
     assert_eq!(left, owed_alice - alice_paid);
 }

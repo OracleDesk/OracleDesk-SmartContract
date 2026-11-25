@@ -119,6 +119,10 @@ pub enum RuleKind {
     Hybrid,
     ScaledPrice,
     Twap,
+    /// Mirrors the resolver's appended variants (same discriminants).
+    CategoricalSigners,
+    Scalar,
+    HybridV2,
 }
 
 #[contractevent]
@@ -316,7 +320,7 @@ impl Router {
         let cfg = Self::load_config(&env)?;
         let (_, treasury) = Self::live_wiring(&env, &cfg)?;
         let resolution_hash = spec_v2_hash(&env, &spec_v2);
-        let mut args: SorobanVec<Val> = soroban_sdk::vec![
+        let args: SorobanVec<Val> = soroban_sdk::vec![
             &env,
             agent.into_val(&env),
             question_hash.into_val(&env),
@@ -410,8 +414,7 @@ impl Router {
         let cfg = Self::load_config(&env)?;
         Self::verify_envelope(&env, &cfg, &spec_v2)?;
         let (resolver, _) = Self::live_wiring(&env, &cfg)?;
-        ResolverClient::new(&env, &resolver).register_spec_v2(&market_id, &spec_v2);
-        Self::assert_rule_kind(&env, &resolver, market_id, &spec_v2)
+        Self::reveal_rule(&env, &resolver, market_id, &spec_v2)
     }
 
     /// Trades `outcome` shares through market-core's `buy_v2`/`sell_v2` and
@@ -644,8 +647,7 @@ impl Router {
             &initial_yes_bps,
         );
 
-        ResolverClient::new(env, &resolver).register_spec_v2(&market_id, spec_v2);
-        Self::assert_rule_kind(env, &resolver, market_id, spec_v2)?;
+        Self::reveal_rule(env, &resolver, market_id, spec_v2)?;
 
         MarketCreatedAndRevealed {
             market_id,
@@ -727,12 +729,7 @@ impl Router {
     /// publish by the same agent makes the registry reject the whole call with
     /// `ChainHeadMismatch`, so a successful read cannot describe a different
     /// publish than the one this invocation just made.
-    fn chain_seq(
-        env: &Env,
-        registry: &Address,
-        author: &Address,
-        chained: bool,
-    ) -> Option<u64> {
+    fn chain_seq(env: &Env, registry: &Address, author: &Address, chained: bool) -> Option<u64> {
         if !chained {
             return None;
         }
@@ -756,6 +753,28 @@ impl Router {
             return Err(Error::DomainMismatch);
         }
         Ok(())
+    }
+
+    /// Reveals `spec_v2` in the resolver and checks the stored kind.
+    ///
+    /// The resolver rejects malformed rules with its own `Error`, and the
+    /// non-`try_` client method panics with that contract error code. The
+    /// router's codes overlap the resolver's (e.g. both have a variant 3), so
+    /// letting the panic escape would misreport the rejection; map it onto
+    /// `InvalidConfig`, which is documented for exactly this case.
+    fn reveal_rule(
+        env: &Env,
+        resolver: &Address,
+        market_id: u64,
+        spec: &ResolutionSpecV2,
+    ) -> Result<(), Error> {
+        if ResolverClient::new(env, resolver)
+            .try_register_spec_v2(&market_id, spec)
+            .is_err()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Self::assert_rule_kind(env, resolver, market_id, spec)
     }
 
     fn live_wiring(env: &Env, cfg: &RouterConfig) -> Result<(Address, Address), Error> {
@@ -791,6 +810,9 @@ impl Router {
             ResolutionSpec::SignersDisputable(_) => RuleKind::SignersDisputable,
             ResolutionSpec::Committee(_) => RuleKind::Committee,
             ResolutionSpec::Hybrid(_) => RuleKind::Hybrid,
+            ResolutionSpec::CategoricalSigners(_) => RuleKind::CategoricalSigners,
+            ResolutionSpec::Scalar(_) => RuleKind::Scalar,
+            ResolutionSpec::HybridV2(_) => RuleKind::HybridV2,
         }
     }
 

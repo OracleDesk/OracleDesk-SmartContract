@@ -358,7 +358,10 @@ fn proof_void_floor_superadditive() {
     let lhs = settle_value(Settlement::Void, a1, b1).unwrap()
         + settle_value(Settlement::Void, a2, b2).unwrap();
     let rhs = settle_upper(Settlement::Void, a1 + a2, b1 + b2).unwrap();
-    assert!(lhs <= rhs, "per-holder floors never exceed the aggregate floor");
+    assert!(
+        lhs <= rhs,
+        "per-holder floors never exceed the aggregate floor"
+    );
     assert!(rhs - lhs <= 1, "and give back at most one unit");
     kani::cover!(rhs - lhs == 1, "two odd claims lose one unit");
 }

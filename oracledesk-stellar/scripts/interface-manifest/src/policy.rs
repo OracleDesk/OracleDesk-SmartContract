@@ -73,6 +73,15 @@ fn git_file(base: &str, path: &str) -> Result<Option<Vec<u8>>, Box<dyn std::erro
         .output()?;
     Ok(out.status.success().then_some(out.stdout))
 }
+
+/// Committed bindings carry a UTF-8 BOM on some packages; serde_json rejects
+/// it, so strip one before parsing regardless of which side of the diff it is.
+fn parse_json<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(bytes)?.trim_start_matches('\u{feff}');
+    Ok(serde_json::from_str(text)?)
+}
 pub fn check(pkg: &Path, base: &str) -> Result<String, Box<dyn std::error::Error>> {
     if !Command::new("git")
         .args(["rev-parse", "--verify", &format!("{base}^{{commit}}")])
@@ -90,9 +99,8 @@ pub fn check(pkg: &Path, base: &str) -> Result<String, Box<dyn std::error::Error
     )?;
     let full = pkg.canonicalize()?;
     let rel = full.strip_prefix(root.trim())?.to_string_lossy();
-    let new: Manifest = serde_json::from_slice(&std::fs::read(full.join("interface.json"))?)?;
-    let new_pkg: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(full.join("package.json"))?)?;
+    let new: Manifest = parse_json(&std::fs::read(full.join("interface.json"))?)?;
+    let new_pkg: serde_json::Value = parse_json(&std::fs::read(full.join("package.json"))?)?;
     let b = Version::parse(new_pkg["version"].as_str().ok_or("Missing version")?)?;
     let changelog = std::fs::read_to_string(full.join("CHANGELOG.md")).unwrap_or_default();
     let Some(bytes) = git_file(base, &format!("{rel}/interface.json"))? else {
@@ -104,11 +112,11 @@ pub fn check(pkg: &Path, base: &str) -> Result<String, Box<dyn std::error::Error
         validate(&initial, &Version::new(0, 0, 0), &b, &changelog)?;
         return Ok(format!("{}: initial ({b})", new.contract));
     };
-    let old: Manifest = serde_json::from_slice(&bytes)?;
+    let old: Manifest = parse_json(&bytes)?;
     if old.schema != new.schema || old.contract != new.contract {
         return Err("Manifest schema/contract mismatch".into());
     }
-    let old_pkg: serde_json::Value = serde_json::from_slice(
+    let old_pkg: serde_json::Value = parse_json(
         &git_file(base, &format!("{rel}/package.json"))?.ok_or("Missing base package.json")?,
     )?;
     let a = Version::parse(old_pkg["version"].as_str().ok_or("Missing old version")?)?;

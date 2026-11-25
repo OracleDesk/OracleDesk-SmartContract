@@ -34,7 +34,7 @@ for ws in "${WORKSPACES[@]}"; do
     errors=$((errors + 1))
     continue
   fi
-  if ! cargo metadata --locked --manifest-path "${abs}/Cargo.toml" --no-deps --format-version 1 > /dev/null 2>&1; then
+  if ! cargo metadata --locked --manifest-path "${abs}/Cargo.toml" --no-deps --format-version 1 >/dev/null 2>&1; then
     echo "STALE: Cargo.lock is out of date for workspace ${ws}" >&2
     echo "  Run: cargo update --manifest-path ${abs}/Cargo.toml" >&2
     errors=$((errors + 1))
@@ -43,7 +43,7 @@ for ws in "${WORKSPACES[@]}"; do
   fi
 done
 
-if (( errors > 0 )); then
+if ((errors > 0)); then
   echo "check-lockfiles: ${errors} workspace(s) failed." >&2
   exit 1
 fi

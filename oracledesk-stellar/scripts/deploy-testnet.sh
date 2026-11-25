@@ -140,6 +140,12 @@ mkdir -p "$(dirname "$OUT")"
 
 json_get() { jq -r "$1 // empty" "$OUT"; }
 
+json_set() {
+  local tmp
+  tmp=$(mktemp)
+  jq "$@" "$OUT" >"$tmp" && mv "$tmp" "$OUT"
+}
+
 json_set_str() {
   local path=$1 val=$2 tmp
   tmp=$(mktemp)
@@ -533,10 +539,15 @@ if [ "$WIRED" != "true" ] || [ "$WIRED_RESOLVER" != "$RESOLVER" ] || [ "$WIRED_T
   if [ "$WIRING_OK" = "1" ]; then
     json_del 'del(.needs_treasury_wiring)'
     json_set_raw ".wired" "true"
+  fi
+else
+  log "market-core already wired to resolver/treasury"
+fi
 # --- optional router ---------------------------------------------------------
 if [ "${DEPLOY_ROUTER:-0}" = "1" ] || [ "${NETWORK}" = "local" ]; then
   ROUTER=$(json_get .contracts.router)
   [ -n "$ROUTER" ] || ROUTER=$(predict_id "$ROUTER_SALT")
+  # shellcheck disable=SC2016  # jq filter: $s is a jq variable, not shell
   json_set --arg s "$ROUTER_SALT" '.salts.router = $s'
   if [ "$(json_get .contracts.router)" = "" ]; then
     log "deploying router at deterministic address $ROUTER"
@@ -553,6 +564,7 @@ if [ "${DEPLOY_ROUTER:-0}" = "1" ] || [ "${NETWORK}" = "local" ]; then
       echo "error: router landed at $DEPLOYED, expected $ROUTER" >&2
       exit 1
     }
+    # shellcheck disable=SC2016  # jq filter: $id is a jq variable, not shell
     json_set --arg id "$ROUTER" '.contracts.router = $id'
   else
     log "router already deployed: $ROUTER"
@@ -729,10 +741,12 @@ json_set_str ".last_deployed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 for contract_name in market_core resolver treasury reasoning_registry; do
   if [ -f "$WASM_DIR/${contract_name}.wasm" ]; then
     wasm_hash=$(sha256sum "$WASM_DIR/${contract_name}.wasm" | awk '{print $1}')
+    # shellcheck disable=SC2016  # jq filter: $k/$h are jq variables, not shell
     json_set --arg k "$contract_name" --arg h "$wasm_hash" '.wasm_sha256[$k] = $h'
   fi
 done
 
+# shellcheck disable=SC2016  # jq filter: $ts is a jq variable, not shell
 json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_deployed_at = $ts'
 
 log "done. Deployment record: $OUT"

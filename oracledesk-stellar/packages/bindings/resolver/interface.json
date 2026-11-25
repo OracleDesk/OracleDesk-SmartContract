@@ -99,6 +99,38 @@
         ]
       }
     },
+    "attest_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical counterpart of `attest`: `signer` attests that `outcome_index` is the winner. `outcome_index` must be below the `outcome_count` the market's commitment fixed. Once `threshold` members have attested an index it becomes the proposal and the dispute window opens.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "signer",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          }
+        ],
+        "name": "attest_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "attest_with_evidence": {
       "kind": "function_v0",
       "spec": {
@@ -176,7 +208,7 @@
     "cancel_proposal": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Guardian action: withdraws an unfinalized signer proposal during the dispute window subject to a rate limit of MAX_CANCELS_PER_MARKET. Works the same for an `Invalid` proposal. Only the proposal is removed: attestations and per-outcome counts stay, so the next attestation that brings any outcome to threshold (for example a further `Yes` once `Yes` already has quorum) proposes again.",
+        "doc": "Guardian action: withdraws an unfinalized signer proposal during the dispute window subject to a rate limit of MAX_CANCELS_PER_MARKET. Works the same for an `Invalid` proposal. Only the proposal is removed: attestations and per-outcome counts stay, so the next attestation that brings any outcome to threshold (for example a further `Yes` once `Yes` already has quorum) proposes again. A categorical market keeps its pending winner in a separate slot, cleared the same way.",
         "inputs": [
           {
             "doc": "",
@@ -248,10 +280,75 @@
         ]
       }
     },
+    "committee_members_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#297: View returning the members and threshold for a committee at a specific epoch, from the `MemberAt` snapshot.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "epoch",
+            "type_": "u32"
+          }
+        ],
+        "name": "committee_members_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "tuple": {
+                  "value_types": [
+                    {
+                      "vec": {
+                        "element_type": "address"
+                      }
+                    },
+                    "u32"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "consent_market_resolver_migrate": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Consent to migrate one market from this resolver to a newly wired resolver. The market-core migration only succeeds while this resolver's address authorizes the market-core call, so this entrypoint provides governance acknowledgement from the resolver admin.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "new_resolver",
+            "type_": "address"
+          }
+        ],
+        "name": "consent_market_resolver_migrate",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "create_committee": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Creates a reusable committee with an admin, member set, threshold, and time-lock delay.",
+        "doc": "Creates a reusable committee with an admin, member set, threshold, and time-lock delay. The named `admin` must authorise creation (#304): without this gate anyone could create a committee claiming any address as its admin, consuming sequential ids and filling instance storage at zero cost beyond fees.",
         "inputs": [
           {
             "doc": "",
@@ -503,7 +600,7 @@
     "expire_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Permissionless liveness fallback: once `resolution_deadline` has passed, anyone may void a market that is still unresolved, so collateral is never locked behind a missing reveal, a dead feed or silent signers. Resolution is preferred over voiding. A price market whose feed is valid right now is *resolved* instead (so a stalled caller can never force a void on a resolvable market), and a market with a pending signer proposal is refused with `ResolutionAvailable` until `finalize_signers` settles it.",
+        "doc": "Permissionless liveness fallback: once `resolution_deadline` has passed, anyone may void a market that is still unresolved, so collateral is never locked behind a missing reveal, a dead feed or silent signers. Resolution is preferred over voiding. A price market whose feed is valid right now is *resolved* instead (so a stalled caller can never force a void on a resolvable market), and a market with a pending signer or categorical proposal is refused with `ResolutionAvailable` until it is finalized.",
         "inputs": [
           {
             "doc": "",
@@ -517,6 +614,28 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "finalize_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical counterpart of `finalize_signers`: once the dispute window of a proposal has passed and its index still has `threshold` attestations, resolves the market in market-core and returns the winning index.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
             }
           }
         ]
@@ -543,6 +662,69 @@
                   "name": "AttestedOutcome"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "finalize_signers_for": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: [`Resolver::finalize_signers`] that pays the market's bounty to `caller`, with the same single-invocation guarantee as [`Resolver::resolve_price_for`].",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_signers_for",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "AttestedOutcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "fund_bounty": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: escrows `amount` of the bounty token for `market_id`. Anyone may fund a market before its `close_time`. An escrow has a single funder (refunds go back to it), so a top-up must come from that same address.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "fund_bounty",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -630,6 +812,34 @@
         ]
       }
     },
+    "market_committee_epoch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#297: View returning the pinned (committee_id, epoch) for a market, or `None` if not yet pinned.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_committee_epoch",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "tuple": {
+                  "value_types": [
+                    "u64",
+                    "u32"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "market_core": {
       "kind": "function_v0",
       "spec": {
@@ -675,6 +885,35 @@
               "value_type": {
                 "udt": {
                   "name": "PendingAdmin"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pin_committee_epoch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#297: Permissionlessly pins the committee epoch for a market to the epoch in force at `close_time`. Can be called by keepers right after close, before any rotation lands. Idempotent: if already pinned, the existing pin is kept. Must not run before close_time.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "pin_committee_epoch",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "tuple": {
+                  "value_types": [
+                    "u64",
+                    "u32"
+                  ]
                 }
               }
             }
@@ -761,6 +1000,64 @@
             "result": {
               "error_type": "error",
               "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "reclaim_bounty": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: returns an unpaid escrow to its funder once the market is final. This covers a market finalized through `resolve_price` or `finalize_signers` rather than their `_for` variants, which would otherwise leave the escrow stranded. Returns the amount refunded.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "reclaim_bounty",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "register_cat_signer_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See `register_price_spec` — same commit/reveal rule, categorical outcome-index committee. Only meaningful for markets whose `resolution_hash` commits to `ResolutionSpec::CategoricalSigners` with this exact `outcome_count`; the reveal target's `resolution_hash` is read from whichever market kind owns the id.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "CatSignerConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_cat_signer_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -859,6 +1156,37 @@
         ]
       }
     },
+    "register_hybrid_v2_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Registers a hybrid V2 resolution specification (price feed with richer fallback). Unlike `register_hybrid_spec`, the fallback can be a committee or a weighted-key group, not only bare signers (issue #314).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "HybridConfigV2"
+              }
+            }
+          }
+        ],
+        "name": "register_hybrid_v2_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "register_price_spec": {
       "kind": "function_v0",
       "spec": {
@@ -880,6 +1208,37 @@
           }
         ],
         "name": "register_price_spec",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "register_scalar_spec": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "See `register_price_spec` — same commit/reveal rule, scalar mode: the market settles fractionally from the feed price clamped into `[lower, upper]` (see `resolve_scalar_price`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "spec",
+            "type_": {
+              "udt": {
+                "name": "ScalarPriceConfig"
+              }
+            }
+          }
+        ],
+        "name": "register_scalar_spec",
         "outputs": [
           {
             "result": {
@@ -1048,7 +1407,7 @@
     "resolution_deadline": {
       "kind": "function_v0",
       "spec": {
-        "doc": "When `expire_market` becomes callable for `market_id`: `close_time` plus [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it is known before (and without) a spec reveal.",
+        "doc": "When `expire_market` becomes callable for `market_id`: `close_time` plus [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it is known before (and without) a spec reveal, for either market kind.",
         "inputs": [
           {
             "doc": "",
@@ -1093,6 +1452,59 @@
         ]
       }
     },
+    "resolve_price_for": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: [`Resolver::resolve_price`] that pays the market's bounty to `caller`. The payout happens in the same invocation that makes the market final, so a call that fails also pays nothing.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolve_price_for",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Outcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "resolve_scalar_price": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Resolves a scalar market from its Reflector feed. The reading is clamped into the committed `[lower, upper]` range and settled as the fractional LONG payout `(clamped - lower) / (upper - lower)` in bps (SHORT pays the complement). Returns the payout. A non-positive reading is `InvalidPrice` rather than a clamp: it means the feed is broken, not that the value sits at the bottom of the range. Same close-time, staleness and terminal-state rules as `resolve_price`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolve_scalar_price",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
     "resolve_twap": {
       "kind": "function_v0",
       "spec": {
@@ -1114,6 +1526,53 @@
                   "name": "Outcome"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "rule_kind": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "rule_kind",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "RuleKind"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "set_bounty_token": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: records the token that resolution bounties are escrowed in. It must be market-core's collateral token, so bounties and market collateral share one asset. Because the only accepted value is the collateral address, this setter cannot repoint existing escrow at a different token, and no entrypoint lets an admin withdraw escrow.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          }
+        ],
+        "name": "set_bounty_token",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -1438,6 +1897,40 @@
         "name": "AttestedOutcome"
       }
     },
+    "CatSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Categorical counterpart of [`SignerConfig`]: signers attest an outcome *index* of a categorical market instead of Yes/No. `outcome_count` binds the market's outcome set to the commitment (2..=8, mirroring market-core's cap), so a reveal cannot silently change how many outcomes signers are voting on.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CatSignerConfig"
+      }
+    },
     "Committee": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1625,6 +2118,12 @@
           },
           {
             "void_v0": {
+              "doc": "Scalar counterpart of `Price` (appended).",
+              "name": "Scalar"
+            }
+          },
+          {
+            "void_v0": {
               "doc": "",
               "name": "Signers"
             }
@@ -1639,6 +2138,55 @@
         "doc": "Which resolution path a market was on when it expired.",
         "lib": "",
         "name": "ExpiryMode"
+      }
+    },
+    "FallbackAuthority": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "A committee registered in the resolver's registry.",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "A simple threshold of well-known signers.",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "An explicit set of pubkeys with per-key weights.",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "Richer fallback authority for `HybridV2`: any attested resolution mode that can produce a quorum, not just bare signers. Variants are intentionally additive and appended after `Signers` so that existing discriminant positions are stable (Soroban encodes as positional).",
+        "lib": "",
+        "name": "FallbackAuthority"
       }
     },
     "GuardianActionKind": {
@@ -1728,6 +2276,39 @@
         ],
         "lib": "",
         "name": "HybridConfig"
+      }
+    },
+    "HybridConfigV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Extended hybrid mode: price feed first, falling back to any attested authority after `fallback_after` seconds past `close_time`. A separate struct (not an in-place update to `HybridConfig`) because `HybridConfig` is consensus-critical — existing commitment hashes must continue to verify.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "FallbackAuthority"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfigV2"
       }
     },
     "OracleAsset": {
@@ -1932,6 +2513,19 @@
         "cases": [
           {
             "tuple_v0": {
+              "doc": "Categorical counterpart of `Signers` (appended, tag 7, after `HybridV2` so develop's deployed discriminants never move).",
+              "name": "CategoricalSigners",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CatSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
               "doc": "",
               "name": "Committee",
               "type_": [
@@ -1958,12 +2552,38 @@
           },
           {
             "tuple_v0": {
+              "doc": "Extended hybrid with richer fallback authority (issue #314). Appended last to preserve discriminant positions of existing variants.",
+              "name": "HybridV2",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfigV2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
               "doc": "",
               "name": "Price",
               "type_": [
                 {
                   "udt": {
                     "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "Scalar counterpart of `Price` (appended, tag 8): the binary pool settles at a fractional LONG payout instead of a side.",
+              "name": "Scalar",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "ScalarPriceConfig"
                   }
                 }
               ]
@@ -2113,6 +2733,121 @@
         "name": "ResolutionState"
       }
     },
+    "RuleKind": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "Appended last: `RuleKind` crosses the resolver→treasury/router boundary, so new variants must keep the existing discriminants stable.",
+              "name": "CategoricalSigners"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Committee"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Hybrid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HybridV2"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Price"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Scalar"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ScaledPrice"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Signers"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "SignersDisputable"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Twap"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WeightedKeys"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "RuleKind"
+      }
+    },
+    "ScalarPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Scalar (range) counterpart of [`PriceConfig`]. The market settles on the fractional position of `price` inside `[lower, upper]`: `payout_long_bps = (clamped_price - lower) / (upper - lower)`, and the SHORT side pays the complement. A reading below the range clamps to `lower` (LONG pays 0), above to `upper` (LONG pays 1.0); a non-positive reading is an invalid price, never a clamp.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "Bottom of the staked range. Validated `0 <= lower < upper`, with `upper` capped so `upper * BPS` cannot overflow.",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ScalarPriceConfig"
+      }
+    },
     "ScaledPriceConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2210,6 +2945,12 @@
             "void_v0": {
               "doc": "A hybrid price-then-signers market, before and after its fallback opens.",
               "name": "Hybrid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Extended hybrid with committee or weighted-key fallback (issue #314).",
+              "name": "HybridV2"
             }
           },
           {
@@ -2452,6 +3193,26 @@
             "value": 17
           },
           {
+            "doc": "#149: a market's escrow has one funder; any other address can neither top it up nor reclaim it.",
+            "name": "BountyFunderMismatch",
+            "value": 47
+          },
+          {
+            "doc": "#149: bounties are funded only before the market's `close_time`.",
+            "name": "BountyFundingClosed",
+            "value": 46
+          },
+          {
+            "doc": "#149: a bounty can be reclaimed only once the market is final.",
+            "name": "BountyNotFinal",
+            "value": 49
+          },
+          {
+            "doc": "#149: a bounty operation ran before `set_bounty_token`.",
+            "name": "BountyTokenNotSet",
+            "value": 44
+          },
+          {
             "doc": "",
             "name": "CommitteeNotFound",
             "value": 26
@@ -2532,9 +3293,19 @@
             "value": 39
           },
           {
+            "doc": "#149: bounty amounts must be positive.",
+            "name": "InvalidBounty",
+            "value": 45
+          },
+          {
             "doc": "",
             "name": "InvalidConfig",
             "value": 3
+          },
+          {
+            "doc": "`attest_cat` outcome index not below the committed `outcome_count`. Renumbered after develop's #149 bounty codes claimed 44..=49.",
+            "name": "InvalidOutcomeIndex",
+            "value": 50
           },
           {
             "doc": "",
@@ -2549,62 +3320,62 @@
           {
             "doc": "",
             "name": "MarketCoreAlreadyClaimed",
-            "value": 1049
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreCallFailed",
-            "value": 1042
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreInsufficientLiquidity",
-            "value": 1047
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreInsufficientShares",
-            "value": 1048
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreInvalidAmount",
-            "value": 1051
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreMarketClosed",
-            "value": 1046
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreMarketNotFound",
-            "value": 1043
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreMarketNotOpen",
-            "value": 1045
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreNotFinal",
-            "value": 1044
-          },
-          {
-            "doc": "",
-            "name": "MarketCoreNothingToRedeem",
             "value": 1050
           },
           {
             "doc": "",
-            "name": "MarketCoreOverflow",
+            "name": "MarketCoreCallFailed",
+            "value": 1055
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientLiquidity",
+            "value": 1048
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientShares",
+            "value": 1049
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInvalidAmount",
             "value": 1052
           },
           {
             "doc": "",
-            "name": "MarketCoreSlippageExceeded",
+            "name": "MarketCoreMarketClosed",
+            "value": 1047
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotFound",
+            "value": 1044
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotOpen",
+            "value": 1046
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNotFinal",
+            "value": 1045
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNothingToRedeem",
+            "value": 1051
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreOverflow",
             "value": 1053
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreSlippageExceeded",
+            "value": 1054
           },
           {
             "doc": "",
@@ -2615,6 +3386,11 @@
             "doc": "",
             "name": "MarketNotConfigured",
             "value": 5
+          },
+          {
+            "doc": "#149: no bounty was funded for this market.",
+            "name": "NoBounty",
+            "value": 48
           },
           {
             "doc": "",
@@ -2652,9 +3428,9 @@
             "value": 8
           },
           {
-            "doc": "A reasoning-registry read failed.",
+            "doc": "",
             "name": "RegistryCallFailed",
-            "value": 1054
+            "value": 1056
           },
           {
             "doc": "",
@@ -2840,6 +3616,172 @@
         ]
       }
     },
+    "BountyFunded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: a market's bounty was escrowed (`total` is the escrow after top-up).",
+        "lib": "",
+        "name": "BountyFunded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_funded"
+        ]
+      }
+    },
+    "BountyPaid": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: a market's bounty was paid to the caller that finalized it.",
+        "lib": "",
+        "name": "BountyPaid",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_paid"
+        ]
+      }
+    },
+    "BountyRefunded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: an unpaid bounty went back to its funder.",
+        "lib": "",
+        "name": "BountyRefunded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_refunded"
+        ]
+      }
+    },
+    "CatResolutionFinalized": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Categorical counterpart of `ResolutionFinalized`.",
+        "lib": "",
+        "name": "CatResolutionFinalized",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "finalized_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "cat_resolution_finalized"
+        ]
+      }
+    },
+    "CatResolutionProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Categorical counterpart of `ResolutionProposed`.",
+        "lib": "",
+        "name": "CatResolutionProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "cat_resolution_proposed"
+        ]
+      }
+    },
     "CommitteeCreated": {
       "kind": "event_v0",
       "spec": {
@@ -2879,6 +3821,38 @@
         ],
         "prefix_topics": [
           "committee_created"
+        ]
+      }
+    },
+    "CommitteeEpochPinned": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#297: Emitted when a committee market's epoch is pinned to the epoch in force at close_time, either through the first attestation or through `pin_committee_epoch`.",
+        "lib": "",
+        "name": "CommitteeEpochPinned",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "committee_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "epoch",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "committee_epoch_pinned"
         ]
       }
     },
@@ -3478,6 +4452,44 @@
         ]
       }
     },
+    "ScalarPriceResolution": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "Scalar counterpart of `PriceResolution`: the settled market carries a fractional LONG payout instead of a side.",
+        "lib": "",
+        "name": "ScalarPriceResolution",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "price_timestamp",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout_long_bps",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "scalar_price_resolution"
+        ]
+      }
+    },
     "TwapResolution": {
       "kind": "event_v0",
       "spec": {
@@ -3537,15 +4549,19 @@
     "Outcome": "market-core"
   },
   "hash_critical": [
+    "CatSignerConfig",
     "CommitteeRef",
     "DisputableSignerConfig",
     "Escalation",
+    "FallbackAuthority",
     "HybridConfig",
+    "HybridConfigV2",
     "OracleAsset",
     "PriceConfig",
     "PriceDirection",
     "ResolutionSpec",
     "ResolutionSpecV2",
+    "ScalarPriceConfig",
     "SignerConfig",
     "WeightedKey",
     "WeightedKeyConfig"

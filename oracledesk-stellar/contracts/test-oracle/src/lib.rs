@@ -300,7 +300,7 @@ impl TestOracle {
 
     fn validate_timestamp(env: &Env, timestamp: u64) -> Result<(), Error> {
         let res = Self::resolution_u64(env);
-        if timestamp % res != 0 {
+        if !timestamp.is_multiple_of(res) {
             return Err(Error::MisalignedTimestamp);
         }
         if timestamp > env.ledger().timestamp() {

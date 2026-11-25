@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use integration_tests::world::{World, MARKET_CLOSE, USDC};
-use integration_tests::{market_core, resolver};
+use integration_tests::{market_core, reasoning_registry::TraceAction, resolver};
 use market_core::Outcome as CoreOutcome;
 use proptest::prelude::*;
 use resolver::AttestedOutcome;
@@ -350,9 +350,9 @@ impl Harness {
             }
         }
         self.w.env.set_auths(&[]);
-        // The signer spec uses a one-second dispute window, so finalize runs
-        // one ledger second after the attestations land.
-        self.w.set_time(time + 1);
+        // The signer spec's dispute window is the protocol minimum, so
+        // finalize runs that many ledger seconds after the attestations land.
+        self.w.set_time(time + 60);
         self.w
             .resolver
             .try_finalize_signers(&id)
@@ -425,7 +425,7 @@ impl Harness {
             return false;
         };
         self.w.set_time(time);
-        let action = String::from_str(&self.w.env, "buy");
+        let action = TraceAction::Buy;
         let hash = BytesN::from_array(&self.w.env, &[3u8; 32]);
         let cid = String::from_str(&self.w.env, "ipfs://model");
         let args = (
@@ -461,6 +461,7 @@ impl Harness {
                 market_core::MarketStatus::Open => "open",
                 market_core::MarketStatus::Resolved(CoreOutcome::Yes) => "resolved_yes",
                 market_core::MarketStatus::Resolved(CoreOutcome::No) => "resolved_no",
+                market_core::MarketStatus::ResolvedScalar(_) => "resolved_scalar",
                 market_core::MarketStatus::Void => "void",
             };
             json!({
@@ -522,7 +523,10 @@ fn signer_spec(
     let native = resolver_native::SignerConfig {
         signers: soroban_sdk::Vec::from_array(env, [a.clone(), b.clone()]),
         threshold: 2,
-        dispute_window: 1,
+        // The protocol floor (`bounds::MIN_WINDOW_SECS`); the model finalizes
+        // inside `resolve`, so the harness waits exactly this long before
+        // calling `finalize_signers`.
+        dispute_window: 60,
     };
     let imported = resolver::SignerConfig {
         signers: native.signers.clone(),
