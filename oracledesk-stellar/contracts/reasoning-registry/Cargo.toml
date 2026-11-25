@@ -9,6 +9,9 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+# Shared storage-TTL policy (issue #371); types-only crate, so it cannot
+# reintroduce the __constructor collision (ADR 0002).
+oracledesk-types = { path = "../oracledesk-types" }
 soroban-sdk = { version = "=27.0.6", features = ["experimental_spec_shaking_v2"] }
 
 [dev-dependencies]
