@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.3.0
+
+- Regenerated from source; the committed bindings had drifted from the
+  contract (functions, types and errors already changed on `develop` now
+  appear), which is part of why this is a breaking release.
+- #320: per-core accounting and legacy core retirement. New entrypoints
+  `settle_market_on`, `init_core_accounting`, `retire_core`, `sweep_retired`;
+  views `core_status`, `known_cores`, `unattributed_net`,
+  `core_accounting_initialized`, `realized_on`, `market_pnl_on`; type
+  `CoreAccounting`; errors `CoreRetired` (79), `AccountingNotInitialized`
+  (80), `CoreNotDrained` (81), `CoreIsCurrent` (82), `TooManyCores` (87),
+  `CoreNotRetired` (88); events `CoreRetired`, `RetiredSweep`,
+  `IndexEntryDropped`, `CoreAccountingInitialized`.
+
+Breaking interface changes (from `interface-manifest check`):
+
+- fn agent_create_market_collateral: removed
+- fn allowed: removed
+- fn available_capital_of: removed
+- fn bucket_exposure: removed
+- fn cancel_correlation_caps: removed
+- fn cancel_op: removed
+- fn cancel_resolvability_policy: removed
+- fn category_exposure: removed
+- fn correlation_caps: removed
+- fn correlation_headroom: removed
+- fn declare_emergency: removed
+- fn deposit_token: removed
+- fn end_emergency: removed
+- fn execute_correlation_caps: removed
+- fn execute_op: removed
+- fn execute_resolvability_policy: removed
+- fn exit_floor: removed
+- fn get_resolvability_policy: removed
+- fn mode: removed
+- fn mode_state: removed
+- fn pause: removed
+- fn pending_correlation_caps: removed
+- fn pending_op: removed
+- fn pending_resolvability_policy: removed
+- fn propose_correlation_caps: removed
+- fn propose_op: removed
+- fn resume_agents: removed
+- fn set_default_exit_floor: removed
+- fn set_exit_floor: removed
+- fn set_mode: removed
+- fn set_resolvability_policy: removed
+- fn set_successor: removed
+- fn set_token_caps: removed
+- fn set_unwinder: removed
+- fn token_caps: removed
+- fn unpause: removed
+- fn unwinder: removed
+- fn unwound: removed
+- type AdminOp: removed
+- type CorrelationCaps: removed
+- type MarkRecord: definition changed
+- type Mode: removed
+- type ModeState: removed
+- type Op: removed
+- type PendingAdminOp: removed
+- type PendingCorrelation: removed
+- type PendingResolvability: removed
+- type ResolvabilityPolicy: removed
+- type TokenCaps: removed
+- error Error: definition changed
+- event AdminOpCancelled: removed
+- event AdminOpExecuted: removed
+- event AdminOpProposed: removed
+- event CorrelatedExposureUpdated: removed
+- event CorrelationCapsCancelled: removed
+- event CorrelationCapsExecuted: removed
+- event CorrelationCapsProposed: removed
+- event DrawdownConfigSet: removed
+- event ExitFloorSet: removed
+- event MarketMigrated: removed
+- event ModeChanged: removed
+- event ResolvabilityPolicyCancelled: removed
+- event ResolvabilityPolicyProposed: removed
+- event ResolvabilityPolicySet: removed
+- event SuccessorSet: removed
+- event TokenDeposited: removed
+- event UnwindSell: removed
+
 ## 0.2.0
 
 Operating-mode state machine (#272) and on-chain resolvability policy (#273).

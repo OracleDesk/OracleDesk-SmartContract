@@ -40,7 +40,7 @@ fn setup() -> Fx {
     soroban_sdk::token::StellarAssetClient::new(&env, &collateral.address())
         .mint(&creator, &(50_000 * 10_000_000_i128));
     let mc_id = env.register(
-        market_core::WASM,
+        market_core::MarketCore,
         (
             admin.clone(),
             collateral.address(),
@@ -227,7 +227,9 @@ fn index_never_shorter_than_newest_trace() {
     let fx = setup();
     let mut ids = std::vec::Vec::new();
     for seed in 0..3u8 {
-        ids.push(publish(&fx, 1, TraceAction::Buy, seed));
+        // #322: Skip is valid in any market state; a Buy would be rejected
+        // once the 25-day steps pass the market's close.
+        ids.push(publish(&fx, 1, TraceAction::Skip, seed));
         // Stay inside the instance window; each publish re-bumps it.
         advance(&fx.env, 25 * ttl::DAY_SECS);
     }
@@ -241,10 +243,10 @@ fn index_never_shorter_than_newest_trace() {
     for key in [
         DataKey::MarketTraceCount(1),
         DataKey::AgentTraceCount(fx.agent.clone()),
-        DataKey::MarketActionTraceCount(1, TraceAction::Buy),
+        DataKey::MarketActionTraceCount(1, TraceAction::Skip),
         DataKey::MarketTrace(1, 2),
         DataKey::AgentTraceAt(fx.agent.clone(), 2),
-        DataKey::MarketActionTraceAt(1, TraceAction::Buy, 2),
+        DataKey::MarketActionTraceAt(1, TraceAction::Skip, 2),
     ] {
         assert!(
             ttl_of(&fx, &key) >= newest_ttl,
@@ -253,7 +255,7 @@ fn index_never_shorter_than_newest_trace() {
     }
     // An index keeps the longer TTL when a later trace has an earlier close.
     let long_ttl = ttl_of(&fx, &DataKey::AgentTraceCount(fx.agent.clone()));
-    publish(&fx, 0, TraceAction::Buy, 9);
+    publish(&fx, 0, TraceAction::Skip, 9);
     assert!(ttl_of(&fx, &DataKey::AgentTraceCount(fx.agent.clone())) >= long_ttl - 1);
 }
 

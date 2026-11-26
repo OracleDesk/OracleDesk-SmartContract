@@ -11,6 +11,11 @@
             "doc": "",
             "name": "admin",
             "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_core",
+            "type_": "address"
           }
         ],
         "name": "__constructor",
@@ -23,6 +28,57 @@
         "doc": "",
         "inputs": [],
         "name": "accept_admin",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "action_grace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Current post-close grace window for Buy/Sell traces, in seconds.",
+        "inputs": [],
+        "name": "action_grace",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "add_signing_key": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proof_sig",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          }
+        ],
+        "name": "add_signing_key",
         "outputs": [
           {
             "result": {
@@ -49,6 +105,95 @@
         ]
       }
     },
+    "affected_traces": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#299: Paged list of affected trace ids starting from the first trace published at or after `compromised_since`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "compromised_since",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "page_start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "affected_traces",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "vec": {
+                  "element_type": "u64"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "agent_batch_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_batch_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "agent_batch_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "agent_batch_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
     "agent_chain_head": {
       "kind": "function_v0",
       "spec": {
@@ -70,7 +215,7 @@
         ]
       }
     },
-    "agent_trace_at": {
+    "agent_chain_trace_at": {
       "kind": "function_v0",
       "spec": {
         "doc": "Trace id at position `seq` (1-based) of `agent`'s chain.",
@@ -86,6 +231,33 @@
             "type_": "u64"
           }
         ],
+        "name": "agent_chain_trace_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "agent_trace_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The `index`-th (0-based, publish order) trace id for `agent` (#57).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u64"
+          }
+        ],
         "name": "agent_trace_at",
         "outputs": [
           {
@@ -94,6 +266,34 @@
               "ok_type": "u64"
             }
           }
+        ]
+      }
+    },
+    "agent_trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Number of traces published by `agent` (#57).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "agent_trace_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "batch_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "batch_count",
+        "outputs": [
+          "u64"
         ]
       }
     },
@@ -108,6 +308,59 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "compute_merkle_root": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "proof",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "bytes_n": {
+                    "n": 32
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "compute_merkle_root",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "bytes_n": {
+                  "n": 32
+                }
+              }
             }
           }
         ]
@@ -144,10 +397,222 @@
         ]
       }
     },
-    "get_trace": {
+    "extend_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Extends an agent's `Identity` entries (registration, chain head, signing keys and up to `retention::MAX_EXTEND_KEY_HISTORY` history records) to the long-lived target. A no-op for unknown agents.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "extend_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "extend_index": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Extends index entries `[from, to)` (clamped to the index length) and the index's count to at least the target of each referenced trace. At most `retention::MAX_EXTEND_INDEX` entries per call.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "key",
+            "type_": {
+              "udt": {
+                "name": "IndexKey"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "u64"
+          }
+        ],
+        "name": "extend_index",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "extend_traces": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Extends every key of each trace (the trace plus its side keys) to its retention target. At most `retention::MAX_EXTEND_TRACES` ids; unknown ids are skipped. Returns the number of entries extended. Also bumps the instance, so archivist traffic alone keeps the contract live.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "extend_traces",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "flag_trace": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "flag_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "get_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "get_agent",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "AgentRecord"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_batch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "batch_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_batch",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TraceBatch"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_key_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "get_key_agent",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "address"
+            }
+          }
+        ]
+      }
+    },
+    "get_signing_keys": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pure read (#329): views never extend TTL.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "get_signing_keys",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": {
+                "bytes_n": {
+                  "n": 32
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Pure read (#329): views never extend TTL, so simulations have a read-only footprint. Retention comes from write-time targets and the archivist entrypoints (`extend_traces`).",
         "inputs": [
           {
             "doc": "",
@@ -163,6 +628,31 @@
               "ok_type": {
                 "udt": {
                   "name": "Trace"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "get_trace_flag": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_trace_flag",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "TraceFlag"
                 }
               }
             }
@@ -216,6 +706,42 @@
         ]
       }
     },
+    "get_trace_signature": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_trace_signature",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "tuple": {
+                  "value_types": [
+                    {
+                      "bytes_n": {
+                        "n": 32
+                      }
+                    },
+                    {
+                      "bytes_n": {
+                        "n": 64
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "is_consumed": {
       "kind": "function_v0",
       "spec": {
@@ -253,7 +779,7 @@
     "is_registered": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Read-only view: no TTL writes, so an indexer's simulation stays cheap. The `Agent` entry is refreshed by `register_agent`/`publish_trace`.",
         "inputs": [
           {
             "doc": "",
@@ -264,6 +790,177 @@
         "name": "is_registered",
         "outputs": [
           "bool"
+        ]
+      }
+    },
+    "is_trace_late": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Whether a Buy/Sell trace was published after its market's close.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "is_trace_late",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "key_affected_from": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#299: Binary search for the first trace index whose `published_at >= compromised_since`. Returns the index, or `total` if none qualify.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "compromised_since",
+            "type_": "u64"
+          }
+        ],
+        "name": "key_affected_from",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "key_trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#299: Number of traces a key has signed (length of the per-key index).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "key_trace_count",
+        "outputs": [
+          "u64"
+        ]
+      }
+    },
+    "key_traces": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#299: Paged list of trace ids a key has signed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "key_traces",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "vec": {
+                  "element_type": "u64"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "market_action_trace_at": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The `index`-th (0-based, publish order) trace id for `(market_id, action)` (#57).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u64"
+          }
+        ],
+        "name": "market_action_trace_at",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "market_action_trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Number of traces for the `(market_id, action)` pair (#57).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          }
+        ],
+        "name": "market_action_trace_count",
+        "outputs": [
+          "u64"
         ]
       }
     },
@@ -308,6 +1005,46 @@
         "name": "market_trace_count",
         "outputs": [
           "u64"
+        ]
+      }
+    },
+    "other_action_rule": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The market rule of an allow-listed `Other(sym)` action.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "sym",
+            "type_": "symbol"
+          }
+        ],
+        "name": "other_action_rule",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "OtherRule"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "other_actions": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Every allow-listed `Other` symbol.",
+        "inputs": [],
+        "name": "other_actions",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": "symbol"
+            }
+          }
         ]
       }
     },
@@ -370,7 +1107,11 @@
           {
             "doc": "",
             "name": "action",
-            "type_": "string"
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
           },
           {
             "doc": "",
@@ -412,6 +1153,88 @@
         ]
       }
     },
+    "publish_chained_trace_signed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "expected_seq",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "prev_trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          }
+        ],
+        "name": "publish_chained_trace_signed",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "publish_trace": {
       "kind": "function_v0",
       "spec": {
@@ -430,7 +1253,11 @@
           {
             "doc": "",
             "name": "action",
-            "type_": "string"
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
           },
           {
             "doc": "",
@@ -453,6 +1280,137 @@
             "result": {
               "error_type": "error",
               "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "publish_trace_batch": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Anchors a Merkle batch of N traces off-chain, storing only the 32-byte root and manifest CID on-chain (#54).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "root",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "manifest_cid",
+            "type_": "string"
+          }
+        ],
+        "name": "publish_trace_batch",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "publish_trace_signed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ipfs_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "signature",
+            "type_": {
+              "bytes_n": {
+                "n": 64
+              }
+            }
+          }
+        ],
+        "name": "publish_trace_signed",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "reactivate_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "reactivate_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -502,14 +1460,526 @@
         ]
       }
     },
-    "trace_count": {
+    "retire_agent": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "retire_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "retire_self": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "retire_self",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "retire_signing_key": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "retire_signing_key",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "revoke_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "effective_from",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "revoke_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "revoke_signing_key": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Revokes a signing key retroactively. Verdicts for traces the key signed at or after `compromised_since` flip to `KeyCompromised`. Callable by the agent or the registry admin, including for retired or revoked agents. Revocation is permanent; `compromised_since` can only move earlier on a subsequent call.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "compromised_since",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "revoke_signing_key",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_action_grace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the post-close grace window for Buy/Sell traces (issue #322), at most [`MAX_ACTION_GRACE_SECS`]. Admin only.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "secs",
+            "type_": "u64"
+          }
+        ],
+        "name": "set_action_grace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_other_action": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Adds, changes (`Some`) or removes (`None`) an allow-listed `Other(sym)` action (issue #322). At most [`MAX_OTHER_ACTIONS`] symbols; canonical action names are refused. Admin only. Applies at publish time only, so existing traces are untouched.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "sym",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "name": "rule",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "OtherRule"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "set_other_action",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "signature_verdict": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#299: Returns the signature-level verdict for a trace, independent of hash/flag/agent checks. Uses a constant number of reads.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "signature_verdict",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "SignatureVerdict"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "signing_key_history": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "signing_key_history",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "vec": {
+                  "element_type": {
+                    "udt": {
+                      "name": "SigningKeyRecord"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "signing_key_history_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "signing_key_history_count",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
+    "trace_count": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Reads the instance's `NextId`. Pure read (#329): the instance is kept alive by mutating entrypoints (and `extend_traces`), not by views.",
         "inputs": [],
         "name": "trace_count",
         "outputs": [
           "u64"
+        ]
+      }
+    },
+    "trace_flags": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "trace_flags",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "vec": {
+                  "element_type": {
+                    "udt": {
+                      "name": "TraceFlag"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "trace_verdict": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "received_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "name": "trace_verdict",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TraceVerdict"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "traces_by_agent": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "A page of every trace `agent` published, in publish order (#57).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "traces_by_agent",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TracePage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "traces_by_market": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "A page of every trace for `market_id`, starting at `start` (#57). Replaces the `market_trace_count` + `market_trace_at` + `get_trace` loop (101 RPC simulations for 50 traces) with one simulation.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "traces_by_market",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TracePage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "traces_by_market_action": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "A page of every trace for `(market_id, action)`, in publish order (#57) — e.g. every `Buy` decision on market 7.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "action",
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "traces_by_market_action",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "TracePage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "unflag_trace": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "unflag_trace",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
         ]
       }
     },
@@ -626,9 +2096,139 @@
           }
         ]
       }
+    },
+    "verify_trace_inclusion": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "batch_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "proof",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "bytes_n": {
+                    "n": 32
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "name": "verify_trace_inclusion",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "bool"
+            }
+          }
+        ]
+      }
+    },
+    "verify_trace_signature": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "verify_trace_signature",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "bool"
+            }
+          }
+        ]
+      }
     }
   },
   "types": {
+    "AgentRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "registered_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "AgentStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "AgentRecord"
+      }
+    },
+    "AgentStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Active"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Retired",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Revoked",
+              "type_": [
+                "u64",
+                "symbol"
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "AgentStatus"
+      }
+    },
     "ChainHead": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -686,19 +2286,13 @@
         "name": "ChainLink"
       }
     },
-    "DataKey": {
+    "IndexKey": {
       "kind": "udt_union_v0",
       "spec": {
         "cases": [
           {
-            "void_v0": {
-              "doc": "",
-              "name": "Admin"
-            }
-          },
-          {
             "tuple_v0": {
-              "doc": "",
+              "doc": "`AgentTraceAt(agent, i)` / `AgentTraceCount(agent)`.",
               "name": "Agent",
               "type_": [
                 "address"
@@ -707,27 +2301,8 @@
           },
           {
             "tuple_v0": {
-              "doc": "Per-agent hash-chain head (#52).",
-              "name": "AgentHead",
-              "type_": [
-                "address"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "Per-agent `seq -> trace_id` (#52).",
-              "name": "AgentTrace",
-              "type_": [
-                "address",
-                "u64"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "Set once a trace has backed an action (#50).",
-              "name": "Consumed",
+              "doc": "`MarketTrace(market_id, i)` / `MarketTraceCount(market_id)`.",
+              "name": "Market",
               "type_": [
                 "u64"
               ]
@@ -735,75 +2310,50 @@
           },
           {
             "tuple_v0": {
-              "doc": "Contracts allowed to call `consume_trace` (#50).",
-              "name": "Consumer",
-              "type_": [
-                "address"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "",
-              "name": "MarketTrace",
+              "doc": "`MarketActionTraceAt(market_id, action, i)` / its count.",
+              "name": "MarketAction",
               "type_": [
                 "u64",
-                "u64"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "Number of traces published for a market, so a client can page through `MarketTrace(market_id, 0..count)` without the contract ever holding an unbounded Vec of trace ids in one storage entry.",
-              "name": "MarketTraceCount",
-              "type_": [
-                "u64"
-              ]
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "NextId"
-            }
-          },
-          {
-            "void_v0": {
-              "doc": "",
-              "name": "PendingAdmin"
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "",
-              "name": "Trace",
-              "type_": [
-                "u64"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "Ledger sequence a trace was written in (#50). Kept beside `Trace` rather than inside it so the `Trace` XDR shape doesn't change.",
-              "name": "TraceLedger",
-              "type_": [
-                "u64"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "`trace_id -> ChainLink`; absent for legacy traces (#52).",
-              "name": "TraceLink",
-              "type_": [
-                "u64"
+                {
+                  "udt": {
+                    "name": "TraceAction"
+                  }
+                }
               ]
             }
           }
         ],
-        "doc": "",
+        "doc": "Which secondary index `extend_index` walks (#329).",
         "lib": "",
-        "name": "DataKey"
+        "name": "IndexKey"
+      }
+    },
+    "OtherRule": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "Either.",
+              "name": "Any"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Must reference an existing market.",
+              "name": "MarketOnly"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Must use `NO_MARKET`.",
+              "name": "NoMarketOnly"
+            }
+          }
+        ],
+        "doc": "Market rule of an allow-listed `TraceAction::Other(Symbol)` (issue #322).",
+        "lib": "",
+        "name": "OtherRule"
       }
     },
     "PendingAdmin": {
@@ -826,6 +2376,76 @@
         "name": "PendingAdmin"
       }
     },
+    "SignatureVerdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "KeyCompromised",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotSigned"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Valid"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "WrongAgent"
+            }
+          }
+        ],
+        "doc": "#299: Verdict for a trace's signature alone (independent of hash/flag/agent).",
+        "lib": "",
+        "name": "SignatureVerdict"
+      }
+    },
+    "SigningKeyRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "added_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "retired_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "SigningKeyRecord"
+      }
+    },
     "Trace": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -834,7 +2454,11 @@
           {
             "doc": "",
             "name": "action",
-            "type_": "string"
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
           },
           {
             "doc": "",
@@ -869,6 +2493,249 @@
         "lib": "",
         "name": "Trace"
       }
+    },
+    "TraceAction": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Buy"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ClaimRemainder"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "CreateMarket"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Other",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "ProposeMarket"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Redeem"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Resolve"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Sell"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Skip"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TraceAction"
+      }
+    },
+    "TraceBatch": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "manifest_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "published_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "root",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TraceBatch"
+      }
+    },
+    "TraceFlag": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "active",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "flagged_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "lib": "",
+        "name": "TraceFlag"
+      }
+    },
+    "TracePage": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "A page of traces returned by one simulation, plus the cursor to fetch the next page (#57). `next == total` means the caller has seen everything.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "entries",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "TracePageEntry"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Index of the first entry the *next* page would return.",
+            "name": "next",
+            "type_": "u64"
+          },
+          {
+            "doc": "Total entries in this index at read time.",
+            "name": "total",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "TracePage"
+      }
+    },
+    "TracePageEntry": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One `(trace_id, Trace)` pair in a [`TracePage`].",
+        "fields": [
+          {
+            "doc": "",
+            "name": "trace",
+            "type_": {
+              "udt": {
+                "name": "Trace"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "TracePageEntry"
+      }
+    },
+    "TraceVerdict": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "AgentRevokedAfter",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Flagged",
+              "type_": [
+                "symbol"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "HashMismatch"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "#299: The signing key was retroactively revoked; traces signed at or after `compromised_since` are tainted.",
+              "name": "KeyCompromised",
+              "type_": [
+                "u64"
+              ]
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "#322: a Buy/Sell trace published after the market's `close_time`, inside the grace window. Only reported when the hash matches and no flag, revocation or key compromise applies.",
+              "name": "Late"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Valid"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TraceVerdict"
+      }
     }
   },
   "errors": {
@@ -878,63 +2745,283 @@
         "cases": [
           {
             "doc": "",
+            "name": "ActionTooLong",
+            "value": 3029
+          },
+          {
+            "doc": "",
             "name": "AgentAlreadyRegistered",
-            "value": 3
+            "value": 3003
+          },
+          {
+            "doc": "",
+            "name": "AgentNotActive",
+            "value": 3028
           },
           {
             "doc": "",
             "name": "AgentNotRegistered",
-            "value": 4
+            "value": 3004
+          },
+          {
+            "doc": "",
+            "name": "AlreadyRetired",
+            "value": 3037
+          },
+          {
+            "doc": "#299: Key already revoked and `compromised_since` cannot move later.",
+            "name": "AlreadyRevoked",
+            "value": 3048
+          },
+          {
+            "doc": "",
+            "name": "BatchNotFound",
+            "value": 3020
+          },
+          {
+            "doc": "",
+            "name": "CannotReactivateRevoked",
+            "value": 3013
           },
           {
             "doc": "`expected_seq` / `prev_trace_hash` don't extend the agent's chain head (#52).",
             "name": "ChainHeadMismatch",
-            "value": 8
+            "value": 3008
           },
           {
             "doc": "Agent already has a chain, so unchained `publish_trace` is refused (#52).",
             "name": "ChainedAgentMustChain",
-            "value": 9
+            "value": 3009
+          },
+          {
+            "doc": "",
+            "name": "CidTooLong",
+            "value": 3030
+          },
+          {
+            "doc": "`set_default_consumer` or `bind_trace_consumer` called with a consumer the agent has not yet authorised.",
+            "name": "ConsumerGrantRequired",
+            "value": 3045
+          },
+          {
+            "doc": "`consume_trace` called by a consumer the publishing agent never granted.",
+            "name": "ConsumerNotAuthorized",
+            "value": 3043
           },
           {
             "doc": "",
             "name": "EmptyAction",
-            "value": 6
+            "value": 3006
           },
           {
             "doc": "",
             "name": "EmptyCid",
-            "value": 7
+            "value": 3007
+          },
+          {
+            "doc": "",
+            "name": "FlagHistoryFull",
+            "value": 3014
+          },
+          {
+            "doc": "",
+            "name": "InvalidBatch",
+            "value": 3021
+          },
+          {
+            "doc": "",
+            "name": "InvalidEffectiveTime",
+            "value": 3015
+          },
+          {
+            "doc": "",
+            "name": "InvalidKey",
+            "value": 3025
+          },
+          {
+            "doc": "",
+            "name": "InvalidProof",
+            "value": 3022
+          },
+          {
+            "doc": "",
+            "name": "InvalidSignature",
+            "value": 3026
+          },
+          {
+            "doc": "",
+            "name": "KeyAlreadyBound",
+            "value": 3024
+          },
+          {
+            "doc": "The `Other` allow-list is full, or a grace above the maximum.",
+            "name": "LimitExceeded",
+            "value": 3056
+          },
+          {
+            "doc": "Buy/Sell on a market that is not open, or past `close_time + grace`.",
+            "name": "MarketClosed",
+            "value": 3050
+          },
+          {
+            "doc": "Resolve (or CreateMarket after close) at the wrong time.",
+            "name": "MarketNotClosed",
+            "value": 3054
+          },
+          {
+            "doc": "Redeem/ClaimRemainder on a market that is still open.",
+            "name": "MarketNotFinal",
+            "value": 3051
+          },
+          {
+            "doc": "",
+            "name": "MarketRequired",
+            "value": 3017
           },
           {
             "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
             "name": "NoPendingAdmin",
-            "value": 11
+            "value": 3011
           },
           {
             "doc": "",
             "name": "NotInitialized",
-            "value": 1
+            "value": 3001
+          },
+          {
+            "doc": "CreateMarket by an agent that neither created the market nor acts through a registered consumer that did.",
+            "name": "NotMarketCreator",
+            "value": 3052
+          },
+          {
+            "doc": "Resolve by an agent with no role in the market's resolution.",
+            "name": "NotResolutionSigner",
+            "value": 3053
+          },
+          {
+            "doc": "",
+            "name": "NotRetired",
+            "value": 3038
+          },
+          {
+            "doc": "",
+            "name": "PageTooLarge",
+            "value": 3031
           },
           {
             "doc": "A proposed admin handover was not accepted within its `expires_at`.",
             "name": "PendingAdminExpired",
-            "value": 12
+            "value": 3012
+          },
+          {
+            "doc": "",
+            "name": "ProposalMustUseNoMarket",
+            "value": 3018
+          },
+          {
+            "doc": "`grant_consumer_legacy` called after scoping has been enabled.",
+            "name": "ScopingAlreadyEnabled",
+            "value": 3047
+          },
+          {
+            "doc": "",
+            "name": "SigningKeyAlreadyBound",
+            "value": 3041
+          },
+          {
+            "doc": "",
+            "name": "SigningKeyNotFound",
+            "value": 3039
+          },
+          {
+            "doc": "`authorize_consumer` called after agent has reached MAX_AGENT_CONSUMERS.",
+            "name": "TooManyConsumers",
+            "value": 3042
+          },
+          {
+            "doc": "#329: an archivist call asked to extend more entries than one call allows.",
+            "name": "TooManyEntries",
+            "value": 3049
+          },
+          {
+            "doc": "",
+            "name": "TooManyKeys",
+            "value": 3023
+          },
+          {
+            "doc": "",
+            "name": "TooManySigningKeys",
+            "value": 3040
+          },
+          {
+            "doc": "",
+            "name": "TraceAgentMismatch",
+            "value": 3035
+          },
+          {
+            "doc": "`bind_trace_consumer` called on a trace that already has a binding.",
+            "name": "TraceAlreadyBound",
+            "value": 3046
           },
           {
             "doc": "Trace already backed an action (#50).",
             "name": "TraceAlreadyConsumed",
-            "value": 10
+            "value": 3010
+          },
+          {
+            "doc": "`consume_trace` called by a consumer other than the one the trace is bound to.",
+            "name": "TraceBoundElsewhere",
+            "value": 3044
+          },
+          {
+            "doc": "",
+            "name": "TraceDecisionMissing",
+            "value": 3034
+          },
+          {
+            "doc": "",
+            "name": "TraceFlagged",
+            "value": 3032
+          },
+          {
+            "doc": "",
+            "name": "TraceMismatch",
+            "value": 3036
           },
           {
             "doc": "",
             "name": "TraceNotFound",
-            "value": 5
+            "value": 3005
+          },
+          {
+            "doc": "",
+            "name": "TraceNotSigned",
+            "value": 3027
+          },
+          {
+            "doc": "",
+            "name": "TraceTooOld",
+            "value": 3033
           },
           {
             "doc": "",
             "name": "Unauthorized",
-            "value": 2
+            "value": 3002
+          },
+          {
+            "doc": "",
+            "name": "UnknownMarket",
+            "value": 3016
+          },
+          {
+            "doc": "`Other(Symbol)` that is not on the admin allow-list.",
+            "name": "UnknownOtherAction",
+            "value": 3055
+          },
+          {
+            "doc": "",
+            "name": "UseCanonicalAction",
+            "value": 3019
           }
         ],
         "doc": "",
@@ -1003,6 +3090,26 @@
         ]
       }
     },
+    "AgentReactivated": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentReactivated",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "agent_reactivated"
+        ]
+      }
+    },
     "AgentRegistered": {
       "kind": "event_v0",
       "spec": {
@@ -1020,6 +3127,178 @@
         ],
         "prefix_topics": [
           "agent_registered"
+        ]
+      }
+    },
+    "AgentRetired": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentRetired",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "agent_retired"
+        ]
+      }
+    },
+    "AgentRevoked": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentRevoked",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "effective_from",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "prefix_topics": [
+          "agent_revoked"
+        ]
+      }
+    },
+    "AgentSigningKeyAdded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentSigningKeyAdded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "agent_signing_key_added"
+        ]
+      }
+    },
+    "AgentSigningKeyRetired": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentSigningKeyRetired",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "agent_signing_key_retired"
+        ]
+      }
+    },
+    "BatchPublished": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "BatchPublished",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "batch_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "root",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "leaf_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "manifest_cid",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "published_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "batch_published"
         ]
       }
     },
@@ -1060,6 +3339,54 @@
         ],
         "prefix_topics": [
           "consumer_unregistered"
+        ]
+      }
+    },
+    "SigningKeyRevoked": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#299: Emitted when a signing key is retroactively revoked.",
+        "lib": "",
+        "name": "SigningKeyRevoked",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "public_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "compromised_since",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "by_admin",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "signing_key_revoked"
         ]
       }
     },
@@ -1141,6 +3468,32 @@
         ]
       }
     },
+    "TraceFlagged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TraceFlagged",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "prefix_topics": [
+          "trace_flagged"
+        ]
+      }
+    },
     "TracePublished": {
       "kind": "event_v0",
       "spec": {
@@ -1171,7 +3524,11 @@
             "doc": "",
             "location": "data",
             "name": "action",
-            "type_": "string"
+            "type_": {
+              "udt": {
+                "name": "TraceAction"
+              }
+            }
           },
           {
             "doc": "",
@@ -1198,6 +3555,68 @@
         ],
         "prefix_topics": [
           "trace_published"
+        ]
+      }
+    },
+    "TraceSigned": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TraceSigned",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "signing_key",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "trace_signed"
+        ]
+      }
+    },
+    "TraceUnflagged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TraceUnflagged",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "trace_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "prefix_topics": [
+          "trace_unflagged"
         ]
       }
     }

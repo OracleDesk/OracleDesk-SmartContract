@@ -87,6 +87,107 @@ export function fromTraceAction(action: TraceActionType): TraceActionString {
   }
 }
 
+// ── #322 action/state validation ──────────────────────────────────────────
+
+/** Default post-close grace the registry applies to Buy/Sell traces. */
+export const DEFAULT_ACTION_GRACE_SECS = 3_600n;
+
+/**
+ * Registry errors that mean the trace can never be accepted as recorded
+ * (retrying the same trace is pointless). Mirrors the registry `Error` enum.
+ */
+export const TERMINAL_TRACE_ERRORS = {
+  3016: "UnknownMarket",
+  3017: "MarketRequired",
+  3018: "ProposalMustUseNoMarket",
+  3019: "UseCanonicalAction",
+  3050: "MarketClosed",
+  3051: "MarketNotFinal",
+  3052: "NotMarketCreator",
+  3053: "NotResolutionSigner",
+  3054: "MarketNotClosed",
+  3055: "UnknownOtherAction",
+} as const;
+
+export type TraceRejection = (typeof TERMINAL_TRACE_ERRORS)[keyof typeof TERMINAL_TRACE_ERRORS];
+
+/** The registry error a failed publish carries, when it is terminal. */
+export function terminalTraceError(err: unknown): TraceRejection | undefined {
+  const text = err instanceof Error ? `${err.message} ${String((err as { cause?: unknown }).cause ?? "")}` : String(err);
+  for (const [code, name] of Object.entries(TERMINAL_TRACE_ERRORS)) {
+    if (new RegExp(`Error\\(Contract, #${code}\\)|#${code}\\b|\\b${name}\\b`).test(text)) {
+      return name;
+    }
+  }
+  return undefined;
+}
+
+/** What the runtime knows about a market when it validates a trace. */
+export interface MarketStateView {
+  status: "Open" | "Resolved" | "Void";
+  closeTime: bigint;
+  creator?: string;
+}
+
+export type ActionStateResult =
+  | { ok: true; late: boolean }
+  | { ok: false; error: TraceRejection };
+
+/**
+ * Off-chain mirror of the registry's `validate_action_state` table, so the
+ * runtime refuses to queue a trace the registry would reject. Signer
+ * membership for `resolve`, the consumer check for `create_market` and the
+ * `other:` allow-list need chain reads and are left to the registry; pass
+ * `agent`/`consumers` to also check the creator rule.
+ *
+ * | action | requirement |
+ * | --- | --- |
+ * | propose_market | NO_MARKET |
+ * | create_market | creator is the agent or a registered consumer, now <= close |
+ * | buy / sell | Open and now < close + grace (late when now >= close) |
+ * | skip | any state |
+ * | redeem / claim_remainder | not Open |
+ * | resolve | now >= close |
+ */
+export function validateActionState(
+  action: TraceActionString,
+  marketId: bigint,
+  market: MarketStateView | undefined,
+  now: bigint,
+  graceSecs: bigint = DEFAULT_ACTION_GRACE_SECS,
+  opts: { agent?: string; consumers?: readonly string[] } = {},
+): ActionStateResult {
+  const isOther = action.startsWith("other:");
+  if (marketId === NO_MARKET) {
+    return action === "propose_market" || isOther
+      ? { ok: true, late: false }
+      : { ok: false, error: "MarketRequired" };
+  }
+  if (action === "propose_market") return { ok: false, error: "ProposalMustUseNoMarket" };
+  if (!market) return { ok: false, error: "UnknownMarket" };
+  const open = market.status === "Open";
+  switch (action) {
+    case "create_market": {
+      const { agent, consumers } = opts;
+      if (agent && market.creator && market.creator !== agent && !(consumers ?? []).includes(market.creator)) {
+        return { ok: false, error: "NotMarketCreator" };
+      }
+      return now > market.closeTime ? { ok: false, error: "MarketClosed" } : { ok: true, late: false };
+    }
+    case "buy":
+    case "sell":
+      if (!open || now >= market.closeTime + graceSecs) return { ok: false, error: "MarketClosed" };
+      return { ok: true, late: now >= market.closeTime };
+    case "redeem":
+    case "claim_remainder":
+      return open ? { ok: false, error: "MarketNotFinal" } : { ok: true, late: false };
+    case "resolve":
+      return now < market.closeTime ? { ok: false, error: "MarketNotClosed" } : { ok: true, late: false };
+    default:
+      return { ok: true, late: false };
+  }
+}
+
 /** @deprecated Use ReasoningTraceV2 for new traces. V1 traces have no schemaVersion. */
 export interface ReasoningTrace {
   agent: AgentRole;

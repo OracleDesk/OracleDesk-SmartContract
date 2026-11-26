@@ -7,6 +7,7 @@
  * to a typed variant, and events that do not decode, become `Unknown`.
  */
 import type { contract, rpc } from "@stellar/stellar-sdk";
+import { fromTraceAction, type TraceActionType } from "../trace.js";
 
 export type ContractName = "market_core" | "resolver" | "treasury" | "reasoning_registry";
 
@@ -188,7 +189,11 @@ export class EventDecoder {
           traceId: d.trace_id as bigint,
           marketId: d.market_id as bigint,
           agent: d.agent as string,
-          action: String(d.action),
+          // The event carries the `TraceAction` enum, not a string.
+          action:
+            typeof d.action === "object" && d.action !== null && "tag" in d.action
+              ? fromTraceAction(d.action as TraceActionType)
+              : String(d.action),
           traceHash: Buffer.from(d.trace_hash as Uint8Array).toString("hex"),
           ipfsCid: String(d.ipfs_cid),
         };
