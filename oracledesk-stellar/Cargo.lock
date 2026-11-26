@@ -880,6 +880,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -979,6 +985,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "heapless"
@@ -1101,7 +1112,7 @@ dependencies = [
  "soroban-sdk",
  "stellar-xdr",
  "treasury",
- "wasmparser",
+ "wasmparser 0.263.0",
 ]
 
 [[package]]
@@ -1849,7 +1860,7 @@ dependencies = [
  "soroban-wasmi",
  "static_assertions",
  "stellar-xdr",
- "wasmparser",
+ "wasmparser 0.116.1",
 ]
 
 [[package]]
@@ -1896,7 +1907,7 @@ dependencies = [
  "soroban-wasmi",
  "static_assertions",
  "stellar-strkey 0.0.13",
- "wasmparser",
+ "wasmparser 0.116.1",
 ]
 
 [[package]]
@@ -1982,7 +1993,7 @@ dependencies = [
  "sha2",
  "stellar-xdr",
  "thiserror 1.0.69",
- "wasmparser",
+ "wasmparser 0.116.1",
 ]
 
 [[package]]
@@ -2379,6 +2390,19 @@ checksum = "a58e28b80dd8340cb07b8242ae654756161f6fc8d0038123d679b7b99964fa50"
 dependencies = [
  "indexmap 2.14.2",
  "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.263.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f5fa0a054ae153606df820eb0a84213e28cda41bbe04ba2628e71b6ba100fcb"
+dependencies = [
+ "bitflags 2.13.2",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
+ "semver",
+ "serde",
 ]
 
 [[package]]
