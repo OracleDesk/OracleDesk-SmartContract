@@ -15,7 +15,7 @@ market-core = { path = "../market-core" }
 resolver-contract = { package = "resolver", path = "../resolver" }
 reasoning-registry = { path = "../reasoning-registry" }
 wasmparser = "0.116"
-stellar-xdr = { version = "27.0.0", features = ["std"] }
+stellar-xdr = { version = "30.0.0", features = ["std"] }
 proptest = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
