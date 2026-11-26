@@ -368,6 +368,51 @@ and cost basis are valued from the first ledger. Packets are versioned,
 authenticated by the predecessor, and idempotent.
 
 
+### Core switches and retirement (#320)
+
+A market-core moves through three states in a treasury: **current** (the
+`GlobalConfig.market_core`), **legacy** (switched away from by the timelocked
+`execute_config`; `LegacyCore(core) = true`) and **retired** (closed out by
+`retire_core`; irreversible).
+
+- Exposure, net, realized-settlement and PnL keys are namespaced per core for
+  every core except the deployment-time `OriginalCore` (`MarketV2`, `NetV2`,
+  `RealizedV2`, `PnlV2`), so the same market id on two cores never shares
+  state. `Realized(id)`/`Pnl(id)` entries a non-original core wrote before
+  this change cannot be told apart from the original core's; they are not
+  migrated, and `settle_market_on` recomputes settlement from the core's
+  live position and market state.
+- `CoreState(core) -> CoreAccounting { open_index, open_exposures, net,
+  retired }` is maintained on every index, exposure and net write.
+  `KnownCores` lists the live cores (at most 4; retired cores leave it).
+  New treasuries start initialized; one deployed earlier runs the
+  permissionless one-shot `init_core_accounting`, which rebuilds the
+  counters from the open-market index and puts any part of `NetTotal` not
+  attributable to an indexed market into `UnattributedNet` (still counted in
+  the caps, never released by a retirement).
+- `settle_market_on(caller, core, market_id)` is `settle_market` for the
+  current core or any legacy core. A market market-core already finalized
+  (`RedemptionClosed`: residual collateral swept, `Position` entries left
+  behind) counts as settled with nothing left to collect.
+- `retire_core(core)` is permissionless and succeeds only for a legacy,
+  non-current, not yet retired core with no index entries and no open
+  exposures. It subtracts the core's `net` from `NetTotal` (so leftover cost
+  basis of losing positions stops consuming the caps), clears `LegacyCore` so
+  the `legacy_*` entrypoints refuse it, and drops it from `KnownCores`.
+  `execute_config` refuses to switch back to a retired core (`CoreRetired`),
+  so its namespaced keys can never be revived. While the treasury is paused,
+  `retire_core` first drops index entries whose core can no longer be read
+  (a broken wasm that would otherwise fail `nav()` forever), each with an
+  `IndexEntryDropped` event.
+- Stray positions that reach the treasury on a retired core later (through
+  market-core's `transfer_position`/`transfer_lp`) are never indexed
+  (`index_add` refuses retired cores), which understates NAV conservatively.
+  The permissionless `sweep_retired(core, market_id)` redeems one straight
+  into idle without index, net or PnL bookkeeping (`RetiredSweep`).
+- `redeem_many`/`claim_pool_remainders` record returns and proceeds per paid
+  item and, once a market is empty, remove it from the index, mark it settled
+  and close its exposure, so the per-core counters stay exact.
+
 ## Consequences
 
 - Outside funders can back an agent. Their claim is enforced on-chain, and

@@ -6,6 +6,7 @@
  */
 import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { TaskContext } from "../runtime.js";
+import { terminalTraceError } from "../../core/trace.js";
 
 export const TRACES = "traces";
 
@@ -16,7 +17,9 @@ export interface PendingTrace {
   cid: string;
   decisionHash?: string;
   traceId?: bigint;
-  status: "pending" | "published";
+  /** `rejected`: the registry refused it with a terminal error (#322). */
+  status: "pending" | "published" | "rejected";
+  rejection?: string;
   attempts: number;
 }
 
@@ -65,6 +68,20 @@ export async function publishPendingTraces(
       ctx.state.set<PendingTrace>(TRACES, key, updated);
       ctx.log.info("TRACE_PUBLISHED", { key, res });
     } catch (err) {
+      // #322: a terminal registry error (e.g. a Buy trace that landed after
+      // the grace window) will fail the same way forever, so drop the trace
+      // instead of retrying it on every tick.
+      const rejection = terminalTraceError(err);
+      if (rejection) {
+        ctx.state.set<PendingTrace>(TRACES, key, {
+          ...t,
+          status: "rejected",
+          rejection,
+          attempts: t.attempts + 1,
+        });
+        ctx.log.warn("TRACE_REJECTED", { key, rejection, err });
+        continue;
+      }
       ctx.state.set<PendingTrace>(TRACES, key, { ...t, attempts: t.attempts + 1 });
       ctx.log.warn("TRACE_PUBLISH_FAILED", { key, attempts: t.attempts + 1, err });
       throw err;

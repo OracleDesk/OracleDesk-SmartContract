@@ -987,6 +987,52 @@ export class StellarAdapter {
     return this.run("resolver", "@oracledesk/bindings-resolver", "dispute", call, (client) => client.dispute(call));
   }
 
+  /**
+   * Permissionless (#321): pins the committed feed's close-time record for a
+   * price, hybrid or scaled market (scaled also pins `decimals()`), so the
+   * market still resolves after the oracle ages the record out. The agent is
+   * recorded as the snapshotter.
+   */
+  async snapshotPrice(marketId: bigint): Promise<AdapterResult<unknown>> {
+    const call = { market_id: marketId, caller: this.agent };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "snapshot_price", call, (client) => client.snapshot_price(call));
+  }
+
+  /**
+   * Permissionless (#321): stores up to `maxReads` (capped at 8 on-chain)
+   * not-yet-stored TWAP grid samples whose slot time has passed, oldest
+   * first. Call repeatedly (it returns 0 once everything due is stored).
+   */
+  async snapshotTwapSamples(marketId: bigint, maxReads = 8): Promise<AdapterResult<unknown>> {
+    const call = { market_id: marketId, caller: this.agent, max_reads: maxReads };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "snapshot_twap_samples", call, (client) =>
+      client.snapshot_twap_samples(call),
+    );
+  }
+
+  /**
+   * Permissionless (#326): submits weighted-key signatures over the v2
+   * attestation message (`buildAttestationMessage(ctx, 2)`), which can carry
+   * `Invalid`. Pre-filter with `verifyAttestation(..., 2)`: one bad signature
+   * aborts the whole batch.
+   */
+  async submitSignaturesV2(args: {
+    market_id: bigint;
+    outcome: "Yes" | "No" | "Invalid";
+    round: number;
+    sigs: ReadonlyArray<{ pubkey: Uint8Array; sig: Uint8Array }>;
+  }): Promise<AdapterResult<void>> {
+    const call = {
+      market_id: args.market_id,
+      outcome: { tag: args.outcome, values: undefined as void },
+      round: args.round,
+      sigs: args.sigs.map(({ pubkey, sig }) => [Buffer.from(pubkey), Buffer.from(sig)] as [Buffer, Buffer]),
+    };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "submit_signatures_v2", call, (client) =>
+      client.submit_signatures_v2(call),
+    );
+  }
+
   /** Permissionless: voids a dispute that outlived `escalation_timeout` and refunds the bond. */
   async expireDispute(marketId: bigint): Promise<AdapterResult<void>> {
     const call = { market_id: marketId };

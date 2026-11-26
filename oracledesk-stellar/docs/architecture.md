@@ -249,9 +249,9 @@ Independent resolution modes, all ultimately calling
   `decimals()` and `threshold_decimals` before comparing — see ADR 0001,
   "Price threshold units". `preview_price(market_id)` reads the feed's newest
   record (`lastprice`) read-only, without resolving or storing anything.
-  Anyone may first pin the grid read with `snapshot_price` (legacy and hybrid
-  specs only; scaled markets reply `WrongMode` — see "Oracle history retention"
-  below).
+  Anyone may first pin the grid read with `snapshot_price`; for a scaled
+  market the snapshot also pins the feed's `decimals()` (issue #321, see
+  "Oracle history retention" below).
 - **PriceTwap**: the time-weighted-average price threshold (issue #27,
   `TwapConfig` + `register_twap_spec`/`resolve_twap`). Samples
   `price(asset, ts)` at every `resolution()`-aligned timestamp in
@@ -363,6 +363,40 @@ Operators and agents should call `snapshot_price` within one oracle period
 of `close_time` (CLI: `stellar contract invoke --id $RESOLVER -- snapshot_price
 --market_id <id> --caller <address>`). A late snapshot is still accepted as
 long as the oracle has the record.
+
+**Scaled markets (#321).** `snapshot_price` on a `PriceScaled` market stores a
+`ScaledSnapshot { data, feed_decimals, taken_at, taken_by }` under its own key:
+the grid record and the feed's `decimals()`, read in the same call. Resolution
+prefers it (re-validated against `max_staleness`), so neither the record
+ageing out nor a later `decimals()` change can alter the rescaled comparison.
+
+**TWAP markets (#321).** A TWAP reads up to 32 grid records spread over
+`window` seconds, and the oldest age out first, possibly before close for a
+long window. `snapshot_twap_samples(market_id, caller, max_reads)` stores grid
+samples one slot at a time in `TwapSamples(market_id)` (a `Map<slot_ts,
+TwapSlot>`, at most `MAX_TWAP_SAMPLES` entries):
+
+- Permissionless with caller attribution; at most `min(max_reads, 8)` feed
+  reads per call, oldest slot first; already-stored slots are skipped.
+- Callable before close for slots whose timestamp has passed: their answer
+  is final. "No record" is stored as `Missing` only once
+  `slot_ts <= now - resolution`, so a record about to be published is never
+  frozen as absent.
+- A record is validated as resolution would (`price > 0`, not after
+  `close_time`, not newer than its slot query); an invalid one aborts the
+  call and is never stored.
+- `resolve_twap` (and the guardian's `OracleUnavailable` check) uses stored
+  slots first and reads only the missing ones live. Both feed the same
+  ordered slot answers to one pure computation (`twap_from_slots`), so any
+  split between stored and live slots gives exactly the full-live-read
+  outcome. `PriceResolutionSource { from_snapshot, stored_slots, live_slots }`
+  reports the split; `TwapResolution` is unchanged.
+- The grid period is pinned in `TwapGrid(market_id)` at reveal (or, for
+  markets revealed before #321, at the first sample snapshot), so a feed
+  changing `resolution()` later cannot move which slots count.
+
+`TwapGrid`, `TwapSamples` and `ScaledSnapshot` use the market's TTL target and
+are bumped with the market's other entries.
 
 #### Bonded disputes (`SignersDisputable`)
 
@@ -1567,3 +1601,40 @@ file is permissioned to its owner and git-ignored. Back it up as sensitive
 purchase history. The admin view also shows `refundId`/`refundTx`. This design
 supports one service process (one writer per ledger file); shared multi-instance
 locking and automatic indeterminate reconciliation remain separate work.
+
+### Weighted-key markets can void (#326)
+
+Weighted-key committees sign off-chain Ed25519 attestations. The v1 message
+(`oracledesk-attest-v1`) can only carry Yes/No; `submit_signatures_v2` accepts
+the v2 message (`oracledesk-attest-v2`, see `docs/agent-signing.md`), whose
+outcome byte can also be `Invalid`. Invalid weight is tallied per round like
+Yes/No, displaces a pending Yes/No proposal once (the address-based rule), and
+`finalize_signers` on an Invalid proposal voids the market (`CommitteeVoided`,
+whose `invalid_count` is the Invalid *weight* for weighted markets). A key
+signs at most once per round across all outcomes and both versions.
+
+### Trace action/state validation (#322)
+
+The reasoning registry checks each single-trace publish (`publish_trace`,
+`publish_chained_trace`, the signed variants and `commit_trace`) against the
+live state of market-core and the resolver, through `#[contractclient]`
+mirrors (no vendored wasm). `now` is the ledger time and `G` the admin-set
+grace (`set_action_grace`, default 3,600 s, at most 86,400 s):
+
+| Action | Requirement | Error |
+| --- | --- | --- |
+| `ProposeMarket` | `NO_MARKET` | `ProposalMustUseNoMarket` |
+| `CreateMarket` | creator is the agent or a registered consumer, `now <= close_time` | `NotMarketCreator`, `MarketClosed` |
+| `Buy` / `Sell` | `status == Open` and `now < close_time + G` | `MarketClosed` |
+| `Skip` | market exists | `UnknownMarket` |
+| `Redeem` / `ClaimRemainder` | `status != Open` (Void is final) | `MarketNotFinal` |
+| `Resolve` | `now >= close_time` and `resolution_role(market, agent, signing_keys(agent)) != None` | `MarketNotClosed`, `NotResolutionSigner` |
+| `Other(sym)` | allow-listed by `set_other_action`; its `OtherRule` decides `NO_MARKET` | `UnknownOtherAction` |
+
+A Buy/Sell trace published after `close_time` (inside `G`) is stored with a
+`TraceLate` side flag and `trace_verdict` reports `TraceVerdict::Late` when the
+hash and flags are otherwise valid. The resolver is read as market-core's
+current `get_config().resolver`. Committee membership is checked against the
+market's bound epoch at publish time. Batched (Merkle) traces are not checked
+per leaf.
+

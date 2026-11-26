@@ -62,7 +62,9 @@ pub fn class_of(key: &DataKey) -> RetentionClass {
         | DataKey::NextId
         | DataKey::MarketCore
         | DataKey::NextBatchId
-        | DataKey::ConsumerScoping => RetentionClass::Instance,
+        | DataKey::ConsumerScoping
+        | DataKey::ActionGrace
+        | DataKey::OtherActions => RetentionClass::Instance,
 
         DataKey::Agent(_)
         | DataKey::AgentHead(_)
@@ -77,7 +79,8 @@ pub fn class_of(key: &DataKey) -> RetentionClass {
         | DataKey::AgentConsumerAt(_, _)
         | DataKey::AgentConsumerSlot(_, _)
         | DataKey::AgentDefaultConsumer(_)
-        | DataKey::AgentMissedRevealCount(_) => RetentionClass::Identity,
+        | DataKey::AgentMissedRevealCount(_)
+        | DataKey::AllowedOther(_) => RetentionClass::Identity,
 
         DataKey::Trace(_)
         | DataKey::TraceLedger(_)
@@ -90,7 +93,8 @@ pub fn class_of(key: &DataKey) -> RetentionClass {
         | DataKey::FlagHistoryCount(_)
         | DataKey::FlagHistory(_, _)
         | DataKey::AgentTrace(_, _)
-        | DataKey::MarketClose(_) => RetentionClass::Audit,
+        | DataKey::MarketClose(_)
+        | DataKey::TraceLate(_) => RetentionClass::Audit,
 
         DataKey::MarketTraceCount(_)
         | DataKey::MarketTrace(_, _)

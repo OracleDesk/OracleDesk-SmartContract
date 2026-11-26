@@ -1534,7 +1534,9 @@ name = "reasoning-registry"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "market-core",
  "oracledesk-types",
+ "resolver",
  "soroban-sdk",
 ]
 

@@ -1,0 +1,70 @@
+{
+  "description": "Weighted-key attestation golden vectors (issue #326). Shared by contracts/resolver (golden_attestation_message_and_signature_v2) and agents/core/attestation.test.ts. Messages are signed raw with Ed25519.",
+  "vectors": [
+    {
+      "version": 1,
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "resolver": "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+      "market_id": 7,
+      "round": 3,
+      "outcome": "Yes",
+      "resolution_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "secret_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "message_hex": "6f7261636c656465736b2d6174746573742d7631cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd4720000001200000001b6aa76760026e0dd76457999dda46739543b1bcce3f54d330b9c17ff08bb043900000000000000070000000300a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "sig_hex": "1c6e163006c6e85c20cc5d908ac83072c6e97151fa408c3d2e0400205ebf5c3a3cab2cdf8dfc79ff4059f88f158fb24f62033bb1df41976b35aa503a7356d307"
+    },
+    {
+      "version": 1,
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "resolver": "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+      "market_id": 7,
+      "round": 3,
+      "outcome": "No",
+      "resolution_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "secret_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "message_hex": "6f7261636c656465736b2d6174746573742d7631cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd4720000001200000001b6aa76760026e0dd76457999dda46739543b1bcce3f54d330b9c17ff08bb043900000000000000070000000301a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "sig_hex": "3f7bfc9882bbe894518d059b50326069523358f3da1d74b7ed90b8b395862367155ae6ac7934b3ae610e21c3dd595b7d99c2ab122037918917c96543c0cde002"
+    },
+    {
+      "version": 2,
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "resolver": "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+      "market_id": 7,
+      "round": 3,
+      "outcome": "Yes",
+      "resolution_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "secret_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "message_hex": "6f7261636c656465736b2d6174746573742d763202cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd4720000001200000001b6aa76760026e0dd76457999dda46739543b1bcce3f54d330b9c17ff08bb043900000000000000070000000300a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "sig_hex": "716239581f788c758dd622ba74e4cf144218ae733b25f0de81a545ee1880df82cbbb23086a13cd92e638f1b0ac8d79f21c81ddb8b64970e3691fa40537142d06"
+    },
+    {
+      "version": 2,
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "resolver": "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+      "market_id": 7,
+      "round": 3,
+      "outcome": "No",
+      "resolution_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "secret_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "message_hex": "6f7261636c656465736b2d6174746573742d763202cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd4720000001200000001b6aa76760026e0dd76457999dda46739543b1bcce3f54d330b9c17ff08bb043900000000000000070000000301a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "sig_hex": "0c54b3ae93a80b5b42b92ec49777286d412cc2151f861bd175ba76b4707eab3fbea42f200958ac86482526767d962fc48c0fc8f7dfca9c7d66ecc09c8be91200"
+    },
+    {
+      "version": 2,
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "resolver": "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+      "market_id": 7,
+      "round": 3,
+      "outcome": "Invalid",
+      "resolution_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "secret_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "message_hex": "6f7261636c656465736b2d6174746573742d763202cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd4720000001200000001b6aa76760026e0dd76457999dda46739543b1bcce3f54d330b9c17ff08bb043900000000000000070000000302a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "sig_hex": "0df99419d3cdfe98c51f67c8dbf33b599a246474cdec19ca70c3a3e0662255f4ff54b66a25570a5bec7eda5a282d08c3ca45e38272b1ba6d08e733f51f79e607"
+    }
+  ]
+}

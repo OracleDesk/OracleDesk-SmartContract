@@ -104,9 +104,10 @@ test("registry and treasury events decode through their own specs", async () => 
     contract: "reasoning_registry",
     name: "TracePublished",
     ledger: 7,
-    values: { trace_id: 9n, market_id: 4n, agent: TRADER, action: "buy", trace_hash: Buffer.alloc(32, 0xab), ipfs_cid: "bafy", published_at: 1n },
+    values: { trace_id: 9n, market_id: 4n, agent: TRADER, action: { tag: "Buy", values: undefined }, trace_hash: Buffer.alloc(32, 0xab), ipfs_cid: "bafy", published_at: 1n },
   });
   assert.deepEqual(traced?.kind === "TracePublished" && [traced.traceId, traced.traceHash], [9n, "ab".repeat(32)]);
+  assert.equal(traced?.kind === "TracePublished" && traced.action, "buy");
   const authorized = await decodeOne({
     contract: "treasury",
     name: "TradeAuthorized",

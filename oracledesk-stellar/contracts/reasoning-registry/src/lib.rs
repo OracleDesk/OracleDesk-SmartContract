@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod peers;
 pub mod retention;
 pub mod ttl;
 
@@ -15,9 +16,13 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 
+use peers::{CoreView, ResolutionRole, ResolverView};
+
+// Tests register a native market-core (and resolver) instead of the removed
+// vendored wasm (issue #322).
+#[cfg(test)]
 mod market_core {
-    #[allow(clippy::too_many_arguments)]
-    soroban_sdk::contractimport!(file = "market_core.wasm");
+    pub use market_core_native::{Category, MarketCore, MarketCoreClient as Client};
 }
 
 /// Domain tag for commit-reveal commitments (#51). Must match
@@ -104,6 +109,26 @@ pub enum TraceAction {
 
 pub const NO_MARKET: u64 = u64::MAX;
 
+/// Default post-close grace for Buy/Sell traces (issue #322): the agents
+/// runtime publishes a trace on a later tick than the trade it describes.
+pub const DEFAULT_ACTION_GRACE_SECS: u64 = 3_600;
+/// Largest grace window the admin may set (one day).
+pub const MAX_ACTION_GRACE_SECS: u64 = 86_400;
+/// Most `Other(Symbol)` actions the allow-list may hold.
+pub const MAX_OTHER_ACTIONS: u32 = 32;
+
+/// Market rule of an allow-listed `TraceAction::Other(Symbol)` (issue #322).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtherRule {
+    /// Must use `NO_MARKET`.
+    NoMarketOnly,
+    /// Must reference an existing market.
+    MarketOnly,
+    /// Either.
+    Any,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentStatus {
@@ -137,6 +162,10 @@ pub enum TraceVerdict {
     /// #299: The signing key was retroactively revoked; traces signed at or
     /// after `compromised_since` are tainted.
     KeyCompromised(u64),
+    /// #322: a Buy/Sell trace published after the market's `close_time`,
+    /// inside the grace window. Only reported when the hash matches and no
+    /// flag, revocation or key compromise applies.
+    Late,
 }
 
 /// #299: Verdict for a trace's signature alone (independent of hash/flag/agent).
@@ -337,6 +366,15 @@ pub enum DataKey {
     /// #329: cached market `close_time`, written on the market's first trace
     /// so later publishes size audit TTLs without a market-core call.
     MarketClose(u64),
+    /// #322: instance, admin-set post-close grace for Buy/Sell traces (secs).
+    ActionGrace,
+    /// #322: side flag for a Buy/Sell trace published after close, so the
+    /// `Trace` XDR is unchanged.
+    TraceLate(u64),
+    /// #322: allow-listed `Other(Symbol)` action and its market rule.
+    AllowedOther(Symbol),
+    /// #322: instance list of allow-listed `Other` symbols (≤ 32).
+    OtherActions,
 }
 
 /// Which secondary index `extend_index` walks (#329).
@@ -495,6 +533,22 @@ pub enum Error {
     AlreadyRevoked = 3048,
     /// #329: an archivist call asked to extend more entries than one call allows.
     TooManyEntries = 3049,
+    // ── #322 action/state validation ─────────────────────────────────────
+    /// Buy/Sell on a market that is not open, or past `close_time + grace`.
+    MarketClosed = 3050,
+    /// Redeem/ClaimRemainder on a market that is still open.
+    MarketNotFinal = 3051,
+    /// CreateMarket by an agent that neither created the market nor acts
+    /// through a registered consumer that did.
+    NotMarketCreator = 3052,
+    /// Resolve by an agent with no role in the market's resolution.
+    NotResolutionSigner = 3053,
+    /// Resolve (or CreateMarket after close) at the wrong time.
+    MarketNotClosed = 3054,
+    /// `Other(Symbol)` that is not on the admin allow-list.
+    UnknownOtherAction = 3055,
+    /// The `Other` allow-list is full, or a grace above the maximum.
+    LimitExceeded = 3056,
 }
 
 #[contractevent]
@@ -898,6 +952,75 @@ impl ReasoningRegistry {
         env.storage().persistent().has(&DataKey::Consumer(consumer))
     }
 
+    /// Sets the post-close grace window for Buy/Sell traces (issue #322),
+    /// at most [`MAX_ACTION_GRACE_SECS`]. Admin only.
+    pub fn set_action_grace(env: Env, secs: u64) -> Result<(), Error> {
+        ttl::bump_instance(&env);
+        Self::require_admin(&env)?;
+        if secs > MAX_ACTION_GRACE_SECS {
+            return Err(Error::LimitExceeded);
+        }
+        env.storage().instance().set(&DataKey::ActionGrace, &secs);
+        Ok(())
+    }
+
+    /// Current post-close grace window for Buy/Sell traces, in seconds.
+    pub fn action_grace(env: Env) -> u64 {
+        Self::grace(&env)
+    }
+
+    /// Whether a Buy/Sell trace was published after its market's close.
+    pub fn is_trace_late(env: Env, trace_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::TraceLate(trace_id))
+    }
+
+    /// Adds, changes (`Some`) or removes (`None`) an allow-listed
+    /// `Other(sym)` action (issue #322). At most [`MAX_OTHER_ACTIONS`]
+    /// symbols; canonical action names are refused. Admin only. Applies at
+    /// publish time only, so existing traces are untouched.
+    pub fn set_other_action(env: Env, sym: Symbol, rule: Option<OtherRule>) -> Result<(), Error> {
+        ttl::bump_instance(&env);
+        Self::require_admin(&env)?;
+        Self::validate_action(&env, &TraceAction::Other(sym.clone()))?;
+        let key = DataKey::AllowedOther(sym.clone());
+        let mut list = Self::other_actions(env.clone());
+        let pos = list.iter().position(|s| s == sym);
+        match rule {
+            Some(rule) => {
+                if pos.is_none() {
+                    if list.len() >= MAX_OTHER_ACTIONS {
+                        return Err(Error::LimitExceeded);
+                    }
+                    list.push_back(sym);
+                }
+                Self::put(&env, &key, &rule);
+            }
+            None => {
+                if let Some(i) = pos {
+                    list.remove(i as u32);
+                }
+                env.storage().persistent().remove(&key);
+            }
+        }
+        env.storage().instance().set(&DataKey::OtherActions, &list);
+        Ok(())
+    }
+
+    /// The market rule of an allow-listed `Other(sym)` action.
+    pub fn other_action_rule(env: Env, sym: Symbol) -> Option<OtherRule> {
+        env.storage().persistent().get(&DataKey::AllowedOther(sym))
+    }
+
+    /// Every allow-listed `Other` symbol.
+    pub fn other_actions(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OtherActions)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Marks a trace as having backed an action, exactly once (#50). Only an
     /// allow-listed consumer contract can call it; the treasury passes its own
     /// address, which satisfies `require_auth` as the direct invoker.
@@ -1064,6 +1187,13 @@ impl ReasoningRegistry {
                     return Ok(TraceVerdict::KeyCompromised(revocation.compromised_since));
                 }
             }
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TraceLate(trace_id))
+        {
+            return Ok(TraceVerdict::Late);
         }
         Ok(TraceVerdict::Valid)
     }
@@ -2213,28 +2343,122 @@ impl ReasoningRegistry {
         Ok(())
     }
 
-    fn validate_reference(env: &Env, market_id: u64, action: &TraceAction) -> Result<(), Error> {
+    /// Checks `action` against the live state of the referenced market
+    /// (issue #322). `now` is the ledger time and `G` the grace window:
+    ///
+    /// | Action | Requirement |
+    /// | --- | --- |
+    /// | `ProposeMarket` | `NO_MARKET` |
+    /// | `CreateMarket` | creator is the agent or a registered consumer, `now <= close_time` |
+    /// | `Buy`/`Sell` | `status == Open` and `now < close_time + G` |
+    /// | `Skip` | market exists |
+    /// | `Redeem`/`ClaimRemainder` | `status != Open` |
+    /// | `Resolve` | `now >= close_time` and a resolution role for the agent or one of its keys |
+    /// | `Other(sym)` | allow-listed; its `OtherRule` decides `NO_MARKET` |
+    fn validate_action_state(
+        env: &Env,
+        agent: &Address,
+        market_id: u64,
+        action: &TraceAction,
+    ) -> Result<(), Error> {
+        let other_rule = match action {
+            TraceAction::Other(sym) => Some(
+                env.storage()
+                    .persistent()
+                    .get::<_, OtherRule>(&DataKey::AllowedOther(sym.clone()))
+                    .ok_or(Error::UnknownOtherAction)?,
+            ),
+            _ => None,
+        };
         let pre_creation = matches!(action, TraceAction::ProposeMarket);
         if market_id == NO_MARKET {
-            return if pre_creation || matches!(action, TraceAction::Other(_)) {
-                Ok(())
-            } else {
-                Err(Error::MarketRequired)
+            return match other_rule {
+                Some(OtherRule::MarketOnly) => Err(Error::MarketRequired),
+                Some(_) => Ok(()),
+                None if pre_creation => Ok(()),
+                None => Err(Error::MarketRequired),
             };
         }
-        if pre_creation {
+        if pre_creation || other_rule == Some(OtherRule::NoMarketOnly) {
             return Err(Error::ProposalMustUseNoMarket);
         }
-        let mc: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketCore)
-            .ok_or(Error::NotInitialized)?;
-        let count = market_core::Client::new(env, &mc).market_count();
-        if market_id >= count {
+        let core = CoreView::new(env, &Self::market_core_address(env)?);
+        if market_id >= core.market_count() {
             return Err(Error::UnknownMarket);
         }
+        let market = match core.try_get_market(&market_id) {
+            Ok(Ok(m)) => m,
+            _ => return Err(Error::UnknownMarket),
+        };
+        let now = env.ledger().timestamp();
+        let open = market.status == oracledesk_types::MarketStatus::Open;
+        match action {
+            TraceAction::CreateMarket => {
+                if market.creator != *agent && !Self::is_consumer(env.clone(), market.creator) {
+                    return Err(Error::NotMarketCreator);
+                }
+                if now > market.close_time {
+                    return Err(Error::MarketClosed);
+                }
+            }
+            TraceAction::Buy | TraceAction::Sell => {
+                // Status first: an early `void_market` has no close-time guard.
+                let deadline = market.close_time.saturating_add(Self::grace(env));
+                if !open || now >= deadline {
+                    return Err(Error::MarketClosed);
+                }
+            }
+            TraceAction::Redeem | TraceAction::ClaimRemainder => {
+                if open {
+                    return Err(Error::MarketNotFinal);
+                }
+            }
+            TraceAction::Resolve => {
+                if now < market.close_time {
+                    return Err(Error::MarketNotClosed);
+                }
+                let keys = Self::get_signing_keys(env.clone(), agent.clone());
+                let resolver = ResolverView::new(env, &Self::resolver_for(env, &core));
+                match resolver.try_resolution_role(&market_id, agent, &keys) {
+                    Ok(Ok(role)) if role != ResolutionRole::None => {}
+                    _ => return Err(Error::NotResolutionSigner),
+                }
+            }
+            TraceAction::Skip | TraceAction::ProposeMarket | TraceAction::Other(_) => {}
+        }
         Ok(())
+    }
+
+    fn market_core_address(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// The resolver whose signer sets decide `Resolve` traces: market-core's
+    /// currently wired resolver, so a resolver rotation needs no registry
+    /// wiring. The single place to switch to a per-market resolver snapshot
+    /// once market-core records one.
+    fn resolver_for(_env: &Env, core: &CoreView) -> Address {
+        core.get_config().resolver
+    }
+
+    fn grace(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActionGrace)
+            .unwrap_or(DEFAULT_ACTION_GRACE_SECS)
+    }
+
+    /// Records `TraceLate` for a Buy/Sell trace published after close.
+    fn mark_late(env: &Env, id: u64, market_id: u64, action: &TraceAction, target: u32) {
+        if market_id == NO_MARKET || !matches!(action, TraceAction::Buy | TraceAction::Sell) {
+            return;
+        }
+        if env.ledger().timestamp() >= Self::market_close(env, market_id) {
+            Self::put_class(env, &DataKey::TraceLate(id), &true, target);
+        }
     }
 
     fn check_publish(
@@ -2250,7 +2474,7 @@ impl ReasoningRegistry {
             return Err(Error::AgentNotActive);
         }
         Self::validate_action(env, action)?;
-        Self::validate_reference(env, market_id, action)?;
+        Self::validate_action_state(env, agent, market_id, action)?;
         if ipfs_cid.is_empty() {
             return Err(Error::EmptyCid);
         }
@@ -2313,6 +2537,7 @@ impl ReasoningRegistry {
             target,
         );
         Self::put_class(env, &action_count_key, &(action_index + 1), target);
+        Self::mark_late(env, id, market_id, &action, target);
 
         TracePublished {
             trace_id: id,
@@ -2393,7 +2618,7 @@ impl ReasoningRegistry {
             return Err(Error::AgentNotActive);
         }
         Self::validate_action(&env, &action)?;
-        Self::validate_reference(&env, market_id, &action)?;
+        Self::validate_action_state(&env, &agent, market_id, &action)?;
 
         let deadline_secs = if reveal_deadline_secs == 0 {
             DEFAULT_REVEAL_DEADLINE_SECS
@@ -2560,9 +2785,7 @@ impl ReasoningRegistry {
             .instance()
             .get(&DataKey::MarketCore)
             .expect("market core configured");
-        let close = market_core::Client::new(env, &mc)
-            .get_market(&market_id)
-            .close_time;
+        let close = CoreView::new(env, &mc).get_market(&market_id).close_time;
         let target = retention::audit_target(env, close);
         retention::put(env, &key, &close, target);
         close
@@ -2601,6 +2824,7 @@ impl ReasoningRegistry {
         ext(DataKey::TraceSignature(trace_id));
         ext(DataKey::TraceConsumer(trace_id));
         ext(DataKey::Consumed(trace_id));
+        ext(DataKey::TraceLate(trace_id));
         ext(DataKey::Flag(trace_id));
         if trace.market_id != NO_MARKET {
             ext(DataKey::MarketClose(trace.market_id));
@@ -2651,6 +2875,9 @@ impl ReasoningRegistry {
 mod retention_tests;
 
 #[cfg(test)]
+mod action_state_tests;
+
+#[cfg(test)]
 mod test {
     use super::*;
     use soroban_sdk::{
@@ -2686,7 +2913,7 @@ mod test {
         token.mint(&creator, &(50_000 * 10_000_000_i128));
 
         let market_core_id = env.register(
-            market_core::WASM,
+            market_core::MarketCore,
             (
                 admin.clone(),
                 collateral.address(),
@@ -2788,7 +3015,7 @@ mod test {
         let t0 = client.publish_trace(
             &agent,
             &7,
-            &TraceAction::CreateMarket,
+            &TraceAction::Skip,
             &BytesN::from_array(&env, &[1u8; 32]),
             &String::from_str(&env, "ipfs://t0"),
         );
@@ -2909,6 +3136,8 @@ mod test {
         let agent_key = DataKey::Agent(agent.clone());
 
         client.register_agent(&agent);
+        // #322: `Other` actions must be allow-listed.
+        client.set_other_action(&Symbol::new(&env, "trade"), &Some(OtherRule::Any));
         assert!(persistent_ttl(&env, &client.address, &agent_key) >= max_ttl - 1);
 
         // Day 0 and day 59 publishes; the day-100 publish only succeeds if the

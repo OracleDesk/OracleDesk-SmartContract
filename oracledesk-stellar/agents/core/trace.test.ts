@@ -148,3 +148,48 @@ test("NO_MARKET constant is u64::MAX", () => {
   assert.equal(NO_MARKET, 18446744073709551615n);
   assert.equal(NO_MARKET, (1n << 64n) - 1n);
 });
+
+// ── #322 action/state validation ─────────────────────────────────────────
+
+import { terminalTraceError, validateActionState, type MarketStateView } from "./trace.js";
+
+const open: MarketStateView = { status: "Open", closeTime: 1_000n, creator: "GAGENT" };
+
+test("validateActionState mirrors the registry table", () => {
+  assert.deepEqual(validateActionState("buy", 1n, open, 999n), { ok: true, late: false });
+  assert.deepEqual(validateActionState("sell", 1n, open, 1_000n), { ok: true, late: true });
+  assert.deepEqual(validateActionState("buy", 1n, open, 1_000n + 3_600n), { ok: false, error: "MarketClosed" });
+  assert.deepEqual(validateActionState("buy", 1n, { ...open, status: "Void" }, 10n), { ok: false, error: "MarketClosed" });
+  assert.deepEqual(validateActionState("redeem", 1n, open, 2_000n), { ok: false, error: "MarketNotFinal" });
+  assert.deepEqual(validateActionState("redeem", 1n, { ...open, status: "Void" }, 2_000n), { ok: true, late: false });
+  assert.deepEqual(validateActionState("resolve", 1n, open, 999n), { ok: false, error: "MarketNotClosed" });
+  assert.deepEqual(validateActionState("resolve", 1n, open, 1_000n), { ok: true, late: false });
+  assert.deepEqual(validateActionState("skip", 1n, { ...open, status: "Resolved" }, 9_999n), { ok: true, late: false });
+  assert.deepEqual(validateActionState("propose_market", NO_MARKET, undefined, 0n), { ok: true, late: false });
+  assert.deepEqual(validateActionState("propose_market", 1n, open, 0n), { ok: false, error: "ProposalMustUseNoMarket" });
+  assert.deepEqual(validateActionState("buy", NO_MARKET, undefined, 0n), { ok: false, error: "MarketRequired" });
+  assert.deepEqual(validateActionState("buy", 7n, undefined, 0n), { ok: false, error: "UnknownMarket" });
+});
+
+test("validateActionState checks the creator rule for create_market", () => {
+  assert.deepEqual(validateActionState("create_market", 1n, open, 0n, 3_600n, { agent: "GAGENT" }), { ok: true, late: false });
+  assert.deepEqual(
+    validateActionState("create_market", 1n, { ...open, creator: "CTREASURY" }, 0n, 3_600n, { agent: "GAGENT" }),
+    { ok: false, error: "NotMarketCreator" },
+  );
+  assert.deepEqual(
+    validateActionState("create_market", 1n, { ...open, creator: "CTREASURY" }, 0n, 3_600n, {
+      agent: "GAGENT",
+      consumers: ["CTREASURY"],
+    }),
+    { ok: true, late: false },
+  );
+  assert.deepEqual(validateActionState("create_market", 1n, open, 1_001n), { ok: false, error: "MarketClosed" });
+});
+
+test("terminalTraceError recognises registry codes and names", () => {
+  assert.equal(terminalTraceError(new Error("HostError: Error(Contract, #3050)")), "MarketClosed");
+  assert.equal(terminalTraceError("simulation failed: NotResolutionSigner"), "NotResolutionSigner");
+  assert.equal(terminalTraceError(new Error("Error(Contract, #3001)")), undefined);
+  assert.equal(terminalTraceError(new Error("timeout")), undefined);
+});

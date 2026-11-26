@@ -378,6 +378,26 @@ pub struct OpenMarket {
     pub market_id: u64,
 }
 
+/// Per-core bookkeeping (issue #320), stored under `DataKey::CoreState`.
+/// Maintained on every index, exposure and net write once
+/// `init_core_accounting` has run (or from deployment for new treasuries).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoreAccounting {
+    /// `OpenMarketAt` entries that belong to this core.
+    pub open_index: u32,
+    /// Markets of this core whose `MarketExposure.open` is true.
+    pub open_exposures: u32,
+    /// This core's share of `NetTotal`.
+    pub net: i128,
+    /// Set once by `retire_core`; never cleared.
+    pub retired: bool,
+}
+
+/// Most market-cores `KnownCores` tracks at once (issue #320). Retired cores
+/// leave the list, so this bounds live cores, not lifetime switches.
+pub const MAX_KNOWN_CORES: u32 = 4;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkRecord {
@@ -683,6 +703,23 @@ pub enum DataKey {
     DataBudgetWindow(Address),
     /// Per-ticket cancellation metadata (#277), persistent.
     TicketMeta(u64),
+    // ── #320 core switches and retirement ──────────────────────────────────
+    /// Realized-settlement state of a non-original core's market. The
+    /// original core keeps `Realized(id)`.
+    RealizedV2(Address, u64),
+    /// Cost/proceeds of a non-original core's market. The original core
+    /// keeps `Pnl(id)`.
+    PnlV2(Address, u64),
+    /// Persistent `CoreAccounting` for one market-core.
+    CoreState(Address),
+    /// Instance list of live (not retired) cores, at most `MAX_KNOWN_CORES`.
+    KnownCores,
+    /// Instance flag: per-core counters are maintained (set at deployment or
+    /// by `init_core_accounting`).
+    AccountingInitialized,
+    /// Part of `NetTotal` the backfill could not attribute to an indexed
+    /// market. Stays counted in the caps.
+    UnattributedNet,
 }
 
 #[contracttype]
@@ -883,26 +920,24 @@ pub enum Error {
     MigrationNotReady = 84,
     IncompatibleSuccessor = 85,
     AlreadyMigrated = 86,
-    /// Cross-contract market-core errors, mapped into the treasury's own
-    /// range by `core_call` / `map_market_core_code`
-    /// (docs/adr/0006-cross-contract-errors.md, #60).
-    MarketCoreCallFailed = 2031,
-    MarketCoreMarketNotFound = 2032,
-    MarketCoreNotFinal = 2033,
-    MarketCoreMarketNotOpen = 2034,
-    MarketCoreMarketClosed = 2035,
-    MarketCoreInsufficientLiquidity = 2036,
-    MarketCoreInsufficientShares = 2037,
-    MarketCoreAlreadyClaimed = 2038,
-    MarketCoreNothingToRedeem = 2039,
-    MarketCoreInvalidAmount = 2040,
-    MarketCoreOverflow = 2041,
-    MarketCoreSlippageExceeded = 2042,
     /// The ticket predates #277 (no `TicketMeta`) and cannot be cancelled;
     /// it still drains and can be transferred.
     TicketNotCancellable = 77,
     /// `cancel_withdraw` before `created_at + MIN_CANCEL_DELAY`.
     CancelTooEarly = 78,
+    // ── #320 core retirement ────────────────────────────────────────────
+    /// The core was retired; it can never be current or legacy again.
+    CoreRetired = 79,
+    /// `retire_core` before `init_core_accounting` has run.
+    AccountingNotInitialized = 80,
+    /// `retire_core` while the core still has index entries or open exposure.
+    CoreNotDrained = 81,
+    /// The current market-core cannot be retired.
+    CoreIsCurrent = 82,
+    /// `KnownCores` is full; retire a drained legacy core first.
+    TooManyCores = 87,
+    /// `sweep_retired` on a core that is not retired.
+    CoreNotRetired = 88,
 }
 
 #[contractevent]
@@ -1164,6 +1199,43 @@ pub struct EmergencyWithdrawn {
     pub amount: i128,
 }
 
+/// #320: a drained legacy core was retired and its net released.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreRetired {
+    #[topic]
+    pub core: Address,
+    pub net_released: i128,
+}
+
+/// #320: a stray position on a retired core was redeemed into idle.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetiredSweep {
+    #[topic]
+    pub core: Address,
+    pub market_id: u64,
+    pub amount: i128,
+}
+
+/// #320: `retire_core`, while paused, dropped an index entry whose core
+/// could not be read.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexEntryDropped {
+    #[topic]
+    pub core: Address,
+    pub market_id: u64,
+}
+
+/// #320: `init_core_accounting` backfilled the per-core counters.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreAccountingInitialized {
+    pub cores: u32,
+    pub unattributed_net: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketSettled {
@@ -1345,10 +1417,11 @@ impl Treasury {
             .unwrap_or(0)
     }
 
-    fn merge_pnl(env: &Env, market_id: u64, incoming: MarketPnl) {
-        let current = Self::load_pnl(env, market_id);
+    fn merge_pnl(env: &Env, core: &Address, market_id: u64, incoming: MarketPnl) {
+        let current = Self::load_pnl(env, core, market_id);
         Self::save_pnl(
             env,
+            core,
             market_id,
             &MarketPnl {
                 cost: current.cost.saturating_add(incoming.cost),
@@ -1435,6 +1508,12 @@ impl Treasury {
         storage.set(&DataKey::Admin, &admin);
         storage.set(&DataKey::Global, &global);
         storage.set(&DataKey::OriginalCore, &global.market_core);
+        // #320: a fresh treasury has nothing to backfill.
+        storage.set(&DataKey::AccountingInitialized, &true);
+        storage.set(
+            &DataKey::KnownCores,
+            &vec![&env, global.market_core.clone()],
+        );
         storage.set(&DataKey::ConfigDelay, &config_delay);
         storage.set(&DataKey::MaxMarkAgeLedgers, &DEFAULT_MAX_MARK_AGE_LEDGERS);
         storage.set(&DataKey::NavHoldings, &0i128);
@@ -1967,7 +2046,13 @@ impl Treasury {
         Self::validate(&new)?;
         Self::check_collateral_change(&env, &old, &new)?;
         if new.market_core != old.market_core {
+            // #320: a retired core's namespaced keys must never be revived.
+            if Self::core_state(&env, &new.market_core).retired {
+                return Err(Error::CoreRetired);
+            }
             Self::put_persistent(&env, &DataKey::LegacyCore(old.market_core.clone()), &true);
+            Self::note_known_core(&env, &old.market_core)?;
+            Self::note_known_core(&env, &new.market_core)?;
         }
         let storage = env.storage().instance();
         storage.set(&DataKey::Global, &new);
@@ -2612,7 +2697,7 @@ impl Treasury {
                 MarketCoreClient::new(&env, &entry.core).try_get_market(&entry.market_id),
             )
             .ok()?;
-            let (floor, _) = Self::holdings_value(&env, &entry.core, entry.market_id).ok()?;
+            let (floor, _, _) = Self::holdings_value(&env, &entry.core, entry.market_id).ok()?;
             // Insertion sort by close time (n <= MAX_OPEN_MARKETS).
             let mut at = markets.len();
             while at > 0 && markets.get_unchecked(at - 1).0 > market.close_time {
@@ -2822,7 +2907,7 @@ impl Treasury {
         )?;
         Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
-        Self::record_cost(&env, market_id, seed_amount)?;
+        Self::record_cost(&env, &global.market_core, market_id, seed_amount)?;
         Ok(market_id)
     }
 
@@ -3231,7 +3316,37 @@ impl Treasury {
         market_id: u64,
     ) -> Result<SettlementReport, Error> {
         caller.require_auth();
-        let mut r = Self::load_realized(&env, market_id);
+        let global = Self::load_global(&env)?;
+        Self::settle_on(&env, caller, &global.market_core, market_id)
+    }
+
+    /// [`Treasury::settle_market`] against any known core (issue #320): the
+    /// current one or a legacy core this treasury was switched away from.
+    /// Restricted to known cores because it calls into `core`. A market that
+    /// market-core already finalized (`RedemptionClosed`) has nothing left
+    /// to collect, so its exposure is closed and its index entry removed;
+    /// otherwise a finalized legacy market would block retirement forever.
+    pub fn settle_market_on(
+        env: Env,
+        caller: Address,
+        core: Address,
+        market_id: u64,
+    ) -> Result<SettlementReport, Error> {
+        caller.require_auth();
+        let global = Self::load_global(&env)?;
+        if core != global.market_core {
+            Self::require_legacy(&env, &core)?;
+        }
+        Self::settle_on(&env, caller, &core, market_id)
+    }
+
+    fn settle_on(
+        env: &Env,
+        caller: Address,
+        core: &Address,
+        market_id: u64,
+    ) -> Result<SettlementReport, Error> {
+        let mut r = Self::load_realized(env, core, market_id);
         if r.settled {
             return Ok(SettlementReport {
                 redeemed: 0,
@@ -3239,40 +3354,47 @@ impl Treasury {
                 already_settled: true,
             });
         }
-        let global = Self::load_global(&env)?;
-        let core = &global.market_core;
-        let client = MarketCoreClient::new(&env, core);
+        let client = MarketCoreClient::new(env, core);
         let treasury_addr = env.current_contract_address();
+        let mut finalized = false;
 
         let redeemed = match client.try_redeem(&treasury_addr, &market_id) {
             Ok(Ok(p)) => p,
             Err(Ok(MarketCoreError::NothingToRedeem)) => 0,
+            Err(Ok(MarketCoreError::RedemptionClosed)) => {
+                finalized = true;
+                0
+            }
             Err(Ok(MarketCoreError::NotFinal)) => {
                 return Err(Error::MarketNotFinal);
             }
             Err(Ok(_)) | Err(Err(_)) | Ok(Err(_)) => return Err(Error::MarketCoreError),
         };
         if redeemed > 0 {
-            Self::record_return(&env, core, market_id, redeemed)?;
-            Self::record_proceeds(&env, market_id, redeemed)?;
+            Self::record_return(env, core, market_id, redeemed)?;
+            Self::record_proceeds(env, core, market_id, redeemed)?;
         }
 
         let m = client.get_market(&market_id);
         if matches!(m.status, MarketStatus::Open) {
             return Err(Error::MarketNotFinal);
         }
-        let lp_claimed = if m.creator == treasury_addr && !m.lp_claimed {
+        let lp_claimed = if !finalized && m.creator == treasury_addr && !m.lp_claimed {
             let p = match client.try_claim_pool_remainder(&market_id) {
                 Ok(Ok(val)) => val,
                 Err(Ok(MarketCoreError::AlreadyClaimed)) => 0,
+                Err(Ok(MarketCoreError::RedemptionClosed)) => {
+                    finalized = true;
+                    0
+                }
                 Err(Ok(MarketCoreError::NotFinal)) => {
                     return Err(Error::MarketNotFinal);
                 }
                 Err(Ok(_)) | Err(Err(_)) | Ok(Err(_)) => return Err(Error::MarketCoreError),
             };
             if p > 0 {
-                Self::record_return(&env, core, market_id, p)?;
-                Self::record_proceeds(&env, market_id, p)?;
+                Self::record_return(env, core, market_id, p)?;
+                Self::record_proceeds(env, core, market_id, p)?;
             }
             p
         } else {
@@ -3288,20 +3410,30 @@ impl Treasury {
             .checked_add(lp_claimed)
             .ok_or(Error::InvalidAmount)?;
 
-        let pos = client.get_position(&market_id, &treasury_addr);
-        let m_after = client.get_market(&market_id);
-        let lp_settled = m_after.creator != treasury_addr || m_after.lp_claimed;
-        if pos.yes == 0 && pos.no == 0 && lp_settled {
+        if finalized {
+            // `finalize_market` swept the residual collateral away but left
+            // `Position` entries behind: nothing more can ever be collected.
             r.settled = true;
-            Self::close_market_exposure(&env, core, market_id);
-        }
-        Self::save_realized(&env, market_id, &r);
-        Self::prune_if_settled(&env, core, market_id)?;
-        if r.settled {
-            Self::try_realize(&env, core, market_id)?;
+            Self::close_market_exposure(env, core, market_id);
+            Self::save_realized(env, core, market_id, &r);
+            Self::index_remove(env, core, market_id)?;
+            Self::realize_finalized(env, core, market_id)?;
+        } else {
+            let pos = client.get_position(&market_id, &treasury_addr);
+            let m_after = client.get_market(&market_id);
+            let lp_settled = m_after.creator != treasury_addr || m_after.lp_claimed;
+            if pos.yes == 0 && pos.no == 0 && lp_settled {
+                r.settled = true;
+                Self::close_market_exposure(env, core, market_id);
+            }
+            Self::save_realized(env, core, market_id, &r);
+            Self::prune_if_settled(env, core, market_id)?;
+            if r.settled {
+                Self::try_realize(env, core, market_id)?;
+            }
         }
         // Proceeds are in idle now: pay the withdrawal queue (#277).
-        Self::drain_after_proceeds(&env);
+        Self::drain_after_proceeds(env);
 
         MarketSettled {
             market_id,
@@ -3309,7 +3441,7 @@ impl Treasury {
             lp_claimed,
             settled_by: caller,
         }
-        .publish(&env);
+        .publish(env);
 
         Ok(SettlementReport {
             redeemed,
@@ -3318,8 +3450,214 @@ impl Treasury {
         })
     }
 
+    // ----- core retirement (#320) -------------------------------------------
+
+    /// One-shot, permissionless backfill of the per-core counters for a
+    /// treasury deployed before issue #320. Walks the open-market index (at
+    /// most `MAX_OPEN_MARKETS` entries) and attributes each entry, its open
+    /// exposure and its net cost basis to its core. Whatever part of
+    /// `NetTotal` is not attributable to an indexed market goes into
+    /// `UnattributedNet`, which stays counted in the caps (conservative).
+    /// Returns the unattributed net.
+    pub fn init_core_accounting(env: Env) -> Result<i128, Error> {
+        let instance = env.storage().instance();
+        if instance
+            .get::<_, bool>(&DataKey::AccountingInitialized)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let global = Self::load_global(&env)?;
+        let mut cores: Vec<Address> = Vec::new(&env);
+        let mut states: Vec<CoreAccounting> = Vec::new(&env);
+        let original: Option<Address> = instance.get(&DataKey::OriginalCore);
+        for core in [original, Some(global.market_core.clone())]
+            .into_iter()
+            .flatten()
+        {
+            if !cores.contains(&core) {
+                cores.push_back(core);
+                states.push_back(CoreAccounting::default());
+            }
+        }
+        let mut attributed: i128 = 0;
+        for i in 0..Self::open_count(&env) {
+            let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OpenMarket>(&DataKey::OpenMarketAt(i))
+            else {
+                continue;
+            };
+            let idx = match cores.first_index_of(&entry.core) {
+                Some(idx) => idx,
+                None => {
+                    cores.push_back(entry.core.clone());
+                    states.push_back(CoreAccounting::default());
+                    cores.len() - 1
+                }
+            };
+            let mut st = states.get_unchecked(idx);
+            st.open_index += 1;
+            if Self::market_exposure(&env, &entry.core, entry.market_id).open {
+                st.open_exposures += 1;
+            }
+            let net = Self::load_net(&env, &entry.core, entry.market_id).cost_basis();
+            st.net = st.net.checked_add(net).ok_or(Error::InvalidAmount)?;
+            attributed = attributed.checked_add(net).ok_or(Error::InvalidAmount)?;
+            states.set(idx, st);
+        }
+        if cores.len() > MAX_KNOWN_CORES {
+            return Err(Error::TooManyCores);
+        }
+        for i in 0..cores.len() {
+            Self::put_persistent(
+                &env,
+                &DataKey::CoreState(cores.get_unchecked(i)),
+                &states.get_unchecked(i),
+            );
+        }
+        let unattributed = Self::net_exposure(env.clone())
+            .saturating_sub(attributed)
+            .max(0);
+        let instance = env.storage().instance();
+        instance.set(&DataKey::UnattributedNet, &unattributed);
+        instance.set(&DataKey::KnownCores, &cores);
+        instance.set(&DataKey::AccountingInitialized, &true);
+        CoreAccountingInitialized {
+            cores: cores.len(),
+            unattributed_net: unattributed,
+        }
+        .publish(&env);
+        Ok(unattributed)
+    }
+
+    /// Permissionless, irreversible retirement of a drained legacy core
+    /// (issue #320). Requires the per-core counters (`init_core_accounting`),
+    /// a legacy core that is not current and not yet retired, and no index
+    /// entries or open exposures left on it. Releases the core's net from
+    /// `NetTotal` (so it stops counting against the caps), clears
+    /// `LegacyCore` so the `legacy_*` entrypoints refuse it, and drops it
+    /// from `KnownCores`.
+    ///
+    /// While the treasury is paused, index entries whose core can no longer
+    /// be read (a broken wasm that would otherwise fail `nav()` forever) are
+    /// dropped first, each with an `IndexEntryDropped` event.
+    /// Returns the net released from `NetTotal`.
+    pub fn retire_core(env: Env, core: Address) -> Result<i128, Error> {
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AccountingInitialized)
+            .unwrap_or(false)
+        {
+            return Err(Error::AccountingNotInitialized);
+        }
+        let global = Self::load_global(&env)?;
+        if core == global.market_core {
+            return Err(Error::CoreIsCurrent);
+        }
+        if Self::core_state(&env, &core).retired {
+            return Err(Error::CoreRetired);
+        }
+        Self::require_legacy(&env, &core)?;
+        if Self::is_paused(&env) {
+            Self::drop_unreadable_entries(&env, &core)?;
+        }
+        let mut st = Self::core_state(&env, &core);
+        if st.open_index != 0 || st.open_exposures != 0 {
+            return Err(Error::CoreNotDrained);
+        }
+        let net_released = st.net;
+        let total = Self::net_exposure(env.clone())
+            .checked_sub(net_released)
+            .filter(|t| *t >= 0)
+            .ok_or(Error::InvalidAmount)?;
+        env.storage().instance().set(&DataKey::NetTotal, &total);
+        st.net = 0;
+        st.retired = true;
+        Self::put_persistent(&env, &DataKey::CoreState(core.clone()), &st);
+        Self::put_persistent(&env, &DataKey::LegacyCore(core.clone()), &false);
+        let mut known = Self::known_cores(env.clone());
+        if let Some(i) = known.first_index_of(&core) {
+            known.remove(i);
+        }
+        env.storage().instance().set(&DataKey::KnownCores, &known);
+        CoreRetired { core, net_released }.publish(&env);
+        Ok(net_released)
+    }
+
+    /// Redeems a stray position that reached the treasury on a retired core
+    /// (e.g. through market-core's `transfer_position`) straight into idle.
+    /// Permissionless. Skips index, net and PnL bookkeeping: the collateral
+    /// simply lands in idle and is counted from then on.
+    pub fn sweep_retired(env: Env, core: Address, market_id: u64) -> Result<i128, Error> {
+        if !Self::core_state(&env, &core).retired {
+            return Err(Error::CoreNotRetired);
+        }
+        let treasury_addr = env.current_contract_address();
+        let amount = match MarketCoreClient::new(&env, &core).try_redeem(&treasury_addr, &market_id)
+        {
+            Ok(Ok(p)) => p,
+            Err(Ok(MarketCoreError::NothingToRedeem))
+            | Err(Ok(MarketCoreError::RedemptionClosed)) => 0,
+            Err(Ok(MarketCoreError::NotFinal)) => return Err(Error::MarketNotFinal),
+            Err(Ok(_)) | Err(Err(_)) | Ok(Err(_)) => return Err(Error::MarketCoreError),
+        };
+        RetiredSweep {
+            core,
+            market_id,
+            amount,
+        }
+        .publish(&env);
+        Self::drain_after_proceeds(&env);
+        Ok(amount)
+    }
+
+    /// Per-core counters (issue #320).
+    pub fn core_status(env: Env, core: Address) -> CoreAccounting {
+        Self::core_state(&env, &core)
+    }
+
+    /// Live (not retired) market-cores this treasury knows.
+    pub fn known_cores(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::KnownCores)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Part of `NetTotal` the backfill could not attribute to a core.
+    pub fn unattributed_net(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UnattributedNet)
+            .unwrap_or(0)
+    }
+
+    /// Whether the per-core counters are maintained.
+    pub fn core_accounting_initialized(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AccountingInitialized)
+            .unwrap_or(false)
+    }
+
+    /// [`Treasury::realized`] for a market on `core`.
+    pub fn realized_on(env: Env, core: Address, market_id: u64) -> Realized {
+        Self::load_realized(&env, &core, market_id)
+    }
+
+    /// [`Treasury::market_pnl`] for a market on `core`.
+    pub fn market_pnl_on(env: Env, core: Address, market_id: u64) -> MarketPnl {
+        Self::load_pnl(&env, &core, market_id)
+    }
+
+    /// Settlement state of `market_id` on the current core; see `realized_on`.
     pub fn realized(env: Env, market_id: u64) -> Realized {
-        Self::load_realized(&env, market_id)
+        Self::load_global(&env)
+            .map(|g| Self::load_realized(&env, &g.market_core, market_id))
+            .unwrap_or_default()
     }
 
     pub fn realize(env: Env, market_id: u64) -> Result<(), Error> {
@@ -3327,8 +3665,11 @@ impl Treasury {
         Self::try_realize(&env, &global.market_core, market_id)
     }
 
+    /// Cost/proceeds of `market_id` on the current core; see `market_pnl_on`.
     pub fn market_pnl(env: Env, market_id: u64) -> MarketPnl {
-        Self::load_pnl(&env, market_id)
+        Self::load_global(&env)
+            .map(|g| Self::load_pnl(&env, &g.market_core, market_id))
+            .unwrap_or_default()
     }
 
     pub fn window_pnl(env: Env) -> Result<i128, Error> {
@@ -3749,7 +4090,7 @@ impl Treasury {
                 lp,
                 floor_value: floor,
                 net: Self::load_net(&env, &core, market_id),
-                pnl: Self::load_pnl(&env, market_id),
+                pnl: Self::load_pnl(&env, &core, market_id),
                 exposure_amount: Self::market_exposure(&env, &core, market_id).amount,
             };
             let shares = successor.receive_migration(&treasury_addr, &packet);
@@ -3932,7 +4273,7 @@ impl Treasury {
                 open: true,
             },
         );
-        Self::merge_pnl(&env, packet.market_id, packet.pnl);
+        Self::merge_pnl(&env, &packet.core, packet.market_id, packet.pnl);
         env.storage().persistent().set(&key, &true);
         let shares = if floor > 0 {
             Self::mint_shares(&env, &predecessor, floor, nav_before)?
@@ -4312,7 +4653,7 @@ impl Treasury {
         }
         Self::reserve_capacity(&env, &global, &agent, &policy, market_id, collateral_in)?;
         Self::reserve_net(&env, &global, market_id, collateral_in)?;
-        Self::record_cost(&env, market_id, collateral_in)?;
+        Self::record_cost(&env, &global.market_core, market_id, collateral_in)?;
         Ok(shares)
     }
 
@@ -4368,7 +4709,7 @@ impl Treasury {
         }
         // market-core transfers exactly `collateral_out` on success.
         Self::record_return(&env, &global.market_core, market_id, collateral_out)?;
-        Self::record_proceeds(&env, market_id, collateral_out)?;
+        Self::record_proceeds(&env, &global.market_core, market_id, collateral_out)?;
         Self::drain_after_proceeds(&env);
         Ok(shares_in)
     }
@@ -4464,6 +4805,8 @@ impl Treasury {
             ResolutionSpec::SignersDisputable(_) => RuleKind::SignersDisputable,
             ResolutionSpec::Committee(_) => RuleKind::Committee,
             ResolutionSpec::Hybrid(_) => RuleKind::Hybrid,
+            // The resolver's `rule_kind` has no HybridV2 kind to confirm.
+            ResolutionSpec::HybridV2(_) => return Err(Error::InvalidResolution),
         };
         if actual == Some(expected) {
             Ok(())
@@ -4496,9 +4839,9 @@ impl Treasury {
         };
         if payout > 0 {
             Self::record_return(env, core, market_id, payout)?;
-            Self::record_proceeds(env, market_id, payout)?;
+            Self::record_proceeds(env, core, market_id, payout)?;
         }
-        let mut r = Self::load_realized(env, market_id);
+        let mut r = Self::load_realized(env, core, market_id);
         r.position_proceeds = r
             .position_proceeds
             .checked_add(payout)
@@ -4510,7 +4853,7 @@ impl Treasury {
             r.settled = true;
             Self::close_market_exposure(env, core, market_id);
         }
-        Self::save_realized(env, market_id, &r);
+        Self::save_realized(env, core, market_id, &r);
         Self::prune_if_settled(env, core, market_id)?;
         if r.settled {
             Self::try_realize(env, core, market_id)?;
@@ -4530,9 +4873,9 @@ impl Treasury {
         };
         if payout > 0 {
             Self::record_return(env, core, market_id, payout)?;
-            Self::record_proceeds(env, market_id, payout)?;
+            Self::record_proceeds(env, core, market_id, payout)?;
         }
-        let mut r = Self::load_realized(env, market_id);
+        let mut r = Self::load_realized(env, core, market_id);
         r.lp_proceeds = r
             .lp_proceeds
             .checked_add(payout)
@@ -4545,7 +4888,7 @@ impl Treasury {
             r.settled = true;
             Self::close_market_exposure(env, core, market_id);
         }
-        Self::save_realized(env, market_id, &r);
+        Self::save_realized(env, core, market_id, &r);
         Self::prune_if_settled(env, core, market_id)?;
         if r.settled {
             Self::try_realize(env, core, market_id)?;
@@ -4787,6 +5130,12 @@ impl Treasury {
         }
         Self::put_persistent(env, &Self::net_key(env, core, market_id), next);
         env.storage().instance().set(&DataKey::NetTotal, &total);
+        // #320: the core's share of NetTotal moves by the same delta.
+        let delta = next.cost_basis() - before.cost_basis();
+        Self::update_core(env, core, |st| {
+            st.net = st.net.checked_add(delta).ok_or(Error::InvalidAmount)?;
+            Ok(())
+        })?;
         NetExposureUpdated {
             market_id,
             net_market: next.cost_basis(),
@@ -4914,7 +5263,7 @@ impl Treasury {
         let holdings = if Self::marks_migrated(env) {
             Self::nav_holdings(env)
         } else {
-            let mut total = 0;
+            let mut total: i128 = 0;
             for i in 0..Self::open_count(env) {
                 let key = DataKey::OpenMarketAt(i);
                 let entry: OpenMarket = env
@@ -5066,7 +5415,7 @@ impl Treasury {
         for item in result.items.iter() {
             if item.payout > 0 {
                 Self::record_return(env, core, item.market_id, item.payout)?;
-                Self::record_proceeds(env, item.market_id, item.payout)?;
+                Self::record_proceeds(env, core, item.market_id, item.payout)?;
             }
             if !Self::is_indexed(env, core, item.market_id) {
                 continue;
@@ -5074,6 +5423,16 @@ impl Treasury {
             let mark = Self::refresh_mark_for(env, core, item.market_id)?;
             if mark.pos_yes == 0 && mark.pos_no == 0 && !mark.lp {
                 Self::index_remove(env, core, item.market_id)?;
+                // #320: same settlement bookkeeping as the single-market path,
+                // so a batch-drained market does not hold an open exposure
+                // (which would block `retire_core`) or unrealized PnL.
+                let mut r = Self::load_realized(env, core, item.market_id);
+                if !r.settled {
+                    r.settled = true;
+                    Self::save_realized(env, core, item.market_id, &r);
+                }
+                Self::close_market_exposure(env, core, item.market_id);
+                Self::try_realize(env, core, item.market_id)?;
             }
         }
         Ok(())
@@ -5118,6 +5477,10 @@ impl Treasury {
         if env.storage().persistent().has(&slot) {
             return Ok(());
         }
+        // #320: a retired core's positions are never valued in NAV.
+        if Self::core_state(env, core).retired {
+            return Err(Error::CoreRetired);
+        }
         let count = Self::open_count(env);
         if count >= MAX_OPEN_MARKETS {
             return Err(Error::TooManyOpenMarkets);
@@ -5134,7 +5497,10 @@ impl Treasury {
         env.storage()
             .instance()
             .set(&DataKey::OpenMarketCount, &(count + 1));
-        Ok(())
+        Self::update_core(env, core, |st| {
+            st.open_index += 1;
+            Ok(())
+        })
     }
 
     fn index_remove(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
@@ -5169,7 +5535,10 @@ impl Treasury {
             .instance()
             .set(&DataKey::OpenMarketCount, &last);
         Self::recompute_mark_age(env);
-        Ok(())
+        Self::update_core(env, core, |st| {
+            st.open_index = st.open_index.saturating_sub(1);
+            Ok(())
+        })
     }
 
     /// Drops `market_id` from the index once the treasury holds nothing in
@@ -5588,18 +5957,37 @@ impl Treasury {
         Ok(())
     }
 
-    fn load_realized(env: &Env, market_id: u64) -> Realized {
+    /// #320: mirrors `market_key`. Entries a non-original core wrote under
+    /// `Realized(id)` before this change cannot be told apart from the
+    /// original core's and are not migrated; `settle_market_on` recomputes
+    /// from the core's live position and market state.
+    fn realized_key(env: &Env, core: &Address, market_id: u64) -> DataKey {
+        if Self::is_original_core(env, core) {
+            DataKey::Realized(market_id)
+        } else {
+            DataKey::RealizedV2(core.clone(), market_id)
+        }
+    }
+
+    fn pnl_key(env: &Env, core: &Address, market_id: u64) -> DataKey {
+        if Self::is_original_core(env, core) {
+            DataKey::Pnl(market_id)
+        } else {
+            DataKey::PnlV2(core.clone(), market_id)
+        }
+    }
+
+    fn load_realized(env: &Env, core: &Address, market_id: u64) -> Realized {
         env.storage()
             .persistent()
-            .get(&DataKey::Realized(market_id))
+            .get(&Self::realized_key(env, core, market_id))
             .unwrap_or_default()
     }
 
-    fn save_realized(env: &Env, market_id: u64, r: &Realized) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Realized(market_id), r);
-        Self::bump_persistent(env, &DataKey::Realized(market_id));
+    fn save_realized(env: &Env, core: &Address, market_id: u64, r: &Realized) {
+        let key = Self::realized_key(env, core, market_id);
+        env.storage().persistent().set(&key, r);
+        Self::bump_persistent(env, &key);
     }
 
     fn close_market_exposure(env: &Env, core: &Address, market_id: u64) {
@@ -5610,18 +5998,17 @@ impl Treasury {
         }
     }
 
-    fn load_pnl(env: &Env, market_id: u64) -> MarketPnl {
+    fn load_pnl(env: &Env, core: &Address, market_id: u64) -> MarketPnl {
         env.storage()
             .persistent()
-            .get(&DataKey::Pnl(market_id))
+            .get(&Self::pnl_key(env, core, market_id))
             .unwrap_or_default()
     }
 
-    fn save_pnl(env: &Env, market_id: u64, pnl: &MarketPnl) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Pnl(market_id), pnl);
-        Self::bump_persistent(env, &DataKey::Pnl(market_id));
+    fn save_pnl(env: &Env, core: &Address, market_id: u64, pnl: &MarketPnl) {
+        let key = Self::pnl_key(env, core, market_id);
+        env.storage().persistent().set(&key, pnl);
+        Self::bump_persistent(env, &key);
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
@@ -5630,26 +6017,31 @@ impl Treasury {
             .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
     }
 
-    fn record_cost(env: &Env, market_id: u64, amount: i128) -> Result<(), Error> {
+    fn record_cost(env: &Env, core: &Address, market_id: u64, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(());
         }
-        let mut pnl = Self::load_pnl(env, market_id);
+        let mut pnl = Self::load_pnl(env, core, market_id);
         pnl.cost = pnl.cost.checked_add(amount).ok_or(Error::InvalidAmount)?;
-        Self::save_pnl(env, market_id, &pnl);
+        Self::save_pnl(env, core, market_id, &pnl);
         Ok(())
     }
 
-    fn record_proceeds(env: &Env, market_id: u64, amount: i128) -> Result<(), Error> {
+    fn record_proceeds(
+        env: &Env,
+        core: &Address,
+        market_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(());
         }
-        let mut pnl = Self::load_pnl(env, market_id);
+        let mut pnl = Self::load_pnl(env, core, market_id);
         pnl.proceeds = pnl
             .proceeds
             .checked_add(amount)
             .ok_or(Error::InvalidAmount)?;
-        Self::save_pnl(env, market_id, &pnl);
+        Self::save_pnl(env, core, market_id, &pnl);
         Ok(())
     }
 
@@ -5753,7 +6145,20 @@ impl Treasury {
         let pos = client.get_position(&market_id, &treasury_addr);
         let lp_settled = m.creator != treasury_addr || m.lp_claimed;
         if pos.yes == 0 && pos.no == 0 && lp_settled {
-            let mut pnl = Self::load_pnl(env, market_id);
+            Self::realize_pnl(env, core, market_id)?;
+        }
+        Ok(())
+    }
+
+    /// #320: realizes a market market-core finalized. Its `Position` entries
+    /// may linger, so the position check of `try_realize` cannot apply.
+    fn realize_finalized(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
+        Self::realize_pnl(env, core, market_id)
+    }
+
+    fn realize_pnl(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
+        {
+            let mut pnl = Self::load_pnl(env, core, market_id);
             if !pnl.realized {
                 let net_pnl = pnl
                     .proceeds
@@ -5761,7 +6166,7 @@ impl Treasury {
                     .ok_or(Error::InvalidAmount)?;
                 Self::add_daily_pnl(env, net_pnl)?;
                 pnl.realized = true;
-                Self::save_pnl(env, market_id, &pnl);
+                Self::save_pnl(env, core, market_id, &pnl);
                 PnlRealized {
                     market_id,
                     cost: pnl.cost,
@@ -5851,7 +6256,94 @@ impl Treasury {
     }
 
     fn save_market(env: &Env, core: &Address, market_id: u64, exposure: &MarketExposure) {
+        let was_open = Self::market_exposure(env, core, market_id).open;
         Self::put_persistent(env, &Self::market_key(env, core, market_id), exposure);
+        // #320: count open exposures per core when `open` flips.
+        if was_open != exposure.open {
+            let _ = Self::update_core(env, core, |st| {
+                if exposure.open {
+                    st.open_exposures += 1;
+                } else {
+                    st.open_exposures = st.open_exposures.saturating_sub(1);
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // ----- per-core accounting (#320) -------------------------------------------
+
+    fn core_state(env: &Env, core: &Address) -> CoreAccounting {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CoreState(core.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Applies `f` to `core`'s counters. A no-op until the counters are
+    /// initialized, so the backfill never double counts.
+    fn update_core(
+        env: &Env,
+        core: &Address,
+        f: impl FnOnce(&mut CoreAccounting) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AccountingInitialized)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let mut st = Self::core_state(env, core);
+        f(&mut st)?;
+        Self::put_persistent(env, &DataKey::CoreState(core.clone()), &st);
+        Ok(())
+    }
+
+    /// Appends `core` to `KnownCores` (bounded by `MAX_KNOWN_CORES`).
+    fn note_known_core(env: &Env, core: &Address) -> Result<(), Error> {
+        let mut known = Self::known_cores(env.clone());
+        if known.contains(core) {
+            return Ok(());
+        }
+        if known.len() >= MAX_KNOWN_CORES {
+            return Err(Error::TooManyCores);
+        }
+        known.push_back(core.clone());
+        env.storage().instance().set(&DataKey::KnownCores, &known);
+        Ok(())
+    }
+
+    /// While paused, drops `core`'s index entries whose market can no longer
+    /// be read from `core`, closing their exposure (#320).
+    fn drop_unreadable_entries(env: &Env, core: &Address) -> Result<(), Error> {
+        let client = MarketCoreClient::new(env, core);
+        let mut i = 0;
+        while i < Self::open_count(env) {
+            let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OpenMarket>(&DataKey::OpenMarketAt(i))
+            else {
+                i += 1;
+                continue;
+            };
+            if entry.core == *core && !matches!(client.try_get_market(&entry.market_id), Ok(Ok(_)))
+            {
+                Self::close_market_exposure(env, core, entry.market_id);
+                Self::index_remove(env, core, entry.market_id)?;
+                IndexEntryDropped {
+                    core: core.clone(),
+                    market_id: entry.market_id,
+                }
+                .publish(env);
+                // swap-and-pop moved another entry into slot `i`.
+                continue;
+            }
+            i += 1;
+        }
+        Ok(())
     }
 }
 
@@ -5905,7 +6397,11 @@ impl Treasury {
         };
         let args = vec![env, agent.clone().into_val(env)];
         let record: Option<AgentRecord> =
-            match env.try_invoke_contract(&registry, &Symbol::new(env, "get_agent"), args) {
+            match env.try_invoke_contract::<Option<AgentRecord>, soroban_sdk::Error>(
+                &registry,
+                &Symbol::new(env, "get_agent"),
+                args,
+            ) {
                 Ok(Ok(v)) => v,
                 _ => return Err(Error::TraceRegistryCallFailed),
             };
@@ -6912,12 +7408,12 @@ mod test {
                 address: &agent,
                 invoke: &MockAuthInvoke {
                     contract: &f.treasury_id,
-                    fn_name: "migrate_market",
-                    args: (f.market_id,).into_val(&f.env),
+                    fn_name: "migrate_markets",
+                    args: (vec![&f.env, f.market_id],).into_val(&f.env),
                     sub_invokes: &[],
                 },
             }])
-            .try_migrate_market(&f.market_id)
+            .try_migrate_markets(&vec![&f.env, f.market_id])
             .is_err());
     }
 
@@ -10895,7 +11391,6 @@ mod test {
         settle_market_redeems_position_after_resolution,
         settle_market_is_idempotent_and_never_errors_on_retry,
         market_core_switch_namespaces_exposure_and_allows_legacy_redeem,
-        migrate_then_successor_redeems_after_resolution,
         settle_market_drains_queue_in_same_tx,
         estimated_unlock_orders_by_close_time,
     );
@@ -11004,7 +11499,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    f.treasury.net_exposure(),
                 ),
             );
             assert!(f
@@ -11023,7 +11518,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    f.treasury.net_exposure(),
                 ),
             );
             assert_eq!(before, after);
@@ -11079,7 +11574,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    f.treasury.net_exposure(),
                 ),
             );
             assert!(f
@@ -11098,7 +11593,7 @@ mod test {
                 &[&f.treasury_id],
                 (
                     f.treasury.daily_usage(),
-                    f.treasury.market_exposure(&f.market_id),
+                    f.treasury.net_exposure(),
                 ),
             );
             assert_eq!(before, after);
@@ -11191,5 +11686,268 @@ mod test {
             );
             assert_eq!(before, after);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #320: core switches and retirement
+    // -----------------------------------------------------------------------
+
+    /// Buys 20 USDC on the original core's market, switches the treasury to a
+    /// fresh core and creates (and buys into) market id 0 there too.
+    fn switched(f: &Fixture) -> (Address, Address, MarketCoreClient<'static>) {
+        let old_core = f.market_core.address.clone();
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let creator = f.market_core.get_market(&f.market_id).creator;
+        let new_core_id = register_market_core(
+            &f.env,
+            (
+                f.admin.clone(),
+                f.token.clone(),
+                f.treasury_id.clone(),
+                Address::generate(&f.env),
+                100u32,
+                10_000u32,
+            ),
+        );
+        let new_core = MarketCoreClient::new(&f.env, &new_core_id);
+        f.treasury
+            .propose_config(&global_with(f, |g| g.market_core = new_core_id.clone()));
+        f.env.ledger().set_timestamp(1_000 + DELAY);
+        f.treasury.execute_config();
+        let new_market = new_core.create_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[42; 32]),
+            &BytesN::from_array(&f.env, &[142; 32]),
+            &String::from_str(&f.env, "ipfs://new-core"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        );
+        assert_eq!(new_market, f.market_id);
+        f.treasury
+            .agent_buy(&f.agent, &new_market, &Outcome::Yes, &(10 * USDC), &0);
+        (old_core, new_core_id, new_core)
+    }
+
+    #[test]
+    fn pnl_keys_namespaced_after_core_switch() {
+        let f = fixture();
+        let (old_core, new_core, _) = switched(&f);
+        // Same market id on two cores: cost bases stay separate.
+        assert_eq!(
+            f.treasury.market_pnl_on(&old_core, &f.market_id).cost,
+            20 * USDC
+        );
+        assert_eq!(
+            f.treasury.market_pnl_on(&new_core, &f.market_id).cost,
+            10 * USDC
+        );
+        assert_eq!(f.treasury.market_pnl(&f.market_id).cost, 10 * USDC);
+        assert_eq!(
+            f.treasury.known_cores(),
+            vec![&f.env, old_core.clone(), new_core.clone()]
+        );
+        let old = f.treasury.core_status(&old_core);
+        let new = f.treasury.core_status(&new_core);
+        assert_eq!(
+            (old.open_index, old.open_exposures, old.net),
+            (1, 1, 20 * USDC)
+        );
+        assert_eq!(
+            (new.open_index, new.open_exposures, new.net),
+            (1, 1, 10 * USDC)
+        );
+        assert_eq!(f.treasury.net_exposure(), old.net + new.net);
+    }
+
+    #[test]
+    fn settle_market_on_legacy_core_then_retire() {
+        let f = fixture();
+        let (old_core, new_core, _) = switched(&f);
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::No);
+        let caller = Address::generate(&f.env);
+        // The current core's market 0 is still open; the legacy one settles.
+        assert_eq!(
+            f.treasury
+                .try_settle_market_on(&caller, &Address::generate(&f.env), &f.market_id),
+            Err(Ok(Error::LegacyCoreUnknown))
+        );
+        let report = f
+            .treasury
+            .settle_market_on(&caller, &old_core, &f.market_id);
+        assert!(!report.already_settled);
+        assert!(f.treasury.realized_on(&old_core, &f.market_id).settled);
+        assert!(!f.treasury.realized_on(&new_core, &f.market_id).settled);
+        assert!(f.treasury.market_pnl_on(&old_core, &f.market_id).realized);
+        let st = f.treasury.core_status(&old_core);
+        assert_eq!((st.open_index, st.open_exposures), (0, 0));
+        // A losing position leaves its cost basis in net until retirement.
+        assert_eq!(st.net, 20 * USDC);
+
+        let total = f.treasury.net_exposure();
+        assert_eq!(f.treasury.retire_core(&old_core), 20 * USDC);
+        assert_eq!(f.treasury.net_exposure(), total - 20 * USDC);
+        let st = f.treasury.core_status(&old_core);
+        assert!(st.retired);
+        assert_eq!(st.net, 0);
+        assert_eq!(f.treasury.known_cores(), vec![&f.env, new_core.clone()]);
+        // Irreversible and closed to the legacy entrypoints.
+        assert_eq!(
+            f.treasury.try_retire_core(&old_core),
+            Err(Ok(Error::CoreRetired))
+        );
+        assert_eq!(
+            f.treasury
+                .try_legacy_redeem(&f.agent, &old_core, &f.market_id),
+            Err(Ok(Error::LegacyCoreUnknown))
+        );
+        assert_eq!(
+            f.treasury
+                .try_settle_market_on(&caller, &old_core, &f.market_id),
+            Err(Ok(Error::LegacyCoreUnknown))
+        );
+    }
+
+    #[test]
+    fn retire_core_requires_drained() {
+        let f = fixture();
+        let (old_core, new_core, _) = switched(&f);
+        assert_eq!(
+            f.treasury.try_retire_core(&old_core),
+            Err(Ok(Error::CoreNotDrained))
+        );
+        assert_eq!(
+            f.treasury.try_retire_core(&new_core),
+            Err(Ok(Error::CoreIsCurrent))
+        );
+        assert_eq!(
+            f.treasury.try_retire_core(&Address::generate(&f.env)),
+            Err(Ok(Error::LegacyCoreUnknown))
+        );
+    }
+
+    #[test]
+    fn execute_config_cannot_return_to_retired_core() {
+        let f = fixture();
+        let (old_core, _, _) = switched(&f);
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury
+            .settle_market_on(&Address::generate(&f.env), &old_core, &f.market_id);
+        f.treasury.retire_core(&old_core);
+        f.treasury
+            .propose_config(&global_with(&f, |g| g.market_core = old_core.clone()));
+        f.env.ledger().set_timestamp(MARKET_CLOSE + DELAY);
+        assert_eq!(f.treasury.try_execute_config(), Err(Ok(Error::CoreRetired)));
+    }
+
+    #[test]
+    fn stray_position_after_retire_swept_not_indexed() {
+        let f = fixture();
+        let (old_core, new_core, _) = switched(&f);
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury
+            .settle_market_on(&Address::generate(&f.env), &old_core, &f.market_id);
+        f.treasury.retire_core(&old_core);
+        // A retired core can never re-enter the NAV index.
+        f.env.as_contract(&f.treasury_id, || {
+            assert_eq!(
+                Treasury::index_add(&f.env, &old_core, f.market_id),
+                Err(Error::CoreRetired)
+            );
+        });
+        // Nothing stray here, so the sweep collects 0; only retired cores.
+        assert_eq!(f.treasury.sweep_retired(&old_core, &f.market_id), 0);
+        assert_eq!(
+            f.treasury.try_sweep_retired(&new_core, &f.market_id),
+            Err(Ok(Error::CoreNotRetired))
+        );
+        assert_eq!(f.treasury.open_market_count(), 1);
+    }
+
+    #[test]
+    fn init_core_accounting_backfill_and_unattributed() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let core = f.market_core.address.clone();
+        // A fresh deployment needs no backfill.
+        assert!(f.treasury.core_accounting_initialized());
+        assert_eq!(
+            f.treasury.try_init_core_accounting(),
+            Err(Ok(Error::InvalidConfig))
+        );
+        // Simulate a treasury deployed before #320, with 5 USDC of net that no
+        // indexed market explains.
+        f.env.as_contract(&f.treasury_id, || {
+            let i = f.env.storage().instance();
+            i.remove(&DataKey::AccountingInitialized);
+            i.remove(&DataKey::KnownCores);
+            let total: i128 = i.get(&DataKey::NetTotal).unwrap();
+            i.set(&DataKey::NetTotal, &(total + 5 * USDC));
+            f.env
+                .storage()
+                .persistent()
+                .remove(&DataKey::CoreState(core.clone()));
+        });
+        assert_eq!(
+            f.treasury.try_retire_core(&core),
+            Err(Ok(Error::AccountingNotInitialized))
+        );
+        assert_eq!(f.treasury.init_core_accounting(), 5 * USDC);
+        assert_eq!(f.treasury.unattributed_net(), 5 * USDC);
+        let st = f.treasury.core_status(&core);
+        assert_eq!(
+            (st.open_index, st.open_exposures, st.net),
+            (1, 1, 20 * USDC)
+        );
+        assert_eq!(f.treasury.known_cores(), vec![&f.env, core.clone()]);
+        assert_eq!(
+            f.treasury.try_init_core_accounting(),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
+    #[test]
+    fn batch_paths_update_core_counters() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let core = f.market_core.address.clone();
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury.redeem_many(&f.agent, &vec![&f.env, f.market_id]);
+        let st = f.treasury.core_status(&core);
+        assert_eq!((st.open_index, st.open_exposures), (0, 0));
+        assert!(f.treasury.realized(&f.market_id).settled);
+        assert!(f.treasury.market_pnl(&f.market_id).realized);
+    }
+
+    #[test]
+    fn settle_after_finalize_market_closes_exposure() {
+        with_market_core(McImpl::Native, || {
+            let f = fixture();
+            let (old_core, _, _) = switched(&f);
+            f.env.ledger().set_timestamp(MARKET_CLOSE);
+            f.market_core.resolve(&f.market_id, &Outcome::Yes);
+            // Nobody redeems before market-core's redemption horizon ends.
+            f.env
+                .ledger()
+                .set_timestamp(MARKET_CLOSE + 366 * DAY_SECONDS);
+            f.market_core.finalize_market(&f.market_id);
+            let report =
+                f.treasury
+                    .settle_market_on(&Address::generate(&f.env), &old_core, &f.market_id);
+            assert_eq!(report.redeemed, 0);
+            let st = f.treasury.core_status(&old_core);
+            assert_eq!((st.open_index, st.open_exposures), (0, 0));
+            assert!(f.treasury.realized_on(&old_core, &f.market_id).settled);
+            f.treasury.retire_core(&old_core);
+            assert!(f.treasury.core_status(&old_core).retired);
+        });
     }
 }

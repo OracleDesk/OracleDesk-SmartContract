@@ -160,6 +160,8 @@ export function toVerdict(raw: unknown): TraceVerdict {
         const ts = Array.isArray(obj["values"]) ? BigInt(String(obj["values"][0] ?? 0)) : 0n;
         return { tag: "AgentRevokedAfter", values: [ts] as [bigint] };
       }
+      case "Late":
+        return { tag: "Late" };
       default:
         // Future variants: treat as unknown but don't crash.
         return { tag: "Unknown" as TraceVerdict["tag"], values: [String(tag)] as never };
