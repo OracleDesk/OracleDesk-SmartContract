@@ -30,7 +30,7 @@ jobs:
       run:
         working-directory: oracledesk-stellar
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,9 +40,9 @@ jobs:
         with:
           workspaces: oracledesk-stellar
 
-      - uses: stellar/stellar-cli@v27.1.0
+      - uses: stellar/stellar-cli@v30.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -51,7 +51,7 @@ jobs:
             oracledesk-stellar/agents/package-lock.json
             oracledesk-stellar/x402/package-lock.json
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -78,7 +78,7 @@ jobs:
 
       - name: Upload deployment + trace artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: local-e2e-artifacts
           path: |
