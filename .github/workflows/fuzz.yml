@@ -1,0 +1,68 @@
+name: Fuzz smoke (resolver)
+
+# Time-boxed libFuzzer runs of the resolver targets (issue #278). Each
+# target runs for 120 s from the committed corpus; crashes are uploaded as
+# artifacts. See oracledesk-stellar/fuzz/README.md.
+
+on:
+  pull_request:
+    paths:
+      - "oracledesk-stellar/contracts/resolver/**"
+      - "oracledesk-stellar/fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_resolver_signatures
+          - fuzz_resolver_committee
+          - fuzz_resolver_spec_decode
+    defaults:
+      run:
+        working-directory: oracledesk-stellar/fuzz
+    env:
+      # Tracked findings only (each has an ignored regression test and a
+      # follow-up fix); see the Findings table in fuzz/README.md.
+      ORACLEDESK_FUZZ_ALLOW: dup-signers
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oracledesk-stellar/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      - name: Replay corpus
+        run: cargo +nightly fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} -- -runs=0
+
+      - name: Fuzz for 120 s
+        run: |
+          mkdir -p /tmp/fuzz-corpus
+          cp corpus/${{ matrix.target }}/* /tmp/fuzz-corpus/
+          cargo +nightly fuzz run ${{ matrix.target }} /tmp/fuzz-corpus -- \
+            -max_total_time=120 -max_len=4096
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashes-${{ matrix.target }}
+          path: oracledesk-stellar/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

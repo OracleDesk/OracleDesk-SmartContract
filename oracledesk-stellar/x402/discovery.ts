@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 export interface TraceIndexRow {
   traceId: bigint;
@@ -6,7 +6,6 @@ export interface TraceIndexRow {
   agent: string;
   action: string;
   traceHash: string;
-  cid: string;
   publishedAt: number;
   syncedAt: number;
 }
@@ -75,24 +74,86 @@ export class MemoryDiscoveryStore implements DiscoveryStore {
 }
 
 export interface CursorData {
+  v?: 1;
+  kid?: string;
+  q?: string;
+  next?: string;
+  anchorTotal?: string;
+  exp?: number;
+  index?: bigint;
   marketId?: string;
-  index: bigint;
   order: "asc" | "desc";
 }
 
-export function encodeCursor(data: CursorData, secret: string): string {
-  const payload = JSON.stringify(data);
-  const hmac = createHmac("sha256", secret).update(payload).digest("hex");
-  return Buffer.from(`${payload}:${hmac}`).toString("base64url");
+export interface CursorKeys {
+  current: { kid: string; secret: string };
+  verify?: Record<string, string>;
 }
 
-export function decodeCursor(cursor: string, secret: string): CursorData | null {
+export interface CursorV1 {
+  v: 1;
+  kid: string;
+  q: string;
+  order: "asc" | "desc";
+  next: string;
+  anchorTotal: string;
+  exp: number;
+}
+
+function keySet(keys: CursorKeys | string): CursorKeys {
+  if (typeof keys === "string")
+    return { current: { kid: "legacy", secret: keys } };
+  return keys;
+}
+
+export function parseCursorKeys(value = process.env.X402_CURSOR_KEYS): CursorKeys | undefined {
+  if (!value) return undefined;
+  const parsed = value.split(",").map((part) => {
+    const [kid, encoded] = part.split(":", 2);
+    if (!kid || !encoded) throw new Error("X402_CURSOR_KEYS entries must be kid:base64");
+    return { kid, secret: Buffer.from(encoded, "base64").toString("utf8") };
+  });
+  if (!parsed.length) return undefined;
+  return {
+    current: parsed[0],
+    verify: Object.fromEntries(parsed.map((key) => [key.kid, key.secret])),
+  };
+}
+
+export function encodeCursor(
+  data: Omit<CursorV1, "v" | "kid"> | CursorData,
+  keys: CursorKeys | string,
+): string {
+  const k = keySet(keys).current;
+  const value = "next" in data
+    ? { v: 1, kid: k.kid, ...data }
+    : { v: 1, kid: k.kid, q: "", next: String(data.index ?? 0n), anchorTotal: "0", exp: Math.floor(Date.now() / 1000) + 86400, order: data.order };
+  const payload = Buffer.from(JSON.stringify(value)).toString("base64url");
+  const mac = createHmac("sha256", k.secret).update(payload).digest("base64url");
+  return `${payload}.${mac}`;
+}
+
+export function decodeCursor(
+  cursor: string,
+  keys: CursorKeys | string,
+  query = "",
+  now = Math.floor(Date.now() / 1000),
+): CursorV1 | null {
   try {
-    const payload = Buffer.from(cursor, "base64url").toString();
-    const [data, hmac] = payload.split(":");
-    const expectedHmac = createHmac("sha256", secret).update(data).digest("hex");
-    if (hmac !== expectedHmac) return null;
-    return JSON.parse(data);
+    const separator = cursor.lastIndexOf(".");
+    if (separator <= 0) return null;
+    const payload = cursor.slice(0, separator);
+    const supplied = Buffer.from(cursor.slice(separator + 1), "base64url");
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString()) as CursorV1;
+    if (parsed.v !== 1 || typeof parsed.kid !== "string") return null;
+    const all = keySet(keys);
+    const secret = all.verify?.[parsed.kid] ?? (all.current.kid === parsed.kid ? all.current.secret : undefined);
+    if (!secret) return null;
+    const expected = createHmac("sha256", secret).update(payload).digest();
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
+    if (parsed.exp <= now || (query && parsed.q !== query)) return null;
+    if (!/^\d+$/.test(parsed.next) || !/^\d+$/.test(parsed.anchorTotal)) return null;
+    return parsed;
   } catch {
     return null;
   }

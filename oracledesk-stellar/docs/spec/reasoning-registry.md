@@ -38,18 +38,18 @@ pub struct TraceEntry {
 
 Admin: registers a new reasoner (agent) address.
 
-**AUTH-1** `auth(admin)`.
+**RR-REGISTER_REASONER-AUTH-1** `auth(admin)`.
 
-**PRE-1** `reasoner` is a valid address.
-**PRE-2** `reasoner` not already registered (or update is allowed; design choice).
+**RR-REGISTER_REASONER-PRE-1** `reasoner` is a valid address.
+**RR-REGISTER_REASONER-PRE-2** `reasoner` not already registered (or update is allowed; design choice).
 
-**POST-1** New reasoner ID assigned: `id = P[ReasonerCount] + 1`.
-**POST-2** `P[Reasoner(id)]` = `reasoner`.
-**POST-3** `P[ReasonerCount]` incremented.
+**RR-REGISTER_REASONER-POST-1** New reasoner ID assigned: `id = P[ReasonerCount] + 1`.
+**RR-REGISTER_REASONER-POST-2** `P[Reasoner(id)]` = `reasoner`.
+**RR-REGISTER_REASONER-POST-3** `P[ReasonerCount]` incremented.
 
-**EVT-1** `ReasonerRegistered { reasoner, reasoner_id: id }`.
+**RR-REGISTER_REASONER-EVT-1** `ReasonerRegistered { reasoner, reasoner_id: id }`.
 
-**ERR-1** `Unauthorized(1)` if not admin.
+**RR-REGISTER_REASONER-ERR-1** `Unauthorized(1)` if not admin.
 
 ---
 
@@ -57,22 +57,22 @@ Admin: registers a new reasoner (agent) address.
 
 Reasoner publishes a trace (the trading rationale behind a market action).
 
-**AUTH-1** `auth(reasoner)`.
+**RR-PUBLISH_TRACE-AUTH-1** `auth(reasoner)`.
 
-**PRE-1** `reasoner` is registered (lookup `P[Reasoner(*)]` for matching address).
-**PRE-2** `content` is non-empty.
-**PRE-3** Trace ID is new (not already published).
+**RR-PUBLISH_TRACE-PRE-1** `reasoner` is registered (lookup `P[Reasoner(*)]` for matching address).
+**RR-PUBLISH_TRACE-PRE-2** `content` is non-empty.
+**RR-PUBLISH_TRACE-PRE-3** Trace ID is new (not already published).
 
-**POST-1** `trace_hash = sha256(content)`.
-**POST-2** `P[TraceEntry(trace_id)]` = `{reasoner_id, trace_hash, content_hash, published_at: now}`.
-**POST-3** If `content.len()` <= threshold, `P[TraceData(trace_id)]` = `content`; else external storage reference.
-**POST-4** Entry TTL-bumped.
+**RR-PUBLISH_TRACE-POST-1** `trace_hash = sha256(content)`.
+**RR-PUBLISH_TRACE-POST-2** `P[TraceEntry(trace_id)]` = `{reasoner_id, trace_hash, content_hash, published_at: now}`.
+**RR-PUBLISH_TRACE-POST-3** If `content.len()` <= threshold, `P[TraceData(trace_id)]` = `content`; else external storage reference.
+**RR-PUBLISH_TRACE-POST-4** Entry TTL-bumped.
 
-**EVT-1** `TracePublished { reasoner_id, trace_id, trace_hash }`.
+**RR-PUBLISH_TRACE-EVT-1** `TracePublished { reasoner_id, trace_id, trace_hash }`.
 
-**ERR-1** `ReasonerNotFound(2)` if reasoner not registered.
-**ERR-2** `InvalidTrace(3)` if content empty.
-**ERR-3** `TraceAlreadyPublished(4)` if trace_id already exists.
+**RR-PUBLISH_TRACE-ERR-1** `ReasonerNotFound(2)` if reasoner not registered.
+**RR-PUBLISH_TRACE-ERR-2** `InvalidTrace(3)` if content empty.
+**RR-PUBLISH_TRACE-ERR-3** `TraceAlreadyPublished(4)` if trace_id already exists.
 
 ---
 
@@ -80,18 +80,18 @@ Reasoner publishes a trace (the trading rationale behind a market action).
 
 Permissionless: verifies a trace hash against stored content (used by x402 and contracts).
 
-**AUTH-1** None (permissionless).
+**RR-VERIFY_TRACE-AUTH-1** None (permissionless).
 
-**PRE-1** `P[TraceEntry(trace_id)]` exists else `TraceNotFound(5)`.
+**RR-VERIFY_TRACE-PRE-1** `P[TraceEntry(trace_id)]` exists else `TraceNotFound(5)`.
 
-**POST-1** Recomputes `sha256(content)` from stored or external data.
-**POST-2** Compares computed hash with `P[TraceEntry(trace_id)].trace_hash`.
-**POST-3** Returns `true` if match, `false` otherwise (or errors if content fetch fails).
+**RR-VERIFY_TRACE-POST-1** Recomputes `sha256(content)` from stored or external data.
+**RR-VERIFY_TRACE-POST-2** Compares computed hash with `P[TraceEntry(trace_id)].trace_hash`.
+**RR-VERIFY_TRACE-POST-3** Returns `true` if match, `false` otherwise (or errors if content fetch fails).
 
-**EVT-1** None.
+**RR-VERIFY_TRACE-EVT-1** None.
 
-**ERR-1** `TraceNotFound(5)` if trace doesn't exist.
-**ERR-2** `VerificationFailed(6)` if hash mismatch.
+**RR-VERIFY_TRACE-ERR-1** `TraceNotFound(5)` if trace doesn't exist.
+**RR-VERIFY_TRACE-ERR-2** `VerificationFailed(6)` if hash mismatch.
 
 ---
 
@@ -99,11 +99,11 @@ Permissionless: verifies a trace hash against stored content (used by x402 and c
 
 View: retrieves trace metadata and content (if stored on-chain).
 
-**AUTH-1** None.
+**RR-GET_TRACE-AUTH-1** None.
 
-**PRE-1** No preconditions.
+**RR-GET_TRACE-PRE-1** No preconditions.
 
-**POST-1** Returns `TraceEntry` and content (if available), or `None`.
+**RR-GET_TRACE-POST-1** Returns `TraceEntry` and content (if available), or `None`.
 
 ---
 

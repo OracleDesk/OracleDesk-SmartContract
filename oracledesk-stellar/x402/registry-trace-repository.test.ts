@@ -269,3 +269,37 @@ test("defaults the cursor and page size when omitted", async () => {
   await repo.listByAgent("GAGENT");
   assert.deepEqual(seen, { agent: "GAGENT", start: 0n, limit: 25 });
 });
+
+test("#328: RPC outage on get() throws RepositoryUnavailable instead of returning undefined", async () => {
+  const { RepositoryUnavailable } = await import("./errors.js");
+  const repo = new RegistryTraceRepository({
+    async get_trace() {
+      throw new Error("fetch failed", { cause: new Error("ETIMEDOUT") });
+    },
+    async traces_by_agent() {
+      throw new Error("unused");
+    },
+    async traces_by_market_action() {
+      throw new Error("unused");
+    },
+  });
+  await assert.rejects(repo.get("1"), RepositoryUnavailable);
+});
+
+test("#329: a simulation restore requirement maps to RegistryRestoreRequired, not absent", async () => {
+  const { RegistryRestoreRequired } = await import("./errors.js");
+  const repo = new RegistryTraceRepository({
+    async get_trace() {
+      throw Object.assign(new Error("simulation failed"), {
+        restorePreamble: { minResourceFee: "1000", transactionData: "AAAA" },
+      });
+    },
+    async traces_by_agent() {
+      throw new Error("unused");
+    },
+    async traces_by_market_action() {
+      throw new Error("unused");
+    },
+  });
+  await assert.rejects(repo.get("1"), RegistryRestoreRequired);
+});

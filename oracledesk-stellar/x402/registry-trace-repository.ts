@@ -24,11 +24,15 @@ import type {
   TraceRepository,
 } from "./trace-api.js";
 import type { TraceVerdict } from "./trace-verification.js";
-import { classifyRegistryError, RepositoryUnavailable, TRACE_NOT_FOUND_CODE } from "./errors.js";
+import {
+  classifyRegistryError,
+  isRestoreRequired,
+  RegistryRestoreRequired,
+  RepositoryUnavailable,
+  TRACE_NOT_FOUND_CODE,
+} from "./errors.js";
 
 export type { TraceVerdict };
-
-export type RegistryAction = string;
 
 export interface RegistryTrace {
   market_id: bigint;
@@ -38,6 +42,9 @@ export interface RegistryTrace {
   ipfs_cid: string;
   published_at: bigint;
 }
+export type RegistryAction =
+  | string
+  | { tag: string; values?: unknown[] };
 
 export interface RegistryTracePageEntry {
   trace_id: bigint;
@@ -52,27 +59,26 @@ export interface RegistryTracePage {
 
 export interface RegistryTraceReader {
   get_trace(args: { trace_id: bigint }): Promise<{ result: RegistryTrace }>;
-  trace_verdict?(args: {
-    trace_id: bigint;
-    received_hash: Buffer;
-  }): Promise<{ result: TraceVerdict }>;
+  trace_verdict?(args: { trace_id: bigint; received_hash: Buffer }): Promise<{ result: TraceVerdict }>;
   /** #57 paginated secondary indexes. */
-  traces_by_agent(args: {
+  traces_by_agent?(args: {
     agent: string;
     start: bigint;
     limit: number;
   }): Promise<{ result: RegistryTracePage }>;
-  traces_by_market_action(args: {
+  traces_by_market?(args: {
+    market_id: bigint;
+    start: bigint;
+    limit: number;
+  }): Promise<{ result: RegistryTracePage }>;
+  traces_by_market_action?(args: {
     market_id: bigint;
     action: string;
     start: bigint;
     limit: number;
   }): Promise<{ result: RegistryTracePage }>;
-  /** #299: optional trace_verdict from the registry. */
-  trace_verdict?(args: {
-    trace_id: bigint;
-    received_hash: Buffer;
-  }): Promise<{ result: TraceVerdict }>;
+  market_trace_count?(args: { market_id: bigint }): Promise<{ result: bigint }>;
+  market_trace_at?(args: { market_id: bigint; index: bigint }): Promise<{ result: bigint }>;
   /** #299: optional signature_verdict from the registry. */
   signature_verdict?(args: { trace_id: bigint }): Promise<{ result: unknown }>;
 }
@@ -89,13 +95,20 @@ export interface RegistryTraceRecord extends TraceRecord {
 const DEFAULT_PAGE_LIMIT = 25;
 const MAX_PAGE_LIMIT = 25;
 
+export function actionLabel(action: RegistryAction): string {
+  if (typeof action === "string") return action.toLowerCase();
+  const tag = action.tag;
+  if (tag === "Other") return `other:${String(action.values?.[0] ?? "")}`;
+  return tag.replace(/[A-Z]/g, (c, i) => (i ? `_${c.toLowerCase()}` : c.toLowerCase()));
+}
+
 function toTraceListEntry(traceId: string, trace: RegistryTrace): TraceListEntry {
   return {
     traceId,
     traceHash: trace.trace_hash.toString("hex"),
     marketId: trace.market_id.toString(),
     agent: trace.agent,
-    action: trace.action,
+    action: actionLabel(trace.action),
     publishedAt: trace.published_at.toString(),
   };
 }
@@ -114,7 +127,7 @@ function clampLimit(limit: number | undefined): number {
   return Math.min(limit, MAX_PAGE_LIMIT);
 }
 
-function parseCursor(cursor: string | undefined): bigint {
+function parseStart(cursor: bigint | string | undefined): bigint {
   if (cursor === undefined || cursor === "") return 0n;
   try {
     const value = BigInt(cursor);
@@ -147,6 +160,8 @@ export function toVerdict(raw: unknown): TraceVerdict {
         const ts = Array.isArray(obj["values"]) ? BigInt(String(obj["values"][0] ?? 0)) : 0n;
         return { tag: "AgentRevokedAfter", values: [ts] as [bigint] };
       }
+      case "Late":
+        return { tag: "Late" };
       default:
         // Future variants: treat as unknown but don't crash.
         return { tag: "Unknown" as TraceVerdict["tag"], values: [String(tag)] as never };
@@ -196,17 +211,22 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
         traceId,
         ipfsCid: result.ipfs_cid,
         traceHash: result.trace_hash.toString("hex"),
+        action: actionLabel(result.action),
+        verdict,
         marketId: result.market_id,
         agent: result.agent,
       };
     } catch (e) {
+      // #328: only the contract's TraceNotFound (3005) means "absent".
+      // Everything else is an outage the caller must not report as 404.
+      // #329: an archived entry (simulation asks for a restore) is
+      // unavailable too, so buyers get 503 + Retry-After, not 404.
+      if (isRestoreRequired(e)) throw new RegistryRestoreRequired(traceId);
       const classified = classifyRegistryError(e);
-      // TraceNotFound (3005) → no record; any other error → surface it.
       if (classified.kind === "contract" && classified.code === TRACE_NOT_FOUND_CODE) {
         return undefined;
       }
-      // RPC failure: surface as undefined (caller gets 404-equivalent).
-      return undefined;
+      throw new RepositoryUnavailable(classified);
     }
   }
 
@@ -264,12 +284,13 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
 
   async listByAgent(
     agent: string,
-    cursor?: string,
+    cursor?: bigint | string,
     limit?: number,
   ): Promise<TraceListPage> {
+    if (!this.reader.traces_by_agent) throw new Error("Agent index unavailable");
     const { result } = await this.reader.traces_by_agent({
       agent,
-      start: parseCursor(cursor),
+      start: parseStart(cursor),
       limit: clampLimit(limit),
     });
     return toTraceListPage(result);
@@ -278,16 +299,56 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
   async listByMarketAction(
     marketId: string,
     action: string,
-    cursor?: string,
+    cursor?: bigint | string,
     limit?: number,
   ): Promise<TraceListPage> {
+    if (!this.reader.traces_by_market_action) throw new Error("Market action index unavailable");
     const { result } = await this.reader.traces_by_market_action({
       market_id: BigInt(marketId),
       action,
-      start: parseCursor(cursor),
+      start: parseStart(cursor),
       limit: clampLimit(limit),
     });
     return toTraceListPage(result);
+  }
+
+  async listByMarket(
+    marketId: string,
+    cursor?: bigint | string,
+    limit?: number,
+  ): Promise<TraceListPage> {
+    if (!this.reader.traces_by_market) throw new Error("Market index unavailable");
+    const market = BigInt(marketId);
+    const start = parseStart(cursor);
+    try {
+      const { result } = await this.reader.traces_by_market!({
+        market_id: market, start, limit: clampLimit(limit),
+      });
+      return toTraceListPage(result);
+    } catch (error) {
+      // A single archived entry can abort trace_page. Re-read the bounded
+      // index and retain a metadata-only placeholder for that entry.
+      if (!this.reader.market_trace_count || !this.reader.market_trace_at) throw error;
+      const total = BigInt((await this.reader.market_trace_count({ market_id: market })).result);
+      const ids: bigint[] = [];
+      for (let i = start; i < total && ids.length < clampLimit(limit); i++) {
+        try { ids.push(BigInt((await this.reader.market_trace_at({ market_id: market, index: i })).result)); } catch { /* stale index */ }
+      }
+      const entries: TraceListEntry[] = [];
+      for (const id of ids) {
+        try {
+          const trace = (await this.get(id.toString()));
+          if (trace) entries.push(toTraceListEntry(id.toString(), {
+            market_id: market, agent: trace.agent ?? "", action: trace.action ?? "",
+            trace_hash: Buffer.from(trace.traceHash, "hex"), ipfs_cid: "", published_at: 0n,
+          }));
+          else entries.push({ traceId: id.toString(), traceHash: "", marketId: market.toString(), agent: "", action: "", publishedAt: "0", archived: true });
+        } catch {
+          entries.push({ traceId: id.toString(), traceHash: "", marketId: market.toString(), agent: "", action: "", publishedAt: "0", archived: true });
+        }
+      }
+      return { items: entries, next: (start + BigInt(entries.length)).toString(), total: total.toString() };
+    }
   }
 }
 

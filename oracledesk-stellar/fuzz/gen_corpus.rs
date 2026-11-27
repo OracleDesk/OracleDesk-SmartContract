@@ -89,4 +89,14 @@ fn main() {
     }
 
     println!("wrote corpus under fuzz/corpus/");
+
+    for (target, seeds) in [
+        ("fuzz_resolver_signatures", seed_encoding::resolver_sig_seed()),
+        ("fuzz_resolver_committee", seed_encoding::resolver_committee_seed()),
+        ("fuzz_resolver_spec_decode", seed_encoding::resolver_spec_seed()),
+    ] {
+        for (name, bytes) in seeds {
+            write(&format!("corpus/{target}/{name}"), &bytes);
+        }
+    }
 }

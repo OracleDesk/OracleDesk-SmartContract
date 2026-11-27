@@ -147,11 +147,56 @@ Agents can never spend reserved collateral. `agent_buy` and
 `agent_create_market` fail with `CapitalReserved` unless
 `idle - amount >= queue_reserved`.
 
-`claim_withdraw(ticket_id)` pays the head ticket as far as idle collateral
-allows. Anyone can call it, but the money always goes to the ticket's owner.
-Tickets wait while capital stays deployed, which is bounded by the close
-times of the open markets. UIs can read `queue_reserved()`,
-`queue_bounds()` and `withdraw_ticket(id)`.
+Tickets are paid automatically (#277). `WithdrawTicket` keeps its layout; a
+new `TicketMeta { shares_burned, assets_at_request }` is written next to every
+new ticket. Tickets from before the upgrade have no meta: they drain and can be
+transferred but not cancelled (`TicketNotCancellable`).
+
+**Drain.** Every entrypoint that brings collateral in drains the queue in the
+same transaction, after its own state writes: `settle_market`, `redeem`,
+`claim_pool_remainder`, the `legacy_*` variants, `redeem_many`,
+`claim_pool_remainders`, `agent_sell` / `agent_sell_v2` (and traced variants),
+`recall_from_yield` and `deposit`. A deposit is priced before the drain, and
+NAV already excludes the reservation, so the drain moves no value between
+shareholders. Settlement never fails because of the queue: an overflow stops
+the drain and emits `QueueDrainSkipped`.
+
+`available = min(idle, queue_reserved)`. The drain takes a window of
+`QUEUE_WINDOW = 8` ticket ids from the head (holes left by paid or cancelled
+tickets are skipped but count as steps), and reads at most
+`MAX_QUEUE_STEPS = 8` ids per call. If `available` covers the window it is paid
+in full and the head moves past it; otherwise each ticket gets
+`floor(available * remaining_i / window_owed)`, the rounding dust goes to the
+oldest ticket only (never above what it is owed) and the drain stops. No ticket
+outside the window is paid while one inside it is owed, the floors never exceed
+`available`, and `queue_reserved` never underflows when `idle < reserved`. Every
+ticket read has its TTL bumped. `claim_withdraw(ticket_id)` stays
+permissionless: it runs the same drain and returns the total paid
+(`NothingToPay` if it made no progress). Measured worst cases
+(contracts/budget-tests, `make budget`) stay under 7% of the network
+instruction, read and write limits, so the constants have large headroom.
+
+**Cancel.** `cancel_withdraw(owner, ticket_id)` needs the owner's auth, an
+unpaused treasury and `now >= created_at + MIN_CANCEL_DELAY` (1 day). It
+releases the ticket's reservation *before* reading NAV (NAV subtracts the
+reservation, so reading first would subtract it twice), then re-mints
+`min(shares_for_deposit(remaining, nav, supply), floor(shares_burned *
+remaining / assets_at_request))` shares. The cap stops a holder who requested
+before a loss from cancelling afterwards for more shares than they burned;
+after a gain the holder gets fewer shares at the higher NAV. If epoch pricing
+(#256) lands, cancellation is priced at the next epoch boundary and the cap
+still applies. `transfer_ticket(from, to, ticket_id)` moves the ticket and its
+cancellation right.
+
+**Views.** `queue_page(start, limit <= 25)`; `queue_position(ticket_id)` ->
+`QueuePosition { index, owed_ahead, in_window, truncated }`, walking at most 200
+ids; `estimated_unlock(ticket_id)`, which accumulates the open markets' floor
+values (at most `MAX_OPEN_MARKETS`) in close-time order on top of
+`min(idle, reserved)` and returns the close time of the market that first
+covers `owed_ahead + remaining`, or `None`. It is an estimate only.
+
+UIs can also read `queue_reserved()`, `queue_bounds()` and
+`withdraw_ticket(id)`.
 
 ### Operating modes and the gate table (#272)
 
@@ -304,19 +349,69 @@ close); and `agent_buy` never asked whether a market could be resolved at all
   market-core, for the case where market-core is what broke. The owner forfeits
   their part of open positions, which stays with the remaining shareholders.
 
-The treasury has no upgrade path, so existing deployments move by
-redeploying:
+The treasury has no upgrade path, so Existing deployments move through the authenticated migration protocol:
 
-1. Deploy the new treasury.
-2. On the old treasury, `set_successor(new)`, then queue and execute
-   `migrate_markets` after `config_delay`.
-3. Call `market_core.propose_treasury`, then the new treasury's
-   `accept_market_core_role` (the `set_treasury` API this ADR predates was
-   replaced by the authenticated handshake in ADR 0006).
+1. Deploy the successor with the same configuration and call
+   `accept_predecessor`.
+2. The old admin calls `begin_migration`, opening the seven-day (or configured
+   timelock, whichever is longer) exit window. Deposits and agent trading are
+   disabled while withdrawals and settlement remain available.
+3. After the window, call `migrate_markets` in bounded batches, then
+   `migrate_idle`. Each packet transfers positions and the LP role, imports net
+   cost, lifetime exposure and PnL, and mints successor shares for the old
+   vault at the conservative floor value. Idle collateral is transferred last.
+4. Old depositors call `exit_to_successor` to receive their pro-rata successor
+   shares. Queued withdrawals remain reserved in the old vault.
 
-Positions moved with `migrate_markets` are not in the successor's index and
-count as zero in its NAV until they are redeemed. The old pre-vault flow's
-admin `withdraw` no longer exists.
+The successor indexes received markets immediately, so their carried positions
+and cost basis are valued from the first ledger. Packets are versioned,
+authenticated by the predecessor, and idempotent.
+
+
+### Core switches and retirement (#320)
+
+A market-core moves through three states in a treasury: **current** (the
+`GlobalConfig.market_core`), **legacy** (switched away from by the timelocked
+`execute_config`; `LegacyCore(core) = true`) and **retired** (closed out by
+`retire_core`; irreversible).
+
+- Exposure, net, realized-settlement and PnL keys are namespaced per core for
+  every core except the deployment-time `OriginalCore` (`MarketV2`, `NetV2`,
+  `RealizedV2`, `PnlV2`), so the same market id on two cores never shares
+  state. `Realized(id)`/`Pnl(id)` entries a non-original core wrote before
+  this change cannot be told apart from the original core's; they are not
+  migrated, and `settle_market_on` recomputes settlement from the core's
+  live position and market state.
+- `CoreState(core) -> CoreAccounting { open_index, open_exposures, net,
+  retired }` is maintained on every index, exposure and net write.
+  `KnownCores` lists the live cores (at most 4; retired cores leave it).
+  New treasuries start initialized; one deployed earlier runs the
+  permissionless one-shot `init_core_accounting`, which rebuilds the
+  counters from the open-market index and puts any part of `NetTotal` not
+  attributable to an indexed market into `UnattributedNet` (still counted in
+  the caps, never released by a retirement).
+- `settle_market_on(caller, core, market_id)` is `settle_market` for the
+  current core or any legacy core. A market market-core already finalized
+  (`RedemptionClosed`: residual collateral swept, `Position` entries left
+  behind) counts as settled with nothing left to collect.
+- `retire_core(core)` is permissionless and succeeds only for a legacy,
+  non-current, not yet retired core with no index entries and no open
+  exposures. It subtracts the core's `net` from `NetTotal` (so leftover cost
+  basis of losing positions stops consuming the caps), clears `LegacyCore` so
+  the `legacy_*` entrypoints refuse it, and drops it from `KnownCores`.
+  `execute_config` refuses to switch back to a retired core (`CoreRetired`),
+  so its namespaced keys can never be revived. While the treasury is paused,
+  `retire_core` first drops index entries whose core can no longer be read
+  (a broken wasm that would otherwise fail `nav()` forever), each with an
+  `IndexEntryDropped` event.
+- Stray positions that reach the treasury on a retired core later (through
+  market-core's `transfer_position`/`transfer_lp`) are never indexed
+  (`index_add` refuses retired cores), which understates NAV conservatively.
+  The permissionless `sweep_retired(core, market_id)` redeems one straight
+  into idle without index, net or PnL bookkeeping (`RetiredSweep`).
+- `redeem_many`/`claim_pool_remainders` record returns and proceeds per paid
+  item and, once a market is empty, remove it from the index, mark it settled
+  and close its exposure, so the per-core counters stay exact.
 
 ## Consequences
 
@@ -331,8 +426,10 @@ admin `withdraw` no longer exists.
   - **Fee sweeps.** `collect_market_fees` (admin) raises NAV for every
     shareholder at the moment fees arrive. A depositor who knows a sweep is
     imminent gets a slightly better entry. Sweep often.
-  - **Admin custody.** `set_successor` + `migrate_markets` can move positions
-    out of the vault without compensation (SECURITY.md).
+  - **Migration timing.** The admin controls when the announced migration is
+    executed after the depositor exit window; successor shares compensate the
+    old vault for every migrated floor value.
+
   - **Unindexed positions** (pre-migration, or received from a predecessor)
     are valued at zero until redeemed.
 - Agent activity is capped at 12 markets with open capital at once.

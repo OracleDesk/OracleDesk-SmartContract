@@ -13,6 +13,7 @@
  *      live mode, best effort in dry-run, skipped by --offline (dry-run only)
  *      and by --print-config.
  */
+import { calibrationGate } from "./calibration.js";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,6 +65,14 @@ export class AgentConfigError extends ConfigError {
   constructor(readonly issues: string[]) {
     super(`invalid agent configuration:\n  - ${issues.join("\n  - ")}`);
   }
+}
+
+export interface InventoryConfig {
+  maxDeltaBps: bigint;
+  rebalanceBps: bigint;
+  maxHedgeStroops: bigint;
+  dailyHedgeStroops: bigint;
+  minSecsToClose: number;
 }
 
 // ─── Field parsers ───────────────────────────────────────────────────────────
@@ -230,8 +239,21 @@ export const EnvSchema = z.object({
   MIN_TRADE_STROOPS: stroopsField(1_000_000n, 1n),
   FAIR_UNCERTAINTY_BPS: bpsField(500),
   FAIR_VALUE_BPS: bpsField(undefined),
+  // #331 volatility-model fair value for price-threshold markets.
+  VOL_ESTIMATOR_ENABLED: z.string().optional(),
+  VOL_LIVE_ENABLED: z.string().optional(),
+  VOL_ESTIMATOR: z.enum(["ewma", "garch"]).default("ewma"),
+  VOL_HISTORY_SLOTS: intField(96, 21, 1_000),
+  VOL_HYBRID_FEED_FAILURE_BPS: bpsField(200),
+  VOL_CALIBRATION_REPORT: nonEmptyPath,
+  VOL_CALIBRATION_REPORT_HASH: z.string().regex(/^[0-9a-fA-F]{64}$/, "must be a sha256 hex digest").optional(),
   TRADE_SIZE_STROOPS: stroopsField(100_000_000n),
   DEFAULT_SEED_STROOPS: stroopsField(1_500_000_000n, MIN_SEED_STROOPS),
+  MAKER_INVENTORY_MAX_DELTA_BPS: bpsField(3000),
+  MAKER_INVENTORY_REBALANCE_BPS: bpsField(1000),
+  MAKER_HEDGE_MAX_STROOPS: stroopsField(100_000_000n, 1n),
+  MAKER_HEDGE_DAILY_STROOPS: stroopsField(1_000_000_000n, 1n),
+  MAKER_HEDGE_MIN_SECS_TO_CLOSE: intField(300, 0, 365 * 86_400),
   DEADLINE_SECS: intField(60, 1, 86_400),
   MARKET_CLOSE_IN_SECS: intField(3600, 1, 365 * 86_400),
   AGENT_STARTUP_PROBE_TIMEOUT_MS: intField(DEFAULT_PROBE_TIMEOUT_MS, 1, 600_000),
@@ -442,6 +464,20 @@ export interface TradingConfig {
   sizingBufferBps: number;
   minTradeStroops: bigint;
   fairUncertaintyBps: number;
+  /** #331 volatility-model estimator settings. */
+  volatility: VolatilityConfig;
+}
+
+export interface VolatilityConfig {
+  /** Use the estimator at all (dry-run rehearsals included). */
+  enabled: boolean;
+  /** Allow it in live mode; requires a passing calibration report. */
+  liveEnabled: boolean;
+  estimator: "ewma" | "garch";
+  historySlots: number;
+  hybridFeedFailureBps: number;
+  calibrationReport?: string;
+  calibrationReportHash?: string;
 }
 
 /** Event-driven triggers (#105), used by `trader --follow`. */
@@ -501,6 +537,7 @@ export interface Tunables {
   fee: FeePolicy;
   trading: TradingConfig;
   maker: MakerConfig;
+  inventory: InventoryConfig;
   events: EventsConfig;
   watcher: WatcherConfig;
   arb: ArbConfig;
@@ -562,11 +599,27 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       sizingBufferBps: e.SIZING_BUFFER_BPS!,
       minTradeStroops: e.MIN_TRADE_STROOPS,
       fairUncertaintyBps: e.FAIR_UNCERTAINTY_BPS!,
+      volatility: {
+        enabled: truthy(e.VOL_ESTIMATOR_ENABLED) || truthy(e.VOL_LIVE_ENABLED),
+        liveEnabled: truthy(e.VOL_LIVE_ENABLED),
+        estimator: e.VOL_ESTIMATOR,
+        historySlots: e.VOL_HISTORY_SLOTS!,
+        hybridFeedFailureBps: e.VOL_HYBRID_FEED_FAILURE_BPS!,
+        calibrationReport: e.VOL_CALIBRATION_REPORT,
+        calibrationReportHash: e.VOL_CALIBRATION_REPORT_HASH,
+      },
     },
     maker: {
       confidenceThresholdBps: e.CONFIDENCE_THRESHOLD_BPS!,
       defaultSeedStroops: e.DEFAULT_SEED_STROOPS,
       closeInSecs: e.MARKET_CLOSE_IN_SECS!,
+    },
+    inventory: {
+      maxDeltaBps: BigInt(e.MAKER_INVENTORY_MAX_DELTA_BPS!),
+      rebalanceBps: BigInt(e.MAKER_INVENTORY_REBALANCE_BPS!),
+      maxHedgeStroops: e.MAKER_HEDGE_MAX_STROOPS,
+      dailyHedgeStroops: e.MAKER_HEDGE_DAILY_STROOPS,
+      minSecsToClose: e.MAKER_HEDGE_MIN_SECS_TO_CLOSE!,
     },
     events: {
       stateDir: e.EVENTS_STATE_DIR ?? "./.events",
@@ -636,6 +689,26 @@ export async function loadAgentConfig(o: LoadAgentConfigOptions): Promise<AgentC
   }
   if (offline && mode === "live") issues.push("--offline is only allowed in dry-run: live mode must verify the network first");
   if ((e.ARB_ENABLED === "1" || e.ARB_ENABLED === "true") && !e.ARB_RELATIONS_FILE) issues.push("ARB_ENABLED needs ARB_RELATIONS_FILE");
+  // #331: live trading uses estimator output only; a static fair value would
+  // trade every market at one made-up probability.
+  if (mode === "live" && e.FAIR_VALUE_BPS !== undefined) {
+    issues.push("FAIR_VALUE_BPS is for tests and dry-run only; live mode trades only on fair-value estimator output");
+  }
+  if (mode === "live" && truthy(e.VOL_LIVE_ENABLED)) {
+    if (!e.VOL_CALIBRATION_REPORT) issues.push("VOL_LIVE_ENABLED needs VOL_CALIBRATION_REPORT (from bin/calibrate-volatility.ts)");
+    else {
+      let report: string | undefined;
+      try {
+        report = readFile(e.VOL_CALIBRATION_REPORT);
+      } catch (err) {
+        issues.push(`cannot read VOL_CALIBRATION_REPORT ${e.VOL_CALIBRATION_REPORT}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (report !== undefined) {
+        const gate = calibrationGate(report, e.VOL_CALIBRATION_REPORT_HASH);
+        for (const reason of gate.reasons) issues.push(`VOL_LIVE_ENABLED: ${reason}`);
+      }
+    }
+  }
   if (e.AGENT_LEASE === "pg" && !e.AGENT_LEASE_PG_URL) {
     issues.push("AGENT_LEASE=pg needs AGENT_LEASE_PG_URL");
   }
@@ -765,7 +838,7 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, fee, trading, maker, events, watcher, arb, ...rest } = cfg;
+  const { env: _env, agentSecret, fee, trading, maker, inventory, events, watcher, arb, ...rest } = cfg;
   const { feePayerSecret, ...feeRest } = fee;
   const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
   const printableFee = {
@@ -793,5 +866,10 @@ export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
       },
     },
     maker: { ...maker, defaultSeedStroops: maker.defaultSeedStroops.toString() },
+    inventory: { ...inventory, maxHedgeStroops: inventory.maxHedgeStroops.toString(), dailyHedgeStroops: inventory.dailyHedgeStroops.toString() },
   };
+}
+
+function truthy(v: string | undefined): boolean {
+  return v === "1" || v === "true";
 }

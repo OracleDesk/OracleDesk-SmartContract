@@ -1142,6 +1142,7 @@ dependencies = [
 name = "market-core"
 version = "0.1.0"
 dependencies = [
+ "oracledesk-types",
  "soroban-sdk",
 ]
 
@@ -1207,8 +1208,17 @@ name = "oracledesk-fuzz"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "ed25519-dalek",
  "libfuzzer-sys",
  "market-core",
+ "resolver",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "oracledesk-types"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 
@@ -1367,6 +1377,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "resolver"
+version = "0.1.0"
+dependencies = [
+ "oracledesk-types",
+ "soroban-sdk",
 ]
 
 [[package]]

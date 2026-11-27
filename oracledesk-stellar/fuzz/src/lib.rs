@@ -5,6 +5,7 @@
 //! `cargo +nightly fuzz`. See `fuzz/README.md`.
 
 pub mod inverse;
+pub mod resolver_harness;
 pub mod registry_model;
 pub mod timelock_model;
 pub mod timelock_targets;

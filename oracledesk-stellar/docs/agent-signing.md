@@ -112,3 +112,45 @@ Auditors can page through a key's signed traces with `key_traces` and
 `key_affected_from`. The per-key index is built by `publish_trace_signed`
 and `publish_chained_trace_signed`; traces published before the index existed
 or published unsigned have no entries and are not covered.
+
+## Attestation signatures (weighted-key resolution, #326)
+
+Weighted-key committees sign resolution attestations off-chain with Ed25519;
+anyone submits a batch with `submit_signatures` (v1) or
+`submit_signatures_v2` (v2). `agents/core/attestation.ts` builds, signs and
+pre-verifies both versions (`buildAttestationMessage(ctx, version = 2)`).
+Messages are signed raw, never pre-hashed.
+
+```text
+v1: "oracledesk-attest-v1" || network_id[32] || XDR(resolver Address)
+    || market_id u64 BE || round u32 BE || outcome u8 {0=Yes,1=No}
+    || resolution_hash[32]
+v2: "oracledesk-attest-v2" || 0x02 || network_id[32] || XDR(resolver Address)
+    || market_id u64 BE || round u32 BE || outcome u8 {0=Yes,1=No,2=Invalid}
+    || resolution_hash[32]
+```
+
+**Replay analysis.** The domain tag separates the versions (and the version
+byte keeps a future v3 parseable); `network_id` blocks cross-network replay;
+the resolver address blocks cross-resolver replay; `market_id` separates
+markets with identical specs; `round` makes a signature from round r invalid
+after a `cancel_proposal` bumps the round; `resolution_hash` binds the spec.
+A key may sign once per round across every outcome and both versions, so it
+cannot equivocate (e.g. Yes in v1 and Invalid in v2).
+
+**Submitting.** One invalid signature traps `ed25519_verify` and aborts the
+whole batch, and a v1 signature never verifies as v2 (or the reverse), so
+always pre-filter with `verifyAttestation(pubkey, sig, ctx, version)` using
+the version you submit.
+
+**Migration.** v1 stays accepted for Yes/No during the transition, and v1
+and v2 weight for the same outcome in one round add up. The resolver admin
+(the governance timelock in deployment) can call `disable_attest_v1` once all
+signers produce v2; afterwards `submit_signatures` returns `WrongMode`. The
+switch is one-way.
+
+Golden vectors for both versions and every outcome live in
+`docs/vectors/attest-v2.json` and are checked by both
+`golden_attestation_message_and_signature_v2` (Rust) and
+`agents/core/attestation.test.ts`.
+

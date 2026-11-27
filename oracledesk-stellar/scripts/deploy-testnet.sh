@@ -229,7 +229,6 @@ if [ "$WASM_MISSING" = "1" ]; then
   stellar contract build
   cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
   cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
-  cp "$WASM_DIR/market_core.wasm" contracts/reasoning-registry/market_core.wasm
   cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
   cp "$WASM_DIR/market_core.wasm" contracts/router/market_core.wasm
   cp "$WASM_DIR/resolver.wasm" contracts/router/resolver.wasm

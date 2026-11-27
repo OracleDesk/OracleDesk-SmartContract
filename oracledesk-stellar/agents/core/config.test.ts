@@ -366,3 +366,50 @@ test("watcher settings are printable without any secret", async () => {
   const described = JSON.stringify(describeConfig(cfg), (_k, v) => (typeof v === "bigint" ? v.toString() : v));
   assert.match(described, /"watcher":\{"enabled":true/);
 });
+
+// ── #331 volatility estimator config ──────────────────────────────────────
+
+test("live mode rejects FAIR_VALUE_BPS; dry-run keeps it for tests", async () => {
+  const issues = await issuesOf(load({ ...LIVE, FAIR_VALUE_BPS: "6000" }).run());
+  assert.ok(issues.some((i) => /FAIR_VALUE_BPS is for tests and dry-run only/.test(i)), issues.join(" | "));
+  const cfg = await load({ FAIR_VALUE_BPS: "6000" }).run();
+  assert.equal(cfg.trading.fairValueBps, 6000);
+});
+
+test("VOL_LIVE_ENABLED requires a calibration report that passes the gate", async () => {
+  const { reportHash } = await import("./calibration.js");
+  const passing = JSON.stringify({ version: 1, markets: 100, brier: 0.1, baselineBrier: 0.2 });
+  const losing = JSON.stringify({ version: 1, markets: 100, brier: 0.3, baselineBrier: 0.2 });
+  const reader = (report: string) => (path: string) =>
+    path === "/cal/report.json" ? report : JSON.stringify(deployment());
+  const missing = await issuesOf(load({ ...LIVE, VOL_LIVE_ENABLED: "1" }).run());
+  assert.ok(missing.some((i) => /VOL_CALIBRATION_REPORT/.test(i)), missing.join(" | "));
+  const env = { ...LIVE, VOL_LIVE_ENABLED: "1", VOL_CALIBRATION_REPORT: "/cal/report.json" };
+  const wrongHash = await issuesOf(
+    load({ ...env, VOL_CALIBRATION_REPORT_HASH: "0".repeat(64) }, { readFile: reader(passing) }).run(),
+  );
+  assert.ok(wrongHash.some((i) => /hash does not match/.test(i)), wrongHash.join(" | "));
+  const lose = await issuesOf(
+    load({ ...env, VOL_CALIBRATION_REPORT_HASH: reportHash(losing) }, { readFile: reader(losing) }).run(),
+  );
+  assert.ok(lose.some((i) => /does not beat/.test(i)), lose.join(" | "));
+  const cfg = await load({ ...env, VOL_CALIBRATION_REPORT_HASH: reportHash(passing) }, { readFile: reader(passing) }).run();
+  assert.equal(cfg.trading.volatility.liveEnabled, true);
+  assert.equal(cfg.trading.volatility.enabled, true);
+});
+
+test("volatility estimator defaults", async () => {
+  const cfg = await load({}).run();
+  assert.deepEqual(
+    { ...cfg.trading.volatility },
+    {
+      enabled: false,
+      liveEnabled: false,
+      estimator: "ewma",
+      historySlots: 96,
+      hybridFeedFailureBps: 200,
+      calibrationReport: undefined,
+      calibrationReportHash: undefined,
+    },
+  );
+});

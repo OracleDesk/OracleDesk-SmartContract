@@ -373,13 +373,29 @@ pub fn split_fee(fee: i128, protocol_share_bps: u32) -> Result<(i128, i128), Mat
 }
 
 /// Collateral value of a (yes, no) share pair once a market is final.
-/// Void pays 0.5 per share, which keeps total payouts <= sets minted.
-pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
+/// Void pays 0.5 per share, floored per call, which keeps total payouts
+/// <= sets minted (see `settle_upper` and the settlement Kani harnesses).
+///
+/// The Void sum is `checked_add`: with `overflow-checks = true` in the
+/// release profile an unchecked `yes + no` would trap instead of returning
+/// an error. Every in-domain input (`0 <= yes, no <= MAX_SETS`) is `Ok`.
+pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> Result<i128, MathError> {
     match kind {
-        Settlement::Yes => yes,
-        Settlement::No => no,
-        Settlement::Void => (yes + no) / 2,
+        Settlement::Yes => Ok(yes),
+        Settlement::No => Ok(no),
+        Settlement::Void => Ok(half_toward_zero(
+            yes.checked_add(no).ok_or(MathError::Overflow)?,
+        )),
     }
+}
+
+/// `x / 2` (Rust's round-toward-zero division), written as shifts. Same
+/// result for every `i128` (`void_half_matches_division` pins it); it exists
+/// because a model checker bit-blasts a full 128-bit divider for `/ 2`,
+/// which made the settlement Kani harnesses intractable.
+fn half_toward_zero(x: i128) -> i128 {
+    // For negative x, add 1 before the (flooring) arithmetic shift.
+    (x + ((x >> 127) & 1)) >> 1
 }
 
 /// Maximum complete sets a holder can merge: `min(yes, no)`.
@@ -406,12 +422,199 @@ pub fn merge_max(yes: i128, no: i128) -> i128 {
 /// per-holder rounding never lets redemptions exceed this bound).
 /// `finalize_market` reserves exactly this much for outstanding claims;
 /// anything the rounding then leaves unclaimed is swept, never stranded.
-pub fn settle_upper(kind: Settlement, yes: i128, no: i128) -> i128 {
-    match kind {
-        Settlement::Yes => yes,
-        Settlement::No => no,
-        Settlement::Void => (yes + no) / 2,
+///
+/// The arithmetic is the same as `settle_value`; the two names exist because
+/// they answer different questions (one holder's payout vs. a reserve for
+/// many holders). The over-reservation is at most `floor(H / 2)` units for
+/// `H` holders, proved by `proof_settle_upper_over_reserve_bound`.
+pub fn settle_upper(kind: Settlement, yes: i128, no: i128) -> Result<i128, MathError> {
+    settle_value(kind, yes, no)
+}
+
+// ---------------------------------------------------------------------------
+// Settlement ledger (issue #276)
+//
+// Everything `redeem`, `claim_pool_remainder`, `redeem_many`,
+// `claim_pool_remainders` and `finalize_market` compute about collateral is
+// done here, on plain integers, so the Kani harnesses in `math_proofs.rs`
+// prove the code the contract actually runs. `lib.rs` only loads the
+// `Market` / `SettleState` / `LpFees` entries into a `SettleLedger`, calls
+// one of these functions, and writes the result back (plus auth, events and
+// the token transfer).
+// ---------------------------------------------------------------------------
+
+/// Settlement view of one market.
+///
+/// Conservation is tracked in two separate legs:
+///
+/// - **Share/pool collateral** (`paid_out`): every complete set is backed by
+///   one unit of collateral, so `paid_out + reserved <= sets_minted` must
+///   hold for the market to stay solvent.
+/// - **LP fees** (`lp_fees`, `fees_paid`): the LP share of trade fees sits in
+///   `DataKey::LpFees(id)`, *outside* `sets_minted` (`buy` adds only
+///   `q.net` to `sets_minted`). Counting fees paid by `apply_pool_claim` in
+///   `paid_out` would subtract them from `sets_minted` once and then again
+///   implicitly (they never entered it), which is the bug that made
+///   `finalize_market` fail after an LP claimed a remainder with fees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettleLedger {
+    /// Complete sets ever minted for the market (`Market::sets_minted`).
+    pub sets_minted: i128,
+    /// Shares held outside the pool and not yet redeemed.
+    pub outstanding_yes: i128,
+    pub outstanding_no: i128,
+    /// Pool reserves; zeroed by `apply_pool_claim`.
+    pub reserve_yes: i128,
+    pub reserve_no: i128,
+    /// Collateral paid for shares and the pool remainder only. LP fees are
+    /// never added here (see `fees_paid`).
+    pub paid_out: i128,
+    /// LP fees paid out by `apply_pool_claim`. Not stored on-chain; it lives
+    /// only for the duration of one call so the proofs can show each fee
+    /// unit leaves exactly once.
+    pub fees_paid: i128,
+    /// Unclaimed LP fees (`DataKey::LpFees(id)`), outside `sets_minted`.
+    pub lp_fees: i128,
+    pub lp_claimed: bool,
+    /// `false` for legacy markets created before `SettleState` existed.
+    /// Their payouts are computed exactly as for tracked markets, but
+    /// `outstanding_*` and `paid_out` are left untouched (there is nothing
+    /// to write them back to) and `finalize_residual` refuses them.
+    pub tracked: bool,
+}
+
+/// One holder's redemption: pays `settle_value(kind, yes, no)`, decrements
+/// **both** outstanding sides by the full position (a losing-side position
+/// still clears, mirroring `redeem`), and adds the payout to `paid_out`.
+///
+/// Negative positions are rejected; `lib.rs` never stores one.
+pub fn apply_redeem(
+    l: &mut SettleLedger,
+    kind: Settlement,
+    yes: i128,
+    no: i128,
+) -> Result<i128, MathError> {
+    if yes < 0 || no < 0 {
+        return Err(MathError::InvalidInput);
     }
+    let payout = settle_value(kind, yes, no)?;
+    if l.tracked {
+        let outstanding_yes = l
+            .outstanding_yes
+            .checked_sub(yes)
+            .ok_or(MathError::Overflow)?;
+        let outstanding_no = l
+            .outstanding_no
+            .checked_sub(no)
+            .ok_or(MathError::Overflow)?;
+        let paid_out = l.paid_out.checked_add(payout).ok_or(MathError::Overflow)?;
+        l.outstanding_yes = outstanding_yes;
+        l.outstanding_no = outstanding_no;
+        l.paid_out = paid_out;
+    }
+    Ok(payout)
+}
+
+/// The LP's pool claim: pays `settle_value(kind, reserve_yes, reserve_no)`
+/// plus the unclaimed LP fees, zeroes the reserves and the fee balance and
+/// marks the pool claimed. Only the pool value is added to `paid_out`; the
+/// fee part goes to `fees_paid`.
+///
+/// Returns `InvalidInput` if the pool was already claimed (`lib.rs` maps
+/// that case to `AlreadyClaimed` before calling).
+pub fn apply_pool_claim(l: &mut SettleLedger, kind: Settlement) -> Result<i128, MathError> {
+    if l.lp_claimed || l.lp_fees < 0 {
+        return Err(MathError::InvalidInput);
+    }
+    let pool_value = settle_value(kind, l.reserve_yes, l.reserve_no)?;
+    let fees = l.lp_fees;
+    let payout = pool_value.checked_add(fees).ok_or(MathError::Overflow)?;
+    let fees_paid = l.fees_paid.checked_add(fees).ok_or(MathError::Overflow)?;
+    if l.tracked {
+        l.paid_out = l
+            .paid_out
+            .checked_add(pool_value)
+            .ok_or(MathError::Overflow)?;
+    }
+    l.fees_paid = fees_paid;
+    l.lp_fees = 0;
+    l.reserve_yes = 0;
+    l.reserve_no = 0;
+    l.lp_claimed = true;
+    Ok(payout)
+}
+
+/// One step of `redeem_many`'s fold: applies the redemption to that
+/// market's ledger and adds the payout to the batch total. The batch fold
+/// is proved equal to the same redemptions done one at a time
+/// (`proof_batch_equals_sequential`).
+pub fn batch_redeem_step(
+    total: i128,
+    l: &mut SettleLedger,
+    kind: Settlement,
+    yes: i128,
+    no: i128,
+) -> Result<i128, MathError> {
+    let mut next = *l;
+    let payout = apply_redeem(&mut next, kind, yes, no)?;
+    let total = total.checked_add(payout).ok_or(MathError::Overflow)?;
+    *l = next;
+    Ok(total)
+}
+
+/// What `finalize_market` reserves and sweeps, as
+/// `(unclaimed_user, lp_claim, dust)`:
+///
+/// - `unclaimed_user = settle_upper(kind, outstanding_yes, outstanding_no)`
+/// - `lp_claim` = the unclaimed pool value (0 once claimed)
+/// - `dust = sets_minted - paid_out - unclaimed_user - lp_claim`
+///
+/// `dust` is proved non-negative on every reachable ledger, exactly 0 for
+/// Yes/No and at most `(H + 1) / 2` for Void with `H` redeeming legs. A
+/// negative value can only come from a broken invariant, so it is an error
+/// (`Overflow`, as before) rather than a silent under-sweep. Untracked
+/// (legacy) ledgers have no outstanding counts and are rejected.
+pub fn finalize_residual(
+    l: &SettleLedger,
+    kind: Settlement,
+) -> Result<(i128, i128, i128), MathError> {
+    if !l.tracked {
+        return Err(MathError::InvalidInput);
+    }
+    let unclaimed_user = settle_upper(kind, l.outstanding_yes, l.outstanding_no)?;
+    let lp_claim = if l.lp_claimed {
+        0
+    } else {
+        settle_value(kind, l.reserve_yes, l.reserve_no)?
+    };
+    let dust = l
+        .sets_minted
+        .checked_sub(l.paid_out)
+        .and_then(|v| v.checked_sub(unclaimed_user))
+        .and_then(|v| v.checked_sub(lp_claim))
+        .ok_or(MathError::Overflow)?;
+    if dust < 0 {
+        return Err(MathError::Overflow);
+    }
+    Ok((unclaimed_user, lp_claim, dust))
+}
+
+/// Total `finalize_market` transfers to the treasury: the share/pool
+/// residual (`dust + unclaimed_user + lp_claim`) plus the two fee legs that
+/// live outside `sets_minted` (`fees_accrued` and the unclaimed LP fees).
+/// Fee legs are added exactly once here and never subtracted from the
+/// share residual (`proof_settlement_fee_legs_counted_once`).
+pub fn finalize_sweep(
+    l: &SettleLedger,
+    residual: (i128, i128, i128),
+    fees_accrued: i128,
+) -> Result<i128, MathError> {
+    let (unclaimed_user, lp_claim, dust) = residual;
+    dust.checked_add(unclaimed_user)
+        .and_then(|v| v.checked_add(lp_claim))
+        .and_then(|v| v.checked_add(fees_accrued))
+        .and_then(|v| v.checked_add(l.lp_fees))
+        .ok_or(MathError::Overflow)
 }
 
 #[cfg(test)]
@@ -444,7 +647,7 @@ mod tests {
             isqrt_exact(root * root + 1);
         }
         // (3e15)^2 = 9e30, the largest product we allow.
-        let max = (3_000_000_000_000_000u128);
+        let max = 3_000_000_000_000_000u128;
         isqrt_exact(max * max);
         isqrt_exact(max * max - 1);
         isqrt_exact(max * max + 1);
@@ -523,10 +726,18 @@ mod tests {
 
     #[test]
     fn sell_shares_rejects_zero_collateral() {
-        // Tiny sell whose collateral floors to 0 must revert.
+        // A sell too small to burn even one complete set must revert: the
+        // pool-favouring correction drives the gross to 0.
         assert_eq!(
             calc_sell_shares(1_000_000, 1_000_000, 1, 0),
             Err(MathError::InsufficientLiquidity),
+        );
+        // One set burned, but the fee floors the seller's collateral to 0.
+        let q = calc_sell_shares(1_000, 1_000, 3, 0).unwrap();
+        assert_eq!(q.gross, 1);
+        assert_eq!(
+            calc_sell_shares(1_000, 1_000, 3, 500),
+            Err(MathError::InvalidInput),
         );
     }
 
@@ -585,14 +796,224 @@ mod tests {
 
     #[test]
     fn void_never_overpays() {
-        assert_eq!(settle_value(Settlement::Void, 3, 4), 3);
-        assert!(settle_value(Settlement::Void, 5, 5) <= 5);
+        assert_eq!(settle_value(Settlement::Void, 3, 4), Ok(3));
+        assert!(settle_value(Settlement::Void, 5, 5).unwrap() <= 5);
+    }
+
+    #[test]
+    fn settle_value_checked_at_i128_edge() {
+        // Out of domain, but must be an error rather than a trap.
+        assert_eq!(
+            settle_value(Settlement::Void, i128::MAX, 1),
+            Err(MathError::Overflow)
+        );
+        assert_eq!(
+            settle_value(Settlement::Void, MAX_SETS, MAX_SETS),
+            Ok(MAX_SETS)
+        );
+    }
+
+    #[test]
+    fn void_half_matches_division() {
+        for x in [
+            0i128,
+            1,
+            2,
+            3,
+            -1,
+            -2,
+            -3,
+            MAX_SETS,
+            MAX_SETS + 1,
+            -MAX_SETS - 1,
+            i128::MAX,
+            i128::MAX - 1,
+            i128::MIN,
+            i128::MIN + 1,
+        ] {
+            assert_eq!(half_toward_zero(x), x / 2, "x={x}");
+        }
     }
 
     #[test]
     fn settle_upper_exact_for_yes_no() {
-        assert_eq!(settle_upper(Settlement::Yes, 7, 3), 7);
-        assert_eq!(settle_upper(Settlement::No, 7, 3), 3);
+        assert_eq!(settle_upper(Settlement::Yes, 7, 3), Ok(7));
+        assert_eq!(settle_upper(Settlement::No, 7, 3), Ok(3));
+    }
+
+    fn ledger(sets: i128, ry: i128, rn: i128, lp_fees: i128) -> SettleLedger {
+        SettleLedger {
+            sets_minted: sets,
+            outstanding_yes: sets - ry,
+            outstanding_no: sets - rn,
+            reserve_yes: ry,
+            reserve_no: rn,
+            paid_out: 0,
+            fees_paid: 0,
+            lp_fees,
+            lp_claimed: false,
+            tracked: true,
+        }
+    }
+
+    /// The arithmetic `redeem` in `lib.rs` performed before the pure layer
+    /// existed, kept verbatim as a reference.
+    fn lib_redeem_reference(
+        kind: Settlement,
+        outstanding: (i128, i128),
+        paid_out: i128,
+        yes: i128,
+        no: i128,
+    ) -> (i128, (i128, i128), i128) {
+        let payout = match kind {
+            Settlement::Yes => yes,
+            Settlement::No => no,
+            Settlement::Void => (yes + no) / 2,
+        };
+        (
+            payout,
+            (outstanding.0 - yes, outstanding.1 - no),
+            paid_out + payout,
+        )
+    }
+
+    #[test]
+    fn apply_redeem_matches_lib_redeem() {
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for kind in [Settlement::Yes, Settlement::No, Settlement::Void] {
+            for _ in 0..500 {
+                let sets = 1 + next() % 1_000_000_000;
+                let ry = next() % (sets + 1);
+                let rn = next() % (sets + 1);
+                let mut l = ledger(sets, ry, rn, 0);
+                l.paid_out = next() % 1_000;
+                let yes = next() % (l.outstanding_yes + 1);
+                let no = next() % (l.outstanding_no + 1);
+                let (payout, (oy, on), paid) = lib_redeem_reference(
+                    kind,
+                    (l.outstanding_yes, l.outstanding_no),
+                    l.paid_out,
+                    yes,
+                    no,
+                );
+                let got = apply_redeem(&mut l, kind, yes, no).unwrap();
+                assert_eq!(got, payout);
+                assert_eq!((l.outstanding_yes, l.outstanding_no), (oy, on));
+                assert_eq!(l.paid_out, paid);
+            }
+        }
+        // Legacy (untracked) markets pay the same amount and touch nothing.
+        let mut l = ledger(100, 40, 60, 0);
+        l.tracked = false;
+        let before = l;
+        assert_eq!(apply_redeem(&mut l, Settlement::Void, 7, 4), Ok(5));
+        assert_eq!(l, before);
+        // Negative positions are rejected without mutating the ledger.
+        let mut l = ledger(100, 40, 60, 0);
+        let before = l;
+        assert_eq!(
+            apply_redeem(&mut l, Settlement::Yes, -1, 0),
+            Err(MathError::InvalidInput)
+        );
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn finalize_residual_zero_for_yes_no() {
+        for kind in [Settlement::Yes, Settlement::No] {
+            // sets 1000, pool 400/700, holders A (350, 100) and B (250, 200).
+            let mut l = ledger(1_000, 400, 700, 0);
+            assert_eq!(l.outstanding_yes, 600);
+            assert_eq!(l.outstanding_no, 300);
+            assert_eq!(finalize_residual(&l, kind).unwrap().2, 0);
+            apply_redeem(&mut l, kind, 350, 100).unwrap();
+            assert_eq!(finalize_residual(&l, kind).unwrap().2, 0);
+            apply_pool_claim(&mut l, kind).unwrap();
+            assert_eq!(finalize_residual(&l, kind).unwrap().2, 0);
+            apply_redeem(&mut l, kind, 250, 200).unwrap();
+            assert_eq!(finalize_residual(&l, kind).unwrap(), (0, 0, 0));
+            assert_eq!(l.paid_out, l.sets_minted);
+        }
+    }
+
+    #[test]
+    fn finalize_residual_after_lp_fee_claim() {
+        // Regression: the LP claims a remainder that includes LP fees before
+        // the deadline. Fees live outside `sets_minted`, so counting them in
+        // `paid_out` drove the residual to `-lp_fees`.
+        for kind in [Settlement::Yes, Settlement::No, Settlement::Void] {
+            let mut l = ledger(1_000, 400, 700, 37);
+            let payout = apply_pool_claim(&mut l, kind).unwrap();
+            let pool_value = settle_value(kind, 400, 700).unwrap();
+            assert_eq!(payout, pool_value + 37);
+            assert_eq!(l.paid_out, pool_value, "fees must not enter paid_out");
+            assert_eq!(l.fees_paid, 37);
+            assert_eq!(l.lp_fees, 0);
+            let residual = finalize_residual(&l, kind).unwrap();
+            assert!(residual.2 >= 0);
+            // The sweep is exactly the market's remaining collateral.
+            let fees_accrued = 11;
+            let swept = finalize_sweep(&l, residual, fees_accrued).unwrap();
+            assert_eq!(swept, 1_000 + 37 + fees_accrued - l.paid_out - l.fees_paid);
+        }
+        // A second claim is refused and leaves the ledger untouched.
+        let mut l = ledger(10, 5, 5, 1);
+        apply_pool_claim(&mut l, Settlement::Yes).unwrap();
+        let before = l;
+        assert_eq!(
+            apply_pool_claim(&mut l, Settlement::Yes),
+            Err(MathError::InvalidInput)
+        );
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn finalize_residual_rejects_negative_and_untracked() {
+        let mut l = ledger(100, 50, 50, 0);
+        l.paid_out = 101;
+        assert_eq!(
+            finalize_residual(&l, Settlement::Yes),
+            Err(MathError::Overflow)
+        );
+        let mut l = ledger(100, 50, 50, 0);
+        l.tracked = false;
+        assert_eq!(
+            finalize_residual(&l, Settlement::Yes),
+            Err(MathError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn batch_fold_equals_sequential() {
+        let legs = [
+            (Settlement::Yes, 30, 5),
+            (Settlement::Void, 7, 4),
+            (Settlement::No, 9, 21),
+        ];
+        let base = [
+            ledger(100, 40, 60, 0),
+            ledger(50, 20, 20, 3),
+            ledger(80, 10, 45, 0),
+        ];
+        let mut batch = base;
+        let mut total = 0;
+        for (l, (kind, yes, no)) in batch.iter_mut().zip(legs) {
+            total = batch_redeem_step(total, l, kind, yes, no).unwrap();
+        }
+        let mut seq_total = 0;
+        for (i, (kind, yes, no)) in legs.into_iter().enumerate() {
+            let mut fresh = base[i];
+            seq_total += apply_redeem(&mut fresh, kind, yes, no).unwrap();
+            assert_eq!(fresh, batch[i]);
+        }
+        assert_eq!(total, seq_total);
+        assert_eq!(total, 30 + 5 + 21);
     }
 
     #[test]
@@ -610,13 +1031,15 @@ mod tests {
         for _ in 0..2_000 {
             let a = next() % 1_000_000_000;
             let b = next() % 1_000_000_000;
-            let summed = settle_upper(Settlement::Void, a, b);
-            let part = settle_value(Settlement::Void, a, 0) + settle_value(Settlement::Void, 0, b);
+            let summed = settle_upper(Settlement::Void, a, b).unwrap();
+            let part = settle_value(Settlement::Void, a, 0).unwrap()
+                + settle_value(Settlement::Void, 0, b).unwrap();
             assert!(part <= summed, "a={a} b={b} part={part} summed={summed}");
         }
         // Boundary shapes around odd sums.
-        assert!(settle_value(Settlement::Void, 1, 0) + settle_value(Settlement::Void, 0, 1) <= 1);
-        assert!(settle_value(Settlement::Void, 1, 1) + settle_value(Settlement::Void, 0, 1) <= 1);
+        let v = |y, n| settle_value(Settlement::Void, y, n).unwrap();
+        assert!(v(1, 0) + v(0, 1) <= 1);
+        assert!(v(1, 1) + v(0, 1) <= 1);
     }
 
     #[test]

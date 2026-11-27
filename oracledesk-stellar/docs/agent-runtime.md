@@ -1,11 +1,11 @@
 # Agent runtime (agentd)
 
-`agents/runtime/` turns the one-shot maker and trader CLIs into one
+`agents/runtime/` turns the one-shot maker, trader, and inventory CLIs into one
 long-running, supervised process.
 
 ```bash
 cd oracledesk-stellar/agents
-npm run agentd                         # both tasks, continuously
+npm run agentd                         # maker, trader, and inventory continuously
 npm run agentd -- --once               # each task exactly once, then exit
 npm run agentd -- --tasks trader       # a subset
 npm run agentd -- --config agentd.json # env-style overrides from a JSON object
@@ -151,6 +151,78 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `WATCHER_MAX_DISPUTES_PER_DAY` | 5 | disputes opened per UTC day |
 | `WATCHER_VERDICTS_FILE` | `./watcher-verdicts.json` | operator verdicts for the manual source |
 | `WATCHER_IPFS_GATEWAY` | | gateway used to fetch metadata and evidence traces (`local://` URIs need none) |
+| `VOL_ESTIMATOR_ENABLED` | `0` | price-rule fair-value estimator (see [Fair value for price markets](#fair-value-for-price-markets)) |
+| `VOL_LIVE_ENABLED` | `0` | allow the estimator in live mode; needs a passing calibration report |
+| `VOL_ESTIMATOR` | `ewma` | `ewma` (λ = 0.94 per slot) or `garch` (GARCH(1,1)-lite) |
+| `VOL_HISTORY_SLOTS` | 96 | feed records read for volatility |
+| `VOL_HYBRID_FEED_FAILURE_BPS` | 200 | hybrid markets: probability the price leg fails and signers decide |
+| `VOL_CALIBRATION_REPORT` / `VOL_CALIBRATION_REPORT_HASH` | | report from `bin/calibrate-volatility.ts` and its sha256 |
+
+## Fair value for price markets
+
+Price-mode markets resolve mechanically from a committed Reflector feed, so
+their fair value is computed, not guessed (#331, completing #112). The
+trader asks its fair-value sources in order for every candidate market; a
+market no source can price is **not traded**. There is no fallback to the
+market's own price (zero edge by construction), and `FAIR_VALUE_BPS` is
+accepted only in tests and dry-run.
+
+The volatility estimator (`core/strategies/price-fair-value.ts`) handles any
+market whose revealed resolver spec is `Price`, `PriceScaled`, `PriceTwap` or
+`Hybrid` (price leg):
+
+1. **Spec.** `StellarAdapter.revealedPriceRule` reads the four resolver
+   entries with one `getLedgerEntries` call.
+2. **Feed.** `core/reflector.ts` simulates `decimals()`, `resolution()`,
+   `lastprice(asset)` and `price(asset, ts)` (never signs), with per-call
+   timeouts and an LRU of historical records. Prices stay `bigint` in feed
+   decimals, and `ScaledPriceConfig` thresholds use the resolver's
+   `max(feed_decimals, threshold_decimals)` rule exactly.
+3. **Grid.** `core/strategies/grid.ts` mirrors the resolver's
+   `read_feed_on_grid` and `twap_outcome` as pure functions; shared vectors in
+   `docs/vectors/price-grid-v1.json` pin the slot choice and floored TWAP.
+4. **Volatility.** EWMA (default) or GARCH(1,1)-lite on per-slot log
+   returns; steps longer than four slots are skipped and reported. Fewer
+   than 20 returns, or a feed staler than the rule's `max_staleness`
+   (`max_gap` for TWAP), gives no estimate. A flat series is clamped to a σ
+   floor with wider uncertainty.
+5. **Pricing.** A driftless lognormal digital on the grid: τ is the exact
+   slot count from the latest record to the slot covering `close_time`, and
+   `Above`/`AtOrAbove` differ by exactly one feed tick. TWAP rules weight the
+   realised samples exactly as the resolver does and moment-match the future
+   weighted sum (Turnbull–Wakeman/Levy), applying the resolver's floor before
+   comparison. Hybrid markets are shrunk toward 50% by
+   `VOL_HYBRID_FEED_FAILURE_BPS`.
+6. **Uncertainty.** The delta method on σ's standard error plus a 100 bps
+   floor becomes `Belief.uncertaintyBps`, so sizing shrinks automatically
+   when σ is poorly estimated (it replaces the static `FAIR_UNCERTAINTY_BPS`
+   for estimated markets).
+
+**Traces.** Trader buy traces are schema v2 when pool and ledger data are
+available, and `inputs.fairValue.model` records every input: feed, asset,
+decimals, resolution, grid slot, spot, threshold, direction, σ and its
+standard error, τ, realised TWAP samples and future slots, and every price
+point read. `replayFairValue(trace)` (`core/fair-value-replay.ts`) recomputes the bps
+from the model; the same `priceModel` function prices live estimates.
+
+**Calibration gate.** Live use needs evidence that the model is calibrated:
+
+```bash
+cd agents
+npx tsx bin/calibrate-volatility.ts --csv xlm-usd.csv --out ../docs/calibration/ --asset XLM-USD
+# markets=… brier=… baseline=…
+# VOL_CALIBRATION_REPORT_HASH=<sha256>
+```
+
+The input is a `ts,price` CSV exported from feed or exchange history
+(Reflector keeps only a short window on chain). The tool builds synthetic
+`AtOrAbove` markets at several thresholds and lead times, estimates each
+using only earlier history, resolves them with the grid mirror, and writes
+Brier score, log loss and a 10-bucket reliability table as JSON and
+markdown. The baseline is a persistence forecast (is the spot already past
+the threshold?), standing in for a market price that only tracks spot. With
+`VOL_LIVE_ENABLED=1`, startup fails unless `VOL_CALIBRATION_REPORT` hashes to
+`VOL_CALIBRATION_REPORT_HASH` and its Brier score beats the baseline.
 
 ## Proposal watcher
 
@@ -276,3 +348,13 @@ provides:
 `Lease` is an interface: a shared backend for multiple hosts can replace
 `FileLease` without touching the runtime. Event-driven wake-ups can later call
 into the same loops instead of waiting out `intervalMs`.
+## Inventory task
+
+`inventory` scans open markets created by the treasury, verifies the local
+inventory floor against `market_valuation`, publishes a trace, then submits a
+bounded `agent_buy_v2` or `agent_sell_v2` under the market lock. It requires a
+credential with `ROLE_TRADE` (normally the trader key); a maker-only key is
+refused. Configure the exposure band and hedge budgets with
+`MAKER_INVENTORY_MAX_DELTA_BPS`, `MAKER_INVENTORY_REBALANCE_BPS`,
+`MAKER_HEDGE_MAX_STROOPS`, `MAKER_HEDGE_DAILY_STROOPS`, and
+`MAKER_HEDGE_MIN_SECS_TO_CLOSE`.

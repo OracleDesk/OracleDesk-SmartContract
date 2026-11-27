@@ -15,7 +15,8 @@
 import "dotenv/config";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { redactString } from "../core/redact.js";
 import type { TraceRepository } from "../../x402/trace-api.js";
 
@@ -43,6 +44,8 @@ export interface AuditEntry {
     timestamp: number;
   };
   verdict: "match" | "deviation" | "mismatch" | "unverifiable";
+  /** #322: publish-time action/state validation of the trace. */
+  validation?: ValidationClass;
   deviationReason?: string;
   timestamp: number;
   signature?: string;
@@ -64,20 +67,38 @@ export interface AuditReport {
   signature?: string;
 }
 
-async function loadTraceRepository(): Promise<TraceRepository> {
-  const deployments = JSON.parse(
-    readFileSync(
-      resolve(process.cwd(), "deployments/stellar-testnet.json"),
-      "utf-8",
-    ),
-  );
+/**
+ * #322: how far the registry validated a trace's action against market state
+ * at publish time. `late`: a Buy/Sell inside the post-close grace window;
+ * `legacy-unchecked`: no verdict available (e.g. a trace published before
+ * action/state validation existed, or a registry that cannot be read).
+ */
+export type ValidationClass = "ok" | "late" | "legacy-unchecked";
 
-  return {
-    async get(traceId: string) {
-      // In production, this would connect to the registry contract
-      return undefined;
-    },
+export function validationClass(verdict: { tag: string } | undefined): ValidationClass {
+  if (!verdict) return "legacy-unchecked";
+  return verdict.tag === "Late" ? "late" : "ok";
+}
+
+/**
+ * Loads traces from the deployed reasoning registry (#322), using the
+ * committed `deployments/testnet.json` (override with `DEPLOYMENTS_FILE`) and
+ * `SOROBAN_RPC_URL` / `NETWORK_PASSPHRASE` for the connection.
+ */
+export async function loadTraceRepository(): Promise<TraceRepository> {
+  const file =
+    process.env.DEPLOYMENTS_FILE ?? resolve(dirname(fileURLToPath(import.meta.url)), "../../deployments/testnet.json");
+  const deployments = JSON.parse(readFileSync(file, "utf-8")) as {
+    contracts?: { reasoning_registry?: string };
   };
+  const contractId = deployments.contracts?.reasoning_registry;
+  if (!contractId) throw new Error(`${file} has no contracts.reasoning_registry`);
+  const { createRegistryTraceRepository } = await import("../../x402/registry-trace-repository.js");
+  return createRegistryTraceRepository({
+    contractId,
+    rpcUrl: process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org",
+    networkPassphrase: process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
+  });
 }
 
 async function fetchTraceContent(cid: string, gateway: string): Promise<string> {
@@ -131,6 +152,8 @@ async function auditTrace(
     };
   }
 
+  const validation = validationClass(record.verdict);
+
   try {
     // Fetch trace content
     const content = await fetchTraceContent(record.ipfsCid, ipfsGateway);
@@ -152,6 +175,7 @@ async function auditTrace(
         verdict: "unverifiable",
         deviationReason: "hash mismatch",
         timestamp: Date.now(),
+        validation,
       };
     }
 
@@ -204,6 +228,7 @@ async function auditTrace(
       verdict,
       deviationReason,
       timestamp: Date.now(),
+        validation,
     };
   } catch (err) {
     return {
@@ -223,6 +248,7 @@ async function auditTrace(
           ? err.message
           : "unknown error during re-execution",
       timestamp: Date.now(),
+        validation,
     };
   }
 }
@@ -286,7 +312,10 @@ async function main(): Promise<void> {
   console.log(`\nReport saved to: ${outputPath}`);
 }
 
-main().catch((err) => {
-  console.error("audit failed:", redactString(err instanceof Error ? err.message : String(err)));
-  process.exit(1);
-});
+// Run only as a CLI, so tests can import the helpers.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error("audit failed:", redactString(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  });
+}

@@ -140,7 +140,7 @@ share-count slippage parameters:
 **Transferability.** `transfer_position(from, to, market_id, outcome,
 amount)` moves shares between any two addresses (owner auth; allowed while
 `Paused` — a transfer moves no collateral — and after finality until
-`redeem`), rejecting self-transfers, transfers to the contract's own
+close-out), rejecting self-transfers, transfers to the contract's own
 address (they could never be redeemed) and over-transfers, and emitting
 `PositionTransferred` so indexers stay in sync. `transfer_lp(market_id,
 new_creator)` (current-creator auth, until `lp_claimed`) moves the single
@@ -176,7 +176,11 @@ complete sets without touching the pool (`split` before `close_time`,
 `merge` any time before resolution, including while paused). After
 finality, `redeem` handles both legs; `merge` is not used post-resolution.
 `finalize_market` (permissionless, after the redemption deadline) closes the
-market and sweeps the residual.
+market and sweeps the residual. `get_market_view` exposes an additive
+`Lifecycle` (`Open`, `Final`, `Closed`) without changing the stored `Market`
+XDR; `get_position` returns zero for `Closed`, and closed transfers fail with
+`MarketClosedOut`. Dead position entries may be removed permissionlessly with
+`purge_closed_positions`.
 
 A per-market `SettleState` side entry (views `settle_state` and
 `redeem_deadline`) tracks user-held outstanding shares, the finality
@@ -245,9 +249,9 @@ Independent resolution modes, all ultimately calling
   `decimals()` and `threshold_decimals` before comparing — see ADR 0001,
   "Price threshold units". `preview_price(market_id)` reads the feed's newest
   record (`lastprice`) read-only, without resolving or storing anything.
-  Anyone may first pin the grid read with `snapshot_price` (legacy and hybrid
-  specs only; scaled markets reply `WrongMode` — see "Oracle history retention"
-  below).
+  Anyone may first pin the grid read with `snapshot_price`; for a scaled
+  market the snapshot also pins the feed's `decimals()` (issue #321, see
+  "Oracle history retention" below).
 - **PriceTwap**: the time-weighted-average price threshold (issue #27,
   `TwapConfig` + `register_twap_spec`/`resolve_twap`). Samples
   `price(asset, ts)` at every `resolution()`-aligned timestamp in
@@ -359,6 +363,40 @@ Operators and agents should call `snapshot_price` within one oracle period
 of `close_time` (CLI: `stellar contract invoke --id $RESOLVER -- snapshot_price
 --market_id <id> --caller <address>`). A late snapshot is still accepted as
 long as the oracle has the record.
+
+**Scaled markets (#321).** `snapshot_price` on a `PriceScaled` market stores a
+`ScaledSnapshot { data, feed_decimals, taken_at, taken_by }` under its own key:
+the grid record and the feed's `decimals()`, read in the same call. Resolution
+prefers it (re-validated against `max_staleness`), so neither the record
+ageing out nor a later `decimals()` change can alter the rescaled comparison.
+
+**TWAP markets (#321).** A TWAP reads up to 32 grid records spread over
+`window` seconds, and the oldest age out first, possibly before close for a
+long window. `snapshot_twap_samples(market_id, caller, max_reads)` stores grid
+samples one slot at a time in `TwapSamples(market_id)` (a `Map<slot_ts,
+TwapSlot>`, at most `MAX_TWAP_SAMPLES` entries):
+
+- Permissionless with caller attribution; at most `min(max_reads, 8)` feed
+  reads per call, oldest slot first; already-stored slots are skipped.
+- Callable before close for slots whose timestamp has passed: their answer
+  is final. "No record" is stored as `Missing` only once
+  `slot_ts <= now - resolution`, so a record about to be published is never
+  frozen as absent.
+- A record is validated as resolution would (`price > 0`, not after
+  `close_time`, not newer than its slot query); an invalid one aborts the
+  call and is never stored.
+- `resolve_twap` (and the guardian's `OracleUnavailable` check) uses stored
+  slots first and reads only the missing ones live. Both feed the same
+  ordered slot answers to one pure computation (`twap_from_slots`), so any
+  split between stored and live slots gives exactly the full-live-read
+  outcome. `PriceResolutionSource { from_snapshot, stored_slots, live_slots }`
+  reports the split; `TwapResolution` is unchanged.
+- The grid period is pinned in `TwapGrid(market_id)` at reveal (or, for
+  markets revealed before #321, at the first sample snapshot), so a feed
+  changing `resolution()` later cannot move which slots count.
+
+`TwapGrid`, `TwapSamples` and `ScaledSnapshot` use the market's TTL target and
+are bumped with the market's other entries.
 
 #### Bonded disputes (`SignersDisputable`)
 
@@ -959,8 +997,8 @@ shared policy:
 - Instance TTL is extended by every entrypoint that reads instance storage
   (30-day target, 7-day threshold); pure views over persistent entries stay
   read-only so indexer simulations keep read-only footprints.
-- The registry additionally refreshes an agent's registration on every
-  successful `publish_trace`.
+- The registry classifies every key into a retention class and extends TTL
+  on writes only; none of its views write ledger state (#329, below).
 - The market-core `Settle` entry (outstanding shares, redemption deadline) is
   kept to the long-lived target — 365 days, clamped to `max_ttl()`. A market
   whose redemption deadline is more than one network-max TTL away can archive
@@ -976,6 +1014,106 @@ shared policy:
   alive by a single bump and need periodic touches or the keeper described in
   [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),
   which also covers TTL monitoring and the rent cost model.
+### Reasoning-registry retention classes (#329)
+
+The registry is an audit log whose entries live for very different times.
+Every `DataKey` variant maps to exactly one class in
+`contracts/reasoning-registry/src/retention.rs` (`class_of` is an exhaustive
+`match`, so a new key without a class does not compile):
+
+| Class | Keys | Target |
+| --- | --- | --- |
+| `Identity` | `Agent`, `AgentHead`, `AgentSigningKeys`, `KeyToAgent`, `SigningKeyHistory*`, `KeyRevocation`, `Consumer`, `AgentConsumer*`, `AgentDefaultConsumer`, `AgentMissedRevealCount` | `long_lived_target` (365 d, clamped to `max_ttl`) |
+| `Audit` | `Trace`, `TraceLedger`, `TraceDecision`, `TraceLink`, `TraceSignature`, `TraceConsumer`, `Consumed`, `Flag`, `FlagHistory*`, `AgentTrace(seq)`, `MarketClose` | `audit_target(close_time)`; `long_lived_target` for `NO_MARKET` traces |
+| `Index` | `MarketTrace*`, `AgentTraceAt`/`Count`, `MarketActionTrace*`, `KeyTraceAt`/`Count`, `AgentBatch*`, `AgentCommit*` | `max(existing TTL, target of the trace written)` |
+| `Batch` | `Batch`, `BatchConsumer`, `TraceCommit` | `long_lived_target` |
+| `Instance` | `Admin`, `PendingAdmin`, `NextId`, `NextBatchId`, `MarketCore`, `ConsumerScoping` | `ttl::bump_instance` on every mutating entrypoint |
+
+`audit_target(close_time) = (close_time − now + SETTLEMENT_HORIZON_SECS +
+AUDIT_MARGIN_SECS) / 5 s`, clamped to `max_ttl()`, with `AUDIT_MARGIN_SECS =
+365 d` so a trace outlives market-core's default 365-day redemption horizon.
+The close time is read from market-core once, on a market's first trace, and
+cached in `DataKey::MarketClose(market_id)`.
+
+**Writes only.** `get_trace`, `get_batch`, `agent_batch_at`, `trace_count`,
+`traces_by_*`, `trace_verdict`, `agent_chain_head`, the signing-key and
+signature views and the internal `load_agent`/`read_head` are pure reads, so
+view simulations have read-only footprints and pay no rent. Publish paths
+write every audit key at the trace's target and extend the three indexes and
+their counts to at least that target, so an index never archives before its
+newest trace. The agent's `Agent` and `AgentHead` entries are refreshed on
+publish (`touch_identity`, half-target threshold).
+
+**Instance liveness.** Views no longer bump the instance. The contract stays
+invocable as long as some write (any mutating entrypoint, including the
+archivist calls below) lands at least every 23 days (30-day target minus the
+7-day threshold). Under view-only traffic, run `extend_traces([])` or any
+archivist call on a schedule.
+
+**Archivist entrypoints** (permissionless; the caller pays the rent; extend
+only, never shorten; missing keys are skipped with `has()` because extending
+a missing key panics):
+
+- `extend_traces(ids: Vec<u64>) -> u32`: at most 32 ids. Extends each trace
+  and all its side keys to its class target, returns how many entries it
+  extended, and bumps the instance.
+- `extend_index(key: IndexKey, from, to) -> u32`: at most 64 entries of
+  `IndexKey::Market(id)`, `Agent(addr)` or `MarketAction(id, action)`; `to`
+  is clamped to the index length. Each entry is extended to its trace's
+  target and the count to the largest of those.
+- `extend_agent(agent)`: the agent's identity entries, active key bindings
+  and up to 32 signing-key history records.
+
+`TooManyEntries` (3049) rejects an oversized call.
+
+**Archived reads.** A paged view cannot skip an archived entry from inside the
+contract: RPC simulation reports the entry as archived and the invocation
+fails at footprint validation before contract code runs. Readers either
+restore (the protocol's automatic restore via the simulation's
+`restorePreamble`, or `stellar contract restore`) or fall back to per-id reads
+around the gap. The x402 server maps a restore-required simulation to
+`503 registry_restore_required` with `Retry-After`, never 404
+(`x402/registry-trace-repository.ts`).
+
+**Rent.** With the CAP-0066 formula cited in `ttl.rs` (`ceil(bytes / 1024) ×
+ledgers × rate / 1215`, rate from 1 000 stroops/KB at the floor to 10 000 at
+the target live-state size), one 1-KB rent unit costs:
+
+| Days live | Ledgers | Floor rate | Target rate |
+| --- | --- | --- | --- |
+| 30 | 518 400 | 0.043 XLM | 0.43 XLM |
+| 180 (today's `max_ttl`) | 3 110 400 | 0.256 XLM | 2.56 XLM |
+| 365 | 6 307 200 | 0.519 XLM | 5.19 XLM |
+
+Every registry entry is under 1 KB (a `Trace` is at most ~340 bytes, see the
+`MAX_PAGE_SIZE` comment), so each costs one unit. A plain trace writes five
+audit/index entries (`Trace`, `TraceLedger`, three index slots; the counts are
+shared), so it costs 5 units: about 1.28 XLM (floor) to 12.8 XLM (target) to
+keep for 180 days. A signed, chained trace adds `TraceLink`, `AgentTrace`,
+`TraceSignature` and `KeyTraceAt` (9 units). These are upper bounds: the
+protocol charges by exact entry size.
+
+**Clamping.** `max_ttl()` (about 180 days on testnet and mainnet today)
+clamps every target, so "until the redemption deadline" means "until
+`max_ttl`, then archivists". That is why `extend_traces` is part of the
+design rather than an extra.
+
+**Migration.** Existing entries keep their current TTL. After upgrading, run a
+one-off sweep over testnet ids `0..trace_count` in batches of 32:
+
+```bash
+for start in $(seq 0 32 $((COUNT - 1))); do
+  ids=$(seq -s, "$start" $((start + 31 < COUNT - 1 ? start + 31 : COUNT - 1)))
+  stellar contract invoke --id "$REGISTRY" --source archivist --network testnet \
+    -- extend_traces --ids "[$ids]"
+done
+```
+
+Resource scenarios: `registry.publish_trace.audit_class`,
+`registry.get_trace.read_only`, `registry.traces_by_market.page25.read_only`
+(both with zero write entries) and `registry.extend_traces.32` in
+`docs/budgets/baseline.json`.
+
 ### router
 
 A stateless address book (`RouterConfig { market_core, resolver,
@@ -1236,6 +1374,24 @@ risks; with no treasury position on the right side, it never disputes. It does
 not attest, does not act as an escalation committee member, and is a
 safety net for the treasury's own capital, not a general-purpose oracle.
 
+## Resolution bounties (#149)
+
+The resolver now holds funds: `fund_bounty` escrows the market's collateral in the resolver, one funder per market. `resolve_price_for` and `finalize_signers_for` pay the escrow to the caller that makes the market final, in the same invocation as the resolution, so a failed resolution pays nothing. `guardian_void_market` refunds an unpaid escrow to its funder. `reclaim_bounty` returns an unpaid escrow after a plain (unpaid) finalization. No entrypoint lets an admin withdraw escrow. `set_bounty_token` accepts only market-core's collateral address. This is a new trust surface: the resolver's escrow balance is outside market-core's solvency invariant, and the resolver's instance and bounty entries are TTL-extended on touch.
+
+## Outcome tokens (#146)
+
+A market position can be wrapped into a standard SEP-41 token, so shares can move to other wallets and into the wider Stellar ecosystem. The normative clauses are in `docs/spec/`; this section describes the design.
+
+- **`market-core.transfer_position(from, to, market_id, outcome, amount)`** moves shares between two market-core positions. `from` must authorize. It is allowed until the market is closed out.
+- **`outcome-token`** (one contract per `(market, outcome)`) is a SEP-41 token. Its own market-core position backs its supply, so `total_supply` equals that position before redemption. Only the factory may mint, unwrap, and redeem. Holders may transfer, approve, and burn. Burning is an unwrap: the shares go back to the burner's position.
+- **`outcome-token-factory`** derives each token's address from `sha256("oracledesk.outcome-token.v1" || market_id_be || outcome_byte)`, so clients can compute it before deployment. `deploy_token` is idempotent. `wrap` and `unwrap` move shares in and out. `redeem_wrapped` pays a holder their pro-rata share of the market's payout: 1:1 for the winning outcome, half (rounded down) for a void market, and zero for the losing outcome.
+
+Auth for `wrap`: the holder signs the `wrap` invocation, and the nested `transfer_position` (holder to token) is a sub-invocation the holder also authorizes. The token calls market-core as its own direct caller, so its outgoing transfers need no extra auth entry.
+
+Redemption happens once. The first `redeem_wrapped` redeems the token's whole market-core position and records the payout with the supply at that moment. Each holder's payout is their balance times that payout, divided by that fixed supply. Wrapping and unwrapping are closed after redemption.
+
+Known limits: the void payout rounds down, so one unit of dust per void can stay in the token. A token redeemed after market-core's redemption window closes cannot be redeemed. The factory does not check that `collateral` matches market-core's collateral; the deployer must pass the right address.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
@@ -1293,6 +1449,74 @@ requests owned by another replica are never touched.
 A settlement timeout returns 502 without content. Other SDK failures retain
 standard HTTP instructions and payment challenge headers.
 
+### x402 observability (#328)
+
+Every log line is structured pino JSON with a `reqId` (an inbound
+`X-Request-Id` matching `^[A-Za-z0-9-]{8,64}$` is reused and echoed);
+payment-path lines also carry `paymentId`, `traceId` and `network`.
+Payment payloads (signed authorisations), facilitator API keys,
+`Authorization`/`Cookie` headers and HTTP-client error bodies are redacted or
+dropped by the serializer, and messages are constant strings so nothing is
+interpolated past the redactor. Every failure is classified into a typed
+`X402Error` with a stable status and `{ error, message }` body; a registry RPC
+outage is `503 registry_unavailable`, not 404. Prometheus metrics are served
+by a separate listener on `METRICS_PORT` with closed label sets only. The
+metric names, labels, error-code table and scrape config are in
+[`x402/README.md`](../x402/README.md). The verify-then-settle order and the
+durable `verifying → settling` CAS are unchanged: timers use
+`performance.now()` deltas and add no awaits between the CAS and the
+facilitator call.
+
+### x402 signed delivery receipts (#330)
+
+When `X402_RECEIPT_KEYS` is configured, every settled payment gets one
+Ed25519 receipt signed by the server, binding payment id, settlement tx,
+trace id and hash, verdict at sale, amount, asset, network, `payTo`, payer and
+`settledAt`. The encoding (`oracledesk-x402-receipt-v1`) is length-prefixed
+fields, never JSON, so the signed bytes are identical in every runtime:
+
+```text
+msg = "oracledesk-x402-receipt-v1" || 0x00
+    || field(1, kid) || field(2, network) || field(3, paymentId hex)
+    || field(4, settlementTx hex) || field(5, traceId decimal) || field(6, traceHash hex)
+    || field(7, verdict tag[:reason]) || field(8, amount decimal base units) || field(9, asset)
+    || field(10, payTo) || field(11, payer) || field(12, settledAt unix secs decimal)
+field(tag, s) = u8 tag || u32be(len(utf8(s))) || utf8(s)
+receipt = base64url(msg) + "." + base64url(ed25519_sign(sha256(msg)))
+```
+
+Hex is lowercase without `0x`, decimals have no leading zeros, and `amount`
+stays a decimal string (it may exceed 2^53). The verdict is `unchecked` when
+no registry verdict was taken at sale.
+
+- **Exactly once.** The route computes `settledAt` and the receipt after the
+  facilitator settles and persists both in the single `settling → settled`
+  CAS. Ed25519 is deterministic, so a replica that loses the CAS would have
+  produced the same bytes; it discards its copy. Replays return
+  `entry.receipt` and never re-sign. Entries settled before receipts existed
+  are signed once on their first replay (`settledAt` from the entry's
+  `updatedAt`) and marked `receiptBackfilled` outside the signed fields.
+- **Delivery.** `X-OracleDesk-Receipt` header plus `"receipt"` in the JSON
+  body on delivery and replay. `GET /receipts/:paymentId` re-serves it to
+  whoever presents the original `PAYMENT-SIGNATURE`; unknown, unsettled and
+  mismatched requests all get the same 404, so the route is not an oracle for
+  payment existence.
+- **Keys.** `GET /.well-known/oracledesk-x402-keys.json` publishes
+  `{ kid, publicKey, notBefore, notAfter? }` for every key
+  (`Cache-Control: public, max-age=300`); `kid` is the first 8 bytes (hex) of
+  `sha256(publicKey)`. Rotate by adding the new key, then setting `notAfter`
+  on the old one. Retired keys stay listed indefinitely, or their receipts
+  become unverifiable; removing a key declares it compromised. A receipt
+  verifies only if its `settledAt` is inside the key's
+  `[notBefore, notAfter)` window.
+- **Clock.** `settledAt` is the issuing server's clock, not ledger close time;
+  `settlementTx` lets a verifier look the ledger time up.
+- **Fail fast.** Invalid keys, or `X402_RECEIPTS=required` with no keys, stop
+  startup: the server never settles payments it cannot receipt.
+
+Golden vectors (including negative ones) live in
+`docs/vectors/x402-receipt-v1.json`, generated by `x402/receipt-vectors.ts`.
+
 ### On-chain reconciliation (#300)
 
 At claim time the ledger persists the auth nonces, payer address, expiration
@@ -1322,16 +1546,95 @@ trace bytes are delivered on the next request.
 Settled/delivered retries return the original stored body and PAYMENT-RESPONSE
 without another facilitator call or gateway fetch. The original raw bytes are
 stored and hash-checked again on replay, so a changed registry record cannot
-change what was purchased. Retries expire at the original persisted deadline,
-bounded by transaction time bounds or maxTimeoutSeconds; expired payments get
-402. Finite ledger bounds and Soroban authorization expirations are checked
-against a live ledger on both first use and replay, using the corresponding
-`STELLAR_TESTNET_RPC_URL` or `STELLAR_MAINNET_RPC_URL`. Failure to obtain that
-anchor fails closed. Database/state conflicts are never auto-settled again.
+change what was purchased. A *new* payment expires at its persisted deadline,
+bounded by transaction time bounds or maxTimeoutSeconds (expired: 402), and its
+finite ledger bounds and Soroban authorization expirations are checked against a
+live ledger using the corresponding `STELLAR_TESTNET_RPC_URL` or
+`STELLAR_MAINNET_RPC_URL` (no anchor: fail closed). A *settled* payment is
+instead replayable for `X402_REDELIVERY_WINDOW_SECS` (default 900) after
+settlement, independent of those authorization bounds, so a buyer whose download
+failed after being charged can re-fetch with the same payment; after the window
+the replay gets 410. Database/state conflicts are never auto-settled again.
+
+#### Refunds for undelivered payments (#279)
+
+A first delivery is recorded (`delivered`) only when the response finishes; a
+client abort or crash between settlement and `finish` leaves the entry
+`settled`. A replay claims delivery with a CAS (`settled → delivered`) *before*
+sending, so a re-download racing the refund sweeper yields exactly one outcome:
+delivered (never refunded) or `refund_pending` (the replay answers 410).
+
+With `X402_REFUNDS_ENABLED=1` the server runs a sweeper every
+`X402_REFUND_SWEEP_MS` (default 60 s, at most `X402_REFUND_BATCH`, default 10,
+entries per tick; stopped on SIGINT/SIGTERM before the ledger closes). An entry
+is refund-eligible when it is `settled` with no `delivered` transition, has a
+`settlementTx` and a valid `G...`/`C...` payer, and its redelivery window has
+passed. States: `settled → refund_pending → refunding → refunded |
+refund_failed`, each a ledger CAS. The refund is a SEP-41
+`transfer(refund_account, payer, amount)` on the payment's own asset contract,
+built from the dedicated account `X402_REFUND_SECRET` (the server never holds
+`payTo` keys), simulated, assembled and signed; its hash and signed XDR are
+written to the `refunds` table **before** `sendTransaction`, and the executor
+polls `getTransaction` until SUCCESS/FAILED or the transaction's time bound. On
+restart a `refunding` entry is resumed by hash: a known outcome is recorded, an
+unknown hash is waited on until its time bound passes and only then rebuilt
+with a fresh sequence number, so one payment never yields two refund
+transactions. RPC and passphrase come from the entry's network. Failed
+simulations or transactions retry with backoff up to
+`X402_REFUND_MAX_ATTEMPTS` (default 5), then end in `refund_failed`.
+
+Payments above `X402_REFUND_AUTO_APPROVE_MAX` (base units, default 1000000 =
+0.1 USDC) and any refund that would push the rolling `X402_REFUND_WINDOW_SECS`
+(default 86400) total above `X402_REFUND_WINDOW_CAP` (default 100000000) park in
+`refund_pending` with `refundReview` set (the cap logs
+`x402_refund_cap_reached`). Operators use `GET /admin/refunds?state=&cursor=`
+and `POST /admin/refunds/:paymentId/approve|reject` (same bearer token as the
+payments endpoint). The SQLite ledger is at schema version 2: the v1 → v2
+migration adds the `refunds` table and a `payments(state, updated_at)` index in
+one transaction, and unknown versions are still refused. Disputes about the
+content of delivered traces are out of scope here.
 
 `GET /admin/payments/:paymentId` requires `Authorization: Bearer X402_ADMIN_TOKEN`
 and is disabled if unset. It returns purchase state and transaction/payer fields,
 with raw trace bytes, response content and requirement keys redacted. The SQLite
 file is permissioned to its owner and git-ignored. Back it up as sensitive
-purchase history. This design supports one service process; shared multi-instance
-locking, refunds and automatic indeterminate reconciliation remain separate work.
+purchase history. The admin view also shows `refundId`/`refundTx`. This design
+supports one service process (one writer per ledger file); shared multi-instance
+locking and automatic indeterminate reconciliation remain separate work.
+
+### Weighted-key markets can void (#326)
+
+Weighted-key committees sign off-chain Ed25519 attestations. The v1 message
+(`oracledesk-attest-v1`) can only carry Yes/No; `submit_signatures_v2` accepts
+the v2 message (`oracledesk-attest-v2`, see `docs/agent-signing.md`), whose
+outcome byte can also be `Invalid`. Invalid weight is tallied per round like
+Yes/No, displaces a pending Yes/No proposal once (the address-based rule), and
+`finalize_signers` on an Invalid proposal voids the market (`CommitteeVoided`,
+whose `invalid_count` is the Invalid *weight* for weighted markets). A key
+signs at most once per round across all outcomes and both versions.
+
+### Trace action/state validation (#322)
+
+The reasoning registry checks each single-trace publish (`publish_trace`,
+`publish_chained_trace`, the signed variants and `commit_trace`) against the
+live state of market-core and the resolver, through `#[contractclient]`
+mirrors (no vendored wasm). `now` is the ledger time and `G` the admin-set
+grace (`set_action_grace`, default 3,600 s, at most 86,400 s):
+
+| Action | Requirement | Error |
+| --- | --- | --- |
+| `ProposeMarket` | `NO_MARKET` | `ProposalMustUseNoMarket` |
+| `CreateMarket` | creator is the agent or a registered consumer, `now <= close_time` | `NotMarketCreator`, `MarketClosed` |
+| `Buy` / `Sell` | `status == Open` and `now < close_time + G` | `MarketClosed` |
+| `Skip` | market exists | `UnknownMarket` |
+| `Redeem` / `ClaimRemainder` | `status != Open` (Void is final) | `MarketNotFinal` |
+| `Resolve` | `now >= close_time` and `resolution_role(market, agent, signing_keys(agent)) != None` | `MarketNotClosed`, `NotResolutionSigner` |
+| `Other(sym)` | allow-listed by `set_other_action`; its `OtherRule` decides `NO_MARKET` | `UnknownOtherAction` |
+
+A Buy/Sell trace published after `close_time` (inside `G`) is stored with a
+`TraceLate` side flag and `trace_verdict` reports `TraceVerdict::Late` when the
+hash and flags are otherwise valid. The resolver is read as market-core's
+current `get_config().resolver`. Committee membership is checked against the
+market's bound epoch at publish time. Batched (Merkle) traces are not checked
+per leaf.
+

@@ -8,9 +8,10 @@
  * trace through the pending-trace queue.
  */
 import { BPS } from "../../core/fpmm.js";
-import { decideTrade, decideTradeSized, type MarketState } from "../../core/strategy.js";
+import { deltaBps, type Inventory } from "../../core/inventory.js";
+import { decideTrade, decideTradeSized, type FairValueResult, type MarketState } from "../../core/strategy.js";
 import type { CapsView, Holdings, SizingParams } from "../../core/sizing.js";
-import { buildTrace, decisionHashBuy, type TraceStore } from "../../core/trace.js";
+import { buildTrace, buildTraceV2, decisionHashBuy, type FairValueEstimate, type TraceStore } from "../../core/trace.js";
 import {
   isDueDiligenceApproved,
   rejectChangedState,
@@ -38,6 +39,12 @@ export interface TraderRiskCheck {
 export interface TraderCandidate {
   market: MarketState;
   fairValueBps: number;
+  /** Estimate-specific uncertainty (#331); overrides `TraderDeps.uncertaintyBps`. */
+  uncertaintyBps?: number;
+  /** The full estimate, recorded in the buy trace for replay (#331). */
+  fairValue?: FairValueResult;
+  /** Close time of the ledger the market state was read at (unix secs). */
+  ledgerCloseTime?: number;
   /** Creator address, when known (our treasury => one of our own markets). */
   creator?: string;
   questionHash?: string;
@@ -46,6 +53,7 @@ export interface TraderCandidate {
   holdings?: Holdings;
   caps?: CapsView;
   setsMinted?: bigint;
+  inventory?: Inventory;
 }
 
 export interface TraderDeps {
@@ -55,11 +63,14 @@ export interface TraderDeps {
   candidates: () => Promise<TraderCandidate[]>;
   /** This deployment's treasury contract id (creator of our own markets). */
   treasury?: string;
+  /** Contract ids recorded in v2 trade traces. */
+  contracts?: { marketCore: string; treasury: string };
   minEdgeBps: number;
   tradeSizeStroops: bigint;
   slippageBps: bigint;
   sizingParams?: SizingParams;
   uncertaintyBps?: bigint;
+  inventoryMaxDeltaBps?: bigint;
   deadlineSecs: number;
   /** Unix seconds. */
   nowSecs: () => number;
@@ -96,6 +107,13 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
   for (const c of candidates) {
     if (ctx.signal.aborted) return;
     const { market, fairValueBps } = c;
+    const directional = c.inventory && ((c.inventory.delta > 0n && fairValueBps > market.yesBps) ||
+      (c.inventory.delta < 0n && fairValueBps < market.yesBps));
+    if (c.inventory && directional && deps.inventoryMaxDeltaBps !== undefined &&
+        deltaBps(c.inventory, c.inventory.floor > 0n ? c.inventory.floor : 1n) > deps.inventoryMaxDeltaBps) {
+      ctx.log.info("TRADER_SKIP_INVENTORY_BAND", { market: market.marketId, delta: c.inventory.delta });
+      continue;
+    }
     const own = deps.treasury !== undefined && c.creator === deps.treasury;
     if (own && !ctx.locks.ownMarketTradable(market.marketId, c.questionHash)) {
       ctx.log.info("TRADER_SKIP_UNREVEALED", { market: market.marketId, status: ctx.locks.status(market.marketId) ?? "unknown" });
@@ -117,7 +135,10 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
             pool,
             c.holdings,
             c.caps,
-            { fairYesBps: BigInt(fairValueBps), uncertaintyBps: deps.uncertaintyBps ?? 0n },
+            {
+              fairYesBps: BigInt(fairValueBps),
+              uncertaintyBps: c.uncertaintyBps !== undefined ? BigInt(c.uncertaintyBps) : (deps.uncertaintyBps ?? 0n),
+            },
             deps.sizingParams,
             deps.minEdgeBps,
           )
@@ -160,14 +181,23 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
       const verdict = await verifyTrade(deps, BigInt(market.marketId), deps.nowSecs);
       const approved = isDueDiligenceApproved(verdict, String(market.marketId), ctx.now());
       ctx.log.info("TRADER_DUE_DILIGENCE", { market: market.marketId, verdict });
-      const built = buildTrace({
+      const v2 = approved
+        ? buyTraceV2(deps, c, {
+            reasoning: decision.reasoning,
+            outcome: decision.outcome!,
+            collateralIn,
+            minSharesOut,
+            extensions: { decision, sizing: sized?.sizing, dueDiligence: verdict, limitPriceBps },
+          })
+        : undefined;
+      const built = v2 ?? buildTrace({
         agent: "trader",
         marketId: market.marketId,
         action: approved ? "buy" : "skip",
         reasoning: approved
           ? decision.reasoning
           : `trade rejected by due diligence: ${verdict.reasons.map((reason) => reason.code).join(", ")}`,
-        inputs: { market, fairValueBps, decision, sizing: sized?.sizing, dueDiligence: verdict },
+        inputs: { market, fairValueBps, ...(c.fairValue ? { fairValue: c.fairValue } : {}), decision, sizing: sized?.sizing, dueDiligence: verdict },
       });
       const { cid } = await deps.traceStore.put(built.hash, built.json);
       ctx.log.info("TRADER_TRACE", { trace: built.hash, cid });
@@ -272,4 +302,65 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
 
 export function traderTask(deps: TraderDeps, opts: { intervalMs: number; jitterMs?: number }): Task {
   return { name: "trader", mode: deps.adapter.mode, ...opts, run: (ctx) => traderTick(deps, ctx) };
+}
+
+/**
+ * A schema-v2 buy trace (#331) when the candidate carries everything v2
+ * needs (pool reserves, fee, ledger, contracts); otherwise undefined and the
+ * caller keeps the v1 shape. The fair value, including the estimator's full
+ * `model`, is recorded so the trace replays to the same bps.
+ */
+export function buyTraceV2(
+  deps: TraderDeps,
+  c: TraderCandidate,
+  order: {
+    reasoning: string;
+    outcome: "Yes" | "No";
+    collateralIn: bigint;
+    minSharesOut: bigint;
+    extensions: Record<string, unknown>;
+  },
+) {
+  const m = c.market;
+  if (
+    m.reserveYesStroops === undefined ||
+    m.reserveNoStroops === undefined ||
+    m.feeBps === undefined ||
+    c.ledger === undefined ||
+    c.ledgerCloseTime === undefined ||
+    !deps.contracts
+  )
+    return undefined;
+  const total = m.reserveYesStroops + m.reserveNoStroops;
+  const fairValue: FairValueEstimate = c.fairValue
+    ? {
+        bps: c.fairValue.fairYesBps,
+        source: c.fairValue.source,
+        observedAt: c.fairValue.observedAt,
+        ...(c.fairValue.model ? { model: c.fairValue.model } : {}),
+      }
+    : { bps: c.fairValueBps, source: "static", observedAt: c.ledgerCloseTime };
+  return buildTraceV2({
+    agent: "trader",
+    marketId: String(m.marketId),
+    action: "buy",
+    reasoning: order.reasoning,
+    inputs: {
+      marketId: String(m.marketId),
+      ledgerSequence: c.ledger,
+      ledgerCloseTime: c.ledgerCloseTime,
+      reserveYes: m.reserveYesStroops.toString(),
+      reserveNo: m.reserveNoStroops.toString(),
+      feeBps: m.feeBps,
+      priceYesBps: total > 0n ? Number((m.reserveNoStroops * 10_000n) / total) : 0,
+      fairValue,
+      order: {
+        outcome: order.outcome === "Yes" ? "yes" : "no",
+        collateralIn: order.collateralIn.toString(),
+        minSharesOut: order.minSharesOut.toString(),
+      },
+      contracts: deps.contracts,
+      extensions: order.extensions,
+    },
+  });
 }

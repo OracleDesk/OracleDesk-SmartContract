@@ -203,18 +203,18 @@ const marketId = await treasury.agent_create_market({
 console.log('Market created:', marketId);
 ```
 
-Or, **with a bounty** (Issue #149, if implemented):
+To attract resolvers, fund a **bounty** on the resolver before the market closes (Issue #149):
 
 ```typescript
-const marketId = await treasury.agent_create_market_with_bounty({
-  agent: agentAddress,
-  seed_amount: 100e7,
-  bounty_amount: 10e7,  // 10 USDC bounty for permissionless resolvers
-  question_hash: questionHash,
-  resolution_hash: resolutionSpecHash,
-  close_time: closeTime,
+// Escrowed in the resolver in the collateral token. Only the funder may top it up.
+await resolver.fund_bounty({
+  funder: agentAddress,
+  market_id: marketId,
+  amount: 10e7,
 });
 ```
+
+A treasury-funded variant (`agent_create_market_with_bounty`) is not implemented yet. Until it is, fund the bounty from the agent's own account as above.
 
 ---
 
@@ -306,6 +306,15 @@ For price-based:
 ```typescript
 const bountyPaid = await resolver.resolve_price_for({
   caller: agentAddress,
+  market_id: marketId,
+});
+```
+
+Only the `_for` variants pay the bounty, and only to the `caller` that makes the market final in that call. A call that fails pays nothing. If the market was finalized through plain `resolve_price` or `finalize_signers`, nobody earns the bounty, and the funder can take it back once the market is final:
+
+```typescript
+const refunded = await resolver.reclaim_bounty({
+  funder: agentAddress,
   market_id: marketId,
 });
 ```
@@ -436,6 +445,12 @@ If your signer set is ambiguous (e.g., signers control the same keys):
 | `MarketClosed` | Trying to trade after close_time. | Wait until resolution is complete, then redeem. |
 | `DisputeWindowOpen` | Signers finalization too early. | Wait for dispute_window to pass (7 days in this example). |
 | `NoProposalToFinalize` | Never revealed a signer spec. | Call `register_signer_spec` before finalizing. |
+| `BountyTokenNotSet` (44) | Bounty used before the admin set the bounty token. | Ask the admin to call `set_bounty_token` with the market collateral. |
+| `InvalidBounty` (45) | Bounty amount is zero or negative. | Pass a positive `amount`. |
+| `BountyFundingClosed` (46) | `fund_bounty` called at or after `close_time`. | Fund before the market closes. |
+| `BountyFunderMismatch` (47) | A different address already funds this market's bounty. | Fund from the original funder, or let that funder reclaim. |
+| `NoBounty` (48) | `reclaim_bounty` for a market with no escrow. | Nothing to reclaim. |
+| `BountyNotFinal` (49) | `reclaim_bounty` before the market is final. | Wait until the market is finalized. |
 
 ---
 

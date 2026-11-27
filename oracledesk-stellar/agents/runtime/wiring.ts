@@ -11,7 +11,9 @@ import { SnapshotCache } from "../core/state/state_cache.js";
 import { ChainStateReader } from "../core/state/reader.js";
 import { existingQuestionHashes, tradableMarkets } from "../core/state/select.js";
 import { toMarketState } from "../core/state/types.js";
-import type { MarketSignal, SignalSource } from "../core/strategy.js";
+import { fairValueFor, type MarketFairValueSource, type MarketSignal, type SignalSource } from "../core/strategy.js";
+import { createReflectorFeed } from "../core/reflector.js";
+import { PriceRuleFairValue } from "../core/strategies/price-fair-value.js";
 import { LocalTraceStore } from "../core/trace.js";
 import type { AgentConfig, Tunables } from "../core/config.js";
 import { evaluateAgentRisk, type AgentRiskState, type AgentRiskEvaluation } from "../core/risk.js";
@@ -28,6 +30,7 @@ import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
 import type { MakerDeps } from "./tasks/maker.js";
 import type { WatcherTaskDeps } from "./tasks/watcher.js";
 import { fixtureCandidates, type TraderCandidate, type TraderDeps, type TraderRiskCheck } from "./tasks/trader.js";
+import { inventoryTask, type InventoryCandidate, type InventoryDeps } from "./tasks/inventory.js";
 
 /** Placeholder signal source until a real one is wired in (see docs/wave-issues).
  * Deterministic so dry-runs are reproducible. */
@@ -76,11 +79,42 @@ function stateReader(rpcUrl: string, deployments: Deployments) {
   });
 }
 
-/** Chain-state market source: tradable markets the treasury can afford. */
+/**
+ * Fair-value sources for the trader (#331), in the order they are asked.
+ * Live mode uses the volatility estimator only when `VOL_LIVE_ENABLED`
+ * passed the calibration gate at config load.
+ */
+export function fairValueSources(
+  t: Tunables,
+  adapter: Pick<StellarAdapter, "mode" | "revealedPriceRule" | "reflectorTransport">,
+): MarketFairValueSource[] {
+  const v = t.trading.volatility;
+  if (!v.enabled || (adapter.mode === "live" && !v.liveEnabled)) return [];
+  return [
+    new PriceRuleFairValue({
+      rules: (id) => adapter.revealedPriceRule(id),
+      feed: createReflectorFeed(adapter.reflectorTransport()),
+      historySlots: v.historySlots,
+      estimator: v.estimator,
+      hybridFeedFailureProb: v.hybridFeedFailureBps / 10_000,
+    }),
+  ];
+}
+
+/**
+ * Chain-state market source: tradable markets the treasury can afford, each
+ * with a fair value from `sources`. A market no source can estimate is not
+ * traded (#331): the old `market.yesBps` fallback had zero edge by
+ * construction. `FAIR_VALUE_BPS` remains a test/dry-run override only (the
+ * config rejects it in live mode).
+ */
 export function chainCandidates(
   t: Tunables,
   deployments: Deployments,
   adapter: TraderDeps["adapter"],
+  sources: readonly MarketFairValueSource[] = [],
+  nowSecs: () => number = () => Math.floor(Date.now() / 1000),
+  onEstimateError?: (source: string, error: unknown) => void,
 ): () => Promise<TraderCandidate[]> {
   const reader = stateReader(t.rpcUrl, deployments);
   const cache = new SnapshotCache();
@@ -91,8 +125,16 @@ export function chainCandidates(
     const dailyHeadroom = risk?.dailyHeadroom ?? (risk ? risk.maxDaily - risk.dailyUsed : 0n);
     if (canSize && (snapshot.portfolio.availableCapital <= 0n || dailyHeadroom <= 0n)) return [];
     const markets = tradableMarkets(snapshot);
-    return Promise.all(markets.map(async (m) => {
+    const candidates = await Promise.all(markets.map(async (m): Promise<TraderCandidate | undefined> => {
       const market = toMarketState(m);
+      const fair = await fairValueFor(
+        sources,
+        t.trading.fairValueBps,
+        { marketId: m.marketId, closeTime: m.closeTime },
+        BigInt(nowSecs()),
+        onEstimateError,
+      );
+      if (!fair) return undefined;
       let holdings;
       let caps: CapsView | undefined;
       if (canSize && risk !== undefined) {
@@ -116,16 +158,17 @@ export function chainCandidates(
       }
       return {
         market,
-        // No external oracle yet: FAIR_VALUE_BPS or the market's own price (strategy.ts decides edge).
-        fairValueBps: t.trading.fairValueBps ?? market.yesBps,
+        ...fair,
         creator: m.creator,
         questionHash: m.questionHash,
         ledger: snapshot.ledgers.max,
+        ledgerCloseTime: Number(snapshot.ledgerCloseTime),
         holdings,
         caps,
         setsMinted: m.setsMinted,
       };
     }));
+    return candidates.filter((c): c is TraderCandidate => c !== undefined);
   };
 }
 
@@ -215,8 +258,17 @@ export function traderDeps(
   return {
     adapter,
     traceStore: new LocalTraceStore(t.traceStoreDir),
-    candidates: deployments ? chainCandidates(t, deployments, adapter) : () => fixtureCandidates(nowSecs()),
+    candidates: deployments
+      ? chainCandidates(
+          t,
+          deployments,
+          adapter,
+          hasEstimatorReads(adapter) ? fairValueSources(t, adapter) : [],
+          nowSecs,
+        )
+      : () => fixtureCandidates(nowSecs()),
     treasury: deployments?.contracts.treasury,
+    contracts: deployments ? { marketCore: deployments.contracts.market_core, treasury: deployments.contracts.treasury } : undefined,
     minEdgeBps: t.trading.minEdgeBps,
     tradeSizeStroops: t.trading.tradeSizeStroops,
     slippageBps: BigInt(t.trading.slippageBps),
@@ -232,6 +284,32 @@ export function traderDeps(
     nowSecs,
     dueDiligence,
     riskCheck,
+  };
+}
+
+export function inventoryDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): InventoryDeps {
+  return {
+    adapter,
+    traceStore: new LocalTraceStore(t.traceStoreDir),
+    treasury: deployments.contracts.treasury,
+    candidates: async () => {
+      const count = await adapter.marketCount();
+      const out: InventoryCandidate[] = [];
+      for (let id = 0n; id < count; id++) {
+        const m = await adapter.getMarket(id);
+        if (!m || m.status !== "Open" || m.creator !== deployments.contracts.treasury) continue;
+        const [position, value] = await Promise.all([adapter.treasuryPosition(id), adapter.marketValuation(id)]);
+        out.push({ marketId: id, closeTime: m.closeTime, pool: { reserveYes: m.reserveYes, reserveNo: m.reserveNo, feeBps: m.feeBps }, position, lpOwned: true, costBasis: value.cost_basis });
+      }
+      return out;
+    },
+    caps: async () => {
+      const c = await adapter.riskCaps();
+      return { ...c, availableCapital: c.dailyHeadroom ?? c.maxDaily - c.dailyUsed };
+    },
+    policy: { maxBuyPriceBps: 10_000n, minSellPriceBps: 1n },
+    hedge: { maxDeltaBps: t.inventory.maxDeltaBps, targetDeltaBps: t.inventory.rebalanceBps, maxTradeStroops: t.inventory.maxHedgeStroops, dailyHeadroom: t.inventory.dailyHedgeStroops, minSecsToClose: t.inventory.minSecsToClose },
+    deadlineSecs: t.trading.deadlineSecs,
   };
 }
 
@@ -347,4 +425,11 @@ export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter): WatcherT
         .map(([id]) => id);
     },
   };
+}
+
+function hasEstimatorReads(
+  a: TraderDeps["adapter"],
+): a is TraderDeps["adapter"] & Pick<StellarAdapter, "mode" | "revealedPriceRule" | "reflectorTransport"> {
+  const x = a as Partial<StellarAdapter>;
+  return typeof x.revealedPriceRule === "function" && typeof x.reflectorTransport === "function";
 }

@@ -6,7 +6,6 @@ import type { MarketState } from "../strategy.js";
 import { priceYesBps } from "../fpmm.js";
 
 export type MarketStatus = "open" | "resolved_yes" | "resolved_no" | "void";
-export type ResolutionMode = "unrevealed" | "price" | "signers" | "finalized" | "unknown";
 
 export interface ChainMarket {
   marketId: bigint;
@@ -23,7 +22,7 @@ export interface ChainMarket {
   setsMinted: bigint;
   feesAccrued: bigint;
   lpClaimed: boolean;
-  resolution: ResolutionMode;
+  closed: boolean;
 }
 
 export interface PortfolioState {

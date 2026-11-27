@@ -500,10 +500,39 @@
         ]
       }
     },
+<<<<<<< HEAD
+    "get_market_view": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Returns the market and its lifecycle. Integrators must use this view rather than `get_market` when deciding whether positions have value.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "get_market_view",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "MarketView"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+=======
+>>>>>>> upstream/develop
     "get_position": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Returns zero for a closed market. Historical amounts must be recovered from `Redeemed`, `PositionTransferred`, and `MarketFinalized` events.",
         "inputs": [
           {
             "doc": "",
@@ -557,6 +586,26 @@
         ]
       }
     },
+<<<<<<< HEAD
+    "is_closed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "is_closed",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+=======
+>>>>>>> upstream/develop
     "market_count": {
       "kind": "function_v0",
       "spec": {
@@ -708,6 +757,37 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "purge_closed_positions": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Removes valueless position entries from a closed market. This is permissionless and does not refund rent; it only reduces live state.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "holders",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "purge_closed_positions",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
             }
           }
         ]
@@ -1872,6 +1952,34 @@
         "name": "HybridConfig"
       }
     },
+    "Lifecycle": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Closed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Final"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Open"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Lifecycle"
+      }
+    },
     "Market": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1996,6 +2104,43 @@
         "doc": "",
         "lib": "",
         "name": "MarketStatus"
+      }
+    },
+    "MarketView": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "lifecycle",
+            "type_": {
+              "udt": {
+                "name": "Lifecycle"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "market",
+            "type_": {
+              "udt": {
+                "name": "Market"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "redeem_deadline",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "MarketView"
       }
     },
     "Observation": {
@@ -2457,6 +2602,12 @@
           {
             "void_v0": {
               "doc": "",
+              "name": "Closed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
               "name": "Duplicate"
             }
           },
@@ -2564,11 +2715,14 @@
             "value": 31
           },
           {
+<<<<<<< HEAD
+=======
             "doc": "Inbound collateral transfer delivered fewer (or different) units than expected, e.g. a fee-on-transfer or under-delivering token (#137).",
             "name": "CollateralShortfall",
             "value": 32
           },
           {
+>>>>>>> upstream/develop
             "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
             "name": "DeadlineExpired",
             "value": 19
@@ -2617,6 +2771,11 @@
             "doc": "",
             "name": "MarketClosed",
             "value": 9
+          },
+          {
+            "doc": "The market was closed out and its remaining value swept.",
+            "name": "MarketClosedOut",
+            "value": 32
           },
           {
             "doc": "",
@@ -3201,6 +3360,32 @@
         ],
         "prefix_topics": [
           "position_transferred"
+        ]
+      }
+    },
+    "PositionsPurged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PositionsPurged",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "count",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "positions_purged"
         ]
       }
     },

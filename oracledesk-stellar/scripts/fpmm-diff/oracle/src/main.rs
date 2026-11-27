@@ -101,7 +101,7 @@ fn run(fn_name: &str, args: &[Value]) -> Result<Map<String, Value>, MathError> {
             };
             out.insert(
                 "value".into(),
-                json!(math::settle_value(kind, a(1)?, a(2)?).to_string()),
+                json!(math::settle_value(kind, a(1)?, a(2)?)?.to_string()),
             );
         }
         "price_after" => {

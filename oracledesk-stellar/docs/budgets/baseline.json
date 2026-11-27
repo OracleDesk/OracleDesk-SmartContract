@@ -5,7 +5,7 @@
     "stellar_cli": "stellar",
     "wasm_bytes": {
       "market_core.wasm": 41905,
-      "reasoning_registry.wasm": 14701,
+      "reasoning_registry.wasm": 58860,
       "resolver.wasm": 67516,
       "treasury.wasm": 86484
     }
@@ -128,41 +128,131 @@
       "write_bytes": 0,
       "events_bytes": 0
     },
-    "registry.publish_trace.action_1k": {
-      "cpu_insns": 792280,
-      "mem_bytes": 1246820,
-      "read_entries": 10,
-      "write_entries": 6,
+    "registry.extend_traces.32": {
+      "cpu_insns": 53156185,
+      "mem_bytes": 7782024,
+      "read_entries": 291,
+      "write_entries": 0,
       "read_bytes": 0,
-      "write_bytes": 2008,
-      "events_bytes": 1328
+      "write_bytes": 0,
+      "events_bytes": 0
     },
-    "registry.publish_trace.cid_1k": {
-      "cpu_insns": 792278,
-      "mem_bytes": 1246817,
-      "read_entries": 10,
-      "write_entries": 6,
-      "read_bytes": 0,
-      "write_bytes": 2004,
-      "events_bytes": 1324
-    },
-    "registry.publish_trace.small": {
-      "cpu_insns": 792024,
-      "mem_bytes": 1245805,
-      "read_entries": 10,
-      "write_entries": 6,
-      "read_bytes": 0,
-      "write_bytes": 992,
-      "events_bytes": 312
-    },
-    "registry.view.get_trace": {
-      "cpu_insns": 469343,
-      "mem_bytes": 1219862,
+    "registry.get_trace.read_only": {
+      "cpu_insns": 747080,
+      "mem_bytes": 1263024,
       "read_entries": 3,
       "write_entries": 0,
       "read_bytes": 0,
       "write_bytes": 0,
       "events_bytes": 0
+    },
+    "registry.publish_trace.action_1k": {
+      "cpu_insns": 3927845,
+      "mem_bytes": 3899584,
+      "read_entries": 18,
+      "write_entries": 11,
+      "read_bytes": 0,
+      "write_bytes": 1960,
+      "events_bytes": 364
+    },
+    "registry.publish_trace.audit_class": {
+      "cpu_insns": 3883637,
+      "mem_bytes": 3898208,
+      "read_entries": 18,
+      "write_entries": 11,
+      "read_bytes": 0,
+      "write_bytes": 1828,
+      "events_bytes": 320
+    },
+    "registry.publish_trace.cid_1k": {
+      "cpu_insns": 3932491,
+      "mem_bytes": 3899294,
+      "read_entries": 18,
+      "write_entries": 11,
+      "read_bytes": 0,
+      "write_bytes": 2004,
+      "events_bytes": 456
+    },
+    "registry.publish_trace.small": {
+      "cpu_insns": 3932461,
+      "mem_bytes": 3899178,
+      "read_entries": 18,
+      "write_entries": 11,
+      "read_bytes": 0,
+      "write_bytes": 1888,
+      "events_bytes": 340
+    },
+    "registry.traces_by_market.page25.read_only": {
+      "cpu_insns": 5241435,
+      "mem_bytes": 1405578,
+      "read_entries": 53,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "registry.view.get_trace": {
+      "cpu_insns": 747080,
+      "mem_bytes": 1263024,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "treasury.cancel_withdraw.markets_12": {
+      "cpu_insns": 21500431,
+      "mem_bytes": 32047636,
+      "read_entries": 47,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 2892,
+      "events_bytes": 216
+    },
+    "treasury.claim_withdraw.pro_rata_window": {
+      "cpu_insns": 5891927,
+      "mem_bytes": 1936114,
+      "read_entries": 20,
+      "write_entries": 18,
+      "read_bytes": 0,
+      "write_bytes": 6580,
+      "events_bytes": 2976
+    },
+    "treasury.deposit.markets_12_tickets_8": {
+      "cpu_insns": 27481384,
+      "mem_bytes": 33324997,
+      "read_entries": 62,
+      "write_entries": 21,
+      "read_bytes": 0,
+      "write_bytes": 7020,
+      "events_bytes": 3440
+    },
+    "treasury.settle_market.queue_0": {
+      "cpu_insns": 9151678,
+      "mem_bytes": 11556380,
+      "read_entries": 18,
+      "write_entries": 12,
+      "read_bytes": 0,
+      "write_bytes": 4144,
+      "events_bytes": 1020
+    },
+    "treasury.settle_market.queue_1": {
+      "cpu_insns": 10141648,
+      "mem_bytes": 11618974,
+      "read_entries": 21,
+      "write_entries": 15,
+      "read_bytes": 0,
+      "write_bytes": 4512,
+      "events_bytes": 1392
+    },
+    "treasury.settle_market.queue_8": {
+      "cpu_insns": 14448654,
+      "mem_bytes": 12431954,
+      "read_entries": 42,
+      "write_entries": 36,
+      "read_bytes": 0,
+      "write_bytes": 6080,
+      "events_bytes": 3996
     }
   }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "outcome-token-factory"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+oracledesk-types = { path = "../oracledesk-types" }
+soroban-sdk = "=27.0.6"
+
+[dev-dependencies]
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
+# Native market-core for tests (see resolver's Cargo.toml for why it is
+# renamed and not a normal dependency).
+market-core-native = { package = "market-core", path = "../market-core" }
+outcome-token = { path = "../outcome-token" }

@@ -1,5 +1,5 @@
 .PHONY: setup build test test-scripts lint fmt deploy-testnet seed-market demo bindings clean interface-check
-.PHONY: doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+.PHONY: budget budget-update doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
 
 # Verify local or CI tool versions match `toolchain.env` (#135).
 doctor:
@@ -88,12 +88,23 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
+spec-check:
+	python3 scripts/spec-trace.py
+
 auth-matrix: build
 	cargo test -p integration-tests --test auth_matrix
 	./scripts/check-no-mock-all-auths.sh
 
 kani:
 	cargo kani -p market-core
+
+# Resource-budget regression tests (incl. the treasury withdrawal-queue
+# scenarios, #277). Needs the wasm from `make build`.
+budget: build
+	cargo test --manifest-path contracts/budget-tests/Cargo.toml -- --test-threads=1
+
+budget-update: build
+	BUDGET_UPDATE=1 cargo test --manifest-path contracts/budget-tests/Cargo.toml budget_baseline -- --test-threads=1
 
 model-test:
 	python3 model/system_model.py --selftest

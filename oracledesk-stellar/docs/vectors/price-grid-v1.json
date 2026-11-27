@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "description": "Shared vectors for the resolver's SEP-40 grid reads (contracts/resolver/src/lib.rs read_feed_on_grid, twap_outcome, compare_price) and the TypeScript mirror (agents/core/strategies/grid.ts). `records` maps a queried grid timestamp to the record the feed returns for it; a missing key is `None`. Expected values were derived by hand from the Rust code.",
+  "spot": [
+    {
+      "name": "aligned_record",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "600",
+      "records": { "900": { "price": "100", "timestamp": "900" } },
+      "expect": { "ok": true, "price": "100", "timestamp": "900", "queried": ["900"] }
+    },
+    {
+      "name": "missing_aligned_walks_back_one_slot",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "600",
+      "records": { "600": { "price": "105", "timestamp": "600" } },
+      "expect": { "ok": true, "price": "105", "timestamp": "600", "queried": ["900", "600"] }
+    },
+    {
+      "name": "lookback_stops_at_staleness",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "350",
+      "records": { "600": { "price": "105", "timestamp": "600" } },
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["900"] }
+    },
+    {
+      "name": "older_record_returned_for_slot_is_validated",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "600",
+      "records": { "900": { "price": "99", "timestamp": "850" } },
+      "expect": { "ok": true, "price": "99", "timestamp": "850", "queried": ["900"] }
+    },
+    {
+      "name": "non_positive_price_is_invalid",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "600",
+      "records": { "900": { "price": "0", "timestamp": "900" } },
+      "expect": { "ok": false, "error": "InvalidPrice", "queried": ["900"] }
+    },
+    {
+      "name": "lookback_capped_at_12_reads",
+      "resolution": "10", "closeTime": "1000", "maxStaleness": "100000",
+      "records": {},
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["1000", "990", "980", "970", "960", "950", "940", "930", "920", "910", "900", "890"] }
+    },
+    {
+      "name": "record_newer_than_close_is_stale",
+      "resolution": "300", "closeTime": "1000", "maxStaleness": "600",
+      "records": { "900": { "price": "100", "timestamp": "1001" } },
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["900"] }
+    }
+  ],
+  "twap": [
+    {
+      "name": "three_samples_floored",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "18", "direction": "AtOrAbove", "window": "300", "minSamples": 3, "maxGap": "200" },
+      "records": {
+        "800": { "price": "10", "timestamp": "800" },
+        "900": { "price": "20", "timestamp": "900" },
+        "1000": { "price": "30", "timestamp": "1000" }
+      },
+      "expect": { "ok": true, "twap": "18", "samples": 3, "firstTs": "800", "lastTs": "1000", "outcome": "Yes", "queried": ["1000", "900", "800"] }
+    },
+    {
+      "name": "above_is_strict_on_floored_average",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "18", "direction": "Above", "window": "300", "minSamples": 3, "maxGap": "200" },
+      "records": {
+        "800": { "price": "10", "timestamp": "800" },
+        "900": { "price": "20", "timestamp": "900" },
+        "1000": { "price": "30", "timestamp": "1000" }
+      },
+      "expect": { "ok": true, "twap": "18", "samples": 3, "firstTs": "800", "lastTs": "1000", "outcome": "No", "queried": ["1000", "900", "800"] }
+    },
+    {
+      "name": "missing_middle_sample_reweights",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "15", "direction": "Below", "window": "300", "minSamples": 2, "maxGap": "200" },
+      "records": {
+        "800": { "price": "10", "timestamp": "800" },
+        "1000": { "price": "30", "timestamp": "1000" }
+      },
+      "expect": { "ok": true, "twap": "14", "samples": 2, "firstTs": "800", "lastTs": "1000", "outcome": "Yes", "queried": ["1000", "900", "800"] }
+    },
+    {
+      "name": "gap_over_max_gap_is_stale",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "15", "direction": "Below", "window": "300", "minSamples": 2, "maxGap": "150" },
+      "records": {
+        "800": { "price": "10", "timestamp": "800" },
+        "1000": { "price": "30", "timestamp": "1000" }
+      },
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["1000", "900", "800"] }
+    },
+    {
+      "name": "duplicate_record_counted_once",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "14", "direction": "AtOrBelow", "window": "300", "minSamples": 2, "maxGap": "200" },
+      "records": {
+        "800": { "price": "10", "timestamp": "800" },
+        "900": { "price": "30", "timestamp": "1000" },
+        "1000": { "price": "30", "timestamp": "1000" }
+      },
+      "expect": { "ok": true, "twap": "14", "samples": 2, "firstTs": "800", "lastTs": "1000", "outcome": "Yes", "queried": ["1000", "900", "800"] }
+    },
+    {
+      "name": "record_newer_than_close_is_stale",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "14", "direction": "Above", "window": "300", "minSamples": 1, "maxGap": "200" },
+      "records": { "1000": { "price": "30", "timestamp": "1060" } },
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["1000"] }
+    },
+    {
+      "name": "too_few_samples_is_stale",
+      "resolution": "100", "closeTime": "1050",
+      "rule": { "threshold": "14", "direction": "Above", "window": "300", "minSamples": 2, "maxGap": "1000" },
+      "records": { "1000": { "price": "30", "timestamp": "1000" } },
+      "expect": { "ok": false, "error": "StalePrice", "queried": ["1000", "900", "800"] }
+    }
+  ]
+}

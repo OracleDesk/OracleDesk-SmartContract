@@ -8,7 +8,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, Symbol, Vec,
+    Bytes, BytesN, Env, Map, Symbol, Vec,
 };
 
 // market-core is imported from its compiled wasm rather than as a normal
@@ -127,6 +127,17 @@ pub const MAX_WEIGHTED_SIGNERS: u32 = 32;
 pub const MAX_SIGS_PER_CALL: u32 = MAX_WEIGHTED_SIGNERS;
 /// Domain tag of the message weighted-key signers sign (20 bytes).
 const ATTEST_DOMAIN: &[u8] = b"oracledesk-attest-v1";
+/// Domain tag of the v2 attestation message (issue #326), which can carry
+/// [`AttestedOutcome::Invalid`]. Same length as v1, so a v1 message can never
+/// be mistaken for a v2 one: the tags differ in their last byte.
+const ATTEST_DOMAIN_V2: &[u8] = b"oracledesk-attest-v2";
+/// Explicit version byte following [`ATTEST_DOMAIN_V2`], so a future v3 stays
+/// parseable from the message prefix alone.
+const ATTEST_VERSION_V2: u8 = 2;
+/// Most TWAP grid slots `snapshot_twap_samples` reads in one call (issue #321).
+/// Bounds the per-call cross-contract footprint; a full 32-slot window is
+/// stored in four calls.
+pub const MAX_TWAP_SNAPSHOT_READS: u32 = 8;
 
 /// Longest a market may stay unresolved after `close_time` before anyone may
 /// void it through [`Resolver::expire_market`]. A compile-time constant on
@@ -373,6 +384,49 @@ pub struct PriceSnapshot {
     pub taken_by: Address,
 }
 
+/// What part, if any, an address (or one of its registered Ed25519 keys)
+/// plays in resolving a market, as reported by [`Resolver::resolution_role`]
+/// (issue #322). The reasoning registry uses it to accept `Resolve` traces
+/// only from a market's resolution signers.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionRole {
+    None,
+    /// Listed in the market's `SignerConfig` (Signers, Disputable, or a
+    /// hybrid's signer fallback).
+    Signer,
+    /// Member of the committee epoch bound to the market.
+    CommitteeMember(u32),
+    /// One of the supplied keys is in the market's weighted-key set; carries
+    /// that key's weight.
+    WeightedKey(u32),
+    /// The resolver admin (guardian), for markets where `who` is not a signer.
+    Guardian,
+}
+
+/// One TWAP grid slot's answer (issue #321): the record the feed returned for
+/// the slot query, or `Missing` when it returned none. Stored by
+/// `snapshot_twap_samples` and replayed by `twap_outcome` in place of a live
+/// read, so stored and live slots are interchangeable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TwapSlot {
+    Missing,
+    Record(PriceData),
+}
+
+/// The grid record and feed decimals pinned for a [`ScaledPriceConfig`]
+/// market by `snapshot_price` (issue #321). Pinning `feed_decimals` means a
+/// feed that later changes `decimals()` cannot alter the rescaled comparison.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScaledSnapshot {
+    pub data: PriceData,
+    pub feed_decimals: u32,
+    pub taken_at: u64,
+    pub taken_by: Address,
+}
+
 /// The escalation authority's ruling. `Invalid` voids the market.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,6 +613,17 @@ pub struct PendingAdmin {
     pub expires_at: u64,
 }
 
+/// #149: a market's resolution bounty. The resolver holds it in the collateral
+/// token until the market is finalized (paid to the finalizing caller) or
+/// refunded to `funder`; `paid` records that one of those has happened.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyEscrow {
+    pub amount: i128,
+    pub funder: Address,
+    pub paid: bool,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -608,6 +673,19 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    /// #149: a bounty operation ran before `set_bounty_token`.
+    BountyTokenNotSet = 44,
+    /// #149: bounty amounts must be positive.
+    InvalidBounty = 45,
+    /// #149: bounties are funded only before the market's `close_time`.
+    BountyFundingClosed = 46,
+    /// #149: a market's escrow has one funder; any other address can neither
+    /// top it up nor reclaim it.
+    BountyFunderMismatch = 47,
+    /// #149: no bounty was funded for this market.
+    NoBounty = 48,
+    /// #149: a bounty can be reclaimed only once the market is final.
+    BountyNotFinal = 49,
     // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
     MarketCoreMarketNotFound      = 1044,
     MarketCoreNotFinal            = 1045,
@@ -625,6 +703,7 @@ pub enum Error {
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -692,6 +771,30 @@ pub enum DataKey {
     /// #314: extended hybrid spec with richer fallback authority.
     /// Appended last to preserve existing discriminant positions.
     HybridV2(u64),
+    /// #149: collateral token the bounty escrow holds (instance storage).
+    /// Appended last to preserve existing discriminant positions.
+    BountyToken,
+    /// #149: a market's bounty escrow (persistent storage). Appended last.
+    Bounty(u64),
+    /// #326: outcome a weighted key signed in a round through the v2 message
+    /// (value: `AttestedOutcome`). Together with the legacy `SigSeen` this
+    /// enforces one signature per key per round across both versions.
+    SigSeenV2(u64, u32, BytesN<32>),
+    /// #326: weight accumulated by v2 signatures for (market, round, outcome).
+    /// v1 keeps writing `Weight`; the two are summed, never double-written.
+    WeightV2(u64, u32, AttestedOutcome),
+    /// #326: instance flag. Once set by the admin, v1 `submit_signatures`
+    /// returns `WrongMode`. One-way: there is no entrypoint to clear it.
+    AttestV1Disabled,
+    /// #321: the TWAP grid period (`resolution()`) pinned for a market at
+    /// reveal, or at its first sample snapshot for markets revealed before
+    /// the pin existed, so a later feed change cannot move the slots.
+    TwapGrid(u64),
+    /// #321: stored TWAP grid samples, `Map<slot_ts, TwapSlot>`, at most
+    /// `MAX_TWAP_SAMPLES` entries in one ledger entry.
+    TwapSamples(u64),
+    /// #321: the grid record and feed decimals pinned for a scaled market.
+    ScaledSnapshot(u64),
 }
 
 /// #297: A committee member set snapshotted at a specific epoch. Loaded from
@@ -843,6 +946,43 @@ pub struct ResolutionProposedV2 {
     pub market_id: u64,
     pub outcome: AttestedOutcome,
     pub proposed_at: u64,
+}
+
+/// #321: `snapshot_twap_samples` stored `stored` new slots; `total` slots of
+/// the market's grid are now stored.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapSamplesSnapshotted {
+    #[topic]
+    pub market_id: u64,
+    pub stored: u32,
+    pub total: u32,
+    pub taken_by: Address,
+}
+
+/// #321: where a scaled or TWAP resolution got its feed data. Emitted next to
+/// the unchanged `PriceResolutionScaled` / `TwapResolution` events.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceResolutionSource {
+    #[topic]
+    pub market_id: u64,
+    pub from_snapshot: bool,
+    pub stored_slots: u32,
+    pub live_slots: u32,
+}
+
+/// #326: a batch of weighted-key signatures added weight to `outcome` in
+/// `round`. `version` is the signed-message version (1 or 2).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignaturesSubmitted {
+    #[topic]
+    pub market_id: u64,
+    pub round: u32,
+    pub outcome: AttestedOutcome,
+    pub added_weight: u32,
+    pub version: u32,
 }
 
 /// A signer committee finalized an `Invalid` proposal and voided the market.
@@ -998,6 +1138,37 @@ pub struct AdminTransferred {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferCancelled {}
 
+/// #149: a market's bounty was escrowed (`total` is the escrow after top-up).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyFunded {
+    #[topic]
+    pub market_id: u64,
+    pub funder: Address,
+    pub amount: i128,
+    pub total: i128,
+}
+
+/// #149: a market's bounty was paid to the caller that finalized it.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyPaid {
+    #[topic]
+    pub market_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+}
+
+/// #149: an unpaid bounty went back to its funder.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyRefunded {
+    #[topic]
+    pub market_id: u64,
+    pub funder: Address,
+    pub amount: i128,
+}
+
 /// SEP-40 Oracle Consumer interface, as implemented by Reflector feeds.
 /// `decimals` and `resolution` are the feed's fixed-point scale and record
 /// grid; `price` returns a record only for a timestamp exactly on one
@@ -1074,7 +1245,7 @@ impl Resolver {
     /// The market-core migration only succeeds while this resolver's address
     /// authorizes the market-core call, so this entrypoint provides governance
     /// acknowledgement from the resolver admin.
-    pub fn consent_market_resolver_migration(
+    pub fn consent_resolver_migration(
         env: Env,
         _market_id: u64,
         _new_resolver: Address,
@@ -1181,9 +1352,12 @@ impl Resolver {
     /// is caught at reveal time, not at close.
     pub fn register_twap_spec(env: Env, market_id: u64, spec: TwapConfig) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
-        Self::validate_twap_rule(&env, &spec)?;
+        let resolution = Self::validate_twap_rule(&env, &spec)?;
         let close_time = Self::assert_matches_commitment(&env, market_id, &twap_spec_hash(&env, &spec))?;
         Self::store_twap_rule(&env, market_id, &spec, close_time);
+        // #321: pin the grid read for the feasibility check, so a later
+        // `resolution()` change cannot move which slots count.
+        Self::persist_market(&env, &DataKey::TwapGrid(market_id), &resolution, close_time);
         Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
@@ -1718,6 +1892,8 @@ impl Resolver {
         core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        // #149: a voided market pays no bounty; the escrow goes back to its funder.
+        Self::refund_bounty(&env, market_id)?;
         Self::bump_market_entries(&env, market_id, market.close_time);
         GuardianAction {
             market_id,
@@ -1834,70 +2010,161 @@ impl Resolver {
     ///   any `checked_mul`/`checked_add` overflow is `InvalidPrice`.
     /// - Floor division: the `AtOrAbove`/`AtOrBelow` comparison of
     ///   `compare_price` applies to the floored average.
+    ///
+    /// Issue #321: the walk is split into fetch and compute. Each slot's
+    /// answer comes from the market's stored samples (`snapshot_twap_samples`)
+    /// when present and from a live `price` read otherwise, and is fed in the
+    /// same newest-to-oldest order to the shared [`twap_fold_slot`] /
+    /// [`twap_finish`] steps that [`twap_from_slots`] also uses, so any split
+    /// between stored and live slots yields exactly the full-live-read result.
+    /// The grid period is the one pinned in `TwapGrid` when present; markets
+    /// revealed before the pin existed fall back to the live `resolution()`.
+    /// Returns the computation plus `(stored_slots, live_slots)`.
     fn twap_outcome(
         env: &Env,
+        market_id: u64,
         config: &TwapConfig,
         close_time: u64,
-    ) -> Result<(i128, u32, u64, u64, Outcome), Error> {
+    ) -> Result<((i128, u32, u64, u64, Outcome), u32, u32), Error> {
         let client = ReflectorPriceClient::new(env, &config.reflector);
-        let Ok(Ok(resolution)) = client.try_resolution() else {
-            return Err(Error::PriceUnavailable);
+        let res = Self::twap_resolution(env, market_id, config)?;
+        let start = close_time.saturating_sub(config.window);
+        let stored: Map<u64, TwapSlot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TwapSamples(market_id))
+            .unwrap_or_else(|| Map::new(env));
+        let mut samples: Vec<(u64, i128)> = Vec::new(env);
+        let (mut from_store, mut from_live) = (0u32, 0u32);
+        for ts in Self::twap_slots(env, close_time, config.window, res).iter() {
+            let slot = match stored.get(ts) {
+                Some(slot) => {
+                    from_store += 1;
+                    slot
+                }
+                None => {
+                    from_live += 1;
+                    match client.try_price(&config.asset, &ts) {
+                        Ok(Ok(Some(data))) => TwapSlot::Record(data),
+                        Ok(Ok(None)) => TwapSlot::Missing,
+                        _ => return Err(Error::PriceUnavailable),
+                    }
+                }
+            };
+            Self::twap_fold_slot(&mut samples, close_time, start, &slot)?;
+        }
+        Ok((
+            Self::twap_finish(config, close_time, start, &samples)?,
+            from_store,
+            from_live,
+        ))
+    }
+
+    /// The grid period of a TWAP market: the pinned `TwapGrid` value, else the
+    /// feed's live `resolution()` (markets revealed before #321). A zero
+    /// period is a broken feed (`InvalidPrice`); a trapping one is
+    /// `PriceUnavailable`.
+    fn twap_resolution(env: &Env, market_id: u64, config: &TwapConfig) -> Result<u64, Error> {
+        let resolution: u32 = match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::TwapGrid(market_id))
+        {
+            Some(pinned) => pinned,
+            None => {
+                let Ok(Ok(live)) =
+                    ReflectorPriceClient::new(env, &config.reflector).try_resolution()
+                else {
+                    return Err(Error::PriceUnavailable);
+                };
+                live
+            }
         };
         if resolution == 0 {
             return Err(Error::InvalidPrice);
         }
-        let res = resolution as u64;
-        let end = close_time - close_time % res;
-        let start = close_time.saturating_sub(config.window);
-        // Oldest-first, strictly ascending timestamps. Bounded in memory by
-        // MAX_TWAP_SAMPLES; never persisted.
-        let mut samples: Vec<(u64, i128)> = Vec::new(env);
-        let mut ts = end;
-        let mut inspected = 0u32;
-        while ts > start {
-            if inspected >= MAX_TWAP_SAMPLES {
-                // Read cap on *reads*, not found samples (issue #27
-                // budget): only reachable if the feed changed
-                // `resolution()` after registration widened the slot count
-                // past MAX_TWAP_SAMPLES. Validation below then rejects via
-                // the min_samples / gap rules rather than trusting a
-                // silently truncated window's average as complete.
-                break;
-            }
-            inspected += 1;
-            match client.try_price(&config.asset, &ts) {
-                Ok(Ok(Some(data))) => {
-                    if data.price <= 0 {
-                        return Err(Error::InvalidPrice);
-                    }
-                    if data.timestamp > close_time {
-                        return Err(Error::StalePrice);
-                    }
-                    if data.timestamp > start {
-                        // Keep the ascending invariant and count each
-                        // distinct timestamp once: samples collected so far
-                        // all have timestamp > this slot's query, so an
-                        // already-seen or newer timestamp is a duplicate of
-                        // a record the walk counted already.
-                        let duplicate = samples
-                            .get(0)
-                            .is_some_and(|(head, _)| data.timestamp >= head);
-                        if !duplicate {
-                            samples.push_front((data.timestamp, data.price));
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {}
-                _ => return Err(Error::PriceUnavailable),
-            }
+        Ok(resolution as u64)
+    }
+
+    /// The grid timestamps a TWAP resolution reads, newest to oldest: from
+    /// `close_time - close_time % res` down while inside
+    /// `(close_time - window, close_time]`, at most [`MAX_TWAP_SAMPLES`].
+    fn twap_slots(env: &Env, close_time: u64, window: u64, res: u64) -> Vec<u64> {
+        let mut slots = Vec::new(env);
+        let start = close_time.saturating_sub(window);
+        let mut ts = close_time - close_time % res;
+        while ts > start && slots.len() < MAX_TWAP_SAMPLES {
+            slots.push_back(ts);
             if ts < res {
                 break;
             }
             ts -= res;
         }
+        slots
+    }
 
+    /// Pure TWAP computation over a pre-built newest-to-oldest slot list
+    /// (issue #321). The live and stored paths both go through the same
+    /// [`twap_fold_slot`] / [`twap_finish`] steps, so this is the reference
+    /// the equivalence property test compares against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn twap_from_slots(
+        env: &Env,
+        config: &TwapConfig,
+        close_time: u64,
+        slots: &Vec<(u64, TwapSlot)>,
+    ) -> Result<(i128, u32, u64, u64, Outcome), Error> {
+        let start = close_time.saturating_sub(config.window);
+        let mut samples: Vec<(u64, i128)> = Vec::new(env);
+        for (_, slot) in slots.iter() {
+            Self::twap_fold_slot(&mut samples, close_time, start, &slot)?;
+        }
+        Self::twap_finish(config, close_time, start, &samples)
+    }
+
+    /// Validates one slot answer and adds it to the oldest-first sample list.
+    /// Order-dependent by design: the dedup compares with the newest kept
+    /// sample, exactly as the original single-pass walk did.
+    fn twap_fold_slot(
+        samples: &mut Vec<(u64, i128)>,
+        close_time: u64,
+        start: u64,
+        slot: &TwapSlot,
+    ) -> Result<(), Error> {
+        let TwapSlot::Record(data) = slot else {
+            return Ok(());
+        };
+        if data.price <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        if data.timestamp > close_time {
+            return Err(Error::StalePrice);
+        }
+        if data.timestamp > start {
+            // Keep the ascending invariant and count each distinct timestamp
+            // once: samples collected so far all have timestamp > this slot's
+            // query, so an already-seen or newer timestamp is a duplicate of a
+            // record the walk counted already.
+            let duplicate = samples
+                .get(0)
+                .is_some_and(|(head, _)| data.timestamp >= head);
+            if !duplicate {
+                samples.push_front((data.timestamp, data.price));
+            }
+        }
+        Ok(())
+    }
+
+    /// `min_samples`, the three gap checks and the floored time-weighted
+    /// average over the collected oldest-first samples.
+    fn twap_finish(
+        config: &TwapConfig,
+        close_time: u64,
+        start: u64,
+        samples: &Vec<(u64, i128)>,
+    ) -> Result<(i128, u32, u64, u64, Outcome), Error> {
         let count = samples.len();
-        if count < config.min_samples {
+        if count < config.min_samples || count == 0 {
             return Err(Error::StalePrice);
         }
         // Gap checks, all three kinds (issue #27 step 3): window start to
@@ -1940,13 +2207,135 @@ impl Resolver {
         Ok((twap, count, first_ts, last_ts, outcome))
     }
 
+    /// Permissionless TWAP sample snapshot (issue #321). Records the answers
+    /// of up to `min(max_reads, MAX_TWAP_SNAPSHOT_READS)` not-yet-stored grid
+    /// slots whose timestamp has already passed, so a TWAP market still
+    /// resolves after the feed's bounded history has aged its oldest records
+    /// out. `caller` only authorizes being recorded as the snapshotter.
+    ///
+    /// - Allowed before close for slots already in the past: their answer is
+    ///   final.
+    /// - Slots are read oldest first, because the oldest records age out of
+    ///   the feed first.
+    /// - A record is validated as resolution would (`price > 0` else
+    ///   `InvalidPrice`, `timestamp <= close_time` else `StalePrice`) and must
+    ///   not be newer than its slot query (`StalePrice`); an invalid record
+    ///   aborts the call and is never stored.
+    /// - "No record" is stored as `Missing` only once `slot_ts <= now - res`,
+    ///   so a record that is about to be published is not frozen as absent.
+    /// - Markets revealed before the grid pin existed freeze the live
+    ///   `resolution()` into `TwapGrid` on the first call.
+    ///
+    /// Storing the correct answer early cannot change the outcome (the
+    /// computation is identical either way), so the entrypoint cannot be used
+    /// to grief. Returns the number of slots stored by this call.
+    pub fn snapshot_twap_samples(
+        env: Env,
+        market_id: u64,
+        caller: Address,
+        max_reads: u32,
+    ) -> Result<u32, Error> {
+        caller.require_auth();
+        let config: TwapConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceTwap(market_id))
+            .ok_or(Error::WrongMode)?;
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let close_time = Self::market_close_time(&env, market_id)?;
+        let grid_key = DataKey::TwapGrid(market_id);
+        let res = Self::twap_resolution(&env, market_id, &config)?;
+        if !env.storage().persistent().has(&grid_key) {
+            Self::persist_market(&env, &grid_key, &(res as u32), close_time);
+        }
+        let now = env.ledger().timestamp();
+        let key = DataKey::TwapSamples(market_id);
+        let mut stored: Map<u64, TwapSlot> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(&env));
+        let client = ReflectorPriceClient::new(&env, &config.reflector);
+        let budget = max_reads.min(MAX_TWAP_SNAPSHOT_READS);
+        let slots = Self::twap_slots(&env, close_time, config.window, res);
+        let (mut reads, mut added) = (0u32, 0u32);
+        // Oldest first: walk the newest-to-oldest grid backwards.
+        for i in (0..slots.len()).rev() {
+            if reads >= budget {
+                break;
+            }
+            let ts = slots.get_unchecked(i);
+            if ts > now || stored.contains_key(ts) {
+                continue;
+            }
+            reads += 1;
+            let slot = match client.try_price(&config.asset, &ts) {
+                Ok(Ok(Some(data))) => {
+                    if data.price <= 0 {
+                        return Err(Error::InvalidPrice);
+                    }
+                    if data.timestamp > close_time || data.timestamp > ts {
+                        return Err(Error::StalePrice);
+                    }
+                    TwapSlot::Record(data)
+                }
+                Ok(Ok(None)) => {
+                    if ts.saturating_add(res) > now {
+                        continue;
+                    }
+                    TwapSlot::Missing
+                }
+                _ => return Err(Error::PriceUnavailable),
+            };
+            stored.set(ts, slot);
+            added += 1;
+        }
+        if added > 0 {
+            Self::persist_market(&env, &key, &stored, close_time);
+        }
+        TwapSamplesSnapshotted {
+            market_id,
+            stored: added,
+            total: stored.len(),
+            taken_by: caller,
+        }
+        .publish(&env);
+        Ok(added)
+    }
+
+    /// The TWAP grid samples stored by `snapshot_twap_samples`, keyed by slot
+    /// timestamp.
+    pub fn twap_samples(env: Env, market_id: u64) -> Map<u64, TwapSlot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TwapSamples(market_id))
+            .unwrap_or_else(|| Map::new(&env))
+    }
+
+    /// The grid period pinned for a TWAP market, if any.
+    pub fn twap_grid(env: Env, market_id: u64) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TwapGrid(market_id))
+    }
+
+    /// The record and decimals pinned for a scaled market by `snapshot_price`.
+    pub fn scaled_snapshot(env: Env, market_id: u64) -> Option<ScaledSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ScaledSnapshot(market_id))
+    }
+
     /// Settles a [`TwapConfig`] market: same lifecycle preconditions as
     /// `settle_scaled`, then the shared `settle_price` finalize with the
     /// averaged price stamped at the newest sample, alongside the dedicated
     /// [`TwapResolution`] event (the dual-event pattern #26 established with
-    /// [`PriceResolutionScaled`]). TWAP markets do not use `snapshot_price`:
-    /// snapshots pin a single record, which is exactly what issue #27
-    /// exists to avoid.
+    /// [`PriceResolutionScaled`]). TWAP markets do not use `snapshot_price`
+    /// (a single record is exactly what issue #27 exists to avoid); they pin
+    /// grid samples through `snapshot_twap_samples` instead (issue #321),
+    /// reported in [`PriceResolutionSource`].
     fn settle_twap(
         env: &Env,
         market_core: &Address,
@@ -1957,8 +2346,8 @@ impl Resolver {
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
-        let (twap, samples, first_ts, last_ts, outcome) =
-            Self::twap_outcome(env, config, market.close_time)?;
+        let ((twap, samples, first_ts, last_ts, outcome), stored_slots, live_slots) =
+            Self::twap_outcome(env, market_id, config, market.close_time)?;
         Self::settle_price(
             env,
             market_core,
@@ -1968,8 +2357,15 @@ impl Resolver {
                 price: twap,
                 timestamp: last_ts,
             },
-            false,
+            stored_slots > 0,
         )?;
+        PriceResolutionSource {
+            market_id,
+            from_snapshot: stored_slots > 0,
+            stored_slots,
+            live_slots,
+        }
+        .publish(env);
         TwapResolution {
             market_id,
             twap,
@@ -1987,11 +2383,54 @@ impl Resolver {
     /// `max(feed_decimals, threshold_decimals)`. Returns the outcome, the raw
     /// record, the feed's decimals and the rescaled threshold (for
     /// [`PriceResolutionScaled`]).
+    ///
+    /// Issue #321: a [`ScaledSnapshot`] pinned by `snapshot_price` takes
+    /// precedence (re-validated against `max_staleness`, no oracle call), so
+    /// neither the feed forgetting the record nor a later `decimals()` change
+    /// can alter the comparison. The trailing flag reports snapshot use.
     fn scaled_price_outcome(
+        env: &Env,
+        market_id: u64,
+        config: &ScaledPriceConfig,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, u32, i128, bool), Error> {
+        let (data, feed_decimals, from_snapshot) = match env
+            .storage()
+            .persistent()
+            .get::<_, ScaledSnapshot>(&DataKey::ScaledSnapshot(market_id))
+        {
+            Some(snap) => {
+                Self::validate_price(config.max_staleness, close_time, &snap.data)?;
+                (snap.data, snap.feed_decimals, true)
+            }
+            None => {
+                let (data, decimals) = Self::read_scaled_feed(env, config, close_time)?;
+                (data, decimals, false)
+            }
+        };
+        let (price_scaled, threshold_scaled) = Self::rescale(
+            data.price,
+            feed_decimals,
+            config.threshold,
+            config.threshold_decimals,
+        )?;
+        let outcome = Self::compare_price(&config.direction, price_scaled, threshold_scaled);
+        Ok((
+            outcome,
+            data,
+            feed_decimals,
+            threshold_scaled,
+            from_snapshot,
+        ))
+    }
+
+    /// Live grid read plus the feed's `decimals()`, in one place so the
+    /// snapshot and resolution paths read exactly the same data.
+    fn read_scaled_feed(
         env: &Env,
         config: &ScaledPriceConfig,
         close_time: u64,
-    ) -> Result<(Outcome, PriceData, u32, i128), Error> {
+    ) -> Result<(PriceData, u32), Error> {
         let data = Self::read_feed_on_grid(
             env,
             &config.reflector,
@@ -2004,14 +2443,7 @@ impl Resolver {
         else {
             return Err(Error::PriceUnavailable);
         };
-        let (price_scaled, threshold_scaled) = Self::rescale(
-            data.price,
-            feed_decimals,
-            config.threshold,
-            config.threshold_decimals,
-        )?;
-        let outcome = Self::compare_price(&config.direction, price_scaled, threshold_scaled);
-        Ok((outcome, data, feed_decimals, threshold_scaled))
+        Ok((data, feed_decimals))
     }
 
     /// The committed price rule's outcome at `close_time`, covering all four
@@ -2035,19 +2467,20 @@ impl Resolver {
             return Self::price_outcome(env, market_id, &h.price, close_time);
         }
         if let Some(s) = storage.get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id)) {
-            let (outcome, data, _feed_decimals, _threshold_scaled) =
-                Self::scaled_price_outcome(env, &s, close_time)?;
-            return Ok((outcome, data, false));
+            let (outcome, data, _feed_decimals, _threshold_scaled, from_snapshot) =
+                Self::scaled_price_outcome(env, market_id, &s, close_time)?;
+            return Ok((outcome, data, from_snapshot));
         }
         if let Some(t) = storage.get::<_, TwapConfig>(&DataKey::PriceTwap(market_id)) {
-            let (twap, _n, _first, last, outcome) = Self::twap_outcome(env, &t, close_time)?;
+            let ((twap, _n, _first, last, outcome), stored, _live) =
+                Self::twap_outcome(env, market_id, &t, close_time)?;
             return Ok((
                 outcome,
                 PriceData {
                     price: twap,
                     timestamp: last,
                 },
-                false,
+                stored > 0,
             ));
         }
         Err(Error::WrongMode)
@@ -2058,9 +2491,9 @@ impl Resolver {
     /// `max(feed_decimals, threshold_decimals)` before applying the
     /// direction. Emits the unchanged [`PriceResolution`]/[`PriceResolutionV2`]
     /// events plus [`PriceResolutionScaled`] with the decimals metadata
-    /// (issue #26). Scaled markets do not use the `snapshot_price` pin: the
-    /// snapshot type stores a raw `PriceConfig` shape (issue #37 will
-    /// revisit snapshots).
+    /// (issue #26). A [`ScaledSnapshot`] pinned by `snapshot_price` is
+    /// preferred over a live read (issue #321); [`PriceResolutionSource`]
+    /// reports which was used.
     fn settle_scaled(
         env: &Env,
         market_core: &Address,
@@ -2071,9 +2504,16 @@ impl Resolver {
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
-        let (outcome, data, feed_decimals, threshold_scaled) =
-            Self::scaled_price_outcome(env, config, market.close_time)?;
-        Self::settle_price(env, market_core, market_id, &outcome, &data, false)?;
+        let (outcome, data, feed_decimals, threshold_scaled, from_snapshot) =
+            Self::scaled_price_outcome(env, market_id, config, market.close_time)?;
+        Self::settle_price(env, market_core, market_id, &outcome, &data, from_snapshot)?;
+        PriceResolutionSource {
+            market_id,
+            from_snapshot,
+            stored_slots: from_snapshot as u32,
+            live_slots: (!from_snapshot) as u32,
+        }
+        .publish(env);
         PriceResolutionScaled {
             market_id,
             raw_price: data.price,
@@ -2099,8 +2539,21 @@ impl Resolver {
     /// `(asset, close_time)` the answer is deterministic, and freezing it
     /// deliberately prefers determinism over an oracle later rewriting
     /// history. A price `resolve_price` would reject is never stored.
+    ///
+    /// Issue #321: `PriceScaled` markets are supported too. Their snapshot
+    /// ([`ScaledSnapshot`], under its own key) pins the grid record *and* the
+    /// feed's `decimals()` read in the same call, so a later decimals change
+    /// cannot alter the rescaled comparison. TWAP markets are still
+    /// `WrongMode`: use `snapshot_twap_samples`.
     pub fn snapshot_price(env: Env, market_id: u64, caller: Address) -> Result<PriceData, Error> {
         caller.require_auth();
+        if let Some(scaled) = env
+            .storage()
+            .persistent()
+            .get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id))
+        {
+            return Self::snapshot_scaled(&env, market_id, caller, &scaled);
+        }
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let market =
@@ -2133,6 +2586,53 @@ impl Resolver {
             taken_by: caller,
         }
         .publish(&env);
+        Ok(data)
+    }
+
+    fn snapshot_scaled(
+        env: &Env,
+        market_id: u64,
+        caller: Address,
+        config: &ScaledPriceConfig,
+    ) -> Result<PriceData, Error> {
+        let close_time = Self::market_close_time(env, market_id)?;
+        let now = env.ledger().timestamp();
+        if now < close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        if Self::resolution_state(env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let key = DataKey::ScaledSnapshot(market_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::SnapshotExists);
+        }
+        let (data, feed_decimals) = Self::read_scaled_feed(env, config, close_time)?;
+        // Never store a pair resolution would reject.
+        Self::rescale(
+            data.price,
+            feed_decimals,
+            config.threshold,
+            config.threshold_decimals,
+        )?;
+        Self::persist_market(
+            env,
+            &key,
+            &ScaledSnapshot {
+                data: data.clone(),
+                feed_decimals,
+                taken_at: now,
+                taken_by: caller.clone(),
+            },
+            close_time,
+        );
+        PriceSnapshotted {
+            market_id,
+            price: data.price,
+            price_timestamp: data.timestamp,
+            taken_by: caller,
+        }
+        .publish(env);
         Ok(data)
     }
 
@@ -2307,56 +2807,260 @@ impl Resolver {
         round: u32,
         sigs: Vec<(BytesN<32>, BytesN<64>)>,
     ) -> Result<(), Error> {
-        let config: WeightedKeyConfig = Self::load(&env, DataKey::WeightedKeys(market_id))?;
-        if Self::resolution_state(&env, market_id).is_terminal() {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AttestV1Disabled)
+            .unwrap_or(false)
+        {
+            return Err(Error::WrongMode);
+        }
+        Self::count_weighted_signatures(
+            &env,
+            market_id,
+            AttestedOutcome::from_market(&outcome),
+            round,
+            sigs,
+            1,
+        )
+    }
+
+    /// Version 2 of [`Resolver::submit_signatures`] (issue #326): the signed
+    /// message is built by `attestation_message_v2`, whose outcome byte can
+    /// encode [`AttestedOutcome::Invalid`], so a weighted committee can void a
+    /// market whose question turned out to be unanswerable.
+    ///
+    /// Same preconditions as v1. A key signs at most once per round across
+    /// every outcome *and* both message versions (no equivocation); v1 and v2
+    /// signatures for the same Yes/No outcome in one round add up. An
+    /// `Invalid` weight crossing the threshold displaces a pending Yes/No
+    /// proposal once, the same rule address-based signers follow. A v1
+    /// signature submitted here (or a v2 one to `submit_signatures`) fails
+    /// verification and aborts the batch, so pre-verify off-chain.
+    pub fn submit_signatures_v2(
+        env: Env,
+        market_id: u64,
+        outcome: AttestedOutcome,
+        round: u32,
+        sigs: Vec<(BytesN<32>, BytesN<64>)>,
+    ) -> Result<(), Error> {
+        Self::count_weighted_signatures(&env, market_id, outcome, round, sigs, 2)
+    }
+
+    /// One-way switch that retires the v1 attestation message (issue #326):
+    /// afterwards `submit_signatures` returns `WrongMode` and only
+    /// `submit_signatures_v2` is accepted. Admin only; in deployment the
+    /// admin is the governance timelock, so the switch is itself delayed.
+    /// There is deliberately no way to turn v1 back on.
+    pub fn disable_attest_v1(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::AttestV1Disabled, &true);
+        ttl::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Whether `disable_attest_v1` has run.
+    pub fn attest_v1_disabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AttestV1Disabled)
+            .unwrap_or(false)
+    }
+
+    /// Accumulated weight for `outcome` in `round` across both message
+    /// versions (issue #326).
+    pub fn signature_weight(env: Env, market_id: u64, round: u32, outcome: AttestedOutcome) -> u32 {
+        Self::round_weight_v2(&env, market_id, round, outcome)
+    }
+
+    /// Shared body of `submit_signatures` (version 1) and
+    /// `submit_signatures_v2` (version 2).
+    fn count_weighted_signatures(
+        env: &Env,
+        market_id: u64,
+        outcome: AttestedOutcome,
+        round: u32,
+        sigs: Vec<(BytesN<32>, BytesN<64>)>,
+        version: u32,
+    ) -> Result<(), Error> {
+        let config: WeightedKeyConfig = Self::load(env, DataKey::WeightedKeys(market_id))?;
+        if Self::resolution_state(env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
         if sigs.len() > MAX_SIGS_PER_CALL {
             return Err(Error::TooManySignatures);
         }
-        if round != Self::round(&env, market_id) {
+        if round != Self::round(env, market_id) {
             return Err(Error::StaleRound);
         }
-        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
         let market =
-            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
 
-        let message =
-            Self::attestation_message(&env, market_id, round, &outcome, &market.resolution_hash);
+        let message = if version == 1 {
+            // v1 can only carry Yes/No: `outcome` came from a market-core Outcome.
+            let Some(o) = outcome.to_market() else {
+                return Err(Error::WrongMode);
+            };
+            Self::attestation_message(env, market_id, round, &o, &market.resolution_hash)
+        } else {
+            Self::attestation_message_v2(env, market_id, round, &outcome, &market.resolution_hash)
+        };
         let storage = env.storage().persistent();
-        let before = Self::round_weight(&env, market_id, round, &outcome);
-        let mut weight = before;
+        let before = Self::round_weight_v2(env, market_id, round, outcome);
+        let mut added: u32 = 0;
         for (pubkey, signature) in sigs.iter() {
             let Some(key_weight) = Self::weight_of(&config, &pubkey) else {
                 continue;
             };
-            let seen = DataKey::SigSeen(market_id, round, pubkey.clone());
-            if storage.has(&seen) {
+            if Self::has_signed(env, market_id, round, &pubkey) {
                 continue;
             }
             env.crypto().ed25519_verify(&pubkey, &message, &signature);
-            Self::persist(&env, &seen, &outcome);
-            weight += key_weight;
+            if version == 1 {
+                let o = outcome.to_market().ok_or(Error::WrongMode)?;
+                Self::persist(env, &DataKey::SigSeen(market_id, round, pubkey.clone()), &o);
+            } else {
+                Self::persist(
+                    env,
+                    &DataKey::SigSeenV2(market_id, round, pubkey.clone()),
+                    &outcome,
+                );
+            }
+            added = added.checked_add(key_weight).ok_or(Error::InvalidConfig)?;
         }
-        if weight == before {
+        if added == 0 {
             return Ok(());
         }
-        Self::persist(
-            &env,
-            &DataKey::Weight(market_id, round, outcome.clone()),
-            &weight,
-        );
+        // Each version writes only its own tally key, so a mixed round is
+        // summed by `round_weight_v2` and never double-counted.
+        if version == 1 {
+            let o = outcome.to_market().ok_or(Error::WrongMode)?;
+            let legacy = Self::round_weight(env, market_id, round, &o);
+            Self::persist(
+                env,
+                &DataKey::Weight(market_id, round, o),
+                &(legacy + added),
+            );
+        } else {
+            let key = DataKey::WeightV2(market_id, round, outcome);
+            let v2: u32 = storage.get(&key).unwrap_or(0);
+            Self::persist(env, &key, &(v2 + added));
+        }
+        let weight = before + added;
+        SignaturesSubmitted {
+            market_id,
+            round,
+            outcome,
+            added_weight: added,
+            version,
+        }
+        .publish(env);
 
-        if before < config.weight_threshold
-            && weight >= config.weight_threshold
-            && !Self::has_proposal(&env, market_id)
-        {
-            Self::propose(&env, market_id, AttestedOutcome::from_market(&outcome));
+        let crossed = before < config.weight_threshold && weight >= config.weight_threshold;
+        // Address-based split-vote rule (see `record_attestation`): an Invalid
+        // quorum may displace a pending Yes/No proposal, once.
+        let may_propose = match Self::load_proposal(env, market_id) {
+            None => true,
+            Some(pending) => {
+                outcome == AttestedOutcome::Invalid && pending.outcome != AttestedOutcome::Invalid
+            }
+        };
+        if crossed && may_propose {
+            Self::propose(env, market_id, outcome);
         }
         Ok(())
+    }
+
+    /// Read-only membership view (issue #322): the role `who` (or any of its
+    /// Ed25519 `keys`, for weighted-key markets) has in resolving
+    /// `market_id`. Checks `SignerConfig.signers` for Signers, Disputable and
+    /// the hybrid signer fallback, the bound committee epoch's members for
+    /// committee markets (the would-be pin before the first attestation), and
+    /// the weighted key set for weighted markets. Membership wins over the
+    /// guardian role; the resolver admin is otherwise `Guardian`. At most
+    /// `MAX_WEIGHTED_SIGNERS` keys are inspected. Writes nothing, including
+    /// TTL bumps.
+    pub fn resolution_role(
+        env: Env,
+        market_id: u64,
+        who: Address,
+        keys: Vec<BytesN<32>>,
+    ) -> ResolutionRole {
+        let role = Self::member_role(&env, market_id, &who, &keys);
+        if role != ResolutionRole::None {
+            return role;
+        }
+        match env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+            Some(admin) if admin == who => ResolutionRole::Guardian,
+            _ => ResolutionRole::None,
+        }
+    }
+
+    fn member_role(
+        env: &Env,
+        market_id: u64,
+        who: &Address,
+        keys: &Vec<BytesN<32>>,
+    ) -> ResolutionRole {
+        let signer = |list: &Vec<Address>| {
+            if Self::contains(list, who) {
+                ResolutionRole::Signer
+            } else {
+                ResolutionRole::None
+            }
+        };
+        let weighted = |cfg: &WeightedKeyConfig| {
+            for key in keys.iter().take(MAX_WEIGHTED_SIGNERS as usize) {
+                if let Some(w) = Self::weight_of(cfg, &key) {
+                    return ResolutionRole::WeightedKey(w);
+                }
+            }
+            ResolutionRole::None
+        };
+        let committee = |snapshot: Result<CommitteeSnapshot, Error>| match snapshot {
+            Ok(snap) if Self::contains(&snap.members, who) => {
+                ResolutionRole::CommitteeMember(snap.epoch)
+            }
+            _ => ResolutionRole::None,
+        };
+        let storage = env.storage().persistent();
+        if let Some(cfg) = storage.get::<_, SignerConfig>(&DataKey::Signers(market_id)) {
+            return signer(&cfg.signers);
+        }
+        if let Some(cfg) = storage.get::<_, DisputableSignerConfig>(&DataKey::Disputable(market_id))
+        {
+            return signer(&cfg.signers);
+        }
+        if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return signer(&cfg.fallback.signers);
+        }
+        if let Some(cfg) = storage.get::<_, WeightedKeyConfig>(&DataKey::WeightedKeys(market_id)) {
+            return weighted(&cfg);
+        }
+        if let Some(ref_spec) = storage.get::<_, CommitteeRef>(&DataKey::CommitteeSpec(market_id)) {
+            let snap = Self::market_close_time(env, market_id)
+                .and_then(|close| Self::committee_snapshot(env, market_id, &ref_spec, close));
+            return committee(snap);
+        }
+        if let Some(cfg) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            return match &cfg.fallback {
+                FallbackAuthority::Signers(s) => signer(&s.signers),
+                FallbackAuthority::WeightedKeys(w) => weighted(w),
+                FallbackAuthority::Committee(ref_spec) => {
+                    let snap = Self::market_close_time(env, market_id).and_then(|close| {
+                        Self::committee_snapshot(env, market_id, ref_spec, close)
+                    });
+                    committee(snap)
+                }
+            };
+        }
+        ResolutionRole::None
     }
 
     /// Current attestation round of a weighted-key market; the `round`
@@ -2387,14 +3091,21 @@ impl Resolver {
             Some(outcome) => core_call(core.try_resolve(&market_id, &to_core_outcome(&outcome)))?,
             None => {
                 core_call(core.try_void_market(&market_id))?;
+                // #326: for weighted-key markets `invalid_count` reports the
+                // Invalid *weight* of the current round, not a signer count.
+                let invalid_count = match &authority {
+                    SignerAuthority::Weighted(_) => Self::round_weight_v2(
+                        &env,
+                        market_id,
+                        Self::round(&env, market_id),
+                        AttestedOutcome::Invalid,
+                    ),
+                    _ => Self::attestation_count(&env, market_id, AttestedOutcome::Invalid),
+                };
                 CommitteeVoided {
                     market_id,
                     finalized_at: now,
-                    invalid_count: Self::attestation_count(
-                        &env,
-                        market_id,
-                        AttestedOutcome::Invalid,
-                    ),
+                    invalid_count,
                 }
                 .publish(&env);
             }
@@ -2556,6 +3267,138 @@ impl Resolver {
         Ok(())
     }
 
+    /// #149: records the token that resolution bounties are escrowed in. It
+    /// must be market-core's collateral token, so bounties and market
+    /// collateral share one asset. Because the only accepted value is the
+    /// collateral address, this setter cannot repoint existing escrow at a
+    /// different token, and no entrypoint lets an admin withdraw escrow.
+    pub fn set_bounty_token(env: Env, token: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let collateral = MarketCoreClient::new(&env, &market_core)
+            .get_config()
+            .collateral;
+        if token != collateral {
+            return Err(Error::InvalidConfig);
+        }
+        env.storage().instance().set(&DataKey::BountyToken, &token);
+        ttl::bump_instance(&env);
+        Ok(())
+    }
+
+    /// #149: escrows `amount` of the bounty token for `market_id`. Anyone may
+    /// fund a market before its `close_time`. An escrow has a single funder
+    /// (refunds go back to it), so a top-up must come from that same address.
+    pub fn fund_bounty(
+        env: Env,
+        funder: Address,
+        market_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        funder.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidBounty);
+        }
+        let token = Self::bounty_token(&env)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() >= market.close_time {
+            return Err(Error::BountyFundingClosed);
+        }
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let key = DataKey::Bounty(market_id);
+        let total = match env.storage().persistent().get::<_, BountyEscrow>(&key) {
+            Some(escrow) => {
+                if escrow.funder != funder {
+                    return Err(Error::BountyFunderMismatch);
+                }
+                escrow
+                    .amount
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidBounty)?
+            }
+            None => amount,
+        };
+        token::Client::new(&env, &token).transfer(
+            &funder,
+            env.current_contract_address(),
+            &amount,
+        );
+        env.storage().persistent().set(
+            &key,
+            &BountyEscrow {
+                amount: total,
+                funder: funder.clone(),
+                paid: false,
+            },
+        );
+        ttl::bump_persistent(&env, &key, ttl::market_target(&env, market.close_time));
+        BountyFunded {
+            market_id,
+            funder,
+            amount,
+            total,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// #149: [`Resolver::resolve_price`] that pays the market's bounty to
+    /// `caller`. The payout happens in the same invocation that makes the
+    /// market final, so a call that fails also pays nothing.
+    pub fn resolve_price_for(env: Env, caller: Address, market_id: u64) -> Result<Outcome, Error> {
+        caller.require_auth();
+        let outcome = Self::resolve_price(env.clone(), market_id)?;
+        Self::pay_finalizer(&env, market_id, &caller)?;
+        Ok(outcome)
+    }
+
+    /// #149: [`Resolver::finalize_signers`] that pays the market's bounty to
+    /// `caller`, with the same single-invocation guarantee as
+    /// [`Resolver::resolve_price_for`].
+    pub fn finalize_signers_for(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+    ) -> Result<AttestedOutcome, Error> {
+        caller.require_auth();
+        let outcome = Self::finalize_signers(env.clone(), market_id)?;
+        Self::pay_finalizer(&env, market_id, &caller)?;
+        Ok(outcome)
+    }
+
+    /// #149: returns an unpaid escrow to its funder once the market is final.
+    /// This covers a market finalized through `resolve_price` or
+    /// `finalize_signers` rather than their `_for` variants, which would
+    /// otherwise leave the escrow stranded. Returns the amount refunded.
+    pub fn reclaim_bounty(env: Env, funder: Address, market_id: u64) -> Result<i128, Error> {
+        funder.require_auth();
+        if !Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::BountyNotFinal);
+        }
+        let escrow: BountyEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(market_id))
+            .ok_or(Error::NoBounty)?;
+        if escrow.funder != funder {
+            return Err(Error::BountyFunderMismatch);
+        }
+        let amount = Self::release_bounty(&env, market_id, &funder)?;
+        if amount > 0 {
+            BountyRefunded {
+                market_id,
+                funder,
+                amount,
+            }
+            .publish(&env);
+        }
+        Ok(amount)
+    }
+
     /// Pure view: no TTL extensions. The instance and the market's entries
     /// are kept alive by the mutating entrypoints above, so a view-only
     /// simulation stays read-only.
@@ -2665,6 +3508,74 @@ impl Resolver {
             let target = ttl::market_target(env, close_time);
             ttl::bump_persistent(env, &key, target);
         }
+    }
+
+    /// #149: the bounty token, set by `set_bounty_token`.
+    fn bounty_token(env: &Env) -> Result<Address, Error> {
+        ttl::bump_instance(env);
+        env.storage()
+            .instance()
+            .get(&DataKey::BountyToken)
+            .ok_or(Error::BountyTokenNotSet)
+    }
+
+    /// #149: moves an unpaid escrow to `to` and marks it paid. The mark is
+    /// written before the transfer (effects before interactions). Returns the
+    /// amount moved, which is zero when there is no unpaid escrow.
+    fn release_bounty(env: &Env, market_id: u64, to: &Address) -> Result<i128, Error> {
+        let key = DataKey::Bounty(market_id);
+        let Some(mut escrow) = env.storage().persistent().get::<_, BountyEscrow>(&key) else {
+            return Ok(0);
+        };
+        if escrow.paid || escrow.amount <= 0 {
+            return Ok(0);
+        }
+        let token = Self::bounty_token(env)?;
+        let amount = escrow.amount;
+        escrow.paid = true;
+        env.storage().persistent().set(&key, &escrow);
+        token::Client::new(env, &token).transfer(&env.current_contract_address(), to, &amount);
+        Ok(amount)
+    }
+
+    /// #149: pays the bounty to the caller whose successful resolution made the
+    /// market final. A non-terminal market pays nothing, though a successful
+    /// resolution always leaves it terminal.
+    fn pay_finalizer(env: &Env, market_id: u64, caller: &Address) -> Result<(), Error> {
+        if !Self::resolution_state(env, market_id).is_terminal() {
+            return Ok(());
+        }
+        let amount = Self::release_bounty(env, market_id, caller)?;
+        if amount > 0 {
+            BountyPaid {
+                market_id,
+                caller: caller.clone(),
+                amount,
+            }
+            .publish(env);
+        }
+        Ok(())
+    }
+
+    /// #149: refunds an unpaid escrow to its funder, used when a market is voided.
+    fn refund_bounty(env: &Env, market_id: u64) -> Result<(), Error> {
+        let Some(escrow) = env
+            .storage()
+            .persistent()
+            .get::<_, BountyEscrow>(&DataKey::Bounty(market_id))
+        else {
+            return Ok(());
+        };
+        let amount = Self::release_bounty(env, market_id, &escrow.funder)?;
+        if amount > 0 {
+            BountyRefunded {
+                market_id,
+                funder: escrow.funder,
+                amount,
+            }
+            .publish(env);
+        }
+        Ok(())
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -2886,12 +3797,12 @@ impl Resolver {
             | SignerAuthority::Disputable(DisputableSignerConfig { threshold, .. }) => {
                 Self::attestation_count(env, market_id, outcome) >= *threshold
             }
-            // Weighted keys sign market-core outcomes only (the signed message
-            // encodes `Outcome`), so they can never propose `Invalid`.
-            SignerAuthority::Weighted(cfg) => outcome.to_market().is_some_and(|o| {
+            // #326: v2 signatures can carry `Invalid`; the weight sums v1 and
+            // v2 tallies of the current round.
+            SignerAuthority::Weighted(cfg) => {
                 let round = Self::round(env, market_id);
-                Self::round_weight(env, market_id, round, &o) >= cfg.weight_threshold
-            }),
+                Self::round_weight_v2(env, market_id, round, outcome) >= cfg.weight_threshold
+            }
             SignerAuthority::Committee(ref_spec, snapshot) => {
                 // #297: quorum is counted against the pinned epoch's snapshot
                 // only. Rotations after close have no effect.
@@ -2911,10 +3822,10 @@ impl Resolver {
                 FallbackAuthority::Signers(s) => {
                     Self::attestation_count(env, market_id, outcome) >= s.threshold
                 }
-                FallbackAuthority::WeightedKeys(w) => outcome.to_market().is_some_and(|o| {
+                FallbackAuthority::WeightedKeys(w) => {
                     let round = Self::round(env, market_id);
-                    Self::round_weight(env, market_id, round, &o) >= w.weight_threshold
-                }),
+                    Self::round_weight_v2(env, market_id, round, outcome) >= w.weight_threshold
+                }
                 FallbackAuthority::Committee(ref_spec) => {
                     let _ = ref_spec;
                     if let Some(snap) = snapshot {
@@ -2974,6 +3885,29 @@ impl Resolver {
             .unwrap_or(0)
     }
 
+    /// #326: weight for `outcome` in `round` across both message versions:
+    /// `WeightV2`, plus the legacy v1 `Weight` for Yes/No.
+    fn round_weight_v2(env: &Env, market_id: u64, round: u32, outcome: AttestedOutcome) -> u32 {
+        let v2: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WeightV2(market_id, round, outcome))
+            .unwrap_or(0);
+        let v1 = outcome
+            .to_market()
+            .map(|o| Self::round_weight(env, market_id, round, &o))
+            .unwrap_or(0);
+        v2.saturating_add(v1)
+    }
+
+    /// #326: whether `pubkey` already signed anything in `round`, through
+    /// either message version.
+    fn has_signed(env: &Env, market_id: u64, round: u32, pubkey: &BytesN<32>) -> bool {
+        let storage = env.storage().persistent();
+        storage.has(&DataKey::SigSeen(market_id, round, pubkey.clone()))
+            || storage.has(&DataKey::SigSeenV2(market_id, round, pubkey.clone()))
+    }
+
     fn weight_of(config: &WeightedKeyConfig, pubkey: &BytesN<32>) -> Option<u32> {
         config
             .signers
@@ -2999,6 +3933,37 @@ impl Resolver {
         message.push_back(match outcome {
             Outcome::Yes => 0,
             Outcome::No => 1,
+        });
+        message.append(&resolution_hash.clone().into());
+        message
+    }
+
+    /// The v2 attestation message (issue #326), signed raw like v1:
+    ///
+    /// ```text
+    /// "oracledesk-attest-v2" || 0x02 || network_id[32] || XDR(resolver Address)
+    ///   || market_id u64 BE || round u32 BE || outcome u8 {0=Yes,1=No,2=Invalid}
+    ///   || resolution_hash[32]
+    /// ```
+    ///
+    /// The v1 layout (`attestation_message`) is unchanged byte for byte.
+    fn attestation_message_v2(
+        env: &Env,
+        market_id: u64,
+        round: u32,
+        outcome: &AttestedOutcome,
+        resolution_hash: &BytesN<32>,
+    ) -> Bytes {
+        let mut message = Bytes::from_slice(env, ATTEST_DOMAIN_V2);
+        message.push_back(ATTEST_VERSION_V2);
+        message.append(&env.ledger().network_id().into());
+        message.append(&env.current_contract_address().to_xdr(env));
+        message.extend_from_array(&market_id.to_be_bytes());
+        message.extend_from_array(&round.to_be_bytes());
+        message.push_back(match outcome {
+            AttestedOutcome::Yes => 0,
+            AttestedOutcome::No => 1,
+            AttestedOutcome::Invalid => 2,
         });
         message.append(&resolution_hash.clone().into());
         message
@@ -3424,6 +4389,16 @@ impl Resolver {
             DataKey::AttestEpoch(_, _) => "market",
             DataKey::MarketEpoch(_) => "market",
             DataKey::HybridV2(_) => "market",
+            DataKey::BountyToken => "global",
+            DataKey::Bounty(_) => "market",
+            // #326
+            DataKey::SigSeenV2(_, _, _) => "market",
+            DataKey::WeightV2(_, _, _) => "market",
+            DataKey::AttestV1Disabled => "global",
+            // #321
+            DataKey::TwapGrid(_) => "market",
+            DataKey::TwapSamples(_) => "market",
+            DataKey::ScaledSnapshot(_) => "market",
         }
     }
 
@@ -3506,7 +4481,7 @@ impl Resolver {
     /// grid (or an unreachable/zero-period feed) fails before any
     /// commitment is spent. Static violations and infeasible slot counts
     /// are `InvalidConfig`; a trapping reflector is `PriceUnavailable`.
-    fn validate_twap_rule(env: &Env, cfg: &TwapConfig) -> Result<(), Error> {
+    fn validate_twap_rule(env: &Env, cfg: &TwapConfig) -> Result<u32, Error> {
         let static_ok = cfg.window > 0
             && cfg.min_samples >= 2
             && cfg.max_gap > 0
@@ -3529,7 +4504,7 @@ impl Resolver {
         if slots > MAX_TWAP_SAMPLES as u64 || (cfg.min_samples as u64) > slots {
             return Err(Error::InvalidConfig);
         }
-        Ok(())
+        Ok(resolution)
     }
 
     /// Issue #27 counterpart of [`store_scaled_rule`] for the TWAP mode.
@@ -3797,6 +4772,28 @@ impl Resolver {
                 }
                 (cfg.fallback.threshold, None)
             }
+            // #314 hybrid-v2 fallback: address signers and committees attest
+            // here once the fallback is open; weighted keys sign off-chain.
+            SignerAuthority::HybridV2(cfg, snapshot) => {
+                if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
+                    return Err(Error::WrongMode);
+                }
+                match (&cfg.fallback, snapshot) {
+                    (FallbackAuthority::Signers(s), _) => {
+                        if !Self::contains(&s.signers, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (s.threshold, None)
+                    }
+                    (FallbackAuthority::Committee(_), Some(snap)) => {
+                        if !Self::contains(&snap.members, &signer) {
+                            return Err(Error::NotSigner);
+                        }
+                        (snap.threshold, Some(snap.epoch))
+                    }
+                    _ => return Err(Error::WrongMode),
+                }
+            }
         };
 
         let storage = env.storage().persistent();
@@ -3991,10 +4988,15 @@ impl Resolver {
             DataKey::EvidenceUsed(market_id),
             DataKey::Cancels(market_id),
             // #309: escalation aggregate keys (per-verdict, not per-signer).
-            DataKey::EscalationCount(market_id, Verdict::Valid),
+            DataKey::EscalationCount(market_id, Verdict::Yes),
+            DataKey::EscalationCount(market_id, Verdict::No),
             DataKey::EscalationCount(market_id, Verdict::Invalid),
             // #314: HybridV2 spec key.
             DataKey::HybridV2(market_id),
+            // #321: TWAP grid pin, stored TWAP samples and the scaled snapshot.
+            DataKey::TwapGrid(market_id),
+            DataKey::TwapSamples(market_id),
+            DataKey::ScaledSnapshot(market_id),
         ];
         for key in scalar_keys {
             if storage.has(&key) {
@@ -4619,6 +5621,158 @@ mod test {
         v2_fixture(salt, |env, _r, a, b| {
             ResolutionSpec::Signers(signer_spec(env, a, b))
         })
+    }
+
+    // ---- #149: resolution bounties ----------------------------------------
+
+    /// Funds a bounty of `amount` from a fresh address and returns that funder.
+    fn funded_bounty(f: &Fixture, amount: i128) -> Address {
+        let funder = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &amount);
+        f.resolver.set_bounty_token(&collateral);
+        f.resolver.fund_bounty(&funder, &f.market_id, &amount);
+        funder
+    }
+
+    // spec: RS-FUND_BOUNTY-AUTH-1, RS-FUND_BOUNTY-POST-1, RS-FUND_BOUNTY-POST-2
+    #[test]
+    fn fund_bounty_escrows_tokens_in_resolver() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 500);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        assert_eq!(coll.balance(&f.resolver_id), 500);
+        assert_eq!(coll.balance(&funder), 0);
+
+        // A top-up from the same funder adds to the one escrow.
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &250);
+        f.resolver.fund_bounty(&funder, &f.market_id, &250);
+        assert_eq!(coll.balance(&f.resolver_id), 750);
+    }
+
+    // spec: RS-FUND_BOUNTY-PRE-3, RS-FUND_BOUNTY-PRE-4, RS-FUND_BOUNTY-ERR-3, RS-FUND_BOUNTY-ERR-4
+    #[test]
+    fn fund_bounty_rejects_second_funder_and_non_positive_amounts() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 500);
+        let other = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_fund_bounty(&other, &f.market_id, &10),
+            Err(Ok(Error::BountyFunderMismatch))
+        );
+        assert_eq!(
+            f.resolver.try_fund_bounty(&funder, &f.market_id, &0),
+            Err(Ok(Error::InvalidBounty))
+        );
+    }
+
+    // spec: RS-FUND_BOUNTY-PRE-2, RS-FUND_BOUNTY-ERR-2
+    #[test]
+    fn fund_bounty_rejected_after_close() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let collateral = f.market_core.get_config().collateral;
+        f.resolver.set_bounty_token(&collateral);
+        let funder = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &100);
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(
+            f.resolver.try_fund_bounty(&funder, &f.market_id, &100),
+            Err(Ok(Error::BountyFundingClosed))
+        );
+    }
+
+    // spec: RS-SET_BOUNTY_TOKEN-PRE-2, RS-SET_BOUNTY_TOKEN-ERR-2
+    #[test]
+    fn set_bounty_token_accepts_only_market_collateral() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let other = f.env.register_stellar_asset_contract_v2(Address::generate(&f.env));
+        assert_eq!(
+            f.resolver.try_set_bounty_token(&other.address()),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
+    // spec: RS-RESOLVE_PRICE_FOR-POST-2, RS-PAY_BOUNTY-PRE-1, RS-PAY_BOUNTY-PRE-2, RS-PAY_BOUNTY-POST-1, RS-PAY_BOUNTY-POST-2, RS-PAY_BOUNTY-EVT-1
+    #[test]
+    fn resolve_price_for_pays_bounty_once() {
+        let f = price_fixture(2_500, 1_999);
+        let funder = funded_bounty(&f, 300);
+        let caller = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert_eq!(
+            f.resolver.resolve_price_for(&caller, &f.market_id),
+            Outcome::Yes
+        );
+        assert_eq!(coll.balance(&caller), 300);
+        assert_eq!(coll.balance(&f.resolver_id), 0);
+
+        // The market is final, so a second finalization pays nothing.
+        assert_eq!(
+            f.resolver.try_resolve_price_for(&caller, &f.market_id),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+        assert_eq!(coll.balance(&caller), 300);
+        // The escrow was paid, so the funder has nothing left to reclaim.
+        assert_eq!(f.resolver.reclaim_bounty(&funder, &f.market_id), 0);
+    }
+
+    // spec: RS-RESOLVE_PRICE_FOR-ERR-1, RS-RECLAIM_BOUNTY-ERR-1
+    #[test]
+    fn failed_resolution_pays_nothing_and_keeps_escrow() {
+        // No spec is revealed, so resolution fails and the escrow must stay put.
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 300);
+        let caller = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert!(f
+            .resolver
+            .try_resolve_price_for(&caller, &f.market_id)
+            .is_err());
+        assert_eq!(coll.balance(&caller), 0);
+        assert_eq!(coll.balance(&f.resolver_id), 300);
+        assert_eq!(
+            f.resolver.try_reclaim_bounty(&funder, &f.market_id),
+            Err(Ok(Error::BountyNotFinal))
+        );
+    }
+
+    // spec: RS-RECLAIM_BOUNTY-PRE-1, RS-RECLAIM_BOUNTY-POST-1, RS-RECLAIM_BOUNTY-EVT-1
+    #[test]
+    fn reclaim_bounty_refunds_funder_after_unpaid_finalization() {
+        let f = price_fixture(2_500, 1_999);
+        let funder = funded_bounty(&f, 300);
+        f.env.ledger().set_timestamp(2_000);
+        // Plain `resolve_price` does not pay the bounty to anyone.
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+
+        assert_eq!(f.resolver.reclaim_bounty(&funder, &f.market_id), 300);
+        let collateral = f.market_core.get_config().collateral;
+        assert_eq!(token::Client::new(&f.env, &collateral).balance(&funder), 300);
+    }
+
+    // spec: RS-REFUND_BOUNTY-PRE-1, RS-REFUND_BOUNTY-POST-1, RS-REFUND_BOUNTY-POST-2, RS-REFUND_BOUNTY-EVT-1
+    #[test]
+    fn guardian_void_refunds_bounty_to_funder() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 300);
+        // Never revealed, so the guardian may void once the reveal grace ends.
+        f.env
+            .ledger()
+            .set_timestamp(2_000 + REVEAL_GRACE_SECS + 1);
+        f.resolver
+            .guardian_void_market(&f.market_id, &GuardianReason::UnrevealedSpec);
+
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        assert_eq!(coll.balance(&funder), 300);
+        assert_eq!(coll.balance(&f.resolver_id), 0);
     }
 
     #[test]
@@ -6128,6 +7282,32 @@ mod test {
         assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
     }
 
+    /// Finding of `fuzz_resolver_spec_decode` (issue #278): a `Signers` rule
+    /// listing the same address twice passes `validate_rule` with a
+    /// threshold only reachable by counting that address twice, but
+    /// `record_attestation` dedups per address, so the market can never
+    /// reach quorum. Not fixed here (the issue keeps fixes in separate PRs):
+    /// tracked by this ignored regression test and the fuzz allow-list entry
+    /// `dup-signers` (fuzz/README.md). Un-ignore with the fix.
+    #[test]
+    #[ignore = "tracked finding dup-signers (#278): validate_rule accepts duplicate signer addresses"]
+    fn signers_rule_rejects_duplicate_addresses() {
+        let f = fixture(|env, _r, a, _b| {
+            ResolutionSpec::Signers(SignerConfig {
+                signers: Vec::from_array(env, [a.clone(), a.clone()]),
+                threshold: 2,
+                dispute_window: 100,
+            })
+        });
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_signer_spec(&f.market_id, &spec),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
     #[test]
     fn bump_market_entries_skips_missing_keys() {
         let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
@@ -7627,6 +8807,867 @@ mod test {
         let pinned = f.resolver.pin_committee_epoch(&f.market_id);
         assert_eq!(pinned.1, 1u32);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #133: deployable SEP-40 test-oracle integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oracle_asset_xdr_matches_test_oracle_asset() {
+        let env = Env::default();
+        let sym = Symbol::new(&env, "XLM");
+        let addr = Address::generate(&env);
+
+        assert_eq!(
+            OracleAsset::Other(sym.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Other(sym).to_xdr(&env),
+        );
+        assert_eq!(
+            OracleAsset::Stellar(addr.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Stellar(addr).to_xdr(&env),
+        );
+    }
+
+    #[test]
+    fn price_mode_resolves_with_sep40_test_oracle() {
+        // Off-boundary close_time (2_150) with resolution = 300 => slot = 2_100,
+        // staleness delta = 50 <= max_staleness (300).
+        let f = fixture_at(2_150, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 300,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        // Advance past close_time so both test-oracle's FutureTimestamp check
+        // and resolver's MarketNotClosed check pass.
+        f.env.ledger().set_timestamp(2_200);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let outcome = f.resolver.resolve_price(&f.market_id);
+        assert_eq!(outcome, Outcome::Yes);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes),
+        );
+    }
+
+    #[test]
+    fn price_mode_stale_when_staleness_below_resolution() {
+        // Off-boundary close_time (2_250) with resolution = 300 => aligned slot
+        // is 2_100 (delta = 150s), which exceeds max_staleness = 60s.
+        let f = fixture_at(2_250, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 60,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        f.env.ledger().set_timestamp(2_300);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+        assert_eq!(err.unwrap(), Error::StalePrice);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-40 oracle suite
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_oracle, OracleKind};
+        use adversarial_mocks::{BudgetBurnerOracleClient, ExtremeOracleClient};
+
+        fn setup_oracle_fixture(kind: OracleKind) -> (Fixture, Address) {
+            let f = fixture_at(2_100, |env, _, _, _| {
+                let oracle_id = deploy_oracle(env, kind);
+                ResolutionSpec::Price(PriceConfig {
+                    reflector: oracle_id,
+                    asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                    threshold: 2_000,
+                    direction: PriceDirection::Above,
+                    max_staleness: 300,
+                })
+            });
+            let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+                unreachable!()
+            };
+            f.resolver.register_price_spec(&f.market_id, &cfg);
+            f.env.ledger().set_timestamp(2_200);
+            let oracle_id = cfg.reflector.clone();
+            (f, oracle_id)
+        }
+
+        #[test]
+        fn adversarial_resolve_price_rejects_zero_and_negative_price() {
+            for bad_price in [0_i128, -1_i128, i128::MIN] {
+                let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+                ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&bad_price);
+                let state_before = f.resolver.state(&f.market_id);
+                let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+                assert_eq!(err.unwrap(), Error::InvalidPrice);
+                assert_eq!(f.resolver.state(&f.market_id), state_before);
+                assert_eq!(state_before, ResolutionState::Unconfigured);
+            }
+        }
+
+        #[test]
+        fn adversarial_resolve_price_extreme_positive_price_tolerated() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+            ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&i128::MAX);
+            let outcome = f.resolver.resolve_price(&f.market_id);
+            assert_eq!(outcome, Outcome::Yes);
+        }
+
+        #[test]
+        fn adversarial_future_dated_price_is_stale() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Future);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_none_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::None);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_resolve_price_with_panic_oracle_keeps_state_unconfigured() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Panic);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+            assert_eq!(state_before, ResolutionState::Unconfigured);
+        }
+
+        #[test]
+        fn adversarial_budget_burner_oracle_reverts_cleanly() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::BudgetBurner);
+            BudgetBurnerOracleClient::new(&f.env, &oracle_id).set_iterations(&50_000);
+            let state_before = f.resolver.state(&f.market_id);
+            f.env.cost_estimate().budget().reset_default();
+            assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_wrong_shape_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::WrongShape);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_guardian_void_succeeds_after_oracle_failure() {
+            for kind in [
+                OracleKind::Extreme,
+                OracleKind::Future,
+                OracleKind::None,
+                OracleKind::Panic,
+                OracleKind::WrongShape,
+            ] {
+                let (f, oracle_id) = setup_oracle_fixture(kind);
+                if kind == OracleKind::Extreme {
+                    ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&0);
+                }
+                assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+                // Advance past close_time + ORACLE_GRACE_SECS so guardian escape hatch opens.
+                f.env.ledger().set_timestamp(2_100 + ORACLE_GRACE_SECS + 1);
+                f.resolver
+                    .guardian_void_market(&f.market_id, &GuardianReason::OracleUnavailable);
+                assert_eq!(
+                    f.market_core.get_market(&f.market_id).status,
+                    market_core::MarketStatus::Void,
+                );
+                assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #326: weighted-key v2 attestations (Invalid outcome)
+    // -----------------------------------------------------------------------
+
+    fn message_v2_for(
+        f: &Fixture,
+        resolver: &Address,
+        market_id: u64,
+        round: u32,
+        outcome: AttestedOutcome,
+    ) -> Bytes {
+        let hash = f.market_core.get_market(&market_id).resolution_hash;
+        f.env.as_contract(resolver, || {
+            Resolver::attestation_message_v2(&f.env, market_id, round, &outcome, &hash)
+        })
+    }
+
+    fn sign_v2(
+        f: &Fixture,
+        seed: u8,
+        round: u32,
+        outcome: AttestedOutcome,
+    ) -> (BytesN<32>, BytesN<64>) {
+        sign_message(
+            f,
+            seed,
+            &message_v2_for(f, &f.resolver_id, f.market_id, round, outcome),
+        )
+    }
+
+    fn proposal_of(f: &Fixture) -> Option<SignerProposalV2> {
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::load_proposal(&f.env, f.market_id)
+        })
+    }
+
+    /// Nine keys of weight 1, threshold 3, so two outcomes can each reach it.
+    fn wide_weighted_fixture() -> Fixture {
+        let f = fixture(|env, _r, _a, _b| {
+            ResolutionSpec::WeightedKeys(weighted_config(
+                env,
+                &[
+                    (1, 1),
+                    (2, 1),
+                    (3, 1),
+                    (4, 1),
+                    (5, 1),
+                    (6, 1),
+                    (7, 1),
+                    (8, 1),
+                    (9, 1),
+                ],
+                3,
+            ))
+        });
+        let ResolutionSpec::WeightedKeys(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_weighted_key_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+        f
+    }
+
+    #[test]
+    fn weighted_v2_invalid_reaches_threshold_and_voids() {
+        let f = weighted_fixture();
+        let batch = sigs(
+            &f,
+            &[
+                sign_v2(&f, 1, 0, AttestedOutcome::Invalid),
+                sign_v2(&f, 2, 0, AttestedOutcome::Invalid),
+            ],
+        );
+        f.resolver
+            .submit_signatures_v2(&f.market_id, &AttestedOutcome::Invalid, &0, &batch);
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Invalid),
+            3
+        );
+        assert_eq!(proposal_of(&f).unwrap().outcome, AttestedOutcome::Invalid);
+        f.env.ledger().set_timestamp(2_000 + 100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Invalid
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            market_core::MarketStatus::Void
+        );
+    }
+
+    #[test]
+    fn weighted_v2_invalid_displaces_yes_once() {
+        let f = wide_weighted_fixture();
+        let yes = sigs(
+            &f,
+            &[
+                sign(&f, 1, 0, &Outcome::Yes),
+                sign(&f, 2, 0, &Outcome::Yes),
+                sign(&f, 3, 0, &Outcome::Yes),
+            ],
+        );
+        f.resolver
+            .submit_signatures(&f.market_id, &Outcome::Yes, &0, &yes);
+        assert_eq!(proposal_of(&f).unwrap().outcome, AttestedOutcome::Yes);
+
+        let invalid = sigs(
+            &f,
+            &[
+                sign_v2(&f, 4, 0, AttestedOutcome::Invalid),
+                sign_v2(&f, 5, 0, AttestedOutcome::Invalid),
+                sign_v2(&f, 6, 0, AttestedOutcome::Invalid),
+            ],
+        );
+        f.resolver
+            .submit_signatures_v2(&f.market_id, &AttestedOutcome::Invalid, &0, &invalid);
+        assert_eq!(proposal_of(&f).unwrap().outcome, AttestedOutcome::Invalid);
+
+        // A No quorum afterwards cannot move an Invalid proposal back.
+        let no = sigs(
+            &f,
+            &[
+                sign_v2(&f, 7, 0, AttestedOutcome::No),
+                sign_v2(&f, 8, 0, AttestedOutcome::No),
+                sign_v2(&f, 9, 0, AttestedOutcome::No),
+            ],
+        );
+        f.resolver
+            .submit_signatures_v2(&f.market_id, &AttestedOutcome::No, &0, &no);
+        assert_eq!(proposal_of(&f).unwrap().outcome, AttestedOutcome::Invalid);
+    }
+
+    #[test]
+    fn weighted_key_cannot_sign_two_outcomes_across_versions() {
+        let f = weighted_fixture();
+        // Key 1 signs Invalid in v2 ...
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::Invalid,
+            &0,
+            &sigs(&f, &[sign_v2(&f, 1, 0, AttestedOutcome::Invalid)]),
+        );
+        // ... so its v1 Yes and v2 No in the same round are skipped.
+        f.resolver.submit_signatures(
+            &f.market_id,
+            &Outcome::Yes,
+            &0,
+            &sigs(&f, &[sign(&f, 1, 0, &Outcome::Yes)]),
+        );
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::No,
+            &0,
+            &sigs(&f, &[sign_v2(&f, 1, 0, AttestedOutcome::No)]),
+        );
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Yes),
+            0
+        );
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::No),
+            0
+        );
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Invalid),
+            2
+        );
+
+        // And the reverse: a v1 signer cannot sign again in v2.
+        f.resolver.submit_signatures(
+            &f.market_id,
+            &Outcome::No,
+            &0,
+            &sigs(&f, &[sign(&f, 2, 0, &Outcome::No)]),
+        );
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::Invalid,
+            &0,
+            &sigs(&f, &[sign_v2(&f, 2, 0, AttestedOutcome::Invalid)]),
+        );
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Invalid),
+            2
+        );
+    }
+
+    #[test]
+    fn weighted_mixed_v1_v2_yes_weights_sum() {
+        let f = weighted_fixture();
+        f.resolver.submit_signatures(
+            &f.market_id,
+            &Outcome::Yes,
+            &0,
+            &sigs(&f, &[sign(&f, 1, 0, &Outcome::Yes)]),
+        );
+        assert!(proposal_of(&f).is_none());
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::Yes,
+            &0,
+            &sigs(&f, &[sign_v2(&f, 2, 0, AttestedOutcome::Yes)]),
+        );
+        // 2 (v1) + 1 (v2) reaches the threshold of 3, counted once each.
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Yes),
+            3
+        );
+        assert_eq!(proposal_of(&f).unwrap().outcome, AttestedOutcome::Yes);
+        let (legacy, v2): (u32, u32) = f.env.as_contract(&f.resolver_id, || {
+            let s = f.env.storage().persistent();
+            (
+                s.get(&DataKey::Weight(f.market_id, 0, Outcome::Yes))
+                    .unwrap(),
+                s.get(&DataKey::WeightV2(f.market_id, 0, AttestedOutcome::Yes))
+                    .unwrap(),
+            )
+        });
+        assert_eq!((legacy, v2), (2, 1));
+        f.env.ledger().set_timestamp(2_000 + 100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn weighted_v2_signature_rejected_in_next_round() {
+        let f = weighted_fixture();
+        // Signed for round 0, submitted as round 1 after a cancel bumps it.
+        let stale = sign_v2(&f, 1, 0, AttestedOutcome::Invalid);
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::persist(&f.env, &DataKey::Round(f.market_id), &1u32);
+        });
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::Invalid,
+            &1,
+            &sigs(&f, &[stale]),
+        );
+    }
+
+    #[test]
+    fn weighted_v2_signature_rejected_on_other_resolver_or_market() {
+        let f = weighted_fixture();
+        let other = f.env.register(
+            Resolver,
+            ResolverArgs::__constructor(&f.admin, &f.market_core.address),
+        );
+        let foreign = sign_message(
+            &f,
+            1,
+            &message_v2_for(&f, &other, f.market_id, 0, AttestedOutcome::Invalid),
+        );
+        let hash = f.market_core.get_market(&f.market_id).resolution_hash;
+        let wrong_market_msg = f.env.as_contract(&f.resolver_id, || {
+            Resolver::attestation_message_v2(
+                &f.env,
+                f.market_id + 1,
+                0,
+                &AttestedOutcome::Invalid,
+                &hash,
+            )
+        });
+        let wrong_market = sign_message(&f, 1, &wrong_market_msg);
+        let v1_as_v2 = sign(&f, 1, 0, &Outcome::Yes);
+        for sig in [foreign, wrong_market, v1_as_v2] {
+            assert!(f
+                .resolver
+                .try_submit_signatures_v2(
+                    &f.market_id,
+                    &AttestedOutcome::Invalid,
+                    &0,
+                    &sigs(&f, &[sig]),
+                )
+                .is_err());
+        }
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Invalid),
+            0
+        );
+    }
+
+    #[test]
+    fn v1_disabled_flag_rejects_v1_submissions() {
+        let f = weighted_fixture();
+        assert!(!f.resolver.attest_v1_disabled());
+        f.resolver.disable_attest_v1();
+        assert!(f.resolver.attest_v1_disabled());
+        assert_eq!(
+            f.resolver.try_submit_signatures(
+                &f.market_id,
+                &Outcome::Yes,
+                &0,
+                &sigs(&f, &[sign(&f, 1, 0, &Outcome::Yes)]),
+            ),
+            Err(Ok(Error::WrongMode))
+        );
+        f.resolver.submit_signatures_v2(
+            &f.market_id,
+            &AttestedOutcome::Yes,
+            &0,
+            &sigs(&f, &[sign_v2(&f, 1, 0, AttestedOutcome::Yes)]),
+        );
+        assert_eq!(
+            f.resolver
+                .signature_weight(&f.market_id, &0, &AttestedOutcome::Yes),
+            2
+        );
+    }
+
+    #[test]
+    fn resolution_role_covers_signers_weighted_and_guardian() {
+        let f = weighted_fixture();
+        let none = Vec::new(&f.env);
+        let keys = Vec::from_array(
+            &f.env,
+            [
+                BytesN::from_array(&f.env, &[0xee; 32]),
+                weighted_key(&f.env, 1, 2).pubkey,
+            ],
+        );
+        let who = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.resolution_role(&f.market_id, &who, &keys),
+            ResolutionRole::WeightedKey(2)
+        );
+        assert_eq!(
+            f.resolver.resolution_role(&f.market_id, &who, &none),
+            ResolutionRole::None
+        );
+        assert_eq!(
+            f.resolver.resolution_role(&f.market_id, &f.admin, &none),
+            ResolutionRole::Guardian
+        );
+
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        let none = Vec::new(&f.env);
+        assert_eq!(
+            f.resolver.resolution_role(&f.market_id, &f.signer_a, &none),
+            ResolutionRole::Signer
+        );
+        assert_eq!(
+            f.resolver
+                .resolution_role(&f.market_id, &Address::generate(&f.env), &none),
+            ResolutionRole::None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #321: scaled snapshots and the TWAP sample store
+    // -----------------------------------------------------------------------
+
+    fn pd(price: i128, timestamp: u64) -> PriceData {
+        PriceData { price, timestamp }
+    }
+
+    fn xlm(env: &Env) -> OracleAsset {
+        OracleAsset::Other(Symbol::new(env, "XLM"))
+    }
+
+    fn scaled_cfg(env: &Env, reflector: &Address) -> ScaledPriceConfig {
+        ScaledPriceConfig {
+            reflector: reflector.clone(),
+            asset: xlm(env),
+            threshold: 2_000,
+            threshold_decimals: 0,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        }
+    }
+
+    #[test]
+    fn scaled_snapshot_survives_history_retention() {
+        let (f, cfg) = scaled_fixture_at(2_000, |env, r, _a, _b| scaled_cfg(env, r));
+        let feed = Sep40MockClient::new(&f.env, &f.reflector_id);
+        feed.set_config(&0, &1);
+        feed.set_history(&xlm(&f.env), &Vec::from_array(&f.env, [pd(2_500, 2_000)]));
+        f.resolver.register_scaled_price_spec(&f.market_id, &cfg);
+        f.env.ledger().set_timestamp(2_000);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.snapshot_price(&f.market_id, &caller),
+            pd(2_500, 2_000)
+        );
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::SnapshotExists))
+        );
+        // The feed forgets the record; resolution still works from the pin.
+        feed.set_history(&xlm(&f.env), &Vec::new(&f.env));
+        f.env.ledger().set_timestamp(3_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+    }
+
+    #[test]
+    fn scaled_snapshot_pins_decimals_against_later_change() {
+        let (f, cfg) = scaled_fixture_at(2_000, |env, r, _a, _b| scaled_cfg(env, r));
+        let feed = Sep40MockClient::new(&f.env, &f.reflector_id);
+        // 2_500 at 0 decimals is above 2_000 ...
+        feed.set_config(&0, &1);
+        feed.set_history(&xlm(&f.env), &Vec::from_array(&f.env, [pd(2_500, 2_000)]));
+        f.resolver.register_scaled_price_spec(&f.market_id, &cfg);
+        f.env.ledger().set_timestamp(2_000);
+        let snap_by = Address::generate(&f.env);
+        f.resolver.snapshot_price(&f.market_id, &snap_by);
+        assert_eq!(
+            f.resolver
+                .scaled_snapshot(&f.market_id)
+                .unwrap()
+                .feed_decimals,
+            0
+        );
+        // ... and would be 0.25 (below) if the live feed now said 4 decimals.
+        feed.set_config(&4, &1);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+    }
+
+    /// Grid of 10 s, window 100 s ending at close 2_000: slots 2_000 down to
+    /// 1_910 (10 slots).
+    fn twap_setup(history: &[(i128, u64)]) -> (Fixture, TwapConfig) {
+        let (f, cfg) = twap_fixture(|env, reflector, _a, _b| {
+            twap_price_spec(env, reflector, 2_000, PriceDirection::Above, 100, 2, 40)
+        });
+        let feed = Sep40MockClient::new(&f.env, &f.reflector_id);
+        feed.set_config(&14, &10);
+        let mut h = Vec::new(&f.env);
+        for (p, t) in history {
+            h.push_back(pd(*p, *t));
+        }
+        feed.set_history(&xlm(&f.env), &h);
+        f.resolver.register_twap_spec(&f.market_id, &cfg);
+        (f, cfg)
+    }
+
+    fn twap_history() -> std::vec::Vec<(i128, u64)> {
+        // Gaps at 1_930 and 1_960, a varying price.
+        [
+            (1_900, 1_910),
+            (2_100, 1_920),
+            (2_050, 1_940),
+            (1_980, 1_950),
+            (2_400, 1_970),
+            (2_200, 1_980),
+            (2_150, 1_990),
+            (1_990, 2_000),
+        ]
+        .to_vec()
+    }
+
+    #[test]
+    fn twap_grid_pinned_against_resolution_change() {
+        let (f, _cfg) = twap_setup(&twap_history());
+        assert_eq!(f.resolver.twap_grid(&f.market_id), Some(10));
+        f.env.ledger().set_timestamp(2_000);
+        let expected = f.resolver.try_resolve_twap(&f.market_id);
+        // A different live grid must not change which slots are read.
+        let (g, _cfg) = twap_setup(&twap_history());
+        Sep40MockClient::new(&g.env, &g.reflector_id).set_config(&14, &7);
+        g.env.ledger().set_timestamp(2_000);
+        assert_eq!(g.resolver.try_resolve_twap(&g.market_id), expected);
+    }
+
+    #[test]
+    fn twap_partial_snapshot_equals_full_read() {
+        // Reference: full live read.
+        let (f, _cfg) = twap_setup(&twap_history());
+        f.env.ledger().set_timestamp(2_000);
+        let expected = f.resolver.resolve_twap(&f.market_id);
+        // Every split point: store the oldest k slots, read the rest live.
+        for k in 0..=10u32 {
+            let (g, _cfg) = twap_setup(&twap_history());
+            g.env.ledger().set_timestamp(2_000 + 10);
+            let caller = Address::generate(&g.env);
+            let mut stored = 0;
+            while stored < k {
+                let n =
+                    g.resolver
+                        .snapshot_twap_samples(&g.market_id, &caller, &(k - stored).min(8));
+                assert!(n > 0);
+                stored += n;
+            }
+            assert_eq!(g.resolver.twap_samples(&g.market_id).len(), k);
+            assert_eq!(g.resolver.resolve_twap(&g.market_id), expected, "split {k}");
+        }
+    }
+
+    #[test]
+    fn twap_full_snapshot_resolves_with_empty_history() {
+        let (f, _cfg) = twap_setup(&twap_history());
+        f.env.ledger().set_timestamp(2_000);
+        let expected = f.resolver.try_resolve_twap(&f.market_id);
+        let (g, _cfg) = twap_setup(&twap_history());
+        g.env.ledger().set_timestamp(2_000 + 10);
+        let caller = Address::generate(&g.env);
+        assert_eq!(
+            g.resolver
+                .snapshot_twap_samples(&g.market_id, &caller, &100),
+            8
+        );
+        assert_eq!(
+            g.resolver
+                .snapshot_twap_samples(&g.market_id, &caller, &100),
+            2
+        );
+        assert_eq!(
+            g.resolver
+                .snapshot_twap_samples(&g.market_id, &caller, &100),
+            0
+        );
+        // The feed forgets everything (and would now fail on any read).
+        Sep40MockClient::new(&g.env, &g.reflector_id).set_panic(&true);
+        g.env.ledger().set_timestamp(10_000);
+        assert_eq!(g.resolver.try_resolve_twap(&g.market_id), expected);
+    }
+
+    #[test]
+    fn twap_presnapshot_before_close_for_past_slots() {
+        let (f, _cfg) = twap_setup(&twap_history());
+        // Before close: only slots <= now - res may store `Missing`, and
+        // only slots <= now are read at all.
+        f.env.ledger().set_timestamp(1_955);
+        let caller = Address::generate(&f.env);
+        let n = f.resolver.snapshot_twap_samples(&f.market_id, &caller, &8);
+        // 1_910..=1_950: five slots, all already in the past.
+        assert_eq!(n, 5);
+        let stored = f.resolver.twap_samples(&f.market_id);
+        assert_eq!(stored.get(1_930), Some(TwapSlot::Missing));
+        assert_eq!(stored.get(1_950), Some(TwapSlot::Record(pd(1_980, 1_950))));
+        assert!(stored.get(1_960).is_none());
+    }
+
+    #[test]
+    fn twap_missing_not_stored_for_recent_slot() {
+        let (f, _cfg) = twap_setup(&twap_history());
+        // 1_960 has no record and is less than one grid period old.
+        f.env.ledger().set_timestamp(1_965);
+        let caller = Address::generate(&f.env);
+        f.resolver.snapshot_twap_samples(&f.market_id, &caller, &8);
+        assert!(f.resolver.twap_samples(&f.market_id).get(1_960).is_none());
+        f.env.ledger().set_timestamp(1_970);
+        f.resolver.snapshot_twap_samples(&f.market_id, &caller, &8);
+        assert_eq!(
+            f.resolver.twap_samples(&f.market_id).get(1_960),
+            Some(TwapSlot::Missing)
+        );
+    }
+
+    #[test]
+    fn twap_snapshot_rejects_invalid_record() {
+        // A non-positive price in the window is rejected exactly like the
+        // resolution path rejects it, and nothing from that call is stored.
+        let (f, _cfg) = twap_setup(&[(2_000, 1_910), (0, 1_920), (2_000, 1_930)]);
+        f.env.ledger().set_timestamp(2_010);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver
+                .try_snapshot_twap_samples(&f.market_id, &caller, &8),
+            Err(Ok(Error::InvalidPrice))
+        );
+        assert_eq!(f.resolver.twap_samples(&f.market_id).len(), 0);
+        assert_eq!(
+            f.resolver.try_resolve_twap(&f.market_id),
+            Err(Ok(Error::InvalidPrice))
+        );
+    }
+
+    #[test]
+    fn twap_from_slots_matches_mixed_sources_property() {
+        // Pseudo-random histories with gaps and duplicate answers.
+        let env = Env::default();
+        let reflector = Address::generate(&env);
+        let cfg = twap_price_spec(&env, &reflector, 2_000, PriceDirection::Above, 100, 2, 40);
+        let mut seed: u64 = 0x9e37_79b9;
+        for _case in 0..200 {
+            let mut slots: Vec<(u64, TwapSlot)> = Vec::new(&env);
+            let mut ts = 2_000u64;
+            while ts > 1_900 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let r = (seed >> 33) % 10;
+                let slot = match r {
+                    0 | 1 => TwapSlot::Missing,
+                    // Duplicate of an older record (nearest-earlier feeds).
+                    2 => {
+                        TwapSlot::Record(pd(1_000 + (seed % 2_000) as i128, ts.saturating_sub(10)))
+                    }
+                    _ => TwapSlot::Record(pd(1_000 + (seed % 2_000) as i128, ts)),
+                };
+                slots.push_back((ts, slot));
+                ts -= 10;
+            }
+            let reference = Resolver::twap_from_slots(&env, &cfg, 2_000, &slots);
+            // Folding the same ordered answers in pieces gives the same result.
+            let start = 2_000u64 - cfg.window;
+            let mut samples: Vec<(u64, i128)> = Vec::new(&env);
+            let mut err = None;
+            for (_, slot) in slots.iter() {
+                if let Err(e) = Resolver::twap_fold_slot(&mut samples, 2_000, start, &slot) {
+                    err = Some(e);
+                    break;
+                }
+            }
+            let folded = match err {
+                Some(e) => Err(e),
+                None => Resolver::twap_finish(&cfg, 2_000, start, &samples),
+            };
+            assert_eq!(reference, folded);
+        }
+    }
+
+    #[test]
+    fn guardian_options_no_oracle_unavailable_after_full_snapshot() {
+        let (f, _cfg) = twap_setup(&twap_history());
+        f.env.ledger().set_timestamp(2_010);
+        let caller = Address::generate(&f.env);
+        while f.resolver.snapshot_twap_samples(&f.market_id, &caller, &8) > 0 {}
+        Sep40MockClient::new(&f.env, &f.reflector_id).set_panic(&true);
+        f.env.ledger().set_timestamp(2_000 + ORACLE_GRACE_SECS + 1);
+        let options = f.resolver.guardian_options(&f.market_id);
+        assert!(!options.contains(&GuardianReason::OracleUnavailable));
+    }
 }
 
 #[cfg(test)]
@@ -7884,6 +9925,74 @@ mod golden {
         assert_eq!(signature_hex, "3f7bfc9882bbe894518d059b50326069523358f3da1d74b7ed90b8b395862367155ae6ac7934b3ae610e21c3dd595b7d99c2ab122037918917c96543c0cde002");
     }
 
+    /// Issue #326: v1 and v2 attestation messages and signatures for every
+    /// outcome, checked against `docs/vectors/attest-v2.json`, which
+    /// `agents/core/attestation.test.ts` reads too.
+    #[test]
+    fn golden_attestation_message_and_signature_v2() {
+        use ed25519_dalek::Signer;
+        use soroban_sdk::testutils::Ledger;
+        let json = include_str!("../../../docs/vectors/attest-v2.json");
+        let field = |obj: &str, key: &str| -> std::string::String {
+            let tag = format!("\"{key}\": ");
+            let start = obj.find(&tag).unwrap_or_else(|| panic!("missing {key}")) + tag.len();
+            let rest = &obj[start..];
+            let end = rest.find([',', '\n', '}']).unwrap();
+            rest[..end].trim().trim_matches('"').into()
+        };
+        let body = &json[json.find("\"vectors\"").unwrap()..];
+        let mut checked = 0;
+        for obj in body.split('{').skip(1) {
+            let env = Env::default();
+            let testnet_id: BytesN<32> = env
+                .crypto()
+                .sha256(&Bytes::from_slice(
+                    &env,
+                    field(obj, "network_passphrase").as_bytes(),
+                ))
+                .into();
+            env.ledger().set_network_id(testnet_id.to_array());
+            let resolver_id = env.register_at(
+                &Address::from_str(&env, &field(obj, "resolver")),
+                Resolver,
+                (Address::from_str(&env, G1), Address::from_str(&env, C2)),
+            );
+            let spec_hash = BytesN::from_array(&env, &core::array::from_fn(|i| 0xa0 + i as u8));
+            let market_id: u64 = field(obj, "market_id").parse().unwrap();
+            let round: u32 = field(obj, "round").parse().unwrap();
+            let outcome = match field(obj, "outcome").as_str() {
+                "Yes" => AttestedOutcome::Yes,
+                "No" => AttestedOutcome::No,
+                _ => AttestedOutcome::Invalid,
+            };
+            let message = env.as_contract(&resolver_id, || match field(obj, "version").as_str() {
+                "1" => Resolver::attestation_message(
+                    &env,
+                    market_id,
+                    round,
+                    &outcome.to_market().unwrap(),
+                    &spec_hash,
+                ),
+                _ => Resolver::attestation_message_v2(&env, market_id, round, &outcome, &spec_hash),
+            });
+            let hex = |b: &[u8]| -> std::string::String {
+                b.iter().map(|x| format!("{x:02x}")).collect()
+            };
+            assert_eq!(hex(&bytes_to_vec(&message)), field(obj, "message_hex"));
+            let signing = ed25519_dalek::SigningKey::from_bytes(&core::array::from_fn(|i| i as u8));
+            assert_eq!(
+                hex(signing.verifying_key().as_bytes()),
+                field(obj, "pubkey")
+            );
+            assert_eq!(
+                hex(&signing.sign(&bytes_to_vec(&message)).to_bytes()),
+                field(obj, "sig_hex")
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5, "two v1 and three v2 vectors");
+    }
+
     #[contracttype]
     #[derive(Clone)]
     struct DeclaredAlphabetically {
@@ -7908,230 +10017,4 @@ mod golden {
         assert_eq!(a, b);
     }
 
-    // -----------------------------------------------------------------------
-    // Issue #133: deployable SEP-40 test-oracle integration tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn oracle_asset_xdr_matches_test_oracle_asset() {
-        let env = Env::default();
-        let sym = Symbol::new(&env, "XLM");
-        let addr = Address::generate(&env);
-
-        assert_eq!(
-            OracleAsset::Other(sym.clone()).to_xdr(&env),
-            ::test_oracle::Asset::Other(sym).to_xdr(&env),
-        );
-        assert_eq!(
-            OracleAsset::Stellar(addr.clone()).to_xdr(&env),
-            ::test_oracle::Asset::Stellar(addr).to_xdr(&env),
-        );
-    }
-
-    #[test]
-    fn price_mode_resolves_with_sep40_test_oracle() {
-        // Off-boundary close_time (2_150) with resolution = 300 => slot = 2_100,
-        // staleness delta = 50 <= max_staleness (300).
-        let f = fixture_at(2_150, |env, _, _, _| {
-            let oracle_admin = Address::generate(env);
-            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
-            let oracle_id = env.register(
-                ::test_oracle::TestOracle,
-                (oracle_admin, base, 14u32, 300u32, 86_400u64),
-            );
-            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
-            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
-            ResolutionSpec::Price(PriceConfig {
-                reflector: oracle_id,
-                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
-                threshold: 2_000,
-                direction: PriceDirection::Above,
-                max_staleness: 300,
-            })
-        });
-        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
-            unreachable!()
-        };
-        f.resolver.register_price_spec(&f.market_id, &cfg);
-
-        // Advance past close_time so both test-oracle's FutureTimestamp check
-        // and resolver's MarketNotClosed check pass.
-        f.env.ledger().set_timestamp(2_200);
-        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
-        oracle.set_price(
-            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
-            &2_500,
-            &2_100,
-        );
-
-        let outcome = f.resolver.resolve_price(&f.market_id);
-        assert_eq!(outcome, Outcome::Yes);
-        assert_eq!(
-            f.market_core.get_market(&f.market_id).status,
-            market_core::MarketStatus::Resolved(market_core::Outcome::Yes),
-        );
-    }
-
-    #[test]
-    fn price_mode_stale_when_staleness_below_resolution() {
-        // Off-boundary close_time (2_250) with resolution = 300 => aligned slot
-        // is 2_100 (delta = 150s), which exceeds max_staleness = 60s.
-        let f = fixture_at(2_250, |env, _, _, _| {
-            let oracle_admin = Address::generate(env);
-            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
-            let oracle_id = env.register(
-                ::test_oracle::TestOracle,
-                (oracle_admin, base, 14u32, 300u32, 86_400u64),
-            );
-            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
-            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
-            ResolutionSpec::Price(PriceConfig {
-                reflector: oracle_id,
-                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
-                threshold: 2_000,
-                direction: PriceDirection::Above,
-                max_staleness: 60,
-            })
-        });
-        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
-            unreachable!()
-        };
-        f.resolver.register_price_spec(&f.market_id, &cfg);
-
-        f.env.ledger().set_timestamp(2_300);
-        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
-        oracle.set_price(
-            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
-            &2_500,
-            &2_100,
-        );
-
-        let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-        assert_eq!(err.unwrap(), Error::StalePrice);
-    }
-
-    // -----------------------------------------------------------------------
-    // Issue #137: Adversarial hostile SEP-40 oracle suite
-    // -----------------------------------------------------------------------
-
-    mod adversarial {
-        use super::*;
-        use adversarial_mocks::harness::{deploy_oracle, OracleKind};
-        use adversarial_mocks::{BudgetBurnerOracleClient, ExtremeOracleClient};
-
-        fn setup_oracle_fixture(kind: OracleKind) -> (Fixture, Address) {
-            let f = fixture_at(2_100, |env, _, _, _| {
-                let oracle_id = deploy_oracle(env, kind);
-                ResolutionSpec::Price(PriceConfig {
-                    reflector: oracle_id,
-                    asset: OracleAsset::Other(Symbol::new(env, "XLM")),
-                    threshold: 2_000,
-                    direction: PriceDirection::Above,
-                    max_staleness: 300,
-                })
-            });
-            let ResolutionSpec::Price(cfg) = f.spec.clone() else {
-                unreachable!()
-            };
-            f.resolver.register_price_spec(&f.market_id, &cfg);
-            f.env.ledger().set_timestamp(2_200);
-            let oracle_id = cfg.reflector.clone();
-            (f, oracle_id)
-        }
-
-        #[test]
-        fn adversarial_resolve_price_rejects_zero_and_negative_price() {
-            for bad_price in [0_i128, -1_i128, i128::MIN] {
-                let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
-                ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&bad_price);
-                let state_before = f.resolver.state(&f.market_id);
-                let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-                assert_eq!(err.unwrap(), Error::InvalidPrice);
-                assert_eq!(f.resolver.state(&f.market_id), state_before);
-                assert_eq!(state_before, ResolutionState::Unconfigured);
-            }
-        }
-
-        #[test]
-        fn adversarial_resolve_price_extreme_positive_price_tolerated() {
-            let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
-            ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&i128::MAX);
-            let outcome = f.resolver.resolve_price(&f.market_id);
-            assert_eq!(outcome, Outcome::Yes);
-        }
-
-        #[test]
-        fn adversarial_future_dated_price_is_stale() {
-            let (f, _) = setup_oracle_fixture(OracleKind::Future);
-            let state_before = f.resolver.state(&f.market_id);
-            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-            assert_eq!(err.unwrap(), Error::StalePrice);
-            assert_eq!(f.resolver.state(&f.market_id), state_before);
-        }
-
-        #[test]
-        fn adversarial_none_oracle_fails_safely() {
-            let (f, _) = setup_oracle_fixture(OracleKind::None);
-            let state_before = f.resolver.state(&f.market_id);
-            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-            assert_eq!(err.unwrap(), Error::StalePrice);
-            assert_eq!(f.resolver.state(&f.market_id), state_before);
-        }
-
-        #[test]
-        fn adversarial_resolve_price_with_panic_oracle_keeps_state_unconfigured() {
-            let (f, _) = setup_oracle_fixture(OracleKind::Panic);
-            let state_before = f.resolver.state(&f.market_id);
-            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-            assert_eq!(err.unwrap(), Error::PriceUnavailable);
-            assert_eq!(f.resolver.state(&f.market_id), state_before);
-            assert_eq!(state_before, ResolutionState::Unconfigured);
-        }
-
-        #[test]
-        fn adversarial_budget_burner_oracle_reverts_cleanly() {
-            let (f, oracle_id) = setup_oracle_fixture(OracleKind::BudgetBurner);
-            BudgetBurnerOracleClient::new(&f.env, &oracle_id).set_iterations(&50_000);
-            let state_before = f.resolver.state(&f.market_id);
-            f.env.cost_estimate().budget().reset_default();
-            assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
-            f.env.cost_estimate().budget().reset_unlimited();
-            assert_eq!(f.resolver.state(&f.market_id), state_before);
-        }
-
-        #[test]
-        fn adversarial_wrong_shape_oracle_fails_safely() {
-            let (f, _) = setup_oracle_fixture(OracleKind::WrongShape);
-            let state_before = f.resolver.state(&f.market_id);
-            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
-            assert_eq!(err.unwrap(), Error::PriceUnavailable);
-            assert_eq!(f.resolver.state(&f.market_id), state_before);
-        }
-
-        #[test]
-        fn adversarial_guardian_void_succeeds_after_oracle_failure() {
-            for kind in [
-                OracleKind::Extreme,
-                OracleKind::Future,
-                OracleKind::None,
-                OracleKind::Panic,
-                OracleKind::WrongShape,
-            ] {
-                let (f, oracle_id) = setup_oracle_fixture(kind);
-                if kind == OracleKind::Extreme {
-                    ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&0);
-                }
-                assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
-                // Advance past close_time + ORACLE_GRACE_SECS so guardian escape hatch opens.
-                f.env.ledger().set_timestamp(2_100 + ORACLE_GRACE_SECS + 1);
-                f.resolver
-                    .guardian_void_market(&f.market_id, &GuardianReason::OracleUnavailable);
-                assert_eq!(
-                    f.market_core.get_market(&f.market_id).status,
-                    market_core::MarketStatus::Void,
-                );
-                assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-            }
-        }
-    }
 }

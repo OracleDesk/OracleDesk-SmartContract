@@ -80,7 +80,7 @@ def find_test_coverage(contracts_dir: Path) -> dict:
                             # Skip UNTESTED markers in this list
                             if 'UNTESTED' in clause_id:
                                 continue
-                            test_path = f"{rust_file.relative_to(Path.cwd())}::{test_name}"
+                            test_path = f"{rust_file.relative_to(contracts_dir.parent)}::{test_name}"
                             coverage[clause_id].append(test_path)
         except Exception as e:
             print(f"Warning: Error reading {rust_file}: {e}", file=sys.stderr)
@@ -120,9 +120,11 @@ def find_untested_marks(contracts_dir: Path, spec_dir: Path) -> dict:
 
 def main():
     """Main function."""
-    repo_root = Path.cwd()
-    spec_dir = repo_root / 'oracledesk-stellar' / 'docs' / 'spec'
-    contracts_dir = repo_root / 'oracledesk-stellar' / 'contracts'
+    # Resolve from this script's location (oracledesk-stellar/scripts/), so the
+    # check works from the repo root or from oracledesk-stellar/ alike.
+    project_root = Path(__file__).resolve().parent.parent
+    spec_dir = project_root / 'docs' / 'spec'
+    contracts_dir = project_root / 'contracts'
 
     if not spec_dir.exists():
         print(f"Error: Spec directory not found: {spec_dir}", file=sys.stderr)

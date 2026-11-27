@@ -6,6 +6,7 @@
  * the same `signalGroup`, so they see identical signals.
  */
 import { BPS, calcBuy } from "../../core/fpmm.js";
+import { inventoryOf } from "../../core/inventory.js";
 import { decideMarketProposal, decideTrade, type MarketState, type TraderDecision } from "../../core/strategy.js";
 import type { Rng } from "../rng.js";
 import type { AgentContext, Observation, Order, SimAgent } from "../types.js";
@@ -101,6 +102,10 @@ export interface OracleDeskMakerOptions {
   seed: bigint;
   closeIn: bigint;
 }
+export interface OracleDeskInventoryManagerOptions {
+  maxDeltaBps: number;
+  targetDeltaBps?: number;
+}
 
 export class OracleDeskMaker implements SimAgent {
   private steps = 0;
@@ -127,5 +132,21 @@ export class OracleDeskMaker implements SimAgent {
     if (decision.action !== "propose_market") return [];
     this.created++;
     return [{ kind: "create", seed: decision.seedAmountStroops!, yesBps: BigInt(decision.initialYesBps!), closeIn: this.o.closeIn }];
+  }
+}
+
+/** Sells creator seed shares when the treasury becomes directionally exposed. */
+export class OracleDeskInventoryManager implements SimAgent {
+  constructor(readonly id: string, readonly treasury: string, private readonly o: OracleDeskInventoryManagerOptions) {}
+  get account(): string { return this.treasury; }
+  act(obs: Observation): Order[] {
+    return obs.markets.flatMap((m) => {
+      if (m.creator !== this.treasury) return [];
+      const p = obs.positions[m.id];
+      if (!p) return [];
+      const inv = inventoryOf({ pool: { reserveYes: m.reserveYes, reserveNo: m.reserveNo, feeBps: m.feeBps }, position: p, lpOwned: true, lpFees: 0n, costBasis: 1n });
+      if (inv.delta === 0n || (inv.delta < 0n ? -inv.delta : inv.delta) * 10_000n <= BigInt(this.o.maxDeltaBps) * (inv.payoutYes > inv.payoutNo ? inv.payoutYes : inv.payoutNo)) return [];
+      return [{ kind: "sellShares" as const, marketId: m.id, outcome: inv.delta > 0n ? "Yes" as const : "No" as const, shares: "all" as const }];
+    });
   }
 }

@@ -1,0 +1,14 @@
+{
+  "name": "maker inventory",
+  "steps": 120,
+  "stepSeconds": 60,
+  "feeBps": 100,
+  "protocolShareBps": 10000,
+  "markets": { "initial": 2, "seed": "1000000000", "closeInSteps": 90, "lpPriceNoiseBps": 250 },
+  "outcome": { "kind": "drift", "p0": 0.5, "sigma": 0.03 },
+  "agents": [
+    { "type": "oracledesk-maker", "id": "maker", "treasury": { "balance": "10000000000", "maxTrade": "100000000", "maxMarket": "5000000000", "maxDaily": "10000000000" }, "signalNoiseBps": 0, "everySteps": 30, "maxMarkets": 2, "confidenceThresholdBps": 500, "seed": "1000000000", "closeInSteps": 60 },
+    { "type": "oracledesk-inventory", "id": "inventory", "treasury": { "balance": "10000000000", "maxTrade": "100000000", "maxMarket": "5000000000", "maxDaily": "10000000000" }, "maxDeltaBps": 3000, "targetDeltaBps": 1000 },
+    { "type": "informed", "id": "flow", "balance": "10000000000", "activity": 0.4, "noiseBps": 500, "minEdgeBps": 300, "tradeSize": "100000000" }
+  ]
+}

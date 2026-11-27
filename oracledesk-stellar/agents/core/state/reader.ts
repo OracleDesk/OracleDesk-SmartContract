@@ -4,7 +4,7 @@
  */
 import type { Server as StellarServer } from "@stellar/stellar-sdk/rpc";
 import { Address, xdr } from "@stellar/stellar-sdk";
-import type { ChainMarket, PortfolioState, Snapshot, MarketStatus, ResolutionMode } from "./types.js";
+import type { ChainMarket, PortfolioState, Snapshot, MarketStatus } from "./types.js";
 
 const MAX_LEDGER_DRIFT = Number(process.env.AGENT_MAX_LEDGER_DRIFT ?? 2);
 const RPC_TIMEOUT_MS = Number(process.env.AGENT_RPC_TIMEOUT_MS ?? 30_000);
@@ -36,7 +36,7 @@ export class ChainStateReader {
 
     // Fetch portfolio and markets concurrently
     const [portfolioResult, marketResults] = await Promise.allSettled([
-      this.readPortfolio(),
+      Promise.resolve(defaultPortfolio()),
       this.readMarkets(marketIds, errors),
     ]);
 
@@ -73,7 +73,10 @@ export class ChainStateReader {
     if (marketIds.length === 0) return { markets: new Map(), ledgerRange: { min: 0, max: 0 } };
 
     // Build ledger keys for each market
-    const keys = marketIds.map((id) => buildMarketKey(this.opts.marketContractId, id));
+    const keys = marketIds.flatMap((id) => [
+      buildMarketKey(this.opts.marketContractId, id),
+      buildSettleKey(this.opts.marketContractId, id),
+    ]);
 
     const entries = await withTimeout(
       this.opts.server.getLedgerEntries(...keys),
@@ -85,12 +88,23 @@ export class ChainStateReader {
     let minLedger = Infinity;
     let maxLedger = 0;
 
+    const marketEntries: RpcLedgerEntry[] = [];
+    const settleEntries: RpcLedgerEntry[] = [];
     for (const entry of (entries as any).entries ?? []) {
       const typed = entry as RpcLedgerEntry;
       minLedger = Math.min(minLedger, typed.lastModifiedLedgerSeq);
       maxLedger = Math.max(maxLedger, typed.lastModifiedLedgerSeq);
       try {
-        const market = decodeMarketEntry(typed);
+        (isMarketEntry(typed) ? marketEntries : settleEntries).push(typed);
+      } catch (e) {
+        errors.push({ scope: "market-decode", message: String(e) });
+      }
+    }
+
+    for (let i = 0; i < marketEntries.length; i++) {
+      try {
+        const market = decodeMarketEntry(marketEntries[i]!, marketIds[i]!);
+        market.closed = settleEntries[i] ? decodeSettleEntry(settleEntries[i]!) : false;
         markets.set(market.marketId, market);
       } catch (e) {
         errors.push({ scope: "market-decode", message: String(e) });
@@ -103,17 +117,6 @@ export class ChainStateReader {
     };
   }
 
-  private async readPortfolio(): Promise<PortfolioState> {
-    const key = buildPortfolioKey(this.opts.portfolioContractId);
-    const entries = await withTimeout(
-      this.opts.server.getLedgerEntries(key),
-      RPC_TIMEOUT_MS,
-      "getLedgerEntries(portfolio) timed out",
-    );
-    const first = ((entries as any).entries ?? [])[0];
-    if (!first) return defaultPortfolio();
-    return decodePortfolioEntry(first as RpcLedgerEntry);
-  }
 }
 
 // ── XDR helpers ──────────────────────────────────────────────────────────────
@@ -122,34 +125,35 @@ function buildMarketKey(contractId: string, marketId: bigint): xdr.LedgerKey {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
       contract: new Address(contractId).toScAddress(),
-      key: xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({
-          key: xdr.ScVal.scvSymbol("MarketState"),
-          val: xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId))),
-        }),
+      key: xdr.ScVal.scvVec([
+        xdr.ScVal.scvSymbol("Market"),
+        xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId))),
       ]),
       durability: xdr.ContractDataDurability.persistent(),
     }),
   );
 }
 
-function buildPortfolioKey(contractId: string): xdr.LedgerKey {
+function buildSettleKey(contractId: string, marketId: bigint): xdr.LedgerKey {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
       contract: new Address(contractId).toScAddress(),
-      key: xdr.ScVal.scvSymbol("PortfolioState"),
+      key: xdr.ScVal.scvVec([
+        xdr.ScVal.scvSymbol("Settle"),
+        xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId))),
+      ]),
       durability: xdr.ContractDataDurability.persistent(),
     }),
   );
 }
 
-function decodeMarketEntry(entry: RpcLedgerEntry): ChainMarket {
+function decodeMarketEntry(entry: RpcLedgerEntry, marketId: bigint): ChainMarket {
   const scval = xdr.ScVal.fromXDR(Buffer.from(entry.val));
   const map = scval.map() ?? [];
   const get = (key: string) => map.find((e) => e.key().sym?.().toString() === key)?.val();
 
   return {
-    marketId: BigInt(get("market_id")?.u64()?.toString() ?? "0"),
+    marketId,
     creator: get("creator")?.address()?.accountId()?.toString() ?? "",
     questionHash: Buffer.from(get("question_hash")?.bytes() ?? []).toString("hex"),
     resolutionHash: Buffer.from(get("resolution_hash")?.bytes() ?? []).toString("hex"),
@@ -163,8 +167,18 @@ function decodeMarketEntry(entry: RpcLedgerEntry): ChainMarket {
     setsMinted: BigInt(get("sets_minted")?.i128()?.toString() ?? "0"),
     feesAccrued: BigInt(get("fees_accrued")?.i128()?.toString() ?? "0"),
     lpClaimed: get("lp_claimed")?.b() ?? false,
-    resolution: decodeResolution(get("resolution")),
+    closed: false,
   };
+}
+
+function isMarketEntry(entry: RpcLedgerEntry): boolean {
+  const map = xdr.ScVal.fromXDR(Buffer.from(entry.val)).map() ?? [];
+  return map.some((e) => e.key().sym?.().toString() === "creator");
+}
+
+function decodeSettleEntry(entry: RpcLedgerEntry): boolean {
+  const map = xdr.ScVal.fromXDR(Buffer.from(entry.val)).map() ?? [];
+  return map.find((e) => e.key().sym?.().toString() === "closed")?.val()?.b() ?? false;
 }
 
 function decodePortfolioEntry(entry: RpcLedgerEntry): PortfolioState {
@@ -196,24 +210,13 @@ function decodePortfolioEntry(entry: RpcLedgerEntry): PortfolioState {
 }
 
 function decodeStatus(val: xdr.ScVal | undefined): MarketStatus {
-  const sym = val?.sym()?.toString();
+  const sym = val?.vec()?.[0]?.sym()?.toString() ?? val?.sym()?.toString();
   if (sym === "Open") return "open";
-  if (sym === "ResolvedYes") return "resolved_yes";
-  if (sym === "ResolvedNo") return "resolved_no";
+  if (sym === "Resolved") {
+    return val?.vec()?.[1]?.sym()?.toString() === "No" ? "resolved_no" : "resolved_yes";
+  }
   if (sym === "Void") return "void";
   return "open";
-}
-
-function decodeResolution(val: xdr.ScVal | undefined): ResolutionMode {
-  const variant = val?.map()?.[0]?.key()?.sym()?.toString();
-  if (!variant) return "unrevealed";
-  const modes: Record<string, ResolutionMode> = {
-    Unrevealed: "unrevealed",
-    Price: "price",
-    Signers: "signers",
-    Finalized: "finalized",
-  };
-  return modes[variant] ?? "unknown";
 }
 
 function defaultPortfolio(): PortfolioState {

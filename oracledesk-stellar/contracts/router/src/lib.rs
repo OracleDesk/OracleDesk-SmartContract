@@ -774,8 +774,8 @@ impl Router {
         spec: &ResolutionSpecV2,
     ) -> Result<(), Error> {
         let args: SorobanVec<Val> = soroban_sdk::vec![env, market_id.into_val(env)];
-        let actual: Option<RuleKind> = env
-            .invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
+        let actual: Option<RuleKind> =
+            env.invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
         if actual == Some(Self::expected_rule_kind(spec)) {
             Ok(())
         } else {
@@ -791,6 +791,9 @@ impl Router {
             ResolutionSpec::SignersDisputable(_) => RuleKind::SignersDisputable,
             ResolutionSpec::Committee(_) => RuleKind::Committee,
             ResolutionSpec::Hybrid(_) => RuleKind::Hybrid,
+            // The resolver's `rule_kind` reports no kind for HybridV2, so the
+            // comparison in `assert_rule_kind` fails (`RuleMismatch`).
+            ResolutionSpec::HybridV2(_) => RuleKind::Hybrid,
         }
     }
 

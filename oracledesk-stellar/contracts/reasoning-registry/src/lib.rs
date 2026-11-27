@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod peers;
+pub mod retention;
 pub mod ttl;
 
 // The test module builds over-length `action`/`ipfs_cid` strings with
@@ -14,14 +16,13 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 
-/// Rolling window for trace entries, unchanged from the pre-#16 policy:
-/// 60 days, extended at half that. Registration (`Agent`) instead uses
-/// `ttl::long_lived_target` and is refreshed by every `publish_trace`.
-const TRACE_TARGET: u32 = 60 * ttl::DAY_IN_LEDGERS;
+use peers::{CoreView, ResolutionRole, ResolverView};
 
+// Tests register a native market-core (and resolver) instead of the removed
+// vendored wasm (issue #322).
+#[cfg(test)]
 mod market_core {
-    #[allow(clippy::too_many_arguments)]
-    soroban_sdk::contractimport!(file = "market_core.wasm");
+    pub use market_core_native::{Category, MarketCore, MarketCoreClient as Client};
 }
 
 /// Domain tag for commit-reveal commitments (#51). Must match
@@ -73,9 +74,6 @@ pub struct TraceBatch {
 
 pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
-const BUMP_THRESHOLD: u32 = 30 * 17_280;
-const BUMP_TO: u32 = 60 * 17_280;
-
 /// Longest accepted `action` string, in bytes (#57). Bounding every trace's
 /// variable-length fields is what makes the paginated batch reads below
 /// provably safe: see [`MAX_PAGE_SIZE`].
@@ -111,6 +109,26 @@ pub enum TraceAction {
 
 pub const NO_MARKET: u64 = u64::MAX;
 
+/// Default post-close grace for Buy/Sell traces (issue #322): the agents
+/// runtime publishes a trace on a later tick than the trade it describes.
+pub const DEFAULT_ACTION_GRACE_SECS: u64 = 3_600;
+/// Largest grace window the admin may set (one day).
+pub const MAX_ACTION_GRACE_SECS: u64 = 86_400;
+/// Most `Other(Symbol)` actions the allow-list may hold.
+pub const MAX_OTHER_ACTIONS: u32 = 32;
+
+/// Market rule of an allow-listed `TraceAction::Other(Symbol)` (issue #322).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtherRule {
+    /// Must use `NO_MARKET`.
+    NoMarketOnly,
+    /// Must reference an existing market.
+    MarketOnly,
+    /// Either.
+    Any,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentStatus {
@@ -144,6 +162,10 @@ pub enum TraceVerdict {
     /// #299: The signing key was retroactively revoked; traces signed at or
     /// after `compromised_since` are tainted.
     KeyCompromised(u64),
+    /// #322: a Buy/Sell trace published after the market's `close_time`,
+    /// inside the grace window. Only reported when the hash matches and no
+    /// flag, revocation or key compromise applies.
+    Late,
 }
 
 /// #299: Verdict for a trace's signature alone (independent of hash/flag/agent).
@@ -341,6 +363,30 @@ pub enum DataKey {
     AgentCommitAt(Address, u64),
     /// Number of traces an agent missed the reveal deadline for.
     AgentMissedRevealCount(Address),
+    /// #329: cached market `close_time`, written on the market's first trace
+    /// so later publishes size audit TTLs without a market-core call.
+    MarketClose(u64),
+    /// #322: instance, admin-set post-close grace for Buy/Sell traces (secs).
+    ActionGrace,
+    /// #322: side flag for a Buy/Sell trace published after close, so the
+    /// `Trace` XDR is unchanged.
+    TraceLate(u64),
+    /// #322: allow-listed `Other(Symbol)` action and its market rule.
+    AllowedOther(Symbol),
+    /// #322: instance list of allow-listed `Other` symbols (≤ 32).
+    OtherActions,
+}
+
+/// Which secondary index `extend_index` walks (#329).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexKey {
+    /// `MarketTrace(market_id, i)` / `MarketTraceCount(market_id)`.
+    Market(u64),
+    /// `AgentTraceAt(agent, i)` / `AgentTraceCount(agent)`.
+    Agent(Address),
+    /// `MarketActionTraceAt(market_id, action, i)` / its count.
+    MarketAction(u64, TraceAction),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -485,6 +531,24 @@ pub enum Error {
     ScopingAlreadyEnabled = 3047,
     /// #299: Key already revoked and `compromised_since` cannot move later.
     AlreadyRevoked = 3048,
+    /// #329: an archivist call asked to extend more entries than one call allows.
+    TooManyEntries = 3049,
+    // ── #322 action/state validation ─────────────────────────────────────
+    /// Buy/Sell on a market that is not open, or past `close_time + grace`.
+    MarketClosed = 3050,
+    /// Redeem/ClaimRemainder on a market that is still open.
+    MarketNotFinal = 3051,
+    /// CreateMarket by an agent that neither created the market nor acts
+    /// through a registered consumer that did.
+    NotMarketCreator = 3052,
+    /// Resolve by an agent with no role in the market's resolution.
+    NotResolutionSigner = 3053,
+    /// Resolve (or CreateMarket after close) at the wrong time.
+    MarketNotClosed = 3054,
+    /// `Other(Symbol)` that is not on the admin allow-list.
+    UnknownOtherAction = 3055,
+    /// The `Other` allow-list is full, or a grace above the maximum.
+    LimitExceeded = 3056,
 }
 
 #[contractevent]
@@ -591,6 +655,7 @@ impl ReasoningRegistry {
     /// `accept_admin` itself, so a typo cannot hand control to an address
     /// nobody holds.
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         env.storage().instance().set(
             &DataKey::PendingAdmin,
@@ -604,6 +669,7 @@ impl ReasoningRegistry {
     }
 
     pub fn accept_admin(env: Env) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
         if env.ledger().timestamp() > pending.expires_at {
             return Err(Error::PendingAdminExpired);
@@ -626,6 +692,7 @@ impl ReasoningRegistry {
     }
 
     pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         if Self::load_pending(&env).is_none() {
             return Err(Error::NoPendingAdmin);
@@ -648,6 +715,7 @@ impl ReasoningRegistry {
     }
 
     pub fn register_agent(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         if Self::load_agent(&env, &agent).is_some() {
             return Err(Error::AgentAlreadyRegistered);
@@ -667,16 +735,19 @@ impl ReasoningRegistry {
     }
 
     pub fn retire_agent(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         Self::retire_agent_internal(&env, agent)
     }
 
     pub fn retire_self(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         Self::retire_agent_internal(&env, agent)
     }
 
     pub fn reactivate_agent(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         let mut record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
         match record.status {
@@ -697,6 +768,7 @@ impl ReasoningRegistry {
         effective_from: u64,
         reason: Symbol,
     ) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         let mut record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
         let now = env.ledger().timestamp();
@@ -715,6 +787,7 @@ impl ReasoningRegistry {
     }
 
     pub fn unregister_agent(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::retire_agent(env, agent)
     }
 
@@ -747,10 +820,12 @@ impl ReasoningRegistry {
         );
         // Once an agent keeps a chained log, unchained traces would sit outside
         // it unseen, so they're refused (#52).
-        if Self::load_head(&env, &agent).seq > 0 {
+        if Self::read_head(&env, &agent).seq > 0 {
             return Err(Error::ChainedAgentMustChain);
         }
-        Self::write_trace(&env, agent, market_id, action, trace_hash, ipfs_cid)
+        let (id, _) = Self::write_trace(&env, agent.clone(), market_id, action, trace_hash, ipfs_cid)?;
+        Self::touch_head(&env, &agent);
+        Ok(id)
     }
 
     /// Publishes a trace that extends `agent`'s hash chain (#52). Fails with
@@ -775,12 +850,12 @@ impl ReasoningRegistry {
             &DataKey::Agent(agent.clone()),
             ttl::long_lived_target(&env),
         );
-        let head = Self::load_head(&env, &agent);
+        let head = Self::read_head(&env, &agent);
         if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
             return Err(Error::ChainHeadMismatch);
         }
 
-        let id = Self::write_trace(
+        let (id, target) = Self::write_trace(
             &env,
             agent.clone(),
             market_id,
@@ -790,15 +865,21 @@ impl ReasoningRegistry {
         )?;
 
         let link_key = DataKey::TraceLink(id);
-        Self::put(
+        Self::put_class(
             &env,
             &link_key,
             &ChainLink {
                 seq: expected_seq,
                 prev_trace_hash: prev_trace_hash.clone(),
             },
+            target,
         );
-        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &id);
+        Self::put_class(
+            &env,
+            &DataKey::AgentTrace(agent.clone(), expected_seq),
+            &id,
+            target,
+        );
         Self::put(
             &env,
             &DataKey::AgentHead(agent.clone()),
@@ -822,7 +903,7 @@ impl ReasoningRegistry {
 
     /// Current chain head for `agent` (genesis if it has never chained).
     pub fn agent_chain_head(env: Env, agent: Address) -> ChainHead {
-        Self::load_head(&env, &agent)
+        Self::read_head(&env, &agent)
     }
 
     /// Trace id at position `seq` (1-based) of `agent`'s chain.
@@ -850,6 +931,7 @@ impl ReasoningRegistry {
 
     /// Allow-lists a contract (e.g. the treasury) to call `consume_trace` (#50).
     pub fn register_consumer(env: Env, consumer: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         Self::put(&env, &DataKey::Consumer(consumer.clone()), &true);
         ConsumerRegistered { consumer }.publish(&env);
@@ -857,6 +939,7 @@ impl ReasoningRegistry {
     }
 
     pub fn unregister_consumer(env: Env, consumer: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         Self::require_admin(&env)?;
         env.storage()
             .persistent()
@@ -867,6 +950,75 @@ impl ReasoningRegistry {
 
     pub fn is_consumer(env: Env, consumer: Address) -> bool {
         env.storage().persistent().has(&DataKey::Consumer(consumer))
+    }
+
+    /// Sets the post-close grace window for Buy/Sell traces (issue #322),
+    /// at most [`MAX_ACTION_GRACE_SECS`]. Admin only.
+    pub fn set_action_grace(env: Env, secs: u64) -> Result<(), Error> {
+        ttl::bump_instance(&env);
+        Self::require_admin(&env)?;
+        if secs > MAX_ACTION_GRACE_SECS {
+            return Err(Error::LimitExceeded);
+        }
+        env.storage().instance().set(&DataKey::ActionGrace, &secs);
+        Ok(())
+    }
+
+    /// Current post-close grace window for Buy/Sell traces, in seconds.
+    pub fn action_grace(env: Env) -> u64 {
+        Self::grace(&env)
+    }
+
+    /// Whether a Buy/Sell trace was published after its market's close.
+    pub fn is_trace_late(env: Env, trace_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::TraceLate(trace_id))
+    }
+
+    /// Adds, changes (`Some`) or removes (`None`) an allow-listed
+    /// `Other(sym)` action (issue #322). At most [`MAX_OTHER_ACTIONS`]
+    /// symbols; canonical action names are refused. Admin only. Applies at
+    /// publish time only, so existing traces are untouched.
+    pub fn set_other_action(env: Env, sym: Symbol, rule: Option<OtherRule>) -> Result<(), Error> {
+        ttl::bump_instance(&env);
+        Self::require_admin(&env)?;
+        Self::validate_action(&env, &TraceAction::Other(sym.clone()))?;
+        let key = DataKey::AllowedOther(sym.clone());
+        let mut list = Self::other_actions(env.clone());
+        let pos = list.iter().position(|s| s == sym);
+        match rule {
+            Some(rule) => {
+                if pos.is_none() {
+                    if list.len() >= MAX_OTHER_ACTIONS {
+                        return Err(Error::LimitExceeded);
+                    }
+                    list.push_back(sym);
+                }
+                Self::put(&env, &key, &rule);
+            }
+            None => {
+                if let Some(i) = pos {
+                    list.remove(i as u32);
+                }
+                env.storage().persistent().remove(&key);
+            }
+        }
+        env.storage().instance().set(&DataKey::OtherActions, &list);
+        Ok(())
+    }
+
+    /// The market rule of an allow-listed `Other(sym)` action.
+    pub fn other_action_rule(env: Env, sym: Symbol) -> Option<OtherRule> {
+        env.storage().persistent().get(&DataKey::AllowedOther(sym))
+    }
+
+    /// Every allow-listed `Other` symbol.
+    pub fn other_actions(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OtherActions)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Marks a trace as having backed an action, exactly once (#50). Only an
@@ -886,7 +1038,9 @@ impl ReasoningRegistry {
         if env.storage().persistent().has(&key) {
             return Err(Error::TraceAlreadyConsumed);
         }
-        Self::put(&env, &key, &true);
+        ttl::bump_instance(&env);
+        let target = Self::market_target(&env, trace.market_id);
+        Self::put_class(&env, &key, &true, target);
         TraceConsumed { trace_id, consumer }.publish(&env);
         Ok(trace)
     }
@@ -906,23 +1060,21 @@ impl ReasoningRegistry {
         Self::commitment_for(&env, &trace_hash, &salt) == commitment
     }
 
-    /// Extends `Trace` on read, as before (a write in a view: simulation
-    /// footprints are read-write, kept for compatibility and noted in
-    /// `docs/architecture.md`).
+    /// Pure read (#329): views never extend TTL, so simulations have a
+    /// read-only footprint. Retention comes from write-time targets and the
+    /// archivist entrypoints (`extend_traces`).
     pub fn get_trace(env: Env, trace_id: u64) -> Result<Trace, Error> {
-        let key = DataKey::Trace(trace_id);
-        let trace: Trace = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&key)
-            .ok_or(Error::TraceNotFound)?;
-        ttl::bump_persistent(&env, &key, TRACE_TARGET);
-        Ok(trace)
+            .get(&DataKey::Trace(trace_id))
+            .ok_or(Error::TraceNotFound)
     }
 
     pub fn flag_trace(env: Env, trace_id: u64, reason: Symbol) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        Self::get_trace(env.clone(), trace_id)?;
+        ttl::bump_instance(&env);
+        let trace = Self::get_trace(env.clone(), trace_id)?;
+        let target = Self::market_target(&env, trace.market_id);
         let count_key = DataKey::FlagHistoryCount(trace_id);
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if count >= 16 {
@@ -934,16 +1086,18 @@ impl ReasoningRegistry {
             flagged_at: now,
             active: true,
         };
-        Self::put(&env, &DataKey::Flag(trace_id), &flag);
-        Self::put(&env, &DataKey::FlagHistory(trace_id, count), &flag);
-        Self::put(&env, &count_key, &(count + 1));
+        Self::put_class(&env, &DataKey::Flag(trace_id), &flag, target);
+        Self::put_class(&env, &DataKey::FlagHistory(trace_id, count), &flag, target);
+        Self::put_class(&env, &count_key, &(count + 1), target);
         TraceFlagged { trace_id, reason }.publish(&env);
         Ok(())
     }
 
     pub fn unflag_trace(env: Env, trace_id: u64, reason: Symbol) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        Self::get_trace(env.clone(), trace_id)?;
+        ttl::bump_instance(&env);
+        let trace = Self::get_trace(env.clone(), trace_id)?;
+        let target = Self::market_target(&env, trace.market_id);
         let count_key = DataKey::FlagHistoryCount(trace_id);
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if count >= 16 {
@@ -955,9 +1109,9 @@ impl ReasoningRegistry {
             flagged_at: now,
             active: false,
         };
-        Self::put(&env, &DataKey::Flag(trace_id), &flag);
-        Self::put(&env, &DataKey::FlagHistory(trace_id, count), &flag);
-        Self::put(&env, &count_key, &(count + 1));
+        Self::put_class(&env, &DataKey::Flag(trace_id), &flag, target);
+        Self::put_class(&env, &DataKey::FlagHistory(trace_id, count), &flag, target);
+        Self::put_class(&env, &count_key, &(count + 1), target);
         TraceUnflagged { trace_id, reason }.publish(&env);
         Ok(())
     }
@@ -1034,6 +1188,13 @@ impl ReasoningRegistry {
                 }
             }
         }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TraceLate(trace_id))
+        {
+            return Ok(TraceVerdict::Late);
+        }
         Ok(TraceVerdict::Valid)
     }
 
@@ -1041,10 +1202,9 @@ impl ReasoningRegistry {
         Ok(Self::trace_verdict(env, trace_id, received_hash)? == TraceVerdict::Valid)
     }
 
-    /// Reads the instance's `NextId`; the bump keeps the instance (and with
-    /// it the whole contract) alive under view-only traffic.
+    /// Reads the instance's `NextId`. Pure read (#329): the instance is kept
+    /// alive by mutating entrypoints (and `extend_traces`), not by views.
     pub fn trace_count(env: Env) -> u64 {
-        ttl::bump_instance(&env);
         env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
 
@@ -1166,6 +1326,7 @@ impl ReasoningRegistry {
         leaf_count: u32,
         manifest_cid: String,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
         if !matches!(record.status, AgentStatus::Active) {
@@ -1210,16 +1371,10 @@ impl ReasoningRegistry {
     }
 
     pub fn get_batch(env: Env, batch_id: u64) -> Result<TraceBatch, Error> {
-        let key = DataKey::Batch(batch_id);
-        let batch: TraceBatch = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::BatchNotFound)?;
         env.storage()
             .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-        Ok(batch)
+            .get(&DataKey::Batch(batch_id))
+            .ok_or(Error::BatchNotFound)
     }
 
     pub fn batch_count(env: Env) -> u64 {
@@ -1278,16 +1433,10 @@ impl ReasoningRegistry {
     }
 
     pub fn agent_batch_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
-        let key = DataKey::AgentBatch(agent, index);
-        let id: u64 = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::BatchNotFound)?;
         env.storage()
             .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-        Ok(id)
+            .get(&DataKey::AgentBatch(agent, index))
+            .ok_or(Error::BatchNotFound)
     }
 
     pub fn verify_trace_inclusion(
@@ -1365,6 +1514,7 @@ impl ReasoningRegistry {
         public_key: BytesN<32>,
         proof_sig: BytesN<64>,
     ) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         Self::require_active_agent(&env, &agent)?;
 
@@ -1422,6 +1572,7 @@ impl ReasoningRegistry {
         agent: Address,
         public_key: BytesN<32>,
     ) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         Self::require_active_agent(&env, &agent)?;
 
@@ -1473,37 +1624,25 @@ impl ReasoningRegistry {
         Ok(())
     }
 
+    /// Pure read (#329): views never extend TTL.
     pub fn get_signing_keys(env: Env, agent: Address) -> Vec<BytesN<32>> {
-        let key = DataKey::AgentSigningKeys(agent);
-        match env.storage().persistent().get::<_, Vec<BytesN<32>>>(&key) {
-            Some(keys) => {
-                Self::bump_persistent(&env, &key);
-                keys
-            }
-            None => Vec::new(&env),
-        }
+        env.storage()
+            .persistent()
+            .get::<_, Vec<BytesN<32>>>(&DataKey::AgentSigningKeys(agent))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_key_agent(env: Env, public_key: BytesN<32>) -> Option<Address> {
-        let key = DataKey::KeyToAgent(public_key);
-        match env.storage().persistent().get::<_, Address>(&key) {
-            Some(agent) => {
-                Self::bump_persistent(&env, &key);
-                Some(agent)
-            }
-            None => None,
-        }
+        env.storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::KeyToAgent(public_key))
     }
 
     pub fn signing_key_history_count(env: Env, agent: Address) -> u32 {
-        let key = DataKey::SigningKeyHistoryCount(agent);
-        match env.storage().persistent().get::<_, u32>(&key) {
-            Some(count) => {
-                Self::bump_persistent(&env, &key);
-                count
-            }
-            None => 0,
-        }
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SigningKeyHistoryCount(agent))
+            .unwrap_or(0)
     }
 
     pub fn signing_key_history(
@@ -1521,7 +1660,6 @@ impl ReasoningRegistry {
         for i in start..end {
             let key = DataKey::SigningKeyHistory(agent.clone(), i);
             if let Some(record) = env.storage().persistent().get::<_, SigningKeyRecord>(&key) {
-                Self::bump_persistent(&env, &key);
                 out.push_back(record);
             }
         }
@@ -1538,9 +1676,10 @@ impl ReasoningRegistry {
         signing_key: BytesN<32>,
         signature: BytesN<64>,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        if Self::load_head(&env, &agent).seq > 0 {
+        if Self::read_head(&env, &agent).seq > 0 {
             return Err(Error::ChainedAgentMustChain);
         }
 
@@ -1569,7 +1708,7 @@ impl ReasoningRegistry {
         );
         env.crypto().ed25519_verify(&signing_key, &msg, &signature);
 
-        let id = Self::write_trace(
+        let (id, target) = Self::write_trace(
             &env,
             agent.clone(),
             market_id,
@@ -1579,13 +1718,18 @@ impl ReasoningRegistry {
         )?;
 
         let sig_key = DataKey::TraceSignature(id);
-        Self::put(&env, &sig_key, &(signing_key.clone(), signature));
+        Self::put_class(&env, &sig_key, &(signing_key.clone(), signature), target);
 
         // #299: index this trace under the signing key for paged revocation views.
         let count_key = DataKey::KeyTraceCount(signing_key.clone());
         let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        Self::put(&env, &DataKey::KeyTraceAt(signing_key.clone(), count), &id);
-        Self::put(&env, &count_key, &(count + 1));
+        Self::put_class(
+            &env,
+            &DataKey::KeyTraceAt(signing_key.clone(), count),
+            &id,
+            target,
+        );
+        Self::put_class(&env, &count_key, &(count + 1), target);
 
         TraceSigned {
             trace_id: id,
@@ -1610,9 +1754,10 @@ impl ReasoningRegistry {
         signing_key: BytesN<32>,
         signature: BytesN<64>,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        let head = Self::load_head(&env, &agent);
+        let head = Self::read_head(&env, &agent);
         if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
             return Err(Error::ChainHeadMismatch);
         }
@@ -1642,7 +1787,7 @@ impl ReasoningRegistry {
         );
         env.crypto().ed25519_verify(&signing_key, &msg, &signature);
 
-        let id = Self::write_trace(
+        let (id, target) = Self::write_trace(
             &env,
             agent.clone(),
             market_id,
@@ -1652,15 +1797,21 @@ impl ReasoningRegistry {
         )?;
 
         let link_key = DataKey::TraceLink(id);
-        Self::put(
+        Self::put_class(
             &env,
             &link_key,
             &ChainLink {
                 seq: expected_seq,
                 prev_trace_hash: prev_trace_hash.clone(),
             },
+            target,
         );
-        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &id);
+        Self::put_class(
+            &env,
+            &DataKey::AgentTrace(agent.clone(), expected_seq),
+            &id,
+            target,
+        );
         Self::put(
             &env,
             &DataKey::AgentHead(agent.clone()),
@@ -1672,13 +1823,18 @@ impl ReasoningRegistry {
         );
 
         let sig_key = DataKey::TraceSignature(id);
-        Self::put(&env, &sig_key, &(signing_key.clone(), signature));
+        Self::put_class(&env, &sig_key, &(signing_key.clone(), signature), target);
 
         // #299: index this trace under the signing key for paged revocation views.
         let count_key = DataKey::KeyTraceCount(signing_key.clone());
         let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        Self::put(&env, &DataKey::KeyTraceAt(signing_key.clone(), count), &id);
-        Self::put(&env, &count_key, &(count + 1));
+        Self::put_class(
+            &env,
+            &DataKey::KeyTraceAt(signing_key.clone(), count),
+            &id,
+            target,
+        );
+        Self::put_class(&env, &count_key, &(count + 1), target);
 
         TraceChained {
             agent: agent.clone(),
@@ -1700,18 +1856,9 @@ impl ReasoningRegistry {
     }
 
     pub fn get_trace_signature(env: Env, trace_id: u64) -> Option<(BytesN<32>, BytesN<64>)> {
-        let key = DataKey::TraceSignature(trace_id);
-        match env
-            .storage()
+        env.storage()
             .persistent()
-            .get::<_, (BytesN<32>, BytesN<64>)>(&key)
-        {
-            Some(sig) => {
-                Self::bump_persistent(&env, &key);
-                Some(sig)
-            }
-            None => None,
-        }
+            .get::<_, (BytesN<32>, BytesN<64>)>(&DataKey::TraceSignature(trace_id))
     }
 
     pub fn verify_trace_signature(env: Env, trace_id: u64) -> Result<bool, Error> {
@@ -1724,7 +1871,6 @@ impl ReasoningRegistry {
         else {
             return Err(Error::TraceNotSigned);
         };
-        Self::bump_persistent(&env, &key);
 
         let bound_agent = Self::get_key_agent(env.clone(), signing_key.clone());
         if bound_agent.as_ref() != Some(&trace.agent) {
@@ -1770,6 +1916,7 @@ impl ReasoningRegistry {
         compromised_since: u64,
         reason: Symbol,
     ) -> Result<(), Error> {
+        ttl::bump_instance(&env);
         caller.require_auth();
 
         // Caller must be the agent or the admin.
@@ -1891,7 +2038,6 @@ impl ReasoningRegistry {
         else {
             return Ok(SignatureVerdict::NotSigned);
         };
-        Self::bump_persistent(&env, &key);
 
         let bound_agent = Self::get_key_agent(env.clone(), signing_key.clone());
         if bound_agent.as_ref() != Some(&trace.agent) {
@@ -1946,7 +2092,6 @@ impl ReasoningRegistry {
         for i in start..end {
             let key = DataKey::KeyTraceAt(public_key.clone(), i);
             if let Some(trace_id) = env.storage().persistent().get::<_, u64>(&key) {
-                Self::bump_persistent(&env, &key);
                 out.push_back(trace_id);
             }
         }
@@ -1975,7 +2120,6 @@ impl ReasoningRegistry {
                 .persistent()
                 .get(&key)
                 .ok_or(Error::TraceNotFound)?;
-            Self::bump_persistent(&env, &key);
             let trace = Self::get_trace(env.clone(), trace_id)?;
             if trace.published_at < compromised_since {
                 lo = mid + 1;
@@ -2001,6 +2145,107 @@ impl ReasoningRegistry {
         let affected_from = Self::key_affected_from(env.clone(), public_key.clone(), compromised_since)?;
         let actual_start = affected_from + page_start;
         Self::key_traces(env, public_key, actual_start, limit)
+    }
+
+    // ── #329 Archivist entrypoints ───────────────────────────────────────────
+    //
+    // Permissionless: anyone may pay rent to keep audit data alive. Each is
+    // bounded per call and skips missing keys (`extend_ttl` on a missing key
+    // panics). They extend only, never shorten, and write no values.
+
+    /// Extends every key of each trace (the trace plus its side keys) to its
+    /// retention target. At most `retention::MAX_EXTEND_TRACES` ids; unknown
+    /// ids are skipped. Returns the number of entries extended. Also bumps
+    /// the instance, so archivist traffic alone keeps the contract live.
+    pub fn extend_traces(env: Env, ids: Vec<u64>) -> Result<u32, Error> {
+        if ids.len() > retention::MAX_EXTEND_TRACES {
+            return Err(Error::TooManyEntries);
+        }
+        ttl::bump_instance(&env);
+        let mut n = 0u32;
+        for id in ids.iter() {
+            n += Self::extend_trace_keys(&env, id);
+        }
+        Ok(n)
+    }
+
+    /// Extends index entries `[from, to)` (clamped to the index length) and
+    /// the index's count to at least the target of each referenced trace.
+    /// At most `retention::MAX_EXTEND_INDEX` entries per call.
+    pub fn extend_index(env: Env, key: IndexKey, from: u64, to: u64) -> Result<u32, Error> {
+        if to < from || to - from > retention::MAX_EXTEND_INDEX {
+            return Err(Error::TooManyEntries);
+        }
+        ttl::bump_instance(&env);
+        let count_key = match &key {
+            IndexKey::Market(m) => DataKey::MarketTraceCount(*m),
+            IndexKey::Agent(a) => DataKey::AgentTraceCount(a.clone()),
+            IndexKey::MarketAction(m, a) => DataKey::MarketActionTraceCount(*m, a.clone()),
+        };
+        let total: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let end = core::cmp::min(to, total);
+        let mut n = 0u32;
+        let mut max_target = 0u32;
+        let mut i = from;
+        while i < end {
+            let entry = match &key {
+                IndexKey::Market(m) => DataKey::MarketTrace(*m, i),
+                IndexKey::Agent(a) => DataKey::AgentTraceAt(a.clone(), i),
+                IndexKey::MarketAction(m, a) => DataKey::MarketActionTraceAt(*m, a.clone(), i),
+            };
+            if let Some(trace_id) = env.storage().persistent().get::<_, u64>(&entry) {
+                let target = match env
+                    .storage()
+                    .persistent()
+                    .get::<_, Trace>(&DataKey::Trace(trace_id))
+                {
+                    Some(t) => Self::market_target(&env, t.market_id),
+                    // The trace itself archived or never existed: keep the
+                    // index entry for the long-lived horizon so the gap stays
+                    // visible to readers.
+                    None => retention::long_lived_target(&env),
+                };
+                max_target = core::cmp::max(max_target, target);
+                if retention::extend_if_present(&env, &entry, target) {
+                    n += 1;
+                }
+            }
+            i += 1;
+        }
+        if max_target > 0 && retention::extend_if_present(&env, &count_key, max_target) {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Extends an agent's `Identity` entries (registration, chain head,
+    /// signing keys and up to `retention::MAX_EXTEND_KEY_HISTORY` history
+    /// records) to the long-lived target. A no-op for unknown agents.
+    pub fn extend_agent(env: Env, agent: Address) -> Result<(), Error> {
+        ttl::bump_instance(&env);
+        let target = retention::long_lived_target(&env);
+        retention::extend_if_present(&env, &DataKey::Agent(agent.clone()), target);
+        retention::extend_if_present(&env, &DataKey::AgentHead(agent.clone()), target);
+        let keys_key = DataKey::AgentSigningKeys(agent.clone());
+        if let Some(keys) = env.storage().persistent().get::<_, Vec<BytesN<32>>>(&keys_key) {
+            retention::extend_if_present(&env, &keys_key, target);
+            for k in keys.iter() {
+                retention::extend_if_present(&env, &DataKey::KeyToAgent(k), target);
+            }
+        }
+        let hist_key = DataKey::SigningKeyHistoryCount(agent.clone());
+        let hist: u32 = env.storage().persistent().get(&hist_key).unwrap_or(0);
+        if hist > 0 {
+            retention::extend_if_present(&env, &hist_key, target);
+            for i in 0..core::cmp::min(hist, retention::MAX_EXTEND_KEY_HISTORY) {
+                retention::extend_if_present(
+                    &env,
+                    &DataKey::SigningKeyHistory(agent.clone(), i),
+                    target,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2060,18 +2305,14 @@ impl ReasoningRegistry {
         Ok(())
     }
 
+    /// Pure read (#329), including the legacy `bool` registration fallback.
+    /// Write paths refresh the entry with `retention::touch_identity`.
     fn load_agent(env: &Env, addr: &Address) -> Option<AgentRecord> {
         let key = DataKey::Agent(addr.clone());
         if let Some(record) = env.storage().persistent().get::<_, AgentRecord>(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
             Some(record)
         } else if let Some(is_reg) = env.storage().persistent().get::<_, bool>(&key) {
             if is_reg {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
                 Some(AgentRecord {
                     status: AgentStatus::Active,
                     registered_at: 0,
@@ -2102,28 +2343,122 @@ impl ReasoningRegistry {
         Ok(())
     }
 
-    fn validate_reference(env: &Env, market_id: u64, action: &TraceAction) -> Result<(), Error> {
+    /// Checks `action` against the live state of the referenced market
+    /// (issue #322). `now` is the ledger time and `G` the grace window:
+    ///
+    /// | Action | Requirement |
+    /// | --- | --- |
+    /// | `ProposeMarket` | `NO_MARKET` |
+    /// | `CreateMarket` | creator is the agent or a registered consumer, `now <= close_time` |
+    /// | `Buy`/`Sell` | `status == Open` and `now < close_time + G` |
+    /// | `Skip` | market exists |
+    /// | `Redeem`/`ClaimRemainder` | `status != Open` |
+    /// | `Resolve` | `now >= close_time` and a resolution role for the agent or one of its keys |
+    /// | `Other(sym)` | allow-listed; its `OtherRule` decides `NO_MARKET` |
+    fn validate_action_state(
+        env: &Env,
+        agent: &Address,
+        market_id: u64,
+        action: &TraceAction,
+    ) -> Result<(), Error> {
+        let other_rule = match action {
+            TraceAction::Other(sym) => Some(
+                env.storage()
+                    .persistent()
+                    .get::<_, OtherRule>(&DataKey::AllowedOther(sym.clone()))
+                    .ok_or(Error::UnknownOtherAction)?,
+            ),
+            _ => None,
+        };
         let pre_creation = matches!(action, TraceAction::ProposeMarket);
         if market_id == NO_MARKET {
-            return if pre_creation || matches!(action, TraceAction::Other(_)) {
-                Ok(())
-            } else {
-                Err(Error::MarketRequired)
+            return match other_rule {
+                Some(OtherRule::MarketOnly) => Err(Error::MarketRequired),
+                Some(_) => Ok(()),
+                None if pre_creation => Ok(()),
+                None => Err(Error::MarketRequired),
             };
         }
-        if pre_creation {
+        if pre_creation || other_rule == Some(OtherRule::NoMarketOnly) {
             return Err(Error::ProposalMustUseNoMarket);
         }
-        let mc: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketCore)
-            .ok_or(Error::NotInitialized)?;
-        let count = market_core::Client::new(env, &mc).market_count();
-        if market_id >= count {
+        let core = CoreView::new(env, &Self::market_core_address(env)?);
+        if market_id >= core.market_count() {
             return Err(Error::UnknownMarket);
         }
+        let market = match core.try_get_market(&market_id) {
+            Ok(Ok(m)) => m,
+            _ => return Err(Error::UnknownMarket),
+        };
+        let now = env.ledger().timestamp();
+        let open = market.status == oracledesk_types::MarketStatus::Open;
+        match action {
+            TraceAction::CreateMarket => {
+                if market.creator != *agent && !Self::is_consumer(env.clone(), market.creator) {
+                    return Err(Error::NotMarketCreator);
+                }
+                if now > market.close_time {
+                    return Err(Error::MarketClosed);
+                }
+            }
+            TraceAction::Buy | TraceAction::Sell => {
+                // Status first: an early `void_market` has no close-time guard.
+                let deadline = market.close_time.saturating_add(Self::grace(env));
+                if !open || now >= deadline {
+                    return Err(Error::MarketClosed);
+                }
+            }
+            TraceAction::Redeem | TraceAction::ClaimRemainder => {
+                if open {
+                    return Err(Error::MarketNotFinal);
+                }
+            }
+            TraceAction::Resolve => {
+                if now < market.close_time {
+                    return Err(Error::MarketNotClosed);
+                }
+                let keys = Self::get_signing_keys(env.clone(), agent.clone());
+                let resolver = ResolverView::new(env, &Self::resolver_for(env, &core));
+                match resolver.try_resolution_role(&market_id, agent, &keys) {
+                    Ok(Ok(role)) if role != ResolutionRole::None => {}
+                    _ => return Err(Error::NotResolutionSigner),
+                }
+            }
+            TraceAction::Skip | TraceAction::ProposeMarket | TraceAction::Other(_) => {}
+        }
         Ok(())
+    }
+
+    fn market_core_address(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// The resolver whose signer sets decide `Resolve` traces: market-core's
+    /// currently wired resolver, so a resolver rotation needs no registry
+    /// wiring. The single place to switch to a per-market resolver snapshot
+    /// once market-core records one.
+    fn resolver_for(_env: &Env, core: &CoreView) -> Address {
+        core.get_config().resolver
+    }
+
+    fn grace(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActionGrace)
+            .unwrap_or(DEFAULT_ACTION_GRACE_SECS)
+    }
+
+    /// Records `TraceLate` for a Buy/Sell trace published after close.
+    fn mark_late(env: &Env, id: u64, market_id: u64, action: &TraceAction, target: u32) {
+        if market_id == NO_MARKET || !matches!(action, TraceAction::Buy | TraceAction::Sell) {
+            return;
+        }
+        if env.ledger().timestamp() >= Self::market_close(env, market_id) {
+            Self::put_class(env, &DataKey::TraceLate(id), &true, target);
+        }
     }
 
     fn check_publish(
@@ -2139,7 +2474,7 @@ impl ReasoningRegistry {
             return Err(Error::AgentNotActive);
         }
         Self::validate_action(env, action)?;
-        Self::validate_reference(env, market_id, action)?;
+        Self::validate_action_state(env, agent, market_id, action)?;
         if ipfs_cid.is_empty() {
             return Err(Error::EmptyCid);
         }
@@ -2155,13 +2490,17 @@ impl ReasoningRegistry {
         action: TraceAction,
         trace_hash: BytesN<32>,
         ipfs_cid: String,
-    ) -> Result<u64, Error> {
+    ) -> Result<(u64, u32), Error> {
         let id: u64 = env
             .storage()
             .instance()
             .get(&DataKey::NextId)
             .ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        // #329: every key written here takes the trace's audit target; the
+        // three indexes (and their counts) are extended to at least that
+        // target, so an index never archives before its newest trace.
+        let target = Self::market_target(env, market_id);
 
         let trace = Trace {
             market_id,
@@ -2171,18 +2510,18 @@ impl ReasoningRegistry {
             ipfs_cid: ipfs_cid.clone(),
             published_at: env.ledger().timestamp(),
         };
-        Self::put(env, &DataKey::Trace(id), &trace);
-        Self::put(env, &DataKey::TraceLedger(id), &env.ledger().sequence());
+        Self::put_class(env, &DataKey::Trace(id), &trace, target);
+        Self::put_class(env, &DataKey::TraceLedger(id), &env.ledger().sequence(), target);
 
         let count_key = DataKey::MarketTraceCount(market_id);
         let index: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        Self::put(env, &DataKey::MarketTrace(market_id, index), &id);
-        Self::put(env, &count_key, &(index + 1));
+        Self::put_class(env, &DataKey::MarketTrace(market_id, index), &id, target);
+        Self::put_class(env, &count_key, &(index + 1), target);
 
         let agent_count_key = DataKey::AgentTraceCount(agent.clone());
         let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
-        Self::put(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id);
-        Self::put(env, &agent_count_key, &(agent_index + 1));
+        Self::put_class(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id, target);
+        Self::put_class(env, &agent_count_key, &(agent_index + 1), target);
 
         let action_count_key =
             DataKey::MarketActionTraceCount(market_id, action.clone());
@@ -2191,12 +2530,14 @@ impl ReasoningRegistry {
             .persistent()
             .get(&action_count_key)
             .unwrap_or(0);
-        Self::put(
+        Self::put_class(
             env,
             &DataKey::MarketActionTraceAt(market_id, action.clone(), action_index),
             &id,
+            target,
         );
-        Self::put(env, &action_count_key, &(action_index + 1));
+        Self::put_class(env, &action_count_key, &(action_index + 1), target);
+        Self::mark_late(env, id, market_id, &action, target);
 
         TracePublished {
             trace_id: id,
@@ -2208,20 +2549,18 @@ impl ReasoningRegistry {
             published_at: trace.published_at,
         }
         .publish(env);
-        Ok(id)
+        Ok((id, target))
     }
 
-    /// Loads (and keeps alive) an agent's chain head. Never reset by
-    /// unregister/re-register, so history can't be rewritten (#52).
-    fn load_head(env: &Env, agent: &Address) -> ChainHead {
-        let key = DataKey::AgentHead(agent.clone());
-        match env.storage().persistent().get::<_, ChainHead>(&key) {
-            Some(head) => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
-                head
-            }
+    /// Reads an agent's chain head without touching TTL (#329). Never reset
+    /// by unregister/re-register, so history can't be rewritten (#52).
+    fn read_head(env: &Env, agent: &Address) -> ChainHead {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, ChainHead>(&DataKey::AgentHead(agent.clone()))
+        {
+            Some(head) => head,
             None => ChainHead {
                 seq: 0,
                 head_hash: BytesN::from_array(env, &[0u8; 32]),
@@ -2230,11 +2569,26 @@ impl ReasoningRegistry {
         }
     }
 
+    /// Keeps the agent's chain head alive; called only from publish paths.
+    fn touch_head(env: &Env, agent: &Address) {
+        retention::touch_identity(env, &DataKey::AgentHead(agent.clone()));
+    }
+
+    /// Writes a long-lived entry: `Identity`, `Batch`, and the batch/commit
+    /// indexes (whose referenced records are themselves long-lived).
     fn put<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
-        env.storage().persistent().set(key, value);
-        env.storage()
-            .persistent()
-            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+        retention::put(env, key, value, retention::long_lived_target(env));
+    }
+
+    /// Writes an entry with an explicit retention target (#329): `Audit`
+    /// and `Index` entries take the target of the trace they belong to.
+    fn put_class<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        key: &DataKey,
+        value: &V,
+        target: u32,
+    ) {
+        retention::put(env, key, value, target);
     }
 
     fn commitment_for(env: &Env, trace_hash: &BytesN<32>, salt: &BytesN<32>) -> BytesN<32> {
@@ -2257,13 +2611,14 @@ impl ReasoningRegistry {
         commitment: BytesN<32>,
         reveal_deadline_secs: u64,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
         if !matches!(record.status, AgentStatus::Active) {
             return Err(Error::AgentNotActive);
         }
         Self::validate_action(&env, &action)?;
-        Self::validate_reference(&env, market_id, &action)?;
+        Self::validate_action_state(&env, &agent, market_id, &action)?;
 
         let deadline_secs = if reveal_deadline_secs == 0 {
             DEFAULT_REVEAL_DEADLINE_SECS
@@ -2315,6 +2670,7 @@ impl ReasoningRegistry {
         commitment: BytesN<32>,
         reveal_deadline_secs: u64,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         // Validation identical to commit_trace; chaining is enforced at reveal.
         Self::commit_trace(env, agent, market_id, action, commitment, reveal_deadline_secs)
     }
@@ -2332,6 +2688,7 @@ impl ReasoningRegistry {
         salt: BytesN<32>,
         ipfs_cid: String,
     ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
         agent.require_auth();
         let commit_key = DataKey::TraceCommit(commit_id);
         let mut commit: TraceCommit = env
@@ -2377,7 +2734,7 @@ impl ReasoningRegistry {
             ttl::long_lived_target(&env),
         );
 
-        let trace_id = Self::write_trace(
+        let (trace_id, _) = Self::write_trace(
             &env,
             agent.clone(),
             commit.market_id,
@@ -2416,10 +2773,88 @@ impl ReasoningRegistry {
 }
 
 impl ReasoningRegistry {
-    fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
+    /// A market's `close_time`, cached in `DataKey::MarketClose` on the
+    /// market's first trace so later publishes skip the market-core call.
+    fn market_close(env: &Env, market_id: u64) -> u64 {
+        let key = DataKey::MarketClose(market_id);
+        if let Some(close) = env.storage().persistent().get::<_, u64>(&key) {
+            return close;
+        }
+        let mc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .expect("market core configured");
+        let close = CoreView::new(env, &mc).get_market(&market_id).close_time;
+        let target = retention::audit_target(env, close);
+        retention::put(env, &key, &close, target);
+        close
+    }
+
+    /// Retention target (#329) for the audit keys of a trace on `market_id`:
+    /// `audit_target(close_time)`, or long-lived for `NO_MARKET` traces.
+    fn market_target(env: &Env, market_id: u64) -> u32 {
+        if market_id == NO_MARKET {
+            retention::long_lived_target(env)
+        } else {
+            retention::audit_target(env, Self::market_close(env, market_id))
+        }
+    }
+
+    /// Extends every audit key of `trace_id` to its class target. Returns the
+    /// number of entries extended (0 for an unknown trace).
+    fn extend_trace_keys(env: &Env, trace_id: u64) -> u32 {
+        let Some(trace) = env
+            .storage()
             .persistent()
-            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+            .get::<_, Trace>(&DataKey::Trace(trace_id))
+        else {
+            return 0;
+        };
+        let target = Self::market_target(env, trace.market_id);
+        let mut n = 0u32;
+        let mut ext = |key: DataKey| {
+            if retention::extend_if_present(env, &key, target) {
+                n += 1;
+            }
+        };
+        ext(DataKey::Trace(trace_id));
+        ext(DataKey::TraceLedger(trace_id));
+        ext(DataKey::TraceDecision(trace_id));
+        ext(DataKey::TraceSignature(trace_id));
+        ext(DataKey::TraceConsumer(trace_id));
+        ext(DataKey::Consumed(trace_id));
+        ext(DataKey::TraceLate(trace_id));
+        ext(DataKey::Flag(trace_id));
+        if trace.market_id != NO_MARKET {
+            ext(DataKey::MarketClose(trace.market_id));
+        }
+        if let Some(link) = env
+            .storage()
+            .persistent()
+            .get::<_, ChainLink>(&DataKey::TraceLink(trace_id))
+        {
+            ext(DataKey::TraceLink(trace_id));
+            ext(DataKey::AgentTrace(trace.agent.clone(), link.seq));
+        }
+        let flags: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FlagHistoryCount(trace_id))
+            .unwrap_or(0);
+        if flags > 0 {
+            ext(DataKey::FlagHistoryCount(trace_id));
+            for i in 0..flags {
+                ext(DataKey::FlagHistory(trace_id, i));
+            }
+        }
+        n
+    }
+
+    /// Write-path refresh of an `Identity` entry (e.g. `KeyToAgent` during
+    /// `revoke_signing_key`). Never called from a view (#329).
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        retention::touch_identity(env, key);
     }
 
     fn load_trace(env: &Env, trace_id: u64) -> Result<Trace, Error> {
@@ -2435,6 +2870,12 @@ impl ReasoningRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod retention_tests;
+
+#[cfg(test)]
+mod action_state_tests;
 
 #[cfg(test)]
 mod test {
@@ -2472,7 +2913,7 @@ mod test {
         token.mint(&creator, &(50_000 * 10_000_000_i128));
 
         let market_core_id = env.register(
-            market_core::WASM,
+            market_core::MarketCore,
             (
                 admin.clone(),
                 collateral.address(),
@@ -2574,7 +3015,7 @@ mod test {
         let t0 = client.publish_trace(
             &agent,
             &7,
-            &TraceAction::CreateMarket,
+            &TraceAction::Skip,
             &BytesN::from_array(&env, &[1u8; 32]),
             &String::from_str(&env, "ipfs://t0"),
         );
@@ -2695,6 +3136,8 @@ mod test {
         let agent_key = DataKey::Agent(agent.clone());
 
         client.register_agent(&agent);
+        // #322: `Other` actions must be allow-listed.
+        client.set_other_action(&Symbol::new(&env, "trade"), &Some(OtherRule::Any));
         assert!(persistent_ttl(&env, &client.address, &agent_key) >= max_ttl - 1);
 
         // Day 0 and day 59 publishes; the day-100 publish only succeeds if the

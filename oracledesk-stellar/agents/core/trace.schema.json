@@ -48,6 +48,40 @@
     }
   },
   "$defs": {
+    "fairValueModel": {
+      "type": "object",
+      "description": "#331: every input of a model-based fair value, so the bps can be replayed (see replayFairValue in core/fair-value-replay.ts).",
+      "required": ["kind", "reflector", "asset", "decimals", "resolution", "gridSlot", "spot", "spotTs", "threshold", "direction", "sigmaPerSlot", "sigmaStdErr", "tau", "samples", "priceRefs"],
+      "properties": {
+        "kind": { "enum": ["spot", "twap"] },
+        "reflector": { "type": "string" },
+        "asset": { "type": "string", "pattern": "^(stellar|other):.+$" },
+        "decimals": { "type": "integer", "minimum": 0 },
+        "resolution": { "$ref": "#/$defs/stroopAmount" },
+        "gridSlot": { "$ref": "#/$defs/stroopAmount" },
+        "spot": { "$ref": "#/$defs/stroopAmount" },
+        "spotTs": { "$ref": "#/$defs/stroopAmount" },
+        "threshold": { "type": "string", "pattern": "^-?[0-9]+$" },
+        "thresholdDecimals": { "type": ["integer", "null"] },
+        "direction": { "enum": ["Above", "AtOrAbove", "Below", "AtOrBelow"] },
+        "sigmaPerSlot": { "type": "number", "minimum": 0 },
+        "sigmaStdErr": { "type": "number", "minimum": 0 },
+        "estimator": { "enum": ["ewma", "garch"] },
+        "lambda": { "type": "number" },
+        "tau": { "type": "integer", "minimum": 0 },
+        "samples": { "type": "integer", "minimum": 0 },
+        "feedFailureProb": { "type": "number", "minimum": 0, "maximum": 1 },
+        "twap": { "type": "object" },
+        "priceRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ts", "price"],
+            "properties": { "ts": { "$ref": "#/$defs/stroopAmount" }, "price": { "$ref": "#/$defs/stroopAmount" } }
+          }
+        }
+      }
+    },
     "stroopAmount": {
       "type": "string",
       "pattern": "^[0-9]+$",
@@ -88,7 +122,8 @@
           "properties": {
             "bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
             "source": { "type": "string", "minLength": 1 },
-            "observedAt": { "type": "integer", "minimum": 0 }
+            "observedAt": { "type": "integer", "minimum": 0 },
+            "model": { "$ref": "#/$defs/fairValueModel" }
           }
         },
         "order": {
@@ -146,7 +181,8 @@
           "properties": {
             "bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
             "source": { "type": "string", "minLength": 1 },
-            "observedAt": { "type": "integer", "minimum": 0 }
+            "observedAt": { "type": "integer", "minimum": 0 },
+            "model": { "$ref": "#/$defs/fairValueModel" }
           }
         },
         "order": {

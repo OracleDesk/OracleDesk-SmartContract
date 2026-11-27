@@ -11,7 +11,7 @@
 import { calcSell } from "../core/fpmm.js";
 import { InformedTrader } from "./agents/informed.js";
 import { NoiseTrader } from "./agents/noise.js";
-import { OracleDeskMaker, OracleDeskTrader } from "./agents/oracledesk.js";
+import { OracleDeskInventoryManager, OracleDeskMaker, OracleDeskTrader } from "./agents/oracledesk.js";
 import { Sandwicher } from "./agents/sandwicher.js";
 import { InvariantError, Ledger, SimContractError, SimMarketCore, sortedHolders, type MarketData, type Outcome } from "./market.js";
 import { LatentProcess, type OutcomeConfig, type Resolution } from "./outcomes.js";
@@ -54,7 +54,8 @@ export type AgentConfig =
       confidenceThresholdBps: number;
       seed: Amount;
       closeInSteps: number;
-    };
+    }
+  | { type: "oracledesk-inventory"; id: string; count?: number; treasury: TreasuryConfig; maxDeltaBps: number; targetDeltaBps?: number };
 
 export interface TreasuryConfig {
   balance: Amount;
@@ -115,6 +116,9 @@ export interface RunResult {
   txCosts: bigint;
   /** Unfunded sink accounts: swept protocol fees and flat tx costs. */
   sinks: { protocol: bigint; network: bigint };
+  lpLoss: bigint;
+  hedgeCost: bigint;
+  maxDrawdown: bigint;
 }
 
 const LP = "lp";
@@ -278,6 +282,12 @@ class World {
               seed: bi(a.seed),
               closeIn: BigInt(a.closeInSteps) * this.stepSeconds,
             });
+            this.treasuryOf.set(id, tr);
+            break;
+          }
+          case "oracledesk-inventory": {
+            const tr = this.treasury(`treasury:${id}`, a.treasury, id);
+            agent = new OracleDeskInventoryManager(id, tr.account, { maxDeltaBps: a.maxDeltaBps, targetDeltaBps: a.targetDeltaBps });
             this.treasuryOf.set(id, tr);
             break;
           }
@@ -526,6 +536,9 @@ class World {
       overshootBps: this.overshoot,
       txCosts: this.txCosts,
       sinks: { protocol: this.ledger.balance(PROTOCOL), network: this.ledger.balance(NETWORK) },
+      lpLoss: markets.reduce((a, m) => a + (m.lpPnl < 0n ? -m.lpPnl : 0n), 0n),
+      hedgeCost: 0n,
+      maxDrawdown: 0n,
     };
   }
 }

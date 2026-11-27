@@ -292,3 +292,15 @@ derivations, flagged as such.
 - **`calc_sell` needs `gross < r_other`** so reserves never reach 0; bounds
   are infima.
 - **Void dust** is quantified in §5.
+## Inventory management
+
+The maker inventory model combines creator seed shares with the unclaimed LP
+reserves. `payoutYes` and `payoutNo` are the two settlement vectors and their
+difference is the hedge delta; `floor` is the conservative complete-set value
+used by treasury `market_valuation`. The runtime inventory task uses
+`MAKER_INVENTORY_MAX_DELTA_BPS`, `MAKER_INVENTORY_REBALANCE_BPS`,
+`MAKER_HEDGE_MAX_STROOPS`, `MAKER_HEDGE_DAILY_STROOPS`, and
+`MAKER_HEDGE_MIN_SECS_TO_CLOSE`. It prefers selling the long seed side and
+falls back to a bounded buy of the short side. The committed
+`agents/sim/configs/maker-inventory.json` reproduces the experiment; reports
+include LP loss, hedge cost, and maximum drawdown.

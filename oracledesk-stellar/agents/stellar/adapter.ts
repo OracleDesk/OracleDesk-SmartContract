@@ -9,6 +9,8 @@
  * packages/bindings/<name> — see README.md's quickstart).
  */
 
+import type { PriceRule } from "../core/strategies/price-fair-value.js";
+import type { ReflectorTransport } from "../core/reflector.js";
 import { Account, Address, Contract, Keypair, rpc, scValToNative, TransactionBuilder, xdr, type Transaction } from "@stellar/stellar-sdk";
 import { KeypairSigner, type MethodOptions } from "@stellar/stellar-sdk/contract";
 import type { Client as MarketCoreBindingClient } from "@oracledesk/bindings-market-core";
@@ -917,6 +919,12 @@ export class StellarAdapter {
     return BigInt(v.cost_basis);
   }
 
+  async marketValuation(marketId: bigint): Promise<{ cost_basis: bigint; floor_value: bigint; spot_value: bigint; at_risk: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as any;
+    return { cost_basis: BigInt(v.cost_basis), floor_value: BigInt(v.floor_value), spot_value: BigInt(v.spot_value), at_risk: BigInt(v.at_risk) };
+  }
+
   /** An RPC client for this adapter's network (event polling, ledger reads). */
   rpcServer(): rpc.Server {
     return new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") });
@@ -977,6 +985,52 @@ export class StellarAdapter {
       alternative: args.alternative === null ? undefined : { tag: args.alternative, values: undefined as void },
     };
     return this.run("resolver", "@oracledesk/bindings-resolver", "dispute", call, (client) => client.dispute(call));
+  }
+
+  /**
+   * Permissionless (#321): pins the committed feed's close-time record for a
+   * price, hybrid or scaled market (scaled also pins `decimals()`), so the
+   * market still resolves after the oracle ages the record out. The agent is
+   * recorded as the snapshotter.
+   */
+  async snapshotPrice(marketId: bigint): Promise<AdapterResult<unknown>> {
+    const call = { market_id: marketId, caller: this.agent };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "snapshot_price", call, (client) => client.snapshot_price(call));
+  }
+
+  /**
+   * Permissionless (#321): stores up to `maxReads` (capped at 8 on-chain)
+   * not-yet-stored TWAP grid samples whose slot time has passed, oldest
+   * first. Call repeatedly (it returns 0 once everything due is stored).
+   */
+  async snapshotTwapSamples(marketId: bigint, maxReads = 8): Promise<AdapterResult<unknown>> {
+    const call = { market_id: marketId, caller: this.agent, max_reads: maxReads };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "snapshot_twap_samples", call, (client) =>
+      client.snapshot_twap_samples(call),
+    );
+  }
+
+  /**
+   * Permissionless (#326): submits weighted-key signatures over the v2
+   * attestation message (`buildAttestationMessage(ctx, 2)`), which can carry
+   * `Invalid`. Pre-filter with `verifyAttestation(..., 2)`: one bad signature
+   * aborts the whole batch.
+   */
+  async submitSignaturesV2(args: {
+    market_id: bigint;
+    outcome: "Yes" | "No" | "Invalid";
+    round: number;
+    sigs: ReadonlyArray<{ pubkey: Uint8Array; sig: Uint8Array }>;
+  }): Promise<AdapterResult<void>> {
+    const call = {
+      market_id: args.market_id,
+      outcome: { tag: args.outcome, values: undefined as void },
+      round: args.round,
+      sigs: args.sigs.map(({ pubkey, sig }) => [Buffer.from(pubkey), Buffer.from(sig)] as [Buffer, Buffer]),
+    };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "submit_signatures_v2", call, (client) =>
+      client.submit_signatures_v2(call),
+    );
   }
 
   /** Permissionless: voids a dispute that outlived `escalation_timeout` and refunds the bond. */
@@ -1091,15 +1145,64 @@ export class StellarAdapter {
     asset: { tag: "Stellar" | "Other"; value: string },
     timestamp: bigint,
   ): Promise<{ price: bigint; timestamp: bigint } | undefined> {
-    const assetVal = xdr.ScVal.scvVec([
-      xdr.ScVal.scvSymbol(asset.tag),
-      asset.tag === "Stellar" ? new Address(asset.value).toScVal() : xdr.ScVal.scvSymbol(asset.value),
-    ]);
-    const r = (await this.simulateRead(reflector, "price", [assetVal, xdr.ScVal.scvU64(xdr.Uint64.fromString(timestamp.toString()))])) as
+    const r = (await this.simulateRead(reflector, "price", [oracleAssetScVal(asset), xdr.ScVal.scvU64(xdr.Uint64.fromString(timestamp.toString()))])) as
       | { price: bigint; timestamp: bigint }
       | null
       | undefined;
     return r ? { price: BigInt(r.price), timestamp: BigInt(r.timestamp) } : undefined;
+  }
+
+  /** Reflector `decimals()`: fixed-point places of every price. */
+  async reflectorDecimals(reflector: string): Promise<number> {
+    return Number(await this.simulateRead(reflector, "decimals", []));
+  }
+
+  /** Reflector `lastprice(asset)`: the newest record, if any. */
+  async reflectorLastPrice(
+    reflector: string,
+    asset: { tag: "Stellar" | "Other"; value: string },
+  ): Promise<{ price: bigint; timestamp: bigint } | undefined> {
+    const r = (await this.simulateRead(reflector, "lastprice", [oracleAssetScVal(asset)])) as
+      | { price: bigint; timestamp: bigint }
+      | null
+      | undefined;
+    return r ? { price: BigInt(r.price), timestamp: BigInt(r.timestamp) } : undefined;
+  }
+
+  /** Simulation-only SEP-40 transport for `core/reflector.ts` (#331). */
+  reflectorTransport(): ReflectorTransport {
+    return {
+      decimals: (r) => this.reflectorDecimals(r),
+      resolution: (r) => this.reflectorResolution(r),
+      lastPrice: (r, a) => this.reflectorLastPrice(r, a),
+      price: (r, a, ts) => this.reflectorPrice(r, a, ts),
+    };
+  }
+
+  /**
+   * The market's revealed price rule (#331): resolver `Price`, `PriceScaled`,
+   * `PriceTwap` and `Hybrid` entries, fetched with one `getLedgerEntries`
+   * call. `null` for signer-resolved or unrevealed markets.
+   */
+  async revealedPriceRule(marketId: bigint): Promise<PriceRule | null> {
+    const variants = ["Price", "PriceScaled", "PriceTwap", "Hybrid"] as const;
+    const keys = variants.map((variant) =>
+      xdr.LedgerKey.contractData(
+        new xdr.LedgerKeyContractData({
+          contract: new Address(this.opts.deployments.contracts.resolver).toScAddress(),
+          key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(variant), xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId)))]),
+          durability: xdr.ContractDataDurability.persistent(),
+        }),
+      ),
+    );
+    const { entries } = await this.rpcServer().getLedgerEntries(...keys);
+    const byVariant = new Map<string, unknown>();
+    for (const entry of entries) {
+      const data = entry.val.contractData();
+      const tag = scValToNative(data.key()) as [string, ...unknown[]];
+      byVariant.set(tag[0], scValToNative(data.val()));
+    }
+    return decodePriceRule(byVariant);
   }
 
   /** The attestation-linked evidence citations recorded for `marketId` (resolver `evidence_at`). */
@@ -1395,4 +1498,59 @@ function unwrapContractResult<T>(methodName: string, result: T): T {
     throw new Error(`${methodName} failed: ${e?.message ?? JSON.stringify(e)}`);
   }
   return r.unwrap!() as T;
+}
+
+/** `OracleAsset` exactly as committed: `Stellar(Address)` or `Other(Symbol)`. */
+export function oracleAssetScVal(asset: { tag: "Stellar" | "Other"; value: string }): xdr.ScVal {
+  return xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol(asset.tag),
+    asset.tag === "Stellar" ? new Address(asset.value).toScVal() : xdr.ScVal.scvSymbol(asset.value),
+  ]);
+}
+
+type NativeAsset = [ "Stellar" | "Other", string ];
+type NativeDirection = [ "Above" | "AtOrAbove" | "Below" | "AtOrBelow" ];
+
+function nativeAsset(a: NativeAsset): { tag: "Stellar" | "Other"; value: string } {
+  return { tag: a[0], value: String(a[1]) };
+}
+
+/**
+ * Decodes resolver price-rule entries (as `scValToNative` yields them:
+ * structs → objects, enum variants → `[name, ...values]`) into a `PriceRule`.
+ * Precedence follows the resolver's own `has()` order.
+ */
+export function decodePriceRule(byVariant: ReadonlyMap<string, unknown>): PriceRule | null {
+  type Spot = { reflector: string; asset: NativeAsset; threshold: bigint; direction: NativeDirection; max_staleness: bigint };
+  const spot = (c: Spot, thresholdDecimals: number | null, hybridFallbackAfter?: bigint): PriceRule => ({
+    kind: "spot",
+    reflector: String(c.reflector),
+    asset: nativeAsset(c.asset),
+    threshold: BigInt(c.threshold),
+    thresholdDecimals,
+    direction: c.direction[0],
+    maxStaleness: BigInt(c.max_staleness),
+    ...(hybridFallbackAfter !== undefined ? { hybridFallbackAfter } : {}),
+  });
+  const price = byVariant.get("Price") as Spot | undefined;
+  if (price) return spot(price, null);
+  const hybrid = byVariant.get("Hybrid") as { price: Spot; fallback_after: bigint } | undefined;
+  if (hybrid) return spot(hybrid.price, null, BigInt(hybrid.fallback_after));
+  const scaled = byVariant.get("PriceScaled") as (Spot & { threshold_decimals: number }) | undefined;
+  if (scaled) return spot(scaled, Number(scaled.threshold_decimals));
+  const twap = byVariant.get("PriceTwap") as
+    | { reflector: string; asset: NativeAsset; threshold: bigint; direction: NativeDirection; window: bigint; min_samples: number; max_gap: bigint }
+    | undefined;
+  if (twap)
+    return {
+      kind: "twap",
+      reflector: String(twap.reflector),
+      asset: nativeAsset(twap.asset),
+      threshold: BigInt(twap.threshold),
+      direction: twap.direction[0],
+      window: BigInt(twap.window),
+      minSamples: Number(twap.min_samples),
+      maxGap: BigInt(twap.max_gap),
+    };
+  return null;
 }

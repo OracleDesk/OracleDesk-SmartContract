@@ -1041,12 +1041,12 @@ fn auth_treasury_admin_actions_and_role_separation() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_request_withdraw(&w.random, &1i128);
+        .try_withdraw(&w.random, &1i128);
     assert!(result.is_err(), "agent must not withdraw vault capital");
 
     w.env.set_auths(&[]);
@@ -1091,19 +1091,19 @@ fn auth_treasury_admin_withdraw_and_collect_market_fees() {
             address: &w.admin,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: args.clone(),
                 sub_invokes: &[],
             },
         }])
-        .request_withdraw(&w.random, &1i128);
+        .withdraw(&w.random, &1i128);
     assert_eq!(
         w.env.auths(),
         vec![invocation(
             &w.env,
             &w.admin,
             &w.treasury_id,
-            "request_withdraw",
+            "withdraw",
             args.clone(),
             vec![],
         )]
@@ -1506,12 +1506,12 @@ fn treasury_admin_cannot_trade_and_agent_cannot_withdraw() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_request_withdraw(&w.random, &1i128);
+        .try_withdraw(&w.random, &1i128);
     assert!(agent_withdraw.is_err());
 }
 
@@ -1527,9 +1527,6 @@ const MATRIX: &[(&str, &[&str])] = &[
         "market-core",
         &[
             "create_market",
-            "create_market_with_collateral",
-            "add_collateral",
-            "set_collateral_enabled",
             "buy",
             "sell",
             "redeem",
@@ -1562,9 +1559,18 @@ const MATRIX: &[(&str, &[&str])] = &[
             "deposit",
             "agent_buy",
             "set_paused",
-            "request_withdraw",
+            "withdraw",
             "collect_market_fees",
             "close_trade",
+            "begin_migration",
+            "cancel_migration",
+            "migrate_markets",
+            "migrate_idle",
+            "accept_predecessor",
+            "receive_migration",
+            "receive_collateral",
+            "transfer_shares",
+            "exit_to_successor",
         ],
     ),
     (
@@ -1595,10 +1601,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "pending_admin",
             "market_count",
             "get_market",
-            "get_market_collateral",
-            "market_collateral_info",
-            "collateral_params",
-            "locked",
             "get_position",
             "get_price",
             "get_config",
@@ -1671,21 +1673,15 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "queue_reserved",
             "queue_bounds",
             "deposit",
-            "deposit_token",
             "request_withdraw",
             "claim_withdraw",
             "emergency_withdraw",
-            "set_token_caps",
-            "token_caps",
-            "available_capital_of",
             "agent_sell",
             "agent_sell_v2",
             "agent_buy_v2",
             "agent_create_market",
-            "agent_create_market_collateral",
             "agent_create_market_and_reveal",
             "agent_claim_lp_fees",
-            "collect_market_fees",
             "agent_daily_usage",
             "agent_at",
             "agent_count",
@@ -1709,27 +1705,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "drawdown_status",
             "acknowledge_drawdown",
             "reset_pnl_window",
-            "set_mode",
-            "mode",
-            "set_unwinder",
-            "unwinder",
-            "set_exit_floor",
-            "set_default_exit_floor",
-            "exit_floor",
-            "unwound",
-            "unwind_sell",
-            "propose_op",
-            "execute_op",
-            "cancel_op",
-            "pending_op",
-            "correlation_caps",
-            "category_exposure",
-            "bucket_exposure",
-            "correlation_headroom",
-            "pending_correlation_caps",
-            "propose_correlation_caps",
-            "execute_correlation_caps",
-            "cancel_correlation_caps",
             "set_drawdown_config",
             "get_creation_policy",
             "creation_usage",
@@ -1758,11 +1733,11 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "allocate_to_yield",
             "recall_from_yield",
             "disable_yield",
-            "set_successor",
-            "migrate_markets",
+            "migration_version",
+            "migration_state",
+            "predecessor",
+            "assets_of",
             "settle_market",
-            "redeem_many",
-            "claim_pool_remainders",
             "legacy_redeem",
             "legacy_claim_pool_remainder",
             "withdraw_ticket",

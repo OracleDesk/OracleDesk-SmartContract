@@ -1,11 +1,11 @@
 #![no_std]
 
-mod math;
+pub mod math;
 #[cfg(kani)]
 mod math_proofs;
 pub mod ttl;
 
-use math::{MathError, Settlement, BPS, MAX_SETS};
+use math::{MathError, SettleLedger, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
     Address, Bytes, BytesN, Env, String, Vec,
@@ -35,11 +35,29 @@ const MIN_REDEEM_HORIZON_SECS: u64 = 180 * ttl::DAY_SECS;
 const MIN_REDEEM_HORIZON_SECS: u64 = 30;
 const MAX_REDEEM_HORIZON_SECS: u64 = 1_825 * ttl::DAY_SECS;
 
-/// Observations kept per market for the TWAP ring buffer (issue #11). One
-/// observation is written per distinct trade timestamp; a consumer asking
-/// for a time older than the oldest surviving observation gets
-/// `ObservationTooOld` instead of a wrong answer.
+/// Observations kept per market for the legacy TWAP ring buffer (closed
+/// #11), read only for migrating a market to `OracleStateV2` (issue #374).
+/// A consumer asking for a time older than the oldest surviving observation
+/// gets `ObservationTooOld` instead of a wrong answer.
 const ORACLE_RING: u32 = 16;
+
+/// Largest `OracleStateV2::cardinality` a market may grow to (issue #374).
+/// Binary-searching this many ring slots (a follow-up to this change; today
+/// `observe_at` still scans linearly) stays well under the per-transaction
+/// read-entry limit alongside a trade; see `docs/wave-issues` for the
+/// budget work this is deferred to.
+const MAX_CARDINALITY: u32 = 256;
+
+/// New slots `grow_oracle` may pre-initialise per call, so growing all the
+/// way to `MAX_CARDINALITY` costs the grower several calls rather than one
+/// footprint-busting one.
+const MAX_GROW_PER_CALL: u32 = 32;
+
+/// Default `OracleStateV2::bucket_secs`: at most one new observation slot
+/// per market per minute, however busy trading is.
+const DEFAULT_BUCKET_SECS: u32 = 60;
+const MIN_BUCKET_SECS: u32 = 5;
+const MAX_BUCKET_SECS: u32 = 3_600;
 
 /// Markets one `redeem_many` / `claim_pool_remainders` call may settle.
 ///
@@ -85,6 +103,15 @@ const ORACLE_RING: u32 = 16;
 /// exactly 150/200 = 75.0% with zero margin, so 46 is the largest
 /// defensible cap.
 const MAX_BATCH: u32 = 46;
+
+/// Holders one `extend_market_ttl` call may list (issue #371). Unlike
+/// `MAX_BATCH` this is not yet measured against `contracts/budget-tests`
+/// (that measurement is tracked as follow-up work); 40 is a conservative
+/// bound chosen to sit well under `MAX_BATCH`'s measured footprint, since
+/// each extended position costs strictly less (one read, plus a write only
+/// when its TTL is below threshold) than a full redemption.
+const MAX_TTL_BATCH: u32 = 40;
+
 /// A proposed admin handover must be accepted (or cancelled) within this many
 /// seconds, so a proposal forgotten by the outgoing admin cannot be used to
 /// seize control months later. 7 days.
@@ -150,6 +177,22 @@ pub struct Position {
 }
 
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lifecycle {
+    Open,
+    Final,
+    Closed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketView {
+    pub market: Market,
+    pub lifecycle: Lifecycle,
+    pub redeem_deadline: Option<u64>,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingMarketResolver {
     pub new_resolver: Address,
@@ -172,8 +215,11 @@ pub struct SettleState {
     /// Redemption window, snapshotted at creation from the admin default.
     /// `redeem_deadline = finalized_at + horizon_secs`.
     pub horizon_secs: u64,
-    /// Collateral already paid to holders and the LP (`redeem` +
-    /// `claim_pool_remainder` payouts); tracks what has left the market.
+    /// Share/pool collateral already paid to holders and the LP (`redeem`
+    /// payouts + the pool value of `claim_pool_remainder`); tracks what of
+    /// `sets_minted` has left the market. LP fees paid alongside the pool
+    /// remainder are **not** counted here: they never entered `sets_minted`
+    /// (issue #276, see docs/formal-verification.md "Settlement").
     pub paid_out: i128,
     /// `finalize_market` has swept the market's remaining balance; no
     /// redemption or claim can ever pay out again.
@@ -212,13 +258,45 @@ pub struct OracleState {
     pub obs_count: u32,
 }
 
-/// One point in the TWAP ring buffer. At most one per distinct timestamp.
+/// One point in the TWAP ring buffer. At most one per distinct timestamp,
+/// except a placeholder pre-initialised by `grow_oracle` (`ts: 0`): it
+/// sits outside the active `[oldest, oldest + obs_count)` range until a
+/// real trade advances into it, so `observe_at`'s scan never reads it as
+/// if it were a genuine observation.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Observation {
     pub ts: u64,
     /// `OracleState::price_cumulative` as of `ts`.
     pub cumulative: i128,
+}
+
+/// Replaces `OracleState` (issue #374): at most one *new* observation slot
+/// per `bucket_secs`, so busy trading no longer erases history by cycling
+/// through all `ORACLE_RING = 16` slots in under two minutes. `Obs(u64,
+/// u32)` slots are reused; growing or shrinking `ORACLE_RING` only ever
+/// meant growing the *fixed* ring before, where V2's `cardinality` is a
+/// runtime, per-market, growable size up to `MAX_CARDINALITY`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleStateV2 {
+    pub price_cumulative: i128,
+    pub last_ts: u64,
+    pub last_price_bps: u32,
+    /// Ring slot of the newest observation, in `0..cardinality`.
+    pub obs_index: u32,
+    /// Observations written so far, capped at `cardinality`.
+    pub obs_count: u32,
+    /// Slots currently in rotation. Grows to `cardinality_next` only when
+    /// `obs_index` wraps back to the start of the ring (Uniswap v3
+    /// semantics): growing mid-ring would break the sorted order
+    /// `observe_at` relies on.
+    pub cardinality: u32,
+    /// Grown-to size requested via `grow_oracle`, applied at the next wrap.
+    pub cardinality_next: u32,
+    /// Seconds per bucket: at most one new slot is written per bucket per
+    /// market. Snapshotted at creation from `DefaultOracleBucket`.
+    pub bucket_secs: u32,
 }
 
 /// Why a market in a batch call did not settle. `Duplicate` is reserved:
@@ -233,6 +311,7 @@ pub enum SkipReason {
     AlreadyClaimed,
     NotCreator,
     Duplicate,
+    Closed,
 }
 
 /// Per-market result of a batch settlement.
@@ -275,6 +354,52 @@ pub struct BatchResult {
     pub items: Vec<BatchItem>,
 }
 
+/// What `finalize_market` does with the LP-owned parts of its sweep (the
+/// unclaimed pool remainder and unclaimed LP fees) once the deadline has
+/// passed without the LP claiming them (issue #372).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LpExpiryPolicy {
+    /// Pay `Market::creator` at finalization time.
+    PayLp,
+    /// Sweep to `SweepTerms::residual_recipient` instead.
+    SweepToResidual,
+}
+
+/// Per-market `finalize_market` destinations, snapshotted at creation as a
+/// side entry (`DataKey::SweepTerms`) so `FeeTerms`'s XDR (and anything
+/// already reading it) stays unchanged.
+///
+/// Protocol fees are never part of this: they always go to
+/// `FeeTerms.recipient` (or the live treasury for a legacy market with no
+/// `FeeTerms`), matching `sweep_fees`. Markets created before this entry
+/// existed have none; `finalize_market` falls back to
+/// `residual_recipient = FeeTerms.recipient` (or the live treasury) and
+/// `lp_expiry = SweepToResidual`, which reproduces the pre-#372 behaviour
+/// exactly, so no deployed market's payout changes retroactively.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepTerms {
+    /// Where expired user claims and void rounding dust go.
+    pub residual_recipient: Address,
+    pub lp_expiry: LpExpiryPolicy,
+}
+
+/// The computed destination of each part of a `finalize_market` sweep,
+/// without executing it (issue #372). `finalize_preview` returns this so a
+/// keeper or UI can show who gets what before calling.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizePreview {
+    pub swept: i128,
+    pub protocol_fees: i128,
+    pub protocol_recipient: Address,
+    pub residual: i128,
+    pub residual_recipient: Address,
+    pub lp_amount: i128,
+    pub lp_recipient: Address,
+}
+
 /// Fee destination and split, snapshotted per market at creation as a side
 /// entry (`DataKey::FeeTerms`) so `Market`'s XDR shape never changes.
 ///
@@ -311,6 +436,74 @@ pub struct BreakerConfig {
 pub struct BandState {
     pub ledger_seq: u32,
     pub ref_price_bps: u32,
+}
+
+/// What the band's reference price tracks (issue #373). `LedgerOpen` is the
+/// original, single-ledger-only anchor (see `BreakerConfig`); `Twap(w)`
+/// anchors to the market's own `w`-second time-weighted average instead, so
+/// walking the price over many ledgers (each individually under
+/// `max_impact_bps`) is bounded by `band_bps` from the average rather than
+/// resetting every ledger.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BandAnchor {
+    LedgerOpen,
+    /// Window in seconds, fed to `twap`.
+    Twap(u64),
+}
+
+/// Per-market circuit breakers, snapshotted at creation from
+/// `DataKey::DefaultBreakerV2` (issue #373). Supersedes `BreakerConfig` for
+/// markets that have one; `breaker_config_v2` synthesises `anchor =
+/// LedgerOpen` for a market with only the legacy `BreakerConfig`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BreakerConfigV2 {
+    pub max_impact_bps: u32,
+    pub band_bps: u32,
+    pub anchor: BandAnchor,
+    /// Under `Twap`, the minimum ring observation count before the TWAP
+    /// anchor is trusted; below it, `LedgerOpen` is used instead (a fresh
+    /// market's only "observation" is its seed price, which is not yet a
+    /// time-weighted average of anything).
+    pub min_twap_obs: u32,
+}
+
+/// Which source actually produced a `BreakerVerdict`'s anchor.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnchorSource {
+    LedgerOpen,
+    Twap,
+}
+
+/// A trade's side and size, for `breaker_check` (issue #373): mirrors
+/// `do_buy`/`do_sell`'s own inputs so a preview matches the real call.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TradeSide {
+    Buy(i128),
+    Sell(i128),
+}
+
+/// Structured reason a `breaker_check` would or would not trip, for any
+/// side (issue #373). Since a revert cannot itself emit an event, this is
+/// the observability path for *why*, not just whether.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BreakerVerdict {
+    pub trips: bool,
+    /// The error the real call would fail with, when `trips`.
+    pub reason: Option<u32>,
+    pub pre_bps: u32,
+    pub post_bps: u32,
+    pub anchor_bps: u32,
+    pub anchor_source: AnchorSource,
+    /// `band_bps - |post_bps - anchor_bps|`; negative exactly when the band
+    /// trips. (`max_impact_bps` has no separate headroom field: a single
+    /// trade either does or does not clear it, and the band is the
+    /// manipulation-resistant check this issue is about.)
+    pub headroom_bps: i32,
 }
 
 #[contracttype]
@@ -355,15 +548,40 @@ pub enum DataKey {
     Paused,
     NextId,
     DefaultRedeemHorizon,
+    /// `LpExpiryPolicy` snapshotted into markets created after the call
+    /// (issue #372). Absent means `PayLp` (see `set_default_lp_expiry`).
+    DefaultLpExpiry,
+    /// `BreakerConfigV2` default (issue #373). Absent means no `BreakerV2`
+    /// is snapshotted into new markets (they may still get the legacy
+    /// `BreakerConfig` from `DefaultBreaker`).
+    DefaultBreakerV2,
+    /// Default `OracleStateV2::bucket_secs` snapshotted into markets
+    /// created after the call (issue #374). Absent means
+    /// `DEFAULT_BUCKET_SECS`.
+    DefaultOracleBucket,
     // persistent storage (one entry each, own TTL)
     Market(u64),
     Position(u64, Address),
     Settle(u64),
+    /// Legacy TWAP accumulator (closed #11). Read only for migration; see
+    /// `OracleV2`.
     Oracle(u64),
+    /// `OracleStateV2` (issue #374). `Obs(u64, u32)` slots are shared with
+    /// the legacy `Oracle` entry they migrate from.
+    OracleV2(u64),
     Obs(u64, u32),
     FeeTerms(u64),
+    /// `SweepTerms` snapshotted at creation (issue #372). Absent for
+    /// markets created before it existed; `finalize_market` falls back to
+    /// the legacy destinations documented on `SweepTerms`.
+    SweepTerms(u64),
     LpFees(u64),
     Breaker(u64),
+    /// `BreakerConfigV2` snapshotted at creation (issue #373), independent
+    /// of the legacy `Breaker` entry. Absent means the market has no V2
+    /// config; `breaker_config_v2` then synthesises one with `anchor =
+    /// LedgerOpen` from `Breaker`, if that exists.
+    BreakerV2(u64),
     MarketResolver(u64),
     // per-token collateral allow-list and solvency accounting (#151)
     CollateralParams(Address),
@@ -431,9 +649,6 @@ pub enum Error {
     /// Inbound collateral transfer delivered fewer (or different) units than
     /// expected, e.g. a fee-on-transfer or under-delivering token (#137).
     CollateralShortfall = 32,
-    /// `create_market` used a token missing from, or disabled in, the
-    /// admin collateral allow-list (#151).
-    CollateralNotAllowed = 32,
     /// Allow-list parameters failed validation (decimals, seed bounds).
     InvalidCollateralParams = 33,
     ResolverMismatch = 34,
@@ -441,6 +656,11 @@ pub enum Error {
     MarketResolverNotReady = 36,
     MarketResolverExpired = 37,
     OldResolverConsentRequired = 38,
+    /// `create_market` used a token missing from, or disabled in, the
+    /// admin collateral allow-list (#151).
+    CollateralNotAllowed = 39,
+    /// The market was closed out and its remaining value swept.
+    MarketClosedOut = 40,
 }
 
 impl From<MathError> for Error {
@@ -514,13 +734,52 @@ pub struct FeesSwept {
 pub struct MarketFinalized {
     #[topic]
     pub market_id: u64,
-    /// Everything swept to the treasury: expired user claims, an unclaimed
-    /// LP remainder, rounding dust and accrued fees.
+    /// Everything swept out of the market: expired user claims, an
+    /// unclaimed LP remainder, rounding dust and accrued fees. Kept
+    /// unchanged for compatibility; `MarketFinalizedSplit` (issue #372)
+    /// reports where each part actually went — it is no longer necessarily
+    /// one single transfer to the treasury.
     pub swept: i128,
     /// The part of `swept` that was reserved for shares never redeemed.
     pub unclaimed_user: i128,
     /// Rounding left over after per-holder void floors were accounted for.
     pub dust: i128,
+}
+
+/// Per-component breakdown of a `finalize_market` sweep (issue #372):
+/// `protocol_fees + residual + lp_amount == MarketFinalized::swept`, always.
+#[contractevent]
+pub struct MarketFinalizedSplit {
+    #[topic]
+    pub market_id: u64,
+    /// `Market::fees_accrued` at finalization, paid to `protocol_recipient`.
+    pub protocol_fees: i128,
+    pub protocol_recipient: Address,
+    /// Expired user claims plus void rounding dust, paid to
+    /// `residual_recipient`.
+    pub residual: i128,
+    pub residual_recipient: Address,
+    /// The unclaimed LP pool remainder plus unclaimed LP fees, paid to
+    /// `lp_recipient` (the creator, or the residual recipient — see
+    /// `SweepTerms`/`LpExpiryPolicy`, including the no-trustline fallback).
+    pub lp_amount: i128,
+    pub lp_recipient: Address,
+}
+
+#[contractevent]
+pub struct PositionsPurged {
+    #[topic]
+    pub market_id: u64,
+    pub count: u32,
+}
+
+/// `grow_oracle` pre-initialised slots up to `cardinality_next` (issue
+/// #374). Applied at the next ring wrap, not immediately.
+#[contractevent]
+pub struct OracleGrown {
+    #[topic]
+    pub market_id: u64,
+    pub cardinality_next: u32,
 }
 
 /// Same sweep as `FeesSwept` plus the actual recipient. New event rather
@@ -992,6 +1251,53 @@ impl MarketCore {
         Ok(())
     }
 
+    /// Sets the V2 breaker defaults copied into markets created after the
+    /// call (issue #373): same bps validation as `set_default_breaker`,
+    /// plus bounds on the anchor itself. A `Twap` window must be between
+    /// 60 seconds and 24 hours (long enough to be a real average, short
+    /// enough to stay responsive), and `min_twap_obs` must not exceed the
+    /// ring's own capacity.
+    pub fn set_default_breaker_v2(env: Env, breaker: BreakerConfigV2) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if breaker.max_impact_bps as i128 > BPS || breaker.band_bps as i128 > BPS {
+            return Err(Error::InvalidAmount);
+        }
+        if breaker.max_impact_bps > 0
+            && breaker.band_bps > 0
+            && breaker.band_bps < breaker.max_impact_bps
+        {
+            return Err(Error::InvalidAmount);
+        }
+        if breaker.min_twap_obs > MAX_CARDINALITY {
+            return Err(Error::InvalidAmount);
+        }
+        if let BandAnchor::Twap(window) = breaker.anchor {
+            if !(60..=24 * 3_600).contains(&window) {
+                return Err(Error::InvalidAmount);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultBreakerV2, &breaker);
+        Ok(())
+    }
+
+    /// Sets the `OracleStateV2::bucket_secs` snapshotted into markets
+    /// created after the call (issue #374). Must be within [5, 3600]
+    /// seconds: long enough that busy trading cannot cycle through the
+    /// whole ring in minutes, short enough to stay a meaningful recent
+    /// history.
+    pub fn set_default_oracle_bucket(env: Env, secs: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !(MIN_BUCKET_SECS..=MAX_BUCKET_SECS).contains(&secs) {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultOracleBucket, &secs);
+        Ok(())
+    }
+
     /// Affects markets created after the call; existing markets keep the
     /// horizon snapshotted at their creation. Must be within
     /// [180 days, 1825 days].
@@ -1003,6 +1309,18 @@ impl MarketCore {
         env.storage()
             .instance()
             .set(&DataKey::DefaultRedeemHorizon, &secs);
+        Ok(())
+    }
+
+    /// Sets the LP-expiry policy snapshotted into markets created after the
+    /// call (issue #372). Existing markets keep whichever policy they were
+    /// created with (or the legacy fallback documented on `SweepTerms`, for
+    /// markets created before this entry existed).
+    pub fn set_default_lp_expiry(env: Env, policy: LpExpiryPolicy) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultLpExpiry, &policy);
         Ok(())
     }
 
@@ -1052,6 +1370,13 @@ impl MarketCore {
         let treasury: Address = s.get(&DataKey::Treasury).ok_or(Error::NotInitialized)?;
         let resolver: Address = s.get(&DataKey::Resolver).ok_or(Error::NotInitialized)?;
         let breaker: Option<BreakerConfig> = s.get(&DataKey::DefaultBreaker);
+        let breaker_v2: Option<BreakerConfigV2> = s.get(&DataKey::DefaultBreakerV2);
+        let lp_expiry: LpExpiryPolicy = s
+            .get(&DataKey::DefaultLpExpiry)
+            .unwrap_or(LpExpiryPolicy::PayLp);
+        let bucket_secs: u32 = s
+            .get(&DataKey::DefaultOracleBucket)
+            .unwrap_or(DEFAULT_BUCKET_SECS);
 
         let market = Market {
             creator: creator.clone(),
@@ -1073,13 +1398,24 @@ impl MarketCore {
             &env,
             id,
             &FeeTerms {
-                recipient: treasury,
+                recipient: treasury.clone(),
                 protocol_share_bps,
+            },
+        );
+        Self::save_sweep_terms(
+            &env,
+            id,
+            &SweepTerms {
+                residual_recipient: treasury,
+                lp_expiry,
             },
         );
         Self::save_market_resolver(&env, id, &resolver);
         if let Some(b) = breaker {
             Self::save_breaker(&env, id, &b);
+        }
+        if let Some(b) = breaker_v2 {
+            Self::save_breaker_v2(&env, id, &b);
         }
         if seed.creator_yes > 0 || seed.creator_no > 0 {
             Self::save_position(
@@ -1090,7 +1426,9 @@ impl MarketCore {
                     yes: seed.creator_yes,
                     no: seed.creator_no,
                 },
-                market.close_time,
+                ttl::TtlClass::MarketOpen {
+                    close_time: market.close_time,
+                },
             );
         }
         // The creator's seed shares count as *user* outstanding, not pool.
@@ -1103,19 +1441,24 @@ impl MarketCore {
             closed: false,
         };
         Self::debug_assert_share_invariant(&market, &settle);
-        Self::save_settle(&env, id, &settle);
+        Self::save_settle(&env, id, &settle, &market);
 
         // TWAP accumulator: cumulative 0 at creation; the seeded price holds
         // from here until the first trade (slot 0 is the creation point).
+        // New markets start directly on `OracleStateV2` (issue #374); only
+        // markets created before it existed carry the legacy `OracleState`.
         let now = env.ledger().timestamp();
-        let oracle = OracleState {
+        let oracle = OracleStateV2 {
             price_cumulative: 0,
             last_ts: now,
             last_price_bps: math::price_yes_bps(market.reserve_yes, market.reserve_no)? as u32,
             obs_index: 0,
             obs_count: 1,
+            cardinality: ORACLE_RING,
+            cardinality_next: ORACLE_RING,
+            bucket_secs,
         };
-        Self::save_oracle(&env, id, &oracle, market.close_time);
+        Self::save_oracle_v2(&env, id, &oracle, market.close_time);
         Self::save_obs(
             &env,
             id,
@@ -1265,19 +1608,22 @@ impl MarketCore {
             .fees_accrued
             .checked_add(protocol_fee)
             .ok_or(Error::Overflow)?;
-        let mut pos = Self::load_position(&env, market_id, &trader, m.close_time);
+        let open_class = ttl::TtlClass::MarketOpen {
+            close_time: m.close_time,
+        };
+        let mut pos = Self::load_position(&env, market_id, &trader, open_class);
         match outcome {
             Outcome::Yes => pos.yes += q.shares_out,
             Outcome::No => pos.no += q.shares_out,
         }
-        Self::save_position(&env, market_id, &trader, &pos, m.close_time);
+        Self::save_position(&env, market_id, &trader, &pos, open_class);
         Self::save_market(&env, market_id, &m);
         if let Some(mut st) = oracle {
             st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
-            Self::save_oracle(&env, market_id, &st, m.close_time);
+            Self::save_oracle_v2(&env, market_id, &st, m.close_time);
         }
         // Legacy markets (no `Settle` entry) predate this bookkeeping.
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id, &m) {
             match outcome {
                 Outcome::Yes => {
                     settle.outstanding_yes = settle
@@ -1293,7 +1639,7 @@ impl MarketCore {
                 }
             }
             Self::debug_assert_share_invariant(&m, &settle);
-            Self::save_settle(&env, market_id, &settle);
+            Self::save_settle(&env, market_id, &settle, &m);
         }
 
         // interaction
@@ -1416,7 +1762,10 @@ impl MarketCore {
             q.new_reserve_other,
         )?;
 
-        let mut pos = Self::load_position(&env, market_id, &trader, m.close_time);
+        let open_class = ttl::TtlClass::MarketOpen {
+            close_time: m.close_time,
+        };
+        let mut pos = Self::load_position(&env, market_id, &trader, open_class);
         let held = match outcome {
             Outcome::Yes => pos.yes,
             Outcome::No => pos.no,
@@ -1430,7 +1779,7 @@ impl MarketCore {
             Outcome::Yes => pos.yes -= q.shares_in,
             Outcome::No => pos.no -= q.shares_in,
         }
-        Self::save_position(&env, market_id, &trader, &pos, m.close_time);
+        Self::save_position(&env, market_id, &trader, &pos, open_class);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
         m.sets_minted = m.sets_minted.checked_sub(q.gross).ok_or(Error::Overflow)?;
         let protocol_fee = Self::accrue_fees(&env, market_id, q.fee)?;
@@ -1441,9 +1790,9 @@ impl MarketCore {
         Self::save_market(&env, market_id, &m);
         if let Some(mut st) = oracle {
             st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
-            Self::save_oracle(&env, market_id, &st, m.close_time);
+            Self::save_oracle_v2(&env, market_id, &st, m.close_time);
         }
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id, &m) {
             match outcome {
                 Outcome::Yes => {
                     settle.outstanding_yes = settle
@@ -1459,7 +1808,7 @@ impl MarketCore {
                 }
             }
             Self::debug_assert_share_invariant(&m, &settle);
-            Self::save_settle(&env, market_id, &settle);
+            Self::save_settle(&env, market_id, &settle, &m);
         }
 
         // interaction
@@ -1494,8 +1843,15 @@ impl MarketCore {
             return Err(Error::NotClosedYet);
         }
         m.status = MarketStatus::Resolved(outcome);
+        // `mark_finalized` first, so it is the one that learns the
+        // redemption deadline; `save_market` then computes the `Market`
+        // entry's own TTL from that already-finalized `Settle` (issue
+        // #371). The reverse order would bump `Market` once toward the
+        // (still stale) `LongLived` fallback and then skip the correct
+        // `MarketSettling` bump, since `extend_ttl` only re-extends below
+        // half of the *new* target and the first bump already cleared it.
+        Self::mark_finalized(&env, market_id, &m);
         Self::save_market(&env, market_id, &m);
-        Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
             outcome: Some(outcome),
@@ -1512,8 +1868,8 @@ impl MarketCore {
             return Err(Error::MarketNotOpen);
         }
         m.status = MarketStatus::Void;
+        Self::mark_finalized(&env, market_id, &m);
         Self::save_market(&env, market_id, &m);
-        Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
             outcome: None,
@@ -1530,37 +1886,25 @@ impl MarketCore {
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
-        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
-            if settle.closed {
-                return Err(Error::RedemptionClosed);
-            }
+        let settle = Self::load_settle_opt(&env, market_id, &m);
+        if settle.as_ref().is_some_and(|s| s.closed) {
+            return Err(Error::RedemptionClosed);
         }
-        let pos = Self::load_position(&env, market_id, &holder, m.close_time);
+        let class = Self::ttl_class_for(&m, settle.as_ref());
+        let pos = Self::load_position(&env, market_id, &holder, class);
         if pos.yes == 0 && pos.no == 0 {
             return Err(Error::NothingToRedeem);
         }
-        let payout = math::settle_value(kind, pos.yes, pos.no);
+        // Pure settlement arithmetic (math::apply_redeem, proved in
+        // math_proofs.rs): both sides decrement even when only one pays, so
+        // a losing-side redemption still clears its outstanding shares.
+        let mut ledger = Self::settle_ledger(&m, settle.as_ref(), 0);
+        let payout = math::apply_redeem(&mut ledger, kind, pos.yes, pos.no)?;
 
-        Self::save_position(
-            &env,
-            market_id,
-            &holder,
-            &Position { yes: 0, no: 0 },
-            m.close_time,
-        );
-        // Both sides decrement even when only one pays: the shares are no
-        // longer outstanding, so a losing-side redemption still clears here.
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
-            settle.outstanding_yes = settle
-                .outstanding_yes
-                .checked_sub(pos.yes)
-                .ok_or(Error::Overflow)?;
-            settle.outstanding_no = settle
-                .outstanding_no
-                .checked_sub(pos.no)
-                .ok_or(Error::Overflow)?;
-            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
-            Self::save_settle(&env, market_id, &settle);
+        Self::save_position(&env, market_id, &holder, &Position { yes: 0, no: 0 }, class);
+        if let Some(mut settle) = settle {
+            Self::write_settle_ledger(&mut settle, &ledger);
+            Self::save_settle(&env, market_id, &settle, &m);
         }
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
@@ -1580,27 +1924,25 @@ impl MarketCore {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let kind = Self::settlement(&m)?;
-        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
-            if settle.closed {
-                return Err(Error::RedemptionClosed);
-            }
+        let settle = Self::load_settle_opt(&env, market_id, &m);
+        if settle.as_ref().is_some_and(|s| s.closed) {
+            return Err(Error::RedemptionClosed);
         }
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
-        let pool_value = math::settle_value(kind, m.reserve_yes, m.reserve_no);
-        let payout = pool_value
-            .checked_add(Self::load_lp_fees(&env, market_id))
-            .ok_or(Error::Overflow)?;
-        Self::save_lp_fees(&env, market_id, 0);
-        m.reserve_yes = 0;
-        m.reserve_no = 0;
-        m.lp_claimed = true;
+        // Pool value goes to `paid_out`; the LP-fee part does not, because
+        // LP fees were never part of `sets_minted` (math::apply_pool_claim).
+        let lp_fees = Self::load_lp_fees(&env, market_id);
+        let mut ledger = Self::settle_ledger(&m, settle.as_ref(), lp_fees);
+        let payout = math::apply_pool_claim(&mut ledger, kind)?;
+        Self::save_lp_fees(&env, market_id, ledger.lp_fees);
+        Self::write_market_ledger(&mut m, &ledger);
         let creator = m.creator.clone();
         Self::save_market(&env, market_id, &m);
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
-            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
-            Self::save_settle(&env, market_id, &settle);
+        if let Some(mut settle) = settle {
+            Self::write_settle_ledger(&mut settle, &ledger);
+            Self::save_settle(&env, market_id, &settle, &m);
         }
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &payout);
@@ -1657,29 +1999,37 @@ impl MarketCore {
                 items.push_back(Self::batch_skip(id, SkipReason::NothingToRedeem));
                 continue;
             }
-            let pos = Self::load_position(&env, id, &holder, m.close_time);
+            let pos = Self::load_position(
+                &env,
+                id,
+                &holder,
+                ttl::TtlClass::MarketOpen {
+                    close_time: m.close_time,
+                },
+            );
             if pos.yes == 0 && pos.no == 0 {
                 items.push_back(Self::batch_skip(id, SkipReason::NothingToRedeem));
                 continue;
             }
-            ttl::bump_persistent(&env, &key, ttl::market_target(&env, m.close_time));
-            let payout = math::settle_value(kind, pos.yes, pos.no);
-            Self::save_position(&env, id, &holder, &Position { yes: 0, no: 0 }, m.close_time);
-            // Both sides decrement even when only one pays (same as the
-            // single-market path).
-            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
-                settle.outstanding_yes = settle
-                    .outstanding_yes
-                    .checked_sub(pos.yes)
-                    .ok_or(Error::Overflow)?;
-                settle.outstanding_no = settle
-                    .outstanding_no
-                    .checked_sub(pos.no)
-                    .ok_or(Error::Overflow)?;
-                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
-                Self::save_settle(&env, id, &settle);
+            // Same arithmetic as the single-market path, folded into the
+            // batch total (math::batch_redeem_step, proved equal to
+            // sequential `redeem`s by proof_batch_equals_sequential).
+            let settle = Self::load_settle_opt(&env, id, &m);
+            // Lifecycle-aware bump (issue #371): a finalized market with a
+            // deadline past the old close-time-relative target must not be
+            // bumped by that stale formula, or this `Market` entry could
+            // still archive before the deadline despite this touch.
+            let class = Self::ttl_class_for(&m, settle.as_ref());
+            ttl::bump_persistent(&env, &key, ttl::target(&env, class));
+            let mut ledger = Self::settle_ledger(&m, settle.as_ref(), 0);
+            let next_total = math::batch_redeem_step(total, &mut ledger, kind, pos.yes, pos.no)?;
+            let payout = next_total - total;
+            total = next_total;
+            Self::save_position(&env, id, &holder, &Position { yes: 0, no: 0 }, class);
+            if let Some(mut settle) = settle {
+                Self::write_settle_ledger(&mut settle, &ledger);
+                Self::save_settle(&env, id, &settle, &m);
             }
-            total = total.checked_add(payout).ok_or(Error::Overflow)?;
             Redeemed {
                 market_id: id,
                 holder: holder.clone(),
@@ -1723,6 +2073,10 @@ impl MarketCore {
                     continue;
                 }
             };
+            if Self::settle_closed(&env, id) {
+                items.push_back(Self::batch_skip(id, SkipReason::Closed));
+                continue;
+            }
             if m.creator != creator {
                 items.push_back(Self::batch_skip(id, SkipReason::NotCreator));
                 continue;
@@ -1734,22 +2088,22 @@ impl MarketCore {
                     continue;
                 }
             };
-            if m.lp_claimed || Self::settle_closed(&env, id) {
+            if m.lp_claimed {
                 items.push_back(Self::batch_skip(id, SkipReason::AlreadyClaimed));
                 continue;
             }
-            let pool_value = math::settle_value(kind, m.reserve_yes, m.reserve_no);
-            let payout = pool_value
-                .checked_add(Self::load_lp_fees(&env, id))
-                .ok_or(Error::Overflow)?;
-            Self::save_lp_fees(&env, id, 0);
-            m.reserve_yes = 0;
-            m.reserve_no = 0;
-            m.lp_claimed = true;
+            // Same arithmetic as `claim_pool_remainder` (LP fees are paid
+            // but kept out of `paid_out`).
+            let settle = Self::load_settle_opt(&env, id, &m);
+            let lp_fees = Self::load_lp_fees(&env, id);
+            let mut ledger = Self::settle_ledger(&m, settle.as_ref(), lp_fees);
+            let payout = math::apply_pool_claim(&mut ledger, kind)?;
+            Self::save_lp_fees(&env, id, ledger.lp_fees);
+            Self::write_market_ledger(&mut m, &ledger);
             Self::save_market(&env, id, &m);
-            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
-                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
-                Self::save_settle(&env, id, &settle);
+            if let Some(mut settle) = settle {
+                Self::write_settle_ledger(&mut settle, &ledger);
+                Self::save_settle(&env, id, &settle, &m);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
             PoolRemainderClaimed {
@@ -1789,41 +2143,33 @@ impl MarketCore {
     pub fn finalize_market(env: Env, market_id: u64) -> Result<i128, Error> {
         let mut m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
-        let mut settle = Self::load_settle(&env, market_id)?;
+        let mut settle = Self::load_settle(&env, market_id, &m)?;
         if settle.closed {
             return Err(Error::RedemptionClosed);
         }
         if env.ledger().timestamp() < settle.finalized_at.saturating_add(settle.horizon_secs) {
             return Err(Error::RedemptionWindowOpen);
         }
-        // Upper bound on what the outstanding shares can still claim. For
-        // Yes/No this is exact; for Void, `floor((oy + on) / 2)` is at least
-        // the sum of per-holder floors (`settle_value` floors each pair), so
-        // reserving the aggregate floor never under-reserves.
-        let unclaimed_user =
-            math::settle_upper(kind, settle.outstanding_yes, settle.outstanding_no);
-        let lp_claim = if m.lp_claimed {
-            0
-        } else {
-            math::settle_value(kind, m.reserve_yes, m.reserve_no)
-        };
-        // Sets are collateralized 1:1 and `paid_out` tracks what already
-        // left the market, so remaining claims minus those two figures is
-        // non-negative: it is exactly the per-holder void rounding dust
-        // (zero for Yes/No markets). checked_sub makes that an assertion.
-        let dust = m
-            .sets_minted
-            .checked_sub(settle.paid_out)
-            .and_then(|v| v.checked_sub(unclaimed_user))
-            .and_then(|v| v.checked_sub(lp_claim))
-            .ok_or(Error::Overflow)?;
+        // math::finalize_residual reserves `settle_upper(outstanding)` for
+        // the shares still out (exact for Yes/No; for Void the aggregate
+        // floor is at least the sum of per-holder floors) plus the unclaimed
+        // pool value, and returns the share/pool residual `dust`. Kani proves
+        // `0 <= dust <= (H + 1) / 2` (0 for Yes/No) on every reachable
+        // ledger, including after the LP claimed a remainder with LP fees.
+        // The two fee legs (`fees_accrued`, unclaimed LP fees) live outside
+        // `sets_minted` and are only added by math::finalize_sweep.
         let lp_fees = Self::load_lp_fees(&env, market_id);
-        let swept = dust
-            .checked_add(unclaimed_user)
-            .and_then(|v| v.checked_add(lp_claim))
-            .and_then(|v| v.checked_add(m.fees_accrued))
-            .and_then(|v| v.checked_add(lp_fees))
-            .ok_or(Error::Overflow)?;
+        let ledger = Self::settle_ledger(&m, Some(&settle), lp_fees);
+        let residual = math::finalize_residual(&ledger, kind)?;
+        let (unclaimed_user, lp_claim, dust) = residual;
+        let protocol_fees = m.fees_accrued;
+        let swept = math::finalize_sweep(&ledger, residual, protocol_fees)?;
+        // The same three legs `finalize_sweep` added together (issue #372):
+        // protocol fees, share/pool residual, and the LP's own parts.
+        let residual_amount = dust.checked_add(unclaimed_user).ok_or(Error::Overflow)?;
+        let lp_amount = lp_claim.checked_add(lp_fees).ok_or(Error::Overflow)?;
+        let (protocol_recipient, residual_recipient, lp_expiry) =
+            Self::sweep_destinations(&env, market_id)?;
 
         m.reserve_yes = 0;
         m.reserve_no = 0;
@@ -1832,16 +2178,56 @@ impl MarketCore {
         settle.outstanding_yes = 0;
         settle.outstanding_no = 0;
         settle.closed = true;
+        let creator = m.creator.clone();
         Self::save_market(&env, market_id, &m);
-        Self::save_settle(&env, market_id, &settle);
+        Self::save_settle(&env, market_id, &settle, &m);
         Self::save_lp_fees(&env, market_id, 0);
-        let treasury: Address = Self::instance_get(&env, &DataKey::Treasury)?;
-        Self::token(&env)?.transfer(&env.current_contract_address(), &treasury, &swept);
+
+        let this = env.current_contract_address();
+        let token = Self::token(&env)?;
+        if protocol_fees > 0 {
+            token.transfer(&this, &protocol_recipient, &protocol_fees);
+        }
+        if residual_amount > 0 {
+            token.transfer(&this, &residual_recipient, &residual_amount);
+        }
+        let mut lp_recipient = residual_recipient.clone();
+        if lp_amount > 0 {
+            // `transfer_lp` already rejects handing the role to the
+            // contract itself, so `PayLp` with `creator == this` should be
+            // unreachable; still fall back rather than risk burning funds.
+            let want_creator =
+                matches!(lp_expiry, LpExpiryPolicy::PayLp) && creator != this;
+            if want_creator {
+                lp_recipient = creator;
+                // A SAC transfer to a contract address always succeeds; a
+                // classic-asset SAC transfer to a `G...` account without a
+                // trustline is the one case that can fail. Fall back to the
+                // residual recipient rather than bricking finalization.
+                if token.try_transfer(&this, &lp_recipient, &lp_amount).is_err() {
+                    lp_recipient = residual_recipient.clone();
+                    token.transfer(&this, &lp_recipient, &lp_amount);
+                }
+            } else {
+                token.transfer(&this, &lp_recipient, &lp_amount);
+            }
+        }
+
         MarketFinalized {
             market_id,
             swept,
             unclaimed_user,
             dust,
+        }
+        .publish(&env);
+        MarketFinalizedSplit {
+            market_id,
+            protocol_fees,
+            protocol_recipient,
+            residual: residual_amount,
+            residual_recipient,
+            lp_amount,
+            lp_recipient,
         }
         .publish(&env);
         Ok(swept)
@@ -1901,9 +2287,9 @@ impl MarketCore {
     // them is bookkeeping only: no collateral moves, `k` is untouched, and
     // the invariant `reserve_yes + Σ pos.yes == sets_minted` holds by
     // construction. Transfers are allowed while the market is Open, Paused,
-    // or final — a transfer spends no collateral, so the pause does not
-    // apply. After `redeem` the position is empty and transfers fail
-    // naturally with `InsufficientShares`.
+    // or final (including after the redemption deadline, before close-out) —
+    // a transfer spends no collateral, so the pause does not apply. Closed
+    // markets reject transfers explicitly.
 
     /// Moves `amount` shares of `outcome` from `from` to `to`.
     pub fn transfer_position(
@@ -1924,8 +2310,13 @@ impl MarketCore {
             return Err(Error::InvalidAmount);
         }
         let m = Self::load_market(&env, market_id)?;
-        let mut a = Self::load_position(&env, market_id, &from, m.close_time);
-        let mut b = Self::load_position(&env, market_id, &to, m.close_time);
+        if Self::settle_closed(&env, market_id) {
+            return Err(Error::MarketClosedOut);
+        }
+        let settle = Self::load_settle_opt(&env, market_id, &m);
+        let class = Self::ttl_class_for(&m, settle.as_ref());
+        let mut a = Self::load_position(&env, market_id, &from, class);
+        let mut b = Self::load_position(&env, market_id, &to, class);
         match outcome {
             Outcome::Yes => {
                 if a.yes < amount {
@@ -1942,8 +2333,8 @@ impl MarketCore {
                 b.no = b.no.checked_add(amount).ok_or(Error::Overflow)?;
             }
         }
-        Self::save_position(&env, market_id, &from, &a, m.close_time);
-        Self::save_position(&env, market_id, &to, &b, m.close_time);
+        Self::save_position(&env, market_id, &from, &a, class);
+        Self::save_position(&env, market_id, &to, &b, class);
         PositionTransferred {
             market_id,
             from,
@@ -1961,6 +2352,9 @@ impl MarketCore {
     pub fn transfer_lp(env: Env, market_id: u64, new_creator: Address) -> Result<(), Error> {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
+        if Self::settle_closed(&env, market_id) {
+            return Err(Error::MarketClosedOut);
+        }
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
@@ -2010,22 +2404,120 @@ impl MarketCore {
         Self::load_market(&env, market_id)
     }
 
-    pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
-        // The TTL of the position entry tracks the market's close time. With
-        // no market to anchor to (a stale id), fall back to the settlement
-        // horizon from now so the entry at least keeps that much cover.
-        let close_time = match Self::load_market(&env, market_id) {
-            Ok(m) => m.close_time,
-            Err(_) => env.ledger().timestamp(),
+    /// Returns the market and its lifecycle. Integrators must use this view
+    /// rather than `get_market` when deciding whether positions have value.
+    pub fn get_market_view(env: Env, market_id: u64) -> Result<MarketView, Error> {
+        let market = Self::load_market(&env, market_id)?;
+        let lifecycle = if Self::settle_closed(&env, market_id) {
+            Lifecycle::Closed
+        } else if market.status != MarketStatus::Open {
+            Lifecycle::Final
+        } else {
+            Lifecycle::Open
         };
-        Self::load_position(&env, market_id, &holder, close_time)
+        let redeem_deadline = Self::load_settle_opt(&env, market_id, &market).and_then(|s| {
+            (s.finalized_at > 0).then_some(s.finalized_at.saturating_add(s.horizon_secs))
+        });
+        Ok(MarketView {
+            market,
+            lifecycle,
+            redeem_deadline,
+        })
+    }
+
+    pub fn is_closed(env: Env, market_id: u64) -> bool {
+        Self::settle_closed(&env, market_id)
+    }
+
+    /// Returns zero for a closed market. Historical amounts must be recovered
+    /// from `Redeemed`, `PositionTransferred`, and `MarketFinalized` events.
+    pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
+        // The TTL of the position entry follows the market's lifecycle
+        // (issue #371): the Open-market target while trading, the
+        // redemption deadline once final. With no market to anchor to (a
+        // stale id), fall back to the settlement horizon from now so the
+        // entry at least keeps that much cover.
+        let class = match Self::load_market(&env, market_id) {
+            Ok(m) => {
+                let settle = Self::load_settle_opt(&env, market_id, &m);
+                Self::ttl_class_for(&m, settle.as_ref())
+            }
+            Err(_) => ttl::TtlClass::MarketOpen {
+                close_time: env.ledger().timestamp(),
+            },
+        };
+        if Self::settle_closed(&env, market_id) {
+            return Position { yes: 0, no: 0 };
+        }
+        Self::load_position(&env, market_id, &holder, class)
+    }
+
+    /// Removes valueless position entries from a closed market. This is
+    /// permissionless and does not refund rent; it only reduces live state.
+    pub fn purge_closed_positions(
+        env: Env,
+        market_id: u64,
+        holders: Vec<Address>,
+    ) -> Result<u32, Error> {
+        Self::load_market(&env, market_id)?;
+        if holders.len() > MAX_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        if !Self::settle_closed(&env, market_id) {
+            return Err(Error::NotFinal);
+        }
+        let mut count = 0u32;
+        for holder in holders.iter() {
+            let key = DataKey::Position(market_id, holder);
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                count = count.checked_add(1).ok_or(Error::Overflow)?;
+            }
+        }
+        PositionsPurged { market_id, count }.publish(&env);
+        Ok(count)
+    }
+
+    /// Permissionless maintenance call (issue #371): extends `market_id`'s
+    /// own entries (`Market`, `SettleState`) and each listed holder's
+    /// `Position` (if one exists) toward the market's lifecycle TTL target
+    /// — the redemption deadline once final, see `ttl::TtlClass`. Loading
+    /// each entry already bumps it (every `load_*` in this contract does),
+    /// so this call's only distinct job is to do that for holders who are
+    /// not otherwise touching the market right now.
+    ///
+    /// No auth is required: extending TTL only costs the caller rent, and
+    /// no collateral moves. `holders` may be empty (it still extends the
+    /// market's own entries). Rejects more than `MAX_TTL_BATCH` holders;
+    /// a holder with no `Position` entry costs only the existence check.
+    /// Returns how many entries were extended.
+    pub fn extend_market_ttl(
+        env: Env,
+        market_id: u64,
+        holders: Vec<Address>,
+    ) -> Result<u32, Error> {
+        if holders.len() > MAX_TTL_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        let m = Self::load_market(&env, market_id)?; // bumps `Market`
+        let settle = Self::load_settle_opt(&env, market_id, &m); // bumps `SettleState`, if present
+        let mut extended: u32 = 1 + settle.is_some() as u32;
+        let class = Self::ttl_class_for(&m, settle.as_ref());
+        for holder in holders.iter() {
+            let key = DataKey::Position(market_id, holder);
+            if env.storage().persistent().has(&key) {
+                ttl::bump_persistent(&env, &key, ttl::target(&env, class));
+                extended = extended.checked_add(1).ok_or(Error::Overflow)?;
+            }
+        }
+        Ok(extended)
     }
 
     /// Outstanding-share accounting for a market (issue #14).
     /// `NotSupported` for markets created before this bookkeeping existed.
     pub fn settle_state(env: Env, market_id: u64) -> Result<SettleState, Error> {
-        Self::load_market(&env, market_id)?;
-        Self::load_settle(&env, market_id)
+        let m = Self::load_market(&env, market_id)?;
+        Self::load_settle(&env, market_id, &m)
     }
 
     /// Timestamp after which unredeemed shares are forfeit (see
@@ -2033,10 +2525,58 @@ impl MarketCore {
     /// deadline is not known yet — and for legacy markets, which have no
     /// deadline and cannot be finalized.
     pub fn redeem_deadline(env: Env, market_id: u64) -> Option<u64> {
-        match Self::load_settle_opt(&env, market_id) {
+        let m = Self::load_market(&env, market_id).ok()?;
+        match Self::load_settle_opt(&env, market_id, &m) {
             Some(s) if s.finalized_at > 0 => Some(s.finalized_at.saturating_add(s.horizon_secs)),
             _ => None,
         }
+    }
+
+    /// The market's snapshotted `finalize_market` destinations (issue
+    /// #372). `None` for a market created before this entry existed —
+    /// `finalize_preview`/`finalize_market` still work for it, through the
+    /// legacy fallback documented on `SweepTerms`.
+    pub fn sweep_terms(env: Env, market_id: u64) -> Result<Option<SweepTerms>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_sweep_terms(&env, market_id))
+    }
+
+    /// Computes what `finalize_market` would pay and to whom, without
+    /// executing it (issue #372). Fails the same way `finalize_market`
+    /// would for a market that is not yet eligible (`NotFinal`, legacy
+    /// `NotSupported`), but does not check the redemption deadline — a
+    /// caller can preview the eventual split before it opens.
+    pub fn finalize_preview(env: Env, market_id: u64) -> Result<FinalizePreview, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let kind = Self::settlement(&m)?;
+        let settle = Self::load_settle(&env, market_id, &m)?;
+        let lp_fees = Self::load_lp_fees(&env, market_id);
+        let ledger = Self::settle_ledger(&m, Some(&settle), lp_fees);
+        let residual = math::finalize_residual(&ledger, kind)?;
+        let (unclaimed_user, lp_claim, dust) = residual;
+        let protocol_fees = m.fees_accrued;
+        let swept = math::finalize_sweep(&ledger, residual, protocol_fees)?;
+        let residual_amount = dust.checked_add(unclaimed_user).ok_or(Error::Overflow)?;
+        let lp_amount = lp_claim.checked_add(lp_fees).ok_or(Error::Overflow)?;
+        let (protocol_recipient, residual_recipient, lp_expiry) =
+            Self::sweep_destinations(&env, market_id)?;
+        let this = env.current_contract_address();
+        let lp_recipient = if matches!(lp_expiry, LpExpiryPolicy::PayLp) && m.creator != this {
+            // The no-trustline fallback can only be learned by attempting
+            // the real transfer, so the preview assumes the common case.
+            m.creator
+        } else {
+            residual_recipient.clone()
+        };
+        Ok(FinalizePreview {
+            swept,
+            protocol_fees,
+            protocol_recipient,
+            residual: residual_amount,
+            residual_recipient,
+            lp_amount,
+            lp_recipient,
+        })
     }
 
     /// Largest accepted `market_ids` length for `redeem_many` /
@@ -2064,7 +2604,7 @@ impl MarketCore {
     pub fn price_cumulative(env: Env, market_id: u64) -> Result<i128, Error> {
         let m = Self::load_market(&env, market_id)?;
         let st = Self::load_oracle(&env, market_id, m.close_time)?;
-        Self::observe_at(&env, market_id, &st, env.ledger().timestamp())
+        Self::observe_at(&env, market_id, &st, m.close_time, env.ledger().timestamp())
     }
 
     /// Cumulative YES-price-seconds as of `now - seconds_ago`.
@@ -2081,15 +2621,15 @@ impl MarketCore {
         let m = Self::load_market(&env, market_id)?;
         let st = Self::load_oracle(&env, market_id, m.close_time)?;
         let now = env.ledger().timestamp();
-        Self::observe_at(&env, market_id, &st, now.saturating_sub(seconds_ago))
+        Self::observe_at(&env, market_id, &st, m.close_time, now.saturating_sub(seconds_ago))
     }
 
     /// Time-weighted average YES price in bps over the trailing
     /// `window_secs`, floored. Rejects a zero window (`InvalidAmount`).
     /// A window reaching before the oldest observation fails with
-    /// `ObservationTooOld`; a window extending past `close_time` keeps
-    /// averaging the final price, because the accumulator only moves when
-    /// trades are possible.
+    /// `ObservationTooOld`. The accumulator is frozen at `close_time`
+    /// (issue #374), so a window extending past it keeps averaging the
+    /// final price instead of extrapolating indefinitely.
     pub fn twap(env: Env, market_id: u64, window_secs: u64) -> Result<u32, Error> {
         if window_secs == 0 {
             return Err(Error::InvalidAmount);
@@ -2097,10 +2637,69 @@ impl MarketCore {
         let m = Self::load_market(&env, market_id)?;
         let st = Self::load_oracle(&env, market_id, m.close_time)?;
         let now = env.ledger().timestamp();
-        let cum_now = Self::observe_at(&env, market_id, &st, now)?;
-        let cum_then = Self::observe_at(&env, market_id, &st, now.saturating_sub(window_secs))?;
-        let delta = cum_now.checked_sub(cum_then).ok_or(Error::Overflow)?;
-        Ok((delta / window_secs as i128) as u32)
+        Self::twap_between_raw(
+            &env,
+            market_id,
+            &st,
+            m.close_time,
+            now.saturating_sub(window_secs),
+            now,
+        )
+    }
+
+    /// `twap`'s general form: the time-weighted average YES price in bps
+    /// between `start` and `end` (each clamped to `close_time`), floored
+    /// (issue #374). `twap(window)` is `twap_between(now - window, now)`.
+    pub fn twap_between(env: Env, market_id: u64, start: u64, end: u64) -> Result<u32, Error> {
+        if start >= end {
+            return Err(Error::InvalidAmount);
+        }
+        let m = Self::load_market(&env, market_id)?;
+        let st = Self::load_oracle(&env, market_id, m.close_time)?;
+        Self::twap_between_raw(&env, market_id, &st, m.close_time, start, end)
+    }
+
+    /// Pre-initialises ring slots `[cardinality_next, new_next)` so later
+    /// trades only overwrite them instead of paying a new-entry cost
+    /// (issue #374). Permissionless otherwise: `payer` only signs for the
+    /// rent its own slots cost (no tokens move). Growth applies at the
+    /// next ring wrap, not immediately (see `OracleStateV2::cardinality`).
+    /// Returns the market's `cardinality_next` after this call.
+    pub fn grow_oracle(
+        env: Env,
+        payer: Address,
+        market_id: u64,
+        new_next: u32,
+    ) -> Result<u32, Error> {
+        payer.require_auth();
+        let m = Self::load_market(&env, market_id)?;
+        let mut st = Self::load_oracle(&env, market_id, m.close_time)?;
+        if new_next > MAX_CARDINALITY || new_next <= st.cardinality_next {
+            return Err(Error::InvalidAmount);
+        }
+        if new_next - st.cardinality_next > MAX_GROW_PER_CALL {
+            return Err(Error::InvalidAmount);
+        }
+        for slot in st.cardinality_next..new_next {
+            Self::save_obs(
+                &env,
+                market_id,
+                slot,
+                &Observation {
+                    ts: 0,
+                    cumulative: 0,
+                },
+                m.close_time,
+            );
+        }
+        st.cardinality_next = new_next;
+        Self::save_oracle_v2(&env, market_id, &st, m.close_time);
+        OracleGrown {
+            market_id,
+            cardinality_next: new_next,
+        }
+        .publish(&env);
+        Ok(new_next)
     }
 
     /// Shares a `buy` of `collateral_in` would return right now.
@@ -2134,6 +2733,14 @@ impl MarketCore {
         Ok(Self::load_breaker(&env, market_id))
     }
 
+    /// The market's effective V2 breaker config (issue #373): its own
+    /// `BreakerV2` if snapshotted, else the legacy `BreakerConfig`
+    /// synthesised with `anchor = LedgerOpen`, else `None`.
+    pub fn breaker_config_v2(env: Env, market_id: u64) -> Result<Option<BreakerConfigV2>, Error> {
+        Self::load_market(&env, market_id)?;
+        Ok(Self::load_breaker_v2(&env, market_id))
+    }
+
     /// The current ledger's band reference, if a band check has run this
     /// ledger. `None` means the next trade sets the reference (to its own
     /// pre-trade price, which equals the ledger-open price).
@@ -2149,48 +2756,92 @@ impl MarketCore {
         })
     }
 
+    /// Structured preview of whether a `Buy`/`Sell` would be rejected by
+    /// the market's breakers right now, for either side (issue #373).
+    /// Read-only: never writes band state (same discipline as the old
+    /// `would_trip`), so a dry run does not itself set the `LedgerOpen`
+    /// reference a subsequent real trade would use.
+    pub fn breaker_check(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        side: TradeSide,
+    ) -> Result<BreakerVerdict, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let pre = math::price_yes_bps(m.reserve_yes, m.reserve_no)?;
+        let no_check = BreakerVerdict {
+            trips: false,
+            reason: None,
+            pre_bps: pre as u32,
+            post_bps: pre as u32,
+            anchor_bps: pre as u32,
+            anchor_source: AnchorSource::LedgerOpen,
+            headroom_bps: i32::MAX,
+        };
+        let Some(cfg) = Self::load_breaker_v2(&env, market_id) else {
+            return Ok(no_check);
+        };
+        if cfg.max_impact_bps == 0 && cfg.band_bps == 0 {
+            return Ok(no_check);
+        }
+        let post = Self::post_price_for(&m, outcome, side)?;
+        if cfg.max_impact_bps > 0 && (post - pre).abs() > cfg.max_impact_bps as i128 {
+            return Ok(BreakerVerdict {
+                trips: true,
+                reason: Some(Error::PriceImpactTooHigh as u32),
+                pre_bps: pre as u32,
+                post_bps: post as u32,
+                anchor_bps: pre as u32,
+                anchor_source: AnchorSource::LedgerOpen,
+                headroom_bps: 0,
+            });
+        }
+        if cfg.band_bps == 0 {
+            return Ok(BreakerVerdict {
+                post_bps: post as u32,
+                ..no_check
+            });
+        }
+        let (anchor, source) = Self::band_anchor(&env, market_id, &m, pre, &cfg, false);
+        let mut trips = (post - anchor as i128).abs() > cfg.band_bps as i128;
+        if !trips && matches!(source, AnchorSource::Twap) {
+            let ledger_ref = Self::peek_band_ref(&env, market_id, pre);
+            trips = (post - ledger_ref as i128).abs() > cfg.band_bps as i128;
+        }
+        let headroom = cfg.band_bps as i64 - (post - anchor as i128).abs() as i64;
+        Ok(BreakerVerdict {
+            trips,
+            reason: trips.then_some(Error::PriceBandExceeded as u32),
+            pre_bps: pre as u32,
+            post_bps: post as u32,
+            anchor_bps: anchor,
+            anchor_source: source,
+            headroom_bps: headroom.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        })
+    }
+
     /// True when a `buy` of `collateral_in` would be rejected by the
-    /// market's breakers right now. Read-only: never writes band state, so
-    /// on a fresh ledger the reference is taken as the current price — the
-    /// same value a subsequent real trade would use.
+    /// market's breakers right now. Thin wrapper over `breaker_check`.
     pub fn would_trip(
         env: Env,
         market_id: u64,
         outcome: Outcome,
         collateral_in: i128,
     ) -> Result<bool, Error> {
-        let m = Self::load_market(&env, market_id)?;
-        let cfg = match Self::load_breaker(&env, market_id) {
-            Some(c) => c,
-            None => return Ok(false),
-        };
-        if cfg.max_impact_bps == 0 && cfg.band_bps == 0 {
-            return Ok(false);
-        }
-        let (r_bought, r_other) = Self::reserves_for(&m, outcome);
-        let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
-        let pre = math::price_yes_bps(m.reserve_yes, m.reserve_no)?;
-        let post = math::price_after(
-            matches!(outcome, Outcome::Yes),
-            q.new_reserve_bought,
-            q.new_reserve_other,
-        )?;
-        if cfg.max_impact_bps > 0 && (post - pre).abs() > cfg.max_impact_bps as i128 {
-            return Ok(true);
-        }
-        if cfg.band_bps > 0 {
-            let reference = env
-                .storage()
-                .temporary()
-                .get::<_, BandState>(&DataKey::Band(market_id))
-                .filter(|s| s.ledger_seq == env.ledger().sequence())
-                .map(|s| s.ref_price_bps)
-                .unwrap_or(pre as u32);
-            if (post - reference as i128).abs() > cfg.band_bps as i128 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(Self::breaker_check(env, market_id, outcome, TradeSide::Buy(collateral_in))?.trips)
+    }
+
+    /// `would_trip`'s counterpart for a `sell` of exactly `collateral_out`.
+    /// Sellers — including the treasury's `agent_sell_v2` and the agents'
+    /// exit and arbitrage paths — previously had no way to learn this
+    /// ahead of time (issue #373).
+    pub fn would_trip_sell(
+        env: Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+    ) -> Result<bool, Error> {
+        Ok(Self::breaker_check(env, market_id, outcome, TradeSide::Sell(collateral_out))?.trips)
     }
 }
 
@@ -2248,6 +2899,8 @@ impl MarketCore {
             return Err(Error::CollateralShortfall);
         }
         Ok(())
+    }
+
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {
@@ -2314,6 +2967,19 @@ impl MarketCore {
         }
     }
 
+    /// Bumps `Market(id)`'s TTL toward `m`'s lifecycle class (issue #371).
+    /// Reads `SettleState` (uncached) only once the market is no longer
+    /// Open, since the Open-market target needs only `m.close_time`.
+    fn bump_market_ttl(env: &Env, id: u64, m: &Market) {
+        let key = DataKey::Market(id);
+        let settle = match m.status {
+            MarketStatus::Open => None,
+            _ => Self::get_settle_raw(env, id),
+        };
+        let class = Self::ttl_class_for(m, settle.as_ref());
+        ttl::bump_persistent(env, &key, ttl::target(env, class));
+    }
+
     fn load_market(env: &Env, id: u64) -> Result<Market, Error> {
         let key = DataKey::Market(id);
         let m: Market = env
@@ -2321,70 +2987,152 @@ impl MarketCore {
             .persistent()
             .get(&key)
             .ok_or(Error::MarketNotFound)?;
-        ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
+        Self::bump_market_ttl(env, id, &m);
         Ok(m)
     }
 
     fn save_market(env: &Env, id: u64, m: &Market) {
-        let key = DataKey::Market(id);
-        env.storage().persistent().set(&key, m);
-        ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
+        env.storage().persistent().set(&DataKey::Market(id), m);
+        Self::bump_market_ttl(env, id, m);
     }
 
-    fn load_position(env: &Env, id: u64, holder: &Address, close_time: u64) -> Position {
+    fn load_position(env: &Env, id: u64, holder: &Address, class: ttl::TtlClass) -> Position {
         let key = DataKey::Position(id, holder.clone());
         match env.storage().persistent().get::<_, Position>(&key) {
             Some(p) => {
-                ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+                ttl::bump_persistent(env, &key, ttl::target(env, class));
                 p
             }
             None => Position { yes: 0, no: 0 },
         }
     }
 
-    /// Empty positions are removed so storage does not grow with dust entries.
-    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position, close_time: u64) {
+    /// Empty positions are removed so storage does not grow with dust
+    /// entries. `class` (the market's lifecycle TTL class, issue #371) is
+    /// unused on that path — pass whatever the caller has in hand.
+    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position, class: ttl::TtlClass) {
         let key = DataKey::Position(id, holder.clone());
         if p.yes == 0 && p.no == 0 {
             env.storage().persistent().remove(&key);
         } else {
             env.storage().persistent().set(&key, p);
-            ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+            ttl::bump_persistent(env, &key, ttl::target(env, class));
         }
     }
 
     /// Records the finality timestamp on `resolve` / `void_market` (both
     /// already require status == Open, so it is never overwritten). No-op
-    /// for legacy markets without a `Settle` entry.
-    fn mark_finalized(env: &Env, id: u64) {
-        if let Some(mut settle) = Self::load_settle_opt(env, id) {
+    /// for legacy markets without a `Settle` entry. `m` must already carry
+    /// the post-transition status (`Resolved`/`Void`), so `save_settle`
+    /// below bumps toward the real redemption deadline rather than the
+    /// Open-market target (issue #371).
+    ///
+    /// Reads via `get_settle_raw`, not `load_settle_opt`: bumping on the
+    /// read would target the *old* (still-zero) `finalized_at`, and
+    /// `extend_ttl` only re-extends below half of the target it is given —
+    /// that premature bump would then block `save_settle`'s correct one a
+    /// few lines later, leaving the entry under-extended.
+    fn mark_finalized(env: &Env, id: u64, m: &Market) {
+        if let Some(mut settle) = Self::get_settle_raw(env, id) {
             settle.finalized_at = env.ledger().timestamp();
-            Self::save_settle(env, id, &settle);
+            Self::save_settle(env, id, &settle, m);
         }
+    }
+
+    /// Lifecycle-aware TTL class for a market's own entries (`Market`,
+    /// `SettleState`, `Position`): `MarketOpen` while trading, and once
+    /// final, `MarketSettling` toward the market's own redemption deadline
+    /// rather than a fixed close-time-relative horizon (issue #371). A
+    /// final market with no `SettleState` (legacy, created before it
+    /// existed) has no deadline and falls back to `LongLived`.
+    fn ttl_class_for(m: &Market, settle: Option<&SettleState>) -> ttl::TtlClass {
+        match m.status {
+            MarketStatus::Open => ttl::TtlClass::MarketOpen {
+                close_time: m.close_time,
+            },
+            _ => match settle {
+                Some(s) if s.finalized_at > 0 => ttl::TtlClass::MarketSettling {
+                    deadline: s.finalized_at.saturating_add(s.horizon_secs),
+                },
+                _ => ttl::TtlClass::LongLived,
+            },
+        }
+    }
+
+    /// Raw (unbumped) read of a market's `SettleState`, used only to learn
+    /// its TTL class without recursing into `load_settle_opt`'s own bump.
+    fn get_settle_raw(env: &Env, id: u64) -> Option<SettleState> {
+        env.storage().persistent().get(&DataKey::Settle(id))
     }
 
     /// `None` for legacy markets created before `SettleState` existed; their
     /// outstanding shares cannot be reconstructed on-chain, so they have no
     /// deadline and `finalize_market` refuses them (`NotSupported`) while
     /// `redeem` / `claim_pool_remainder` keep working as before.
-    fn load_settle_opt(env: &Env, id: u64) -> Option<SettleState> {
+    ///
+    /// `m` must be the caller's already-loaded `Market` for this `id`, used
+    /// only to pick the TTL class (issue #371) — its `close_time`/`status`
+    /// are not otherwise consulted here.
+    fn load_settle_opt(env: &Env, id: u64, m: &Market) -> Option<SettleState> {
         let key = DataKey::Settle(id);
         let settle = env.storage().persistent().get::<_, SettleState>(&key)?;
-        // The deadline can be up to 5 years out, past `max_ttl()`; the entry
-        // is kept as long as the network allows and then needs a restore or
-        // the keeper (docs/wave-issues/14) until the market is finalized.
-        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        // Once final, the deadline can be up to 5 years out, past
+        // `max_ttl()`; the entry is kept as long as the network allows and
+        // then needs a restore, the permissionless `extend_market_ttl`, or
+        // the keeper (docs/wave-issues/14) to outlive one bump.
+        let class = Self::ttl_class_for(m, Some(&settle));
+        ttl::bump_persistent(env, &key, ttl::target(env, class));
         Some(settle)
     }
 
-    fn load_settle(env: &Env, id: u64) -> Result<SettleState, Error> {
-        Self::load_settle_opt(env, id).ok_or(Error::NotSupported)
+    /// Builds the pure settlement view of a market (issue #276). `settle`
+    /// is `None` for legacy markets, which the ledger marks untracked so the
+    /// pure layer leaves `outstanding_*` / `paid_out` alone, exactly as the
+    /// `if let Some(settle)` guards did before the refactor.
+    fn settle_ledger(m: &Market, settle: Option<&SettleState>, lp_fees: i128) -> SettleLedger {
+        let (outstanding_yes, outstanding_no, paid_out) = match settle {
+            Some(s) => (s.outstanding_yes, s.outstanding_no, s.paid_out),
+            None => (0, 0, 0),
+        };
+        SettleLedger {
+            sets_minted: m.sets_minted,
+            outstanding_yes,
+            outstanding_no,
+            reserve_yes: m.reserve_yes,
+            reserve_no: m.reserve_no,
+            paid_out,
+            fees_paid: 0,
+            lp_fees,
+            lp_claimed: m.lp_claimed,
+            tracked: settle.is_some(),
+        }
     }
 
-    fn save_settle(env: &Env, id: u64, settle: &SettleState) {
+    /// Copies the pool fields of a ledger back into the `Market`.
+    fn write_market_ledger(m: &mut Market, ledger: &SettleLedger) {
+        m.reserve_yes = ledger.reserve_yes;
+        m.reserve_no = ledger.reserve_no;
+        m.lp_claimed = ledger.lp_claimed;
+    }
+
+    /// Copies the tracked fields of a ledger back into `SettleState`. The
+    /// stored layout is unchanged; `paid_out` now means share/pool
+    /// collateral only (see docs/formal-verification.md, "Settlement").
+    fn write_settle_ledger(settle: &mut SettleState, ledger: &SettleLedger) {
+        settle.outstanding_yes = ledger.outstanding_yes;
+        settle.outstanding_no = ledger.outstanding_no;
+        settle.paid_out = ledger.paid_out;
+    }
+
+    fn load_settle(env: &Env, id: u64, m: &Market) -> Result<SettleState, Error> {
+        Self::load_settle_opt(env, id, m).ok_or(Error::NotSupported)
+    }
+
+    fn save_settle(env: &Env, id: u64, settle: &SettleState, m: &Market) {
         let key = DataKey::Settle(id);
         env.storage().persistent().set(&key, settle);
-        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        let class = Self::ttl_class_for(m, Some(settle));
+        ttl::bump_persistent(env, &key, ttl::target(env, class));
     }
 
     /// `true` once `finalize_market` closed the market. Raw read on purpose:
@@ -2424,21 +3172,62 @@ impl MarketCore {
     /// missing `Settle` entry this cannot be reconstructed on-chain, so the
     /// oracle views refuse them (`NotSupported`) while trading keeps working
     /// (with no TWAP support) for backwards compatibility.
-    fn load_oracle_opt(env: &Env, id: u64, close_time: u64) -> Option<OracleState> {
-        let key = DataKey::Oracle(id);
-        let st = env.storage().persistent().get::<_, OracleState>(&key)?;
-        ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
-        Some(st)
+    /// Raw (unbumped) read of a market's legacy `OracleState`, for
+    /// migration only (issue #374).
+    fn load_legacy_oracle_raw(env: &Env, id: u64) -> Option<OracleState> {
+        env.storage().persistent().get(&DataKey::Oracle(id))
     }
 
-    fn load_oracle(env: &Env, id: u64, close_time: u64) -> Result<OracleState, Error> {
+    /// `None` for a market created before the accumulator existed; unlike a
+    /// missing `Settle` entry this cannot be reconstructed, so the oracle
+    /// views refuse it (`NotSupported`) while trading keeps working (no
+    /// TWAP support) for backwards compatibility.
+    ///
+    /// A legacy market (an `OracleState` but no `OracleStateV2`) is
+    /// migrated on the fly: `cardinality`/`cardinality_next` start at
+    /// `ORACLE_RING` (`Obs` slots are reused, so no history is lost) and
+    /// `bucket_secs` at the current admin default. This read alone does
+    /// not persist the conversion — only `save_oracle_v2` (the next trade,
+    /// or `grow_oracle`) does, deleting the legacy entry.
+    fn load_oracle_opt(env: &Env, id: u64, close_time: u64) -> Option<OracleStateV2> {
+        let key = DataKey::OracleV2(id);
+        if let Some(st) = env.storage().persistent().get::<_, OracleStateV2>(&key) {
+            ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+            return Some(st);
+        }
+        let legacy = Self::load_legacy_oracle_raw(env, id)?;
+        let bucket_secs: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultOracleBucket)
+            .unwrap_or(DEFAULT_BUCKET_SECS);
+        Some(OracleStateV2 {
+            price_cumulative: legacy.price_cumulative,
+            last_ts: legacy.last_ts,
+            last_price_bps: legacy.last_price_bps,
+            obs_index: legacy.obs_index,
+            obs_count: legacy.obs_count,
+            cardinality: ORACLE_RING,
+            cardinality_next: ORACLE_RING,
+            bucket_secs,
+        })
+    }
+
+    fn load_oracle(env: &Env, id: u64, close_time: u64) -> Result<OracleStateV2, Error> {
         Self::load_oracle_opt(env, id, close_time).ok_or(Error::NotSupported)
     }
 
-    fn save_oracle(env: &Env, id: u64, st: &OracleState, close_time: u64) {
-        let key = DataKey::Oracle(id);
+    /// Writes `OracleStateV2` and completes the legacy migration (if any):
+    /// a market is never read as both an `OracleState` and an
+    /// `OracleStateV2` at once.
+    fn save_oracle_v2(env: &Env, id: u64, st: &OracleStateV2, close_time: u64) {
+        let key = DataKey::OracleV2(id);
         env.storage().persistent().set(&key, st);
         ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+        let legacy_key = DataKey::Oracle(id);
+        if env.storage().persistent().has(&legacy_key) {
+            env.storage().persistent().remove(&legacy_key);
+        }
     }
 
     fn save_obs(env: &Env, id: u64, slot: u32, obs: &Observation, close_time: u64) {
@@ -2457,7 +3246,7 @@ impl MarketCore {
     /// ledger can move spot, but the price that counts toward future time is
     /// whatever the last trade of the ledger left behind — which arbitrageurs
     /// can punish as soon as the next ledger opens.
-    fn accumulate(env: &Env, id: u64, m: &Market, st: &mut OracleState) -> Result<(), Error> {
+    fn accumulate(env: &Env, id: u64, m: &Market, st: &mut OracleStateV2) -> Result<(), Error> {
         let now = env.ledger().timestamp();
         if now <= st.last_ts {
             return Ok(());
@@ -2471,9 +3260,34 @@ impl MarketCore {
                     .ok_or(Error::Overflow)?,
             )
             .ok_or(Error::Overflow)?;
+        // Bucketed write (issue #374): `st.last_ts` (about to be
+        // overwritten below) is always the timestamp of the newest
+        // written `Obs` slot, by invariant of this same function, so
+        // comparing against it directly needs no extra read. A trade
+        // inside the same bucket overwrites that slot instead of
+        // advancing the ring — the cumulative stays exact either way,
+        // and this keeps busy trading from cycling through the whole
+        // ring (and erasing history) in under two minutes.
+        let same_bucket =
+            st.bucket_secs > 0 && now / st.bucket_secs as u64 == st.last_ts / st.bucket_secs as u64;
         st.last_ts = now;
-        st.obs_index = (st.obs_index + 1) % ORACLE_RING;
-        st.obs_count = core::cmp::min(st.obs_count + 1, ORACLE_RING);
+        if !same_bucket {
+            let mut next = st.obs_index + 1;
+            if next >= st.cardinality {
+                next = if st.cardinality_next > st.cardinality {
+                    // Grow only at the wrap (Uniswap v3 semantics): the
+                    // slot right after the old last one is a fresh,
+                    // previously unused slot, not slot 0.
+                    let fresh = st.cardinality;
+                    st.cardinality = st.cardinality_next;
+                    fresh
+                } else {
+                    0
+                };
+            }
+            st.obs_index = next;
+            st.obs_count = core::cmp::min(st.obs_count + 1, st.cardinality);
+        }
         Self::save_obs(
             env,
             id,
@@ -2487,9 +3301,19 @@ impl MarketCore {
         Ok(())
     }
 
-    /// `price_cumulative` as of time `t`. Per-slot reads only, so a missing
-    /// (never-written or archived) slot is skipped, never a panic.
-    fn observe_at(env: &Env, id: u64, st: &OracleState, t: u64) -> Result<i128, Error> {
+    /// `price_cumulative` as of time `t`, clamped to `close_time` (issue
+    /// #374: the accumulator is frozen at close, so no TWAP ever includes
+    /// post-close time). Per-slot reads only, so a missing (never-written,
+    /// archived, or `grow_oracle` placeholder) slot is skipped, never a
+    /// panic.
+    fn observe_at(
+        env: &Env,
+        id: u64,
+        st: &OracleStateV2,
+        close_time: u64,
+        t: u64,
+    ) -> Result<i128, Error> {
+        let t = core::cmp::min(t, close_time);
         if t >= st.last_ts {
             // Counterfactual extension: the last traded price holds.
             let ext = (st.last_price_bps as i128)
@@ -2499,11 +3323,19 @@ impl MarketCore {
         }
         // `obs_count >= 1` for every live market: slot 0 is the creation
         // point. `oldest` is the ring position of the oldest written slot.
-        let oldest = (st.obs_index + ORACLE_RING + 1 - st.obs_count) % ORACLE_RING;
+        // Binary search (O(log n)) over this ring is tracked as follow-up
+        // work; this scan stays correct at any `cardinality`, just not
+        // optimally cheap once it grows large.
+        // `grow_oracle` placeholders (`ts: 0`, outside `[oldest, oldest +
+        // obs_count)`) are never reached by this scan: `obs_count` only
+        // ever grows in lockstep with `obs_index` advancing into a slot
+        // `accumulate` is about to write for real, in the same call that
+        // makes it reachable — so no explicit skip is needed here.
+        let oldest = (st.obs_index + st.cardinality + 1 - st.obs_count) % st.cardinality;
         let mut a: Option<Observation> = None; // newest point with ts <= t
         let mut b: Option<Observation> = None; // oldest point with ts >= t
         for k in 0..st.obs_count {
-            let slot = (oldest + k) % ORACLE_RING;
+            let slot = (oldest + k) % st.cardinality;
             let Some(obs) = env
                 .storage()
                 .persistent()
@@ -2582,6 +3414,41 @@ impl MarketCore {
         ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
     }
 
+    fn load_sweep_terms(env: &Env, id: u64) -> Option<SweepTerms> {
+        let key = DataKey::SweepTerms(id);
+        let terms = env.storage().persistent().get(&key);
+        if terms.is_some() {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        }
+        terms
+    }
+
+    fn save_sweep_terms(env: &Env, id: u64, terms: &SweepTerms) {
+        let key = DataKey::SweepTerms(id);
+        env.storage().persistent().set(&key, terms);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+    }
+
+    /// Resolves `finalize_market`'s effective destinations for `id`,
+    /// applying the legacy fallback documented on `SweepTerms` for a market
+    /// created before that entry existed (issue #372): `residual_recipient
+    /// = FeeTerms.recipient` (or the live treasury) and `lp_expiry =
+    /// SweepToResidual`, which reproduces the pre-#372 behaviour exactly.
+    fn sweep_destinations(env: &Env, id: u64) -> Result<(Address, Address, LpExpiryPolicy), Error> {
+        let fee_recipient = match Self::load_fee_terms(env, id) {
+            Some(t) => t.recipient,
+            None => Self::instance_get(env, &DataKey::Treasury)?,
+        };
+        Ok(match Self::load_sweep_terms(env, id) {
+            Some(terms) => (fee_recipient, terms.residual_recipient, terms.lp_expiry),
+            None => (
+                fee_recipient.clone(),
+                fee_recipient,
+                LpExpiryPolicy::SweepToResidual,
+            ),
+        })
+    }
+
     fn load_lp_fees(env: &Env, id: u64) -> i128 {
         env.storage()
             .persistent()
@@ -2631,6 +3498,30 @@ impl MarketCore {
         ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
     }
 
+    /// The market's own `BreakerV2`, or the legacy `BreakerConfig`
+    /// synthesised with `anchor = LedgerOpen` (issue #373), or `None` if
+    /// the market has neither (never checked, as before #373).
+    fn load_breaker_v2(env: &Env, id: u64) -> Option<BreakerConfigV2> {
+        let key = DataKey::BreakerV2(id);
+        let cfg: Option<BreakerConfigV2> = env.storage().persistent().get(&key);
+        if cfg.is_some() {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+            return cfg;
+        }
+        Self::load_breaker(env, id).map(|legacy| BreakerConfigV2 {
+            max_impact_bps: legacy.max_impact_bps,
+            band_bps: legacy.band_bps,
+            anchor: BandAnchor::LedgerOpen,
+            min_twap_obs: 0,
+        })
+    }
+
+    fn save_breaker_v2(env: &Env, id: u64, cfg: &BreakerConfigV2) {
+        let key = DataKey::BreakerV2(id);
+        env.storage().persistent().set(&key, cfg);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+    }
+
     /// Runs the market's snapshotted breakers against a quote's
     /// outcome-relative post-trade reserves. Absent entry (legacy market) or
     /// an all-zero config means no checks.
@@ -2639,7 +3530,7 @@ impl MarketCore {
     /// trip would be rolled back with it — this contract therefore emits
     /// **no** breaker event. The error code (`PriceImpactTooHigh` /
     /// `PriceBandExceeded`) in the transaction result, and the
-    /// `would_trip` / `breaker_state` views, are the observability path.
+    /// `would_trip` / `breaker_check` views, are the observability path.
     fn check_breakers(
         env: &Env,
         id: u64,
@@ -2648,7 +3539,7 @@ impl MarketCore {
         new_outcome_reserve: i128,
         new_other_reserve: i128,
     ) -> Result<(), Error> {
-        let cfg = match Self::load_breaker(env, id) {
+        let cfg = match Self::load_breaker_v2(env, id) {
             Some(c) => c,
             None => return Ok(()),
         };
@@ -2666,9 +3557,18 @@ impl MarketCore {
             return Err(Error::PriceImpactTooHigh);
         }
         if cfg.band_bps > 0 {
-            let reference = Self::band_ref(env, id, pre);
-            if (post - reference as i128).abs() > cfg.band_bps as i128 {
+            let (anchor, source) = Self::band_anchor(env, id, m, pre, &cfg, true);
+            if (post - anchor as i128).abs() > cfg.band_bps as i128 {
                 return Err(Error::PriceBandExceeded);
+            }
+            // Under a TWAP anchor, the original per-ledger bound still
+            // applies too (issue #373): a tighter, single-ledger-spike
+            // check that catches what the slower-moving TWAP cannot yet.
+            if matches!(source, AnchorSource::Twap) {
+                let ledger_ref = Self::band_ref(env, id, pre);
+                if (post - ledger_ref as i128).abs() > cfg.band_bps as i128 {
+                    return Err(Error::PriceBandExceeded);
+                }
             }
         }
         Ok(())
@@ -2697,6 +3597,105 @@ impl MarketCore {
         );
         env.storage().temporary().extend_ttl(&key, 1, 16);
         reference
+    }
+
+    /// Same reference `band_ref` would return, without writing it — for
+    /// read-only previews (`breaker_check`), which must not themselves set
+    /// the ledger's `LedgerOpen` reference ahead of a real trade.
+    fn peek_band_ref(env: &Env, id: u64, pre_price: i128) -> u32 {
+        env.storage()
+            .temporary()
+            .get::<_, BandState>(&DataKey::Band(id))
+            .filter(|s| s.ledger_seq == env.ledger().sequence())
+            .map(|s| s.ref_price_bps)
+            .unwrap_or(pre_price as u32)
+    }
+
+    /// Resolves the band's reference price for this trade (issue #373).
+    /// `LedgerOpen` is `band_ref`/`peek_band_ref` directly. `Twap(window)`
+    /// anchors to the market's own time-weighted average instead, falling
+    /// back to `LedgerOpen` when it is not yet trustworthy: too few ring
+    /// observations, or a window reaching before the oldest one (a fresh
+    /// market, or one whose ring genuinely does not cover `window` yet).
+    /// Never bricks trading and never silently disables the band — the
+    /// fallback is always itself a real, checked anchor.
+    fn band_anchor(
+        env: &Env,
+        id: u64,
+        m: &Market,
+        pre: i128,
+        cfg: &BreakerConfigV2,
+        write: bool,
+    ) -> (u32, AnchorSource) {
+        if let BandAnchor::Twap(window) = cfg.anchor {
+            if let Some(st) = Self::load_oracle_opt(env, id, m.close_time) {
+                if st.obs_count >= cfg.min_twap_obs {
+                    let now = env.ledger().timestamp();
+                    if let Ok(t) = Self::twap_between_raw(
+                        env,
+                        id,
+                        &st,
+                        m.close_time,
+                        now.saturating_sub(window),
+                        now,
+                    ) {
+                        return (t, AnchorSource::Twap);
+                    }
+                }
+            }
+        }
+        let reference = if write {
+            Self::band_ref(env, id, pre)
+        } else {
+            Self::peek_band_ref(env, id, pre)
+        };
+        (reference, AnchorSource::LedgerOpen)
+    }
+
+    /// Shared arithmetic for `twap`/`twap_between`/`band_anchor`: the
+    /// time-weighted average YES price in bps between `start` and `end`
+    /// (each clamped to `close_time`, issue #374), floored.
+    fn twap_between_raw(
+        env: &Env,
+        id: u64,
+        st: &OracleStateV2,
+        close_time: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<u32, Error> {
+        let span = end.saturating_sub(start);
+        if span == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let cum_end = Self::observe_at(env, id, st, close_time, end)?;
+        let cum_start = Self::observe_at(env, id, st, close_time, start)?;
+        let delta = cum_end.checked_sub(cum_start).ok_or(Error::Overflow)?;
+        Ok((delta / span as i128) as u32)
+    }
+
+    /// The post-trade YES price in bps a `Buy`/`Sell` of this size would
+    /// produce right now, shared by `breaker_check` and `would_trip`.
+    fn post_price_for(m: &Market, outcome: Outcome, side: TradeSide) -> Result<i128, Error> {
+        match side {
+            TradeSide::Buy(collateral_in) => {
+                let (r_bought, r_other) = Self::reserves_for(m, outcome);
+                let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
+                Ok(math::price_after(
+                    matches!(outcome, Outcome::Yes),
+                    q.new_reserve_bought,
+                    q.new_reserve_other,
+                )?)
+            }
+            TradeSide::Sell(collateral_out) => {
+                let (r_sold, r_other) = Self::reserves_for(m, outcome);
+                let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
+                Ok(math::price_after(
+                    matches!(outcome, Outcome::Yes),
+                    q.new_reserve_sold,
+                    q.new_reserve_other,
+                )?)
+            }
+        }
     }
 }
 
@@ -3731,6 +4730,192 @@ mod test {
         assert_eq!(client.breaker_state(&market_id), None);
     }
 
+    // ----- Manipulation-resistant breaker band (#373) -----------------------
+
+    #[test]
+    fn breaker_config_v2_synthesizes_ledger_open_for_legacy_market() {
+        let (env, client, creator, _, _, _) = setup_market_full(
+            10_000,
+            Some(BreakerConfig {
+                max_impact_bps: 300,
+                band_bps: 500,
+            }),
+        );
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(
+            client.breaker_config_v2(&market_id),
+            Some(BreakerConfigV2 {
+                max_impact_bps: 300,
+                band_bps: 500,
+                anchor: BandAnchor::LedgerOpen,
+                min_twap_obs: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn set_default_breaker_v2_rejects_invalid_configs() {
+        let (_, client, _, _, _, _) = setup_market();
+        // band_bps < max_impact_bps (both non-zero).
+        assert!(client
+            .try_set_default_breaker_v2(&BreakerConfigV2 {
+                max_impact_bps: 300,
+                band_bps: 100,
+                anchor: BandAnchor::LedgerOpen,
+                min_twap_obs: 0,
+            })
+            .is_err());
+        // Window below the 60-second floor.
+        assert!(client
+            .try_set_default_breaker_v2(&BreakerConfigV2 {
+                max_impact_bps: 0,
+                band_bps: 500,
+                anchor: BandAnchor::Twap(59),
+                min_twap_obs: 0,
+            })
+            .is_err());
+        // Window above the 24-hour ceiling.
+        assert!(client
+            .try_set_default_breaker_v2(&BreakerConfigV2 {
+                max_impact_bps: 0,
+                band_bps: 500,
+                anchor: BandAnchor::Twap(24 * 3_600 + 1),
+                min_twap_obs: 0,
+            })
+            .is_err());
+        // More observations than the ring can ever hold.
+        assert!(client
+            .try_set_default_breaker_v2(&BreakerConfigV2 {
+                max_impact_bps: 0,
+                band_bps: 500,
+                anchor: BandAnchor::Twap(3_600),
+                min_twap_obs: MAX_CARDINALITY + 1,
+            })
+            .is_err());
+        // A valid config is accepted.
+        client.set_default_breaker_v2(&BreakerConfigV2 {
+            max_impact_bps: 300,
+            band_bps: 500,
+            anchor: BandAnchor::Twap(3_600),
+            min_twap_obs: 1,
+        });
+    }
+
+    #[test]
+    fn twap_anchor_falls_back_to_ledger_open_when_insufficient_observations() {
+        let (env, client, creator, _, _, _) = setup_market_full(10_000, None);
+        client.set_default_breaker_v2(&BreakerConfigV2 {
+            max_impact_bps: 0,
+            band_bps: 9_000,
+            anchor: BandAnchor::Twap(3_600),
+            min_twap_obs: 5,
+        });
+        let market_id = new_market(&env, &client, &creator, 5000);
+        // Freshly created: only the seed observation exists.
+        let verdict = client.breaker_check(
+            &market_id,
+            &Outcome::Yes,
+            &TradeSide::Buy(10 * 10_000_000_i128),
+        );
+        assert_eq!(verdict.anchor_source, AnchorSource::LedgerOpen);
+    }
+
+    #[test]
+    fn would_trip_sell_matches_actual_sell_outcome() {
+        let (env, client, creator, trader, _, _) = setup_market_full(
+            10_000,
+            Some(BreakerConfig {
+                max_impact_bps: 500,
+                band_bps: 0,
+            }),
+        );
+        let market_id = new_market(&env, &client, &creator, 5000);
+        // Build a position across many ledgers, each buy individually
+        // under `max_impact_bps` (this breaker has no cumulative band, so
+        // nothing about crossing ledgers matters here, only each call's
+        // own impact).
+        for _ in 0..20 {
+            advance_ledgers(&env, ttl::LEDGER_SECS);
+            client.buy(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &(5 * 10_000_000_i128),
+                &0_i128,
+            );
+        }
+        let held = client.get_position(&market_id, &trader).yes;
+
+        // Selling a large chunk of the accumulated position in one call
+        // moves the price by more than any single one of the building
+        // buys did, and should trip the same impact cap.
+        let big_sell = held / 2;
+        assert!(client.would_trip_sell(&market_id, &Outcome::Yes, &big_sell));
+        assert!(client
+            .try_sell(&trader, &market_id, &Outcome::Yes, &big_sell, &i128::MAX)
+            .is_err());
+
+        let small_sell = 1_000_000_i128;
+        assert!(!client.would_trip_sell(&market_id, &Outcome::Yes, &small_sell));
+        client.sell(&trader, &market_id, &Outcome::Yes, &small_sell, &i128::MAX);
+    }
+
+    /// The core claim of issue #373: a TWAP anchor bounds a slow walk that
+    /// never trips the original per-ledger reference, because that
+    /// reference resets to wherever the price already is at the start of
+    /// every ledger, while the TWAP lags behind and eventually catches up.
+    #[test]
+    fn twap_anchor_bounds_a_walk_that_ledger_open_would_allow() {
+        let (env, client, creator, trader, _, _) = setup_market_full(10_000, None);
+        let band_bps = 60u32;
+        // Two bucket widths (`DEFAULT_BUCKET_SECS = 60`, issue #374): long
+        // enough that the window reaches a second, frozen bucket once the
+        // walk is past its first one, not just the single bucket still
+        // being overwritten by the latest trade.
+        let window = 120u64;
+
+        client.set_default_breaker_v2(&BreakerConfigV2 {
+            max_impact_bps: 0,
+            band_bps,
+            anchor: BandAnchor::LedgerOpen,
+            min_twap_obs: 0,
+        });
+        let ledger_open_market = new_market(&env, &client, &creator, 5000);
+
+        client.set_default_breaker_v2(&BreakerConfigV2 {
+            max_impact_bps: 0,
+            band_bps,
+            anchor: BandAnchor::Twap(window),
+            min_twap_obs: 1,
+        });
+        let twap_market = new_market(&env, &client, &creator, 5000);
+
+        let step = 2_000_000_i128;
+        let mut twap_tripped = false;
+        for i in 0..150u32 {
+            advance_ledgers(&env, ttl::LEDGER_SECS);
+            assert!(
+                client
+                    .try_buy(&trader, &ledger_open_market, &Outcome::Yes, &step, &0_i128)
+                    .is_ok(),
+                "step {i}: the per-ledger reference resets every ledger, so a \
+                 per-step move that stays under band_bps must never trip"
+            );
+            if !twap_tripped
+                && client
+                    .try_buy(&trader, &twap_market, &Outcome::Yes, &step, &0_i128)
+                    .is_err()
+            {
+                twap_tripped = true;
+            }
+        }
+        assert!(
+            twap_tripped,
+            "a sustained walk bounded only by the per-ledger reference must \
+             eventually deviate from its own TWAP by more than band_bps"
+        );
+    }
+
     // ----- #12: deadlines and limit prices ----------------------------------
 
     #[test]
@@ -3863,6 +5048,84 @@ mod test {
     }
 
     // ----- #13: transferable positions and LP role --------------------------
+
+    #[test]
+    fn market_view_and_positions_reflect_close_out() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert_eq!(client.get_market_view(&market_id).lifecycle, Lifecycle::Open);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_eq!(client.get_market_view(&market_id).lifecycle, Lifecycle::Final);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+
+        assert!(client.is_closed(&market_id));
+        let view = client.get_market_view(&market_id);
+        assert_eq!(view.lifecycle, Lifecycle::Closed);
+        assert_eq!(client.get_position(&market_id, &trader), Position { yes: 0, no: 0 });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #40)")]
+    fn transfer_position_rejected_after_close_out() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+        client.transfer_position(
+            &trader,
+            &Address::generate(&env),
+            &market_id,
+            &Outcome::Yes,
+            &1_i128,
+        );
+    }
+
+    #[test]
+    fn purge_closed_positions_removes_entries_and_rejects_open() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(
+            client.try_purge_closed_positions(&market_id, &soroban_sdk::vec![&env, trader.clone()]),
+            Err(Ok(Error::NotFinal))
+        );
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+        assert_eq!(
+            client.purge_closed_positions(&market_id, &soroban_sdk::vec![&env, trader.clone()]),
+            1
+        );
+    }
 
     #[test]
     fn transfer_position_moves_shares_and_preserves_invariant() {
@@ -4173,6 +5436,116 @@ mod test {
         assert!(long_ttl > short_ttl);
     }
 
+    /// Regression for issue #371: once a market finalizes, its own entries
+    /// must follow the redemption deadline (which can be far beyond
+    /// `close_time + SETTLEMENT_HORIZON_SECS`), not the Open-market
+    /// formula. The old fixed formula let a market with the default
+    /// 365-day horizon archive before its holders could redeem.
+    #[test]
+    fn finalized_market_ttl_follows_redemption_deadline() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        // Raised well past the real network cap so the redemption-deadline
+        // target (365 days out) is actually observable instead of being
+        // clamped to the same value as the stale close-relative one.
+        env.ledger().set_max_entry_ttl(400 * ttl::DAY_IN_LEDGERS);
+        env.ledger().set_min_persistent_entry_ttl(4_096);
+
+        let market_id = create_market_closing_in(&env, &client, &creator, 10 * ttl::DAY_SECS);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let market_key = DataKey::Market(market_id);
+        let pos_key = DataKey::Position(market_id, trader.clone());
+
+        // While Open: close + 90-day settlement horizon, unchanged from
+        // before #371.
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &market_key),
+            100 * ttl::DAY_IN_LEDGERS
+        );
+
+        advance_ledgers(&env, 10 * ttl::DAY_SECS + ttl::LEDGER_SECS);
+        client.resolve(&market_id, &Outcome::Yes);
+        let resolved_at = env.ledger().timestamp();
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        assert_eq!(deadline, resolved_at + DEFAULT_REDEEM_HORIZON_SECS);
+        let expected_target = ((deadline - resolved_at + ttl::DEADLINE_MARGIN_SECS)
+            / ttl::LEDGER_SECS) as u32;
+
+        // `resolve` already re-bumps the `Market`/`Settle` entries toward
+        // the deadline, with no separate touch needed.
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &market_key),
+            expected_target
+        );
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &DataKey::Settle(market_id)),
+            expected_target
+        );
+        // The position is extended lazily (positions are not enumerable
+        // on-chain): it still carries its stale Open-market TTL...
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &pos_key),
+            100 * ttl::DAY_IN_LEDGERS - (10 * ttl::DAY_IN_LEDGERS + 1)
+        );
+        // ...until the permissionless `extend_market_ttl` reaches it.
+        let extended =
+            client.extend_market_ttl(&market_id, &soroban_sdk::vec![&env, trader.clone()]);
+        assert_eq!(extended, 3); // Market + Settle + the one listed holder
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &pos_key),
+            expected_target
+        );
+
+        // A touch right at the deadline must still extend past it (the
+        // margin, not just whatever the shrinking target leaves).
+        env.ledger().set_timestamp(deadline);
+        client.extend_market_ttl(&market_id, &soroban_sdk::vec![&env, trader.clone()]);
+        assert!(
+            persistent_ttl(&env, &client.address, &market_key) as u64 * ttl::LEDGER_SECS
+                >= ttl::DEADLINE_MARGIN_SECS
+        );
+    }
+
+    #[test]
+    fn extend_market_ttl_rejects_over_cap_and_skips_missing_holders() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        let stranger = Address::generate(&env);
+
+        // Only `trader` holds a position; `stranger` costs an existence
+        // check and nothing else.
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let extended = client.extend_market_ttl(
+            &market_id,
+            &soroban_sdk::vec![&env, trader.clone(), stranger.clone()],
+        );
+        assert_eq!(extended, 3); // Market + Settle + trader's Position
+
+        let too_many: Vec<Address> = (0..(MAX_TTL_BATCH + 1))
+            .map(|_| Address::generate(&env))
+            .collect::<std::vec::Vec<_>>()
+            .into_iter()
+            .fold(Vec::new(&env), |mut v, a| {
+                v.push_back(a);
+                v
+            });
+        assert_eq!(
+            client.try_extend_market_ttl(&market_id, &too_many),
+            Err(Ok(Error::BatchTooLarge))
+        );
+    }
+
     // ----- Outstanding shares + redemption deadline (#14) ------------------
 
     fn create_market_with(
@@ -4322,7 +5695,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
+    #[should_panic(expected = "Error(Contract, #28)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4380,16 +5753,24 @@ mod test {
 
         let balance_before = token.balance(&client.address);
         let treasury_before = token.balance(&client.get_config().treasury);
+        let creator_before = token.balance(&creator);
         let swept = client.finalize_market(&market_id);
 
         // The sweep drains the market's entire balance — nothing stranded.
         assert_eq!(swept, expected_swept);
         assert_eq!(balance_before, swept);
         assert_eq!(token.balance(&client.address), 0);
+        // Issue #372: the LP's own part (the unclaimed pool remainder, here
+        // with no LP fees since `protocol_share_bps = 10_000`) is no longer
+        // swept to the treasury with everything else — it follows the
+        // default `PayLp` policy to the creator instead. Only the protocol
+        // fees and the share/pool residual (expired user claims + dust)
+        // still land on the treasury.
         assert_eq!(
             token.balance(&client.get_config().treasury),
-            treasury_before + swept
+            treasury_before + swept - expected_lp
         );
+        assert_eq!(token.balance(&creator), creator_before + expected_lp);
 
         let m_after = client.get_market(&market_id);
         assert!(m_after.lp_claimed);
@@ -4405,6 +5786,223 @@ mod test {
 
         // The never-redeemed holder is forfeit, not unpaid-but-pending.
         assert!(client.try_redeem(&trader2, &market_id).is_err());
+    }
+
+    /// Regression for issue #276: the LP claims a pool remainder that
+    /// includes LP fees *before* the deadline. LP fees never entered
+    /// `sets_minted`, so counting them in `paid_out` drove the finalize
+    /// residual to `-lp_fees` and the market could never close.
+    fn finalize_after_lp_fee_claim(void: bool) {
+        // protocol_share_bps = 0: the whole trade fee goes to the LP.
+        let (env, client, creator, trader, _, collateral) = setup_market_full(0, None);
+        let trader2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&trader2, &10_000_000_000_i128);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        // Odd collateral amounts so the per-holder Void floors bite.
+        client.buy(&trader, &market_id, &Outcome::Yes, &333_333_333_i128, &0_i128);
+        client.buy(&trader2, &market_id, &Outcome::No, &77_777_777_i128, &0_i128);
+        client.buy(&trader, &market_id, &Outcome::No, &12_345_678_i128, &0_i128);
+        let lp_fees = lp_fees_stored(&env, &client, market_id);
+        assert!(lp_fees > 0, "fees must accrue to the LP");
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        if void {
+            client.void_market(&market_id);
+        } else {
+            client.resolve(&market_id, &Outcome::Yes);
+        }
+        let pos = client.get_position(&market_id, &trader);
+        if void {
+            assert_eq!((pos.yes + pos.no) % 2, 1, "want an odd void position");
+        }
+
+        // LP claims first (pool value + LP fees), then one holder redeems.
+        let m = client.get_market(&market_id);
+        let pool_value = if void {
+            (m.reserve_yes + m.reserve_no) / 2
+        } else {
+            m.reserve_yes
+        };
+        let lp_payout = client.claim_pool_remainder(&market_id);
+        assert_eq!(lp_payout, pool_value + lp_fees);
+        assert_eq!(
+            client.settle_state(&market_id).paid_out,
+            pool_value,
+            "LP fees must not be counted as share/pool collateral"
+        );
+        let trader_payout = client.redeem(&trader, &market_id);
+
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+        let m_before = client.get_market(&market_id);
+        let s_before = client.settle_state(&market_id);
+        assert_eq!(s_before.paid_out, pool_value + trader_payout);
+        let balance_before = token.balance(&client.address);
+
+        let swept = client.finalize_market(&market_id);
+
+        // Nothing stranded: the sweep is the whole remaining balance.
+        assert_eq!(swept, balance_before);
+        assert_eq!(token.balance(&client.address), 0);
+        let unclaimed = if void {
+            (s_before.outstanding_yes + s_before.outstanding_no) / 2
+        } else {
+            s_before.outstanding_yes
+        };
+        let dust = m_before.sets_minted - s_before.paid_out - unclaimed;
+        // Two redeeming legs (trader + LP): dust <= (2 + 1) / 2 = 1 for Void,
+        // exactly 0 for Yes/No.
+        if void {
+            assert!((0..=1).contains(&dust), "dust={dust}");
+        } else {
+            assert_eq!(dust, 0);
+        }
+        assert_eq!(swept, dust + unclaimed + m_before.fees_accrued);
+        assert!(client.settle_state(&market_id).closed);
+    }
+
+    #[test]
+    fn finalize_succeeds_after_large_lp_fee_claim() {
+        finalize_after_lp_fee_claim(true);
+    }
+
+    #[test]
+    fn finalize_succeeds_after_lp_fee_claim_yes_market() {
+        finalize_after_lp_fee_claim(false);
+    }
+
+    // ----- Finalization sweep split (#372) ----------------------------------
+
+    /// Default policy (`PayLp`): the LP's part of the sweep (the unclaimed
+    /// pool remainder plus LP fees) goes to the *current* creator — proven
+    /// here across a `transfer_lp`, so it is not hard-wired to whoever
+    /// created the market — while the treasury only gets the protocol fees
+    /// and the share/pool residual. `finalize_preview` must match exactly.
+    #[test]
+    fn finalize_pays_lp_part_to_current_creator_by_default() {
+        let (env, client, creator, trader, _, collateral) = setup_market_full(0, None);
+        let new_creator = Address::generate(&env);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let lp_fees = lp_fees_stored(&env, &client, market_id);
+        assert!(lp_fees > 0, "protocol_share_bps = 0: all fee goes to the LP");
+        client.transfer_lp(&market_id, &new_creator);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.void_market(&market_id);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+
+        let m = client.get_market(&market_id);
+        let expected_lp_claim = (m.reserve_yes + m.reserve_no) / 2;
+        let preview = client.finalize_preview(&market_id);
+        assert_eq!(preview.lp_recipient, new_creator);
+        assert_eq!(preview.lp_amount, expected_lp_claim + lp_fees);
+        assert_eq!(
+            preview.protocol_fees + preview.residual + preview.lp_amount,
+            preview.swept
+        );
+
+        let treasury_before = token.balance(&client.get_config().treasury);
+        let new_creator_before = token.balance(&new_creator);
+        let swept = client.finalize_market(&market_id);
+        assert_eq!(swept, preview.swept);
+        assert_eq!(
+            token.balance(&client.get_config().treasury),
+            treasury_before + preview.protocol_fees + preview.residual
+        );
+        assert_eq!(
+            token.balance(&new_creator),
+            new_creator_before + preview.lp_amount
+        );
+    }
+
+    /// `set_default_lp_expiry(SweepToResidual)` affects markets created
+    /// after the call: the LP's part is folded into the residual recipient
+    /// (the treasury here) instead of paid to the creator.
+    #[test]
+    fn finalize_sweep_to_residual_policy_skips_the_creator() {
+        let (env, client, creator, trader, _, collateral) = setup_market_full(0, None);
+        client.set_default_lp_expiry(&LpExpiryPolicy::SweepToResidual);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert!(lp_fees_stored(&env, &client, market_id) > 0);
+        assert_eq!(
+            client.sweep_terms(&market_id).unwrap().lp_expiry,
+            LpExpiryPolicy::SweepToResidual
+        );
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.void_market(&market_id);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+
+        let treasury_before = token.balance(&client.get_config().treasury);
+        let creator_before = token.balance(&creator);
+        let swept = client.finalize_market(&market_id);
+        assert_eq!(
+            token.balance(&client.get_config().treasury),
+            treasury_before + swept
+        );
+        assert_eq!(token.balance(&creator), creator_before);
+    }
+
+    /// Golden test: a market created before `SweepTerms` existed finalizes
+    /// exactly as it did before issue #372 — the entire sweep, LP part
+    /// included, goes to the treasury, with no change to any deployed
+    /// market's payout.
+    #[test]
+    fn legacy_market_without_sweep_terms_matches_pre_372_behavior() {
+        let (env, client, creator, trader, _, collateral) = setup_market_full(0, None);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert!(lp_fees_stored(&env, &client, market_id) > 0);
+        remove_side_entry(&env, &client, DataKey::SweepTerms(market_id));
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.void_market(&market_id);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+
+        assert!(client.sweep_terms(&market_id).is_none());
+        let treasury_before = token.balance(&client.get_config().treasury);
+        let creator_before = token.balance(&creator);
+        let swept = client.finalize_market(&market_id);
+        assert_eq!(
+            token.balance(&client.get_config().treasury),
+            treasury_before + swept
+        );
+        assert_eq!(token.balance(&creator), creator_before);
     }
 
     #[test]
@@ -4445,7 +6043,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -4466,7 +6064,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4480,7 +6078,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4494,7 +6092,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #26)")]
+    #[should_panic(expected = "Error(Contract, #30)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4584,11 +6182,11 @@ mod test {
 
     // ----- TWAP accumulator (#11) ------------------------------------------
 
-    fn oracle_state(env: &Env, client: &MarketCoreClient, market_id: u64) -> OracleState {
+    fn oracle_state(env: &Env, client: &MarketCoreClient, market_id: u64) -> OracleStateV2 {
         env.as_contract(&client.address, || {
             env.storage()
                 .persistent()
-                .get::<_, OracleState>(&DataKey::Oracle(market_id))
+                .get::<_, OracleStateV2>(&DataKey::OracleV2(market_id))
                 .unwrap()
         })
     }
@@ -4896,6 +6494,122 @@ mod test {
         assert_eq!(oracle_state(&env, &client, market_id).obs_count, 16);
     }
 
+    // ----- Time-bucketed observations and growable cardinality (#374) ------
+
+    #[test]
+    fn bucketed_writes_collapse_busy_trading_into_one_slot_per_bucket() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        // Bucket-aligned (`DEFAULT_BUCKET_SECS = 60`) so the whole first
+        // loop below stays inside bucket [960, 1020) by construction.
+        env.ledger().set_timestamp(960);
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 600_000);
+
+        // Five trades inside the same 60-second bucket: only the newest
+        // slot's timestamp/cumulative should change, never `obs_count`.
+        let st0 = oracle_state(&env, &client, market_id);
+        assert_eq!(st0.obs_count, 1);
+        for k in 1..=5u64 {
+            env.ledger().set_timestamp(960 + k * 5);
+            client.buy(&trader, &market_id, &Outcome::Yes, &1_000_000_i128, &0_i128);
+            let st = oracle_state(&env, &client, market_id);
+            assert_eq!(
+                st.obs_count, 1,
+                "trade {k}: still inside the first bucket, no new slot"
+            );
+            assert_eq!(st.obs_index, 0);
+            assert_eq!(obs_at(&env, &client, market_id, 0).unwrap().ts, 960 + k * 5);
+        }
+
+        // Crossing into the next bucket ([1020, 1080)) writes a genuinely
+        // new slot.
+        env.ledger().set_timestamp(1_025);
+        client.buy(&trader, &market_id, &Outcome::Yes, &1_000_000_i128, &0_i128);
+        let st = oracle_state(&env, &client, market_id);
+        assert_eq!(st.obs_count, 2);
+        assert_eq!(st.obs_index, 1);
+        assert_eq!(obs_at(&env, &client, market_id, 0).unwrap().ts, 985);
+        assert_eq!(obs_at(&env, &client, market_id, 1).unwrap().ts, 1_025);
+    }
+
+    #[test]
+    fn oracle_migrates_legacy_state_on_first_trade() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 600_000);
+
+        // Simulate a market created before `OracleStateV2` existed: write
+        // the legacy shape directly and remove the V2 entry `create_market`
+        // wrote.
+        let legacy = OracleState {
+            price_cumulative: 0,
+            last_ts: env.ledger().timestamp(),
+            last_price_bps: 5_000,
+            obs_index: 0,
+            obs_count: 1,
+        };
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OracleV2(market_id));
+            env.storage()
+                .persistent()
+                .set(&DataKey::Oracle(market_id), &legacy);
+        });
+
+        // Reads alone (no trade yet) see a synthesised V2 view and leave
+        // the legacy entry in place.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        assert_eq!(client.twap(&market_id, &100), 5_000);
+        env.as_contract(&client.address, || {
+            assert!(env.storage().persistent().has(&DataKey::Oracle(market_id)));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::OracleV2(market_id)));
+        });
+
+        // The next trade completes the migration.
+        client.buy(&trader, &market_id, &Outcome::Yes, &1_000_000_i128, &0_i128);
+        env.as_contract(&client.address, || {
+            assert!(!env.storage().persistent().has(&DataKey::Oracle(market_id)));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::OracleV2(market_id)));
+        });
+        let st = oracle_state(&env, &client, market_id);
+        assert_eq!(st.cardinality, ORACLE_RING);
+        assert_eq!(st.cardinality_next, ORACLE_RING);
+    }
+
+    #[test]
+    fn grow_oracle_extends_cardinality_and_rejects_oversized_requests() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 600_000);
+        let payer = Address::generate(&env);
+
+        assert_eq!(oracle_state(&env, &client, market_id).cardinality_next, 16);
+        let next = client.grow_oracle(&payer, &market_id, &48);
+        assert_eq!(next, 48);
+        assert_eq!(
+            oracle_state(&env, &client, market_id).cardinality_next,
+            48
+        );
+        // Placeholder slots are pre-initialised but not yet active.
+        assert_eq!(obs_at(&env, &client, market_id, 16).unwrap().ts, 0);
+        assert_eq!(obs_at(&env, &client, market_id, 47).unwrap().ts, 0);
+
+        // Can't shrink or stand still.
+        assert!(client.try_grow_oracle(&payer, &market_id, &48).is_err());
+        // Can't grow more than `MAX_GROW_PER_CALL` in one call.
+        assert!(client
+            .try_grow_oracle(&payer, &market_id, &(48 + MAX_GROW_PER_CALL + 1))
+            .is_err());
+        // Can't grow past `MAX_CARDINALITY`.
+        assert!(client
+            .try_grow_oracle(&payer, &market_id, &(MAX_CARDINALITY + 1))
+            .is_err());
+    }
+
     #[test]
     fn legacy_market_oracle_views_not_supported() {
         let (env, client, creator, _, _, _) = setup_market();
@@ -4904,7 +6618,7 @@ mod test {
         env.as_contract(&client.address, || {
             env.storage()
                 .persistent()
-                .remove(&DataKey::Oracle(market_id));
+                .remove(&DataKey::OracleV2(market_id));
             env.storage()
                 .persistent()
                 .remove(&DataKey::Obs(market_id, 0));
@@ -5856,7 +7570,9 @@ mod multisig_account {
             }
         }
 
-        fn create_default(f: &AdvFixture) -> Result<u64, Result<Error, soroban_sdk::InvokeError>> {
+        fn create_default(
+            f: &AdvFixture,
+        ) -> Result<Result<u64, soroban_sdk::Error>, Result<Error, soroban_sdk::InvokeError>> {
             f.client.try_create_market(
                 &f.creator,
                 &BytesN::from_array(&f.env, &[1u8; 32]),

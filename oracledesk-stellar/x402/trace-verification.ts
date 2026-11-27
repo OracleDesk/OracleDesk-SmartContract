@@ -7,7 +7,9 @@ export type TraceVerdict =
   | { tag: "HashMismatch"; values?: void }
   | { tag: "Flagged"; values: [string] | readonly [string] }
   | { tag: "AgentRevokedAfter"; values: [bigint] | readonly [bigint] }
-  | { tag: "KeyCompromised"; values: [bigint] | readonly [bigint] };
+  | { tag: "KeyCompromised"; values: [bigint] | readonly [bigint] }
+  /** #322: a Buy/Sell trace published after close, inside the grace window. */
+  | { tag: "Late"; values?: void };
 
 export interface TraceRecord {
   traceId: string;
@@ -15,6 +17,7 @@ export interface TraceRecord {
   traceHash: string;
   marketId?: bigint;
   agent?: string;
+  action?: string;
   /** #299: verdict from the registry's `trace_verdict`, if available. */
   verdict?: TraceVerdict;
 }
@@ -211,4 +214,3 @@ export function verifyEd25519Signature(
     return false;
   }
 }
-

@@ -24,6 +24,8 @@
 //! `contracts/resolver`'s `shared_types_are_byte_identical_to_imported` test
 //! pins that byte-for-byte.
 
+pub mod ttl;
+
 use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 // ---------------------------------------------------------------------------

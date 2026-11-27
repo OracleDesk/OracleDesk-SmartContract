@@ -185,6 +185,14 @@ can commit to.
   follow-up alongside the golden re-pin.
 * **Manipulation scope.** A TWAP dilutes a single print, but a sustained
   push still moves the average; median filtering is out of scope.
+* **Snapshots (#321).** Grid samples can be pinned ahead of resolution with
+  `snapshot_twap_samples`, and scaled markets pin their record plus
+  `decimals()` with `snapshot_price`. The grid period is pinned at reveal
+  (`TwapGrid`), or at the first sample snapshot for markets revealed earlier.
+  None of this touches the commitment: the spec hash and `TwapConfig` are
+  unchanged, and the TWAP is computed by one pure function over the ordered
+  slot answers whether each came from storage or a live read, so a snapshot
+  can never change the outcome.
 
 ## Amendment: Market-linked resolution (Issue #147)
 
@@ -340,6 +348,13 @@ Rules the contract enforces:
 
 A `G...` account's raw key is `StrKey.decodeEd25519PublicKey(address)`;
 `C...` contract addresses have no Ed25519 key and cannot be committee members.
+
+**Invalid via v2 (#326).** The v1 message encodes market-core's two-valued
+`Outcome`, so weighted keys could not attest `Invalid`. The v2 message
+(`oracledesk-attest-v2 || 0x02 || …`, outcome byte `2 = Invalid`) is submitted
+through `submit_signatures_v2`; v1 is unchanged byte for byte and stays
+accepted until the admin calls `disable_attest_v1`. See
+`docs/agent-signing.md` for the layout and replay analysis.
 
 ## Committee commitments and rotation bounds
 

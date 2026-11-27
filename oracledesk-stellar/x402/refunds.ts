@@ -1,366 +1,412 @@
-// x402/refunds.ts - Issue #90: Refund and dispute handling for failed x402 trace deliveries
+// Automatic refunds for settled payments whose trace delivery failed (#279).
+//
+// A buyer whose download failed after settlement can re-download with the
+// same payment for `redeliveryWindowMs` (trace-api.ts). After that window the
+// sweeper refunds the payment with a real SEP-41 `transfer` from a dedicated
+// refund account. All state lives in the payment ledger (entry state +
+// `refunds` table), every transition is a CAS, and the signed transaction and
+// its hash are persisted *before* submission, so a crash at any point can
+// never produce two refund transactions for one payment.
+//
+// Lifecycle: settled -> refund_pending -> refunding -> refunded | refund_failed
+// (refund_pending carries `refundReview: true` while it waits for an operator).
 
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import {
+  Address,
+  Contract,
+  Keypair,
+  Networks,
+  StrKey,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  type Transaction,
+} from "@stellar/stellar-sdk";
+import {
+  LedgerConflict,
+  type PaymentEntry,
+  type PaymentLedger,
+  type RefundRecord,
+} from "./payment-ledger.js";
 
-export enum PaymentState {
-  SettledNotDelivered = "settled-not-delivered",
-  Indeterminate = "indeterminate",
-  Delivered = "delivered",
+export interface RefundPolicy {
+  /** How long a settled payment stays re-downloadable before it is refunded. */
+  redeliveryWindowMs: number;
+  /** Refunds up to this amount (base units) are executed without review. */
+  autoApproveMax: bigint;
+  /** Max total refunded per rolling `windowMs`; above it refunds wait for review. */
+  windowCap: bigint;
+  windowMs: number;
+  /** Attempts before a refund ends in `refund_failed`. */
+  maxAttempts: number;
 }
 
-export enum RefundState {
-  Requested = "requested",
-  AutoApproved = "auto_approved",
-  PendingReview = "pending_review",
-  Approved = "approved",
-  Rejected = "rejected",
-  Executing = "executing",
-  Completed = "completed",
-  Failed = "failed",
-}
+export type RefundClass = "wait" | "auto_refund" | "review" | "ignore";
 
-export interface PaymentRecord {
-  paymentId: string;
-  traceId: string;
-  network: string;
-  payer: string;
-  amount: bigint;
-  asset: string;
-  settlementTx?: string;
-  state: PaymentState;
-  deliveredAt?: number;
-}
-
-export interface RefundRequest {
-  id: string;
-  paymentId: string;
-  traceId: string;
-  nonce: string;
-  signature: string;
-  payer: string;
-  amount: bigint;
-  state: RefundState;
-  createdAt: number;
-  refundTx?: string;
-  disputeBytes?: Uint8Array;
-}
-
-export interface ChallengeNonce {
-  nonce: string;
-  createdAt: number;
-  expiresAt: number;
-  used: boolean;
-}
-
-/**
- * Store interface for payment records (to be implemented on top of PaymentLedger)
- */
-export interface RefundablePaymentStore {
-  get(paymentId: string): Promise<PaymentRecord | undefined>;
-  findBySettlementTx(tx: string): Promise<PaymentRecord | undefined>;
-  markRefund(paymentId: string, refundId: string): Promise<void>;
-  recordPayment(record: PaymentRecord): Promise<void>;
-  updatePaymentState(paymentId: string, state: PaymentState, deliveredAt?: number): Promise<void>;
+/** `G...` account or `C...` contract: both can receive a SEP-41 transfer. */
+export function isRefundablePayer(payer: string | undefined): payer is string {
+  return (
+    !!payer &&
+    (StrKey.isValidEd25519PublicKey(payer) || StrKey.isValidContract(payer))
+  );
 }
 
 /**
- * In-memory implementation of payment store for testing
+ * Whether a ledger entry is refund-eligible: settled with no `delivered`
+ * transition, with a settlement transaction and a valid payer, and past its
+ * redelivery window. The rolling window cap is applied by the sweeper, which
+ * needs the refund store.
  */
-export class MemoryPaymentStore implements RefundablePaymentStore {
-  private payments = new Map<string, PaymentRecord>();
-  private txIndex = new Map<string, string>();
-
-  async get(paymentId: string): Promise<PaymentRecord | undefined> {
-    return this.payments.get(paymentId);
+export function classify(
+  e: PaymentEntry,
+  now: number,
+  p: RefundPolicy,
+): RefundClass {
+  if (e.state !== "settled") return "ignore";
+  if (!e.settlementTx || !isRefundablePayer(e.payer)) return "ignore";
+  let amount: bigint;
+  try {
+    amount = BigInt(e.amount);
+  } catch {
+    return "ignore";
   }
-
-  async findBySettlementTx(tx: string): Promise<PaymentRecord | undefined> {
-    const paymentId = this.txIndex.get(tx);
-    return paymentId ? this.payments.get(paymentId) : undefined;
-  }
-
-  async markRefund(paymentId: string, refundId: string): Promise<void> {
-    const payment = this.payments.get(paymentId);
-    if (payment) {
-      // Mark refund in audit log (simplified)
-    }
-  }
-
-  async recordPayment(record: PaymentRecord): Promise<void> {
-    this.payments.set(record.paymentId, record);
-    if (record.settlementTx) {
-      this.txIndex.set(record.settlementTx, record.paymentId);
-    }
-  }
-
-  async updatePaymentState(paymentId: string, state: PaymentState, deliveredAt?: number): Promise<void> {
-    const payment = this.payments.get(paymentId);
-    if (payment) {
-      payment.state = state;
-      if (deliveredAt) payment.deliveredAt = deliveredAt;
-    }
-  }
+  if (amount <= 0n) return "ignore";
+  const settledAt = e.settledAt ?? e.updatedAt;
+  if (now < settledAt + p.redeliveryWindowMs) return "wait";
+  return amount > p.autoApproveMax ? "review" : "auto_refund";
 }
 
-export interface RefundManager {
-  issueChallenge(paymentId: string, traceId: string): Promise<{ nonce: string; expiresAt: number }>;
-  requestRefund(req: {
-    paymentId?: string;
-    settlementTx?: string;
-    traceId: string;
-    nonce: string;
-    signature: string;
-    network: string;
-  }): Promise<{ refundId: string; eligible: boolean; reason?: string }>;
-  getRefunds(state?: RefundState, limit?: number): Promise<RefundRequest[]>;
-  approveRefund(refundId: string): Promise<void>;
-  rejectRefund(refundId: string, reason: string): Promise<void>;
+/** The subset of `rpc.Server` the executor uses (stubbed in tests). */
+export interface RefundRpc {
+  getAccount(address: string): Promise<{ accountId(): string; sequenceNumber(): string; incrementSequenceNumber(): void }>;
+  simulateTransaction(tx: Transaction): Promise<rpc.Api.SimulateTransactionResponse>;
+  sendTransaction(tx: Transaction): Promise<rpc.Api.SendTransactionResponse>;
+  getTransaction(hash: string): Promise<rpc.Api.GetTransactionResponse>;
 }
 
-export class RefundManagerImpl implements RefundManager {
-  private nonces = new Map<string, ChallengeNonce>();
-  private refunds = new Map<string, RefundRequest>();
-  private refundWindow = 72 * 3600 * 1000; // 72 hours
-  private autoApproveMax = 1_000_000n; // stroops
-  private dailyCap = 100_000_000n; // stroops
-  private paymentRefundMap = new Map<string, string>(); // paymentId -> refundId
-
-  constructor(
-    private paymentStore: RefundablePaymentStore,
-    private rpcUrl: string,
-  ) {}
-
-  async issueChallenge(paymentId: string, traceId: string): Promise<{ nonce: string; expiresAt: number }> {
-    const nonce = this.generateNonce();
-    const now = Date.now();
-    const expiresAt = now + 5 * 60 * 1000; // 5 minutes
-
-    this.nonces.set(nonce, {
-      nonce,
-      createdAt: now,
-      expiresAt,
-      used: false,
-    });
-
-    return { nonce, expiresAt };
-  }
-
-  async requestRefund(req: {
-    paymentId?: string;
-    settlementTx?: string;
-    traceId: string;
-    nonce: string;
-    signature: string;
-    network: string;
-  }): Promise<{ refundId: string; eligible: boolean; reason?: string }> {
-    // Resolve payment
-    let payment: PaymentRecord | undefined;
-    if (req.paymentId) {
-      payment = await this.paymentStore.get(req.paymentId);
-    } else if (req.settlementTx) {
-      payment = await this.paymentStore.findBySettlementTx(req.settlementTx);
-    }
-
-    if (!payment) {
-      return { refundId: "", eligible: false, reason: "Payment not found" };
-    }
-
-    // Check for existing refund
-    if (this.paymentRefundMap.has(payment.paymentId)) {
-      return { refundId: "", eligible: false, reason: "Refund already requested for this payment" };
-    }
-
-    // Verify nonce
-    const nonceData = this.nonces.get(req.nonce);
-    if (!nonceData || nonceData.used || Date.now() > nonceData.expiresAt) {
-      return { refundId: "", eligible: false, reason: "Invalid or expired nonce" };
-    }
-
-    // Verify signature
-    const message = this.buildRefundMessage(payment.paymentId, req.traceId, req.nonce, payment.network);
-    const valid = this.verifySignature(message, req.signature, payment.payer);
-    if (!valid) {
-      return { refundId: "", eligible: false, reason: "Invalid signature" };
-    }
-
-    // Mark nonce as used
-    nonceData.used = true;
-
-    // Check eligibility
-    const now = Date.now();
-    const age = now - (payment.deliveredAt || payment.state === PaymentState.Delivered ? now : 0);
-
-    if (age > this.refundWindow) {
-      return { refundId: "", eligible: false, reason: "Refund window expired" };
-    }
-
-    if (payment.state === PaymentState.Delivered) {
-      // Can only refund delivered traces with verifiable hash dispute
-      return { refundId: "", eligible: false, reason: "Delivered traces require hash dispute" };
-    }
-
-    // Create refund request
-    const refundId = this.generateRefundId();
-    const refundRequest: RefundRequest = {
-      id: refundId,
-      paymentId: payment.paymentId,
-      traceId: req.traceId,
-      nonce: req.nonce,
-      signature: req.signature,
-      payer: payment.payer,
-      amount: payment.amount,
-      state: payment.amount <= this.autoApproveMax ? RefundState.AutoApproved : RefundState.PendingReview,
-      createdAt: now,
-    };
-
-    this.refunds.set(refundId, refundRequest);
-    this.paymentRefundMap.set(payment.paymentId, refundId);
-    await this.paymentStore.markRefund(payment.paymentId, refundId);
-
-    return {
-      refundId,
-      eligible: true,
-    };
-  }
-
-  async getRefunds(state?: RefundState, limit = 100): Promise<RefundRequest[]> {
-    let refunds = Array.from(this.refunds.values());
-    if (state) {
-      refunds = refunds.filter((r) => r.state === state);
-    }
-    return refunds.slice(0, limit);
-  }
-
-  async approveRefund(refundId: string): Promise<void> {
-    const refund = this.refunds.get(refundId);
-    if (!refund) throw new Error("Refund not found");
-    refund.state = RefundState.Approved;
-  }
-
-  async rejectRefund(refundId: string, reason: string): Promise<void> {
-    const refund = this.refunds.get(refundId);
-    if (!refund) throw new Error("Refund not found");
-    refund.state = RefundState.Rejected;
-  }
-
-  private buildRefundMessage(paymentId: string, traceId: string, nonce: string, network: string): string {
-    return `oracledesk-x402-refund:v1\nnetwork:${network}\npayment:${paymentId}\ntrace:${traceId}\nnonce:${nonce}`;
-  }
-
-  private verifySignature(message: string, signature: string, publicKey: string): boolean {
-    // In a real implementation, verify Ed25519 signature using the payer's public key
-    // For now, a placeholder
-    try {
-      const messageHash = createHash("sha256").update(message).digest();
-      // Would verify signature here with publicKey
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private generateNonce(): string {
-    return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
-  }
-
-  private generateRefundId(): string {
-    return Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("hex");
-  }
+export interface RefundExecutorOptions {
+  ledger: PaymentLedger;
+  policy: RefundPolicy;
+  /** Secret of the dedicated refund source account (`X402_REFUND_SECRET`). */
+  secret: string;
+  /** RPC for a payment's network; chosen per entry, never a global default. */
+  rpcFor(network: string): RefundRpc;
+  /** Seconds a refund transaction stays valid (its time bound). */
+  txTimeoutSecs?: number;
+  /** Poll interval while waiting for a submitted transaction. */
+  pollMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  log?: (event: Record<string, unknown>) => void;
 }
 
-/**
- * SEP-41 transfer builder for refund execution
- */
-export interface TransferOp {
-  to: string;
-  from: string;
-  amount: bigint;
-  asset: string;
-  memo?: string;
+export function passphraseFor(network: string): string {
+  if (network === "stellar:testnet") return Networks.TESTNET;
+  if (network === "stellar:pubnet") return Networks.PUBLIC;
+  throw new Error(`Unsupported refund network ${network}`);
 }
 
-/**
- * Refund executor - sends SEP-41 transfers from float account
- */
+class RetryableRefundError extends Error {}
+
+/** Backoff before retry `attempt` (1-based): 1, 2, 4, ... minutes, capped at 1 h. */
+export function backoffMs(attempt: number): number {
+  return Math.min(60_000 * 2 ** Math.max(0, attempt - 1), 3_600_000);
+}
+
 export class RefundExecutor {
-  private executing = new Map<string, { txHash: string; startTime: number }>();
+  private readonly keypair: Keypair;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly log: (event: Record<string, unknown>) => void;
 
-  constructor(
-    private refundStore: Map<string, RefundRequest>,
-    private floatAccount: string,
-    private rpcUrl: string,
-  ) {}
+  constructor(private readonly o: RefundExecutorOptions) {
+    if (!o.secret) throw new Error("Refunds require X402_REFUND_SECRET");
+    this.keypair = Keypair.fromSecret(o.secret);
+    this.now = o.now ?? Date.now;
+    this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.log = o.log ?? ((e) => console.log(JSON.stringify(e)));
+  }
 
-  async executeRefund(refund: RefundRequest): Promise<{ txHash: string; success: boolean }> {
-    // Check if already executing
-    if (this.executing.has(refund.id)) {
-      const exec = this.executing.get(refund.id)!;
-      // Check if still executing or completed
-      return { txHash: exec.txHash, success: true };
-    }
+  get source(): string {
+    return this.keypair.publicKey();
+  }
 
+  /**
+   * Moves a `settled` entry into the refund pipeline (CAS). `review` parks it
+   * for an operator. Returns `false` if the entry moved meanwhile (for
+   * example a concurrent re-download delivered it).
+   */
+  async open(e: PaymentEntry, review: boolean): Promise<boolean> {
+    const refundId = randomUUID();
     try {
-      // Build transfer operation
-      const transferOp: TransferOp = {
-        from: this.floatAccount,
-        to: refund.payer,
-        amount: refund.amount,
-        asset: "native", // or the specific asset from payment record
-      };
-
-      // Simulate transaction (placeholder)
-      const simResult = await this.simulateTransfer(transferOp);
-      if (!simResult.ok) {
-        throw new Error(`Simulation failed: ${simResult.error}`);
-      }
-
-      // Build and sign transaction
-      const txHash = this.generateTxHash();
-      this.executing.set(refund.id, { txHash, startTime: Date.now() });
-
-      // Send transaction
-      const sendResult = await this.sendTransaction(txHash, transferOp);
-      if (!sendResult.ok) {
-        this.executing.delete(refund.id);
-        throw new Error(`Send failed: ${sendResult.error}`);
-      }
-
-      // Poll for confirmation
-      const confirmed = await this.pollForConfirmation(txHash);
-      this.executing.delete(refund.id);
-
-      refund.refundTx = txHash;
-      refund.state = confirmed ? RefundState.Completed : RefundState.Failed;
-
-      return { txHash, success: confirmed };
+      await this.o.ledger.transition(e.paymentId, ["settled"], "refund_pending", {
+        refundId,
+        refundReview: review,
+        refundAttempts: 0,
+      });
     } catch (error) {
-      this.executing.delete(refund.id);
-      refund.state = RefundState.Failed;
+      if (error instanceof LedgerConflict) return false;
       throw error;
     }
-  }
-
-  private async simulateTransfer(
-    op: TransferOp,
-  ): Promise<{ ok: boolean; error?: string }> {
-    // Placeholder: would call Soroban RPC simulateTransaction
-    return { ok: true };
-  }
-
-  private async sendTransaction(
-    txHash: string,
-    op: TransferOp,
-  ): Promise<{ ok: boolean; error?: string }> {
-    // Placeholder: would call Soroban RPC sendTransaction
-    return { ok: true };
-  }
-
-  private async pollForConfirmation(txHash: string, maxAttempts = 30): Promise<boolean> {
-    // Placeholder: would poll getTransaction until SUCCESS or FAILED
+    const t = this.now();
+    await this.o.ledger.refunds.insert({
+      refundId,
+      paymentId: e.paymentId,
+      state: review ? "review" : "pending",
+      amount: e.amount,
+      asset: e.asset,
+      payer: e.payer!,
+      createdAt: t,
+      updatedAt: t,
+    });
     return true;
   }
 
-  private generateTxHash(): string {
-    return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
+  /**
+   * Executes (or resumes) the refund of an entry in `refund_pending` or
+   * `refunding`. Safe to call again after a crash at any point.
+   */
+  async execute(entryIn: PaymentEntry): Promise<PaymentEntry> {
+    const ledger = this.o.ledger;
+    let entry = entryIn;
+    if (entry.state === "refund_pending") {
+      if (entry.refundReview) return entry;
+      entry = await ledger.transition(entry.paymentId, ["refund_pending"], "refunding", {
+        refundAttempts: (entry.refundAttempts ?? 0) + 1,
+      });
+    }
+    if (entry.state !== "refunding") return entry;
+    const record = await ledger.refunds.get(entry.paymentId);
+    if (!record) throw new Error(`Refund record missing for ${entry.paymentId}`);
+    const server = this.o.rpcFor(entry.network);
+    const passphrase = passphraseFor(entry.network);
+    try {
+      let hash = record.txHash;
+      let validUntil = record.txXdr
+        ? this.timeBound(record.txXdr, passphrase)
+        : 0;
+      if (hash) {
+        // Crash recovery: the previous attempt may already be on the network.
+        const known = await server.getTransaction(hash);
+        if (known.status === rpc.Api.GetTransactionStatus.SUCCESS)
+          return await this.succeed(entry, hash);
+        if (known.status === rpc.Api.GetTransactionStatus.FAILED)
+          throw new RetryableRefundError(`refund transaction ${hash} failed`);
+        if (this.now() <= validUntil * 1000) {
+          // It could still land: never resend, only wait for it.
+          return await this.await(entry, server, hash, validUntil);
+        }
+        hash = undefined; // expired unseen: safe to rebuild with a fresh sequence
+      }
+      const tx = await this.build(entry, record, server, passphrase);
+      hash = tx.hash().toString("hex");
+      validUntil = Number(tx.timeBounds?.maxTime ?? 0);
+      // Persist before submitting: a crash after this line resumes by hash.
+      await ledger.refunds.update(entry.paymentId, {
+        state: "submitted",
+        txHash: hash,
+        txXdr: tx.toXDR(),
+      });
+      const sent = await server.sendTransaction(tx);
+      if (sent.status === "ERROR")
+        throw new RetryableRefundError(`sendTransaction rejected the refund`);
+      return await this.await(entry, server, hash, validUntil);
+    } catch (error) {
+      return this.fail(entry, error);
+    }
   }
+
+  private timeBound(xdr: string, passphrase: string): number {
+    const tx = TransactionBuilder.fromXDR(xdr, passphrase) as Transaction;
+    return Number(tx.timeBounds?.maxTime ?? 0);
+  }
+
+  private async build(
+    entry: PaymentEntry,
+    record: RefundRecord,
+    server: RefundRpc,
+    passphrase: string,
+  ): Promise<Transaction> {
+    const account = await server.getAccount(this.source);
+    // SEP-41 transfer on the payment's own asset contract. Works for G...
+    // and C... payers alike; never a classic payment.
+    const op = new Contract(entry.asset).call(
+      "transfer",
+      new Address(this.source).toScVal(),
+      new Address(record.payer).toScVal(),
+      nativeToScVal(BigInt(record.amount), { type: "i128" }),
+    );
+    const tx = new TransactionBuilder(account as never, {
+      fee: "100000",
+      networkPassphrase: passphrase,
+    })
+      .addOperation(op)
+      .setTimeout(this.o.txTimeoutSecs ?? 60)
+      .build();
+    const sim = await server.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim))
+      throw new RetryableRefundError(`simulation failed: ${sim.error}`);
+    const assembled = rpc.assembleTransaction(tx, sim).build();
+    assembled.sign(this.keypair);
+    return assembled;
+  }
+
+  private async await(
+    entry: PaymentEntry,
+    server: RefundRpc,
+    hash: string,
+    validUntil: number,
+  ): Promise<PaymentEntry> {
+    for (;;) {
+      const r = await server.getTransaction(hash);
+      if (r.status === rpc.Api.GetTransactionStatus.SUCCESS)
+        return this.succeed(entry, hash);
+      if (r.status === rpc.Api.GetTransactionStatus.FAILED)
+        throw new RetryableRefundError(`refund transaction ${hash} failed`);
+      if (validUntil > 0 && this.now() > validUntil * 1000) {
+        // Past its time bound and still unknown: it can no longer land.
+        // Leave the hash; the next attempt confirms NOT_FOUND and rebuilds.
+        throw new RetryableRefundError(`refund transaction ${hash} expired`);
+      }
+      await this.sleep(this.o.pollMs ?? 1_000);
+    }
+  }
+
+  private async succeed(entry: PaymentEntry, hash: string) {
+    await this.o.ledger.refunds.update(entry.paymentId, { state: "succeeded" });
+    const done = await this.o.ledger.transition(entry.paymentId, ["refunding"], "refunded", {
+      refundTx: hash,
+    });
+    this.log({ event: "x402_refunded", paymentId: entry.paymentId, refundTx: hash });
+    return done;
+  }
+
+  private async fail(entry: PaymentEntry, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const attempts = entry.refundAttempts ?? 1;
+    // A lost CAS means another worker owns this payment now.
+    if (error instanceof LedgerConflict) throw error;
+    if (!(error instanceof RetryableRefundError)) {
+      // Infrastructure error (RPC unreachable...): leave `refunding`; the
+      // sweeper resumes it by hash next tick.
+      this.log({ event: "x402_refund_error", paymentId: entry.paymentId, error: message });
+      return entry;
+    }
+    if (attempts >= this.o.policy.maxAttempts) {
+      await this.o.ledger.refunds.update(entry.paymentId, { state: "failed" });
+      this.log({ event: "x402_refund_failed", paymentId: entry.paymentId, error: message });
+      return this.o.ledger.transition(entry.paymentId, ["refunding"], "refund_failed", {
+        refundLastError: message,
+      });
+    }
+    // Keep the old tx hash on the record: the next attempt checks it first.
+    return this.o.ledger.transition(entry.paymentId, ["refunding"], "refund_pending", {
+      refundLastError: message,
+    });
+  }
+}
+
+export interface SweepOptions {
+  batch: number;
+  log?: (event: Record<string, unknown>) => void;
+  now?: () => number;
+}
+
+/**
+ * One sweeper tick: resumes interrupted refunds, retries pending ones whose
+ * backoff elapsed, then opens refunds for settled-but-undelivered payments
+ * past the redelivery window, at most `batch` entries in total.
+ */
+export async function sweepRefunds(
+  ledger: PaymentLedger,
+  executor: RefundExecutor,
+  policy: RefundPolicy,
+  o: SweepOptions,
+): Promise<number> {
+  const now = (o.now ?? Date.now)();
+  const log = o.log ?? ((e) => console.log(JSON.stringify(e)));
+  let budget = o.batch;
+  let processed = 0;
+  // 1. Crash recovery: anything left mid-flight.
+  for (const e of await ledger.listByState(["refunding"], 0, budget)) {
+    await executor.execute(e);
+    budget--;
+    processed++;
+  }
+  // 2. Retries (after backoff) of approved pending refunds.
+  for (const e of await ledger.listByState(["refund_pending"], 0, Math.max(budget, 0))) {
+    if (budget <= 0) break;
+    if (e.refundReview) continue;
+    const attempts = e.refundAttempts ?? 0;
+    if (attempts > 0 && now < e.updatedAt + backoffMs(attempts)) continue;
+    await executor.execute(e);
+    budget--;
+    processed++;
+  }
+  // 3. New refunds.
+  if (budget > 0) {
+    const candidates = await ledger.listByState(
+      ["settled"],
+      policy.redeliveryWindowMs,
+      budget,
+    );
+    for (const e of candidates) {
+      const c = classify(e, now, policy);
+      if (c === "wait" || c === "ignore") continue;
+      let review = c === "review";
+      if (!review) {
+        const used = await ledger.refunds.sumSince(now - policy.windowMs);
+        if (used + BigInt(e.amount) > policy.windowCap) {
+          review = true;
+          log({
+            event: "x402_refund_cap_reached",
+            paymentId: e.paymentId,
+            used: used.toString(),
+            windowCap: policy.windowCap.toString(),
+          });
+        }
+      }
+      if (!(await executor.open(e, review))) continue;
+      processed++;
+      if (!review) {
+        const opened = await ledger.get(e.paymentId);
+        if (opened) await executor.execute(opened);
+      }
+    }
+  }
+  return processed;
+}
+
+/** Operator approval of a refund parked for review. */
+export async function approveRefund(ledger: PaymentLedger, paymentId: string) {
+  const current = await ledger.get(paymentId);
+  if (!current || current.state !== "refund_pending" || !current.refundReview)
+    throw new LedgerConflict(`Payment ${paymentId}: not awaiting review`);
+  const e = await ledger.transition(paymentId, ["refund_pending"], "refund_pending", {
+    refundReview: false,
+  });
+  await ledger.refunds.update(paymentId, { state: "pending" });
+  return e;
+}
+
+/** Operator rejection: the payment stays paid, nothing is sent. */
+export async function rejectRefund(ledger: PaymentLedger, paymentId: string) {
+  const e = await ledger.get(paymentId);
+  if (!e || e.state !== "refund_pending" || !e.refundReview)
+    throw new LedgerConflict(`Payment ${paymentId}: not awaiting review`);
+  await ledger.refunds.update(paymentId, { state: "rejected" });
+  return ledger.transition(paymentId, ["refund_pending"], "refund_failed", {
+    refundLastError: "Rejected by operator",
+  });
+}
+
+export function refundPolicyFromEnv(env: NodeJS.ProcessEnv): RefundPolicy {
+  return {
+    redeliveryWindowMs: Number(env.X402_REDELIVERY_WINDOW_SECS ?? 900) * 1000,
+    autoApproveMax: BigInt(env.X402_REFUND_AUTO_APPROVE_MAX ?? "1000000"),
+    windowCap: BigInt(env.X402_REFUND_WINDOW_CAP ?? "100000000"),
+    windowMs: Number(env.X402_REFUND_WINDOW_SECS ?? 86_400) * 1000,
+    maxAttempts: Number(env.X402_REFUND_MAX_ATTEMPTS ?? 5),
+  };
 }

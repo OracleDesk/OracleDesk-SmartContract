@@ -109,6 +109,7 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
         env.ledger().set_timestamp(START_TIME);
         env.ledger().set_network_id([7u8; 32]);
 

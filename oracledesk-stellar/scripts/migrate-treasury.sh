@@ -1,160 +1,72 @@
 #!/usr/bin/env bash
-# Migrate an old OracleDesk treasury deployment to a fresh one, one market
-# at a time. Writes nothing until the new treasury is deployed; re-running
-# is safe (already-migrated markets have empty positions and are skipped by
-# the on-chain logic).
-#
-# What it does, against the `testnet` network only (hardcoded, like
-# deploy-testnet.sh — this script never touches mainnet):
-#   1. reads the old treasury + market-core addresses from
-#      deployments/testnet.json and the old treasury's RiskConfig on-chain
-#      (agent, collateral, caps),
-#   2. deploys a new treasury with the same config,
-#   3. queues set_successor(new) on the OLD treasury, waits out the
-#      timelock, then executes it,
-#   4. queues one migrate_markets([0..market_count]) call, waits out the
-#      timelock, then executes it, moving every market's position and (if
-#      still held) LP ownership to the new treasury.
-#
-# It does NOT rewire market-core (`propose_treasury`) — that is a separate,
-# deliberate cutover step, because it changes the fee recipient for future
-# markets. The recorded successor id lands in
-# deployments/testnet.json under `.contracts.treasury_successor`.
-#
-# Requires: stellar CLI, jq.
+# Migrate a treasury through the authenticated, vault-wide migration protocol.
+
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-
 NETWORK=testnet
 DEPLOYER_KEY=oracledesk-deployer
 OUT=deployments/testnet.json
 WASM_DIR=target/wasm32v1-none/release
-
+DRY_RUN=${DRY_RUN:-0}
 log() { echo "==> $*" >&2; }
-
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "error: '$1' is required but not installed" >&2
-    exit 1
-  }
-}
-require_cmd stellar
-require_cmd jq
-
-[ -f "$OUT" ] || {
-  echo "error: $OUT not found — run scripts/deploy-testnet.sh first" >&2
-  exit 1
-}
+for cmd in stellar jq; do command -v "$cmd" >/dev/null || { echo "error: '$cmd' is required" >&2; exit 1; }; done
+[ -f "$OUT" ] || { echo "error: $OUT not found" >&2; exit 1; }
 json_get() { jq -r "$1 // empty" "$OUT"; }
 json_set() {
-  local tmp
-  tmp=$(mktemp)
+  local tmp="${OUT}.migrate.tmp"
   jq "$@" "$OUT" >"$tmp" && mv "$tmp" "$OUT"
 }
-
-OLD_TREASURY=$(json_get .contracts.treasury)
-MARKET_CORE=$(json_get .contracts.market_core)
-[ -n "$OLD_TREASURY" ] && [ -n "$MARKET_CORE" ] || {
-  echo "error: $OUT has no contracts.treasury / contracts.market_core" >&2
-  exit 1
+invoke() {
+  local id=$1; shift
+  if [ "$DRY_RUN" = 1 ]; then
+    stellar contract invoke --id "$id" --source-account "$DEPLOYER_KEY" --network "$NETWORK" --send=no -- "$@"
+  else
+    stellar contract invoke --id "$id" --source-account "$DEPLOYER_KEY" --network "$NETWORK" -- "$@"
+  fi
 }
-log "old treasury: $OLD_TREASURY"
-log "market-core:  $MARKET_CORE"
-
-[ -f "$WASM_DIR/treasury.wasm" ] || {
-  log "missing $WASM_DIR/treasury.wasm — running stellar contract build first"
-  stellar contract build
-}
-
-# --- read the old treasury's live config ------------------------------------
-CONFIG=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-  --network "$NETWORK" -- get_config)
-AGENT=$(jq -r '.agent' <<<"$CONFIG")
-COLLATERAL=$(jq -r '.collateral' <<<"$CONFIG")
-CONFIG_MARKET_CORE=$(jq -r '.market_core' <<<"$CONFIG")
-MAX_TRADE=$(jq -r '.max_trade' <<<"$CONFIG")
-MAX_MARKET=$(jq -r '.max_market' <<<"$CONFIG")
-MAX_DAILY=$(jq -r '.max_daily' <<<"$CONFIG")
-# Treasuries deployed before the net cap have no get_net_cap; fall back to an
-# explicit MAX_NET_EXPOSURE, else max_daily (the contract's own fallback).
-if [ -z "${MAX_NET_EXPOSURE:-}" ]; then
-  MAX_NET_EXPOSURE=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- get_net_cap 2>/dev/null | tr -d '"' || true)
-  MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
+OLD=$(json_get .contracts.treasury)
+CORE=$(json_get .contracts.market_core)
+[ -n "$OLD" ] && [ -n "$CORE" ] || { echo "error: deployment has no treasury/market_core" >&2; exit 1; }
+[ -f "$WASM_DIR/treasury.wasm" ] || stellar contract build
+GLOBAL=$(invoke "$OLD" get_global)
+AGENT=$(jq -r '.agent // empty' <<<"$(invoke "$OLD" get_config)")
+COLLATERAL=$(jq -r '.collateral' <<<"$GLOBAL")
+MAX_TRADE=$(jq -r '.max_trade' <<<"$GLOBAL")
+MAX_MARKET=$(jq -r '.max_market' <<<"$(invoke "$OLD" get_config)")
+MAX_DAILY=$(jq -r '.max_daily' <<<"$GLOBAL")
+MAX_NET=$(jq -r '.max_net_exposure' <<<"$GLOBAL")
+DELAY=$(invoke "$OLD" config_delay | tr -d '"')
+DRAWDOWN=$(invoke "$OLD" drawdown_status)
+MAX_DRAWDOWN=$(jq -r '.max_drawdown' <<<"$DRAWDOWN")
+WINDOW_DAYS=$(jq -r '.window_days // 1' <<<"$DRAWDOWN")
+POLICY=$(invoke "$OLD" get_creation_policy)
+SUCCESSOR=$(json_get .contracts.treasury_successor)
+if [ -z "$SUCCESSOR" ] && [ "$DRY_RUN" != 1 ]; then
+  ADMIN=$(stellar keys address "$DEPLOYER_KEY")
+  SUCCESSOR=$(stellar contract deploy --wasm "$WASM_DIR/treasury.wasm" --source-account "$DEPLOYER_KEY" --network "$NETWORK" -- \
+    --admin "$ADMIN" --agent "$AGENT" --collateral "$COLLATERAL" --market_core "$CORE" \
+    --max_trade "$MAX_TRADE" --max_market "$MAX_MARKET" --max_daily "$MAX_DAILY" --max_net_exposure "$MAX_NET" \
+    --config_delay "$DELAY" --max_drawdown "$MAX_DRAWDOWN" --window_days "$WINDOW_DAYS" \
+    --creation_policy "$POLICY")
+  json_set --arg id "$SUCCESSOR" '.contracts.treasury_successor = $id'
 fi
-# Treasuries deployed before the config timelock have no config_delay.
-if [ -z "${CONFIG_DELAY:-}" ]; then
-  CONFIG_DELAY=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- config_delay 2>/dev/null | tr -d '"' || true)
-  CONFIG_DELAY=${CONFIG_DELAY:-86400}
+[ -n "$SUCCESSOR" ] || { echo "error: successor required (deploy first or set .contracts.treasury_successor)" >&2; exit 1; }
+log "successor: $SUCCESSOR"
+invoke "$SUCCESSOR" accept_predecessor --predecessor "$OLD"
+invoke "$OLD" begin_migration --successor "$SUCCESSOR"
+if [ "$DRY_RUN" = 1 ]; then
+  log "dry-run complete"
+  log "old NAV: $(invoke "$OLD" nav)"
+  log "successor NAV: $(invoke "$SUCCESSOR" nav)"
+  exit 0
 fi
-if [ "$CONFIG_MARKET_CORE" != "$MARKET_CORE" ]; then
-  log "warning: old treasury points at $CONFIG_MARKET_CORE, $OUT records $MARKET_CORE"
-fi
-DEPLOYER=$(stellar keys address "$DEPLOYER_KEY")
-
-# --- deploy the successor with the same config ------------------------------
-NEW_TREASURY=$(json_get .contracts.treasury_successor)
-if [ -z "$NEW_TREASURY" ]; then
-  log "deploying successor treasury (same agent/collateral/caps)"
-  NEW_TREASURY=$(stellar contract deploy \
-    --wasm "$WASM_DIR/treasury.wasm" \
-    --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" \
-    -- \
-    --admin "$DEPLOYER" \
-    --agent "$AGENT" \
-    --collateral "$COLLATERAL" \
-    --market_core "$MARKET_CORE" \
-    --max_trade "$MAX_TRADE" \
-    --max_market "$MAX_MARKET" \
-    --max_daily "$MAX_DAILY" \
-    --max_net_exposure "$MAX_NET_EXPOSURE" \
-    --config_delay "$CONFIG_DELAY")
-  json_set --arg id "$NEW_TREASURY" '.contracts.treasury_successor = $id'
-else
-  log "successor treasury already recorded: $NEW_TREASURY"
-fi
-
-# --- record the successor on the old treasury --------------------------------
-SET_FOR=$(json_get .migration.successor_set_for)
-if [ "$SET_FOR" != "$NEW_TREASURY" ]; then
-  log "old treasury: queue set_successor($NEW_TREASURY)"
-  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- set_successor --successor "$NEW_TREASURY"
-  log "waiting ${CONFIG_DELAY}s for the successor proposal timelock"
-  sleep "$CONFIG_DELAY"
-  log "old treasury: execute successor (op kind 2)"
-  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- execute_op --kind 2
-  json_set --arg id "$NEW_TREASURY" '.migration.successor_set_for = $id'
-else
-  log "old treasury already points at the successor"
-fi
-
-# --- migrate every market in one delayed batch ------------------------------
-MARKET_COUNT=$(stellar contract invoke --id "$MARKET_CORE" --source-account "$DEPLOYER_KEY" \
-  --network "$NETWORK" -- market_count)
-log "migrating $MARKET_COUNT market(s)"
-if [ "$MARKET_COUNT" -gt 0 ]; then
-  MARKET_IDS=$(jq -nc --argjson n "$MARKET_COUNT" '[range(0; $n)]')
-  log "old treasury: queue migrate_markets($MARKET_IDS)"
-  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- migrate_markets --market_ids "$MARKET_IDS"
-  log "waiting ${CONFIG_DELAY}s for the migration proposal timelock"
-  sleep "$CONFIG_DELAY"
-  log "old treasury: execute migration (op kind 3)"
-  stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- execute_op --kind 3
-  json_set --arg n "$MARKET_COUNT" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '.migration.markets_migrated = ($n | tonumber) | .migration.completed_at = $ts'
-else
-  log "no markets to migrate"
-fi
-
-log "done. Successor: $NEW_TREASURY"
-log "next steps (deliberate, operator-owned):"
-log "  1. rewire market-core's fee recipient to the new treasury (#61, ADR 0006):"
-log "     market-core.propose_treasury($NEW_TREASURY); then the new treasury calls"
-log "     accept_market_core_role() to authenticate the wiring"
-log "  2. update .contracts.treasury in $OUT and restart the agents against it"
+STATE=$(invoke "$OLD" migration_state)
+AFTER=$(jq -r '.migrate_after' <<<"$STATE")
+while [ "$(date +%s)" -lt "$AFTER" ]; do sleep 5; done
+COUNT=$(invoke "$OLD" open_market_count)
+IDS=()
+for ((i=0; i<COUNT; i++)); do IDS+=("$(invoke "$OLD" open_market_at --i "$i" | jq -r '.market_id')"); done
+[ "${#IDS[@]}" -eq 0 ] || invoke "$OLD" migrate_markets --market_ids "[${IDS[*]}]"
+invoke "$OLD" migrate_idle
+json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.migration.completed_at = $ts | .contracts.treasury = .contracts.treasury_successor'
+log "migration complete: $SUCCESSOR"

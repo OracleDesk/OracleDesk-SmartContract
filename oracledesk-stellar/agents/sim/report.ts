@@ -29,6 +29,9 @@ export interface RunMetrics {
   overshootP95Bps: number | null;
   /** Share of OracleDesk fills that left the price past their own fair value. */
   overshootRate: number | null;
+  lpLoss: number;
+  hedgeCost: number;
+  maxDrawdown: number;
   capBindings: Record<string, Record<string, number>>;
   capBindingRate: Record<string, number>;
   peakDailyUtil: Record<string, number>;
@@ -82,6 +85,9 @@ export function runMetrics(r: RunResult): RunMetrics {
     overshootMeanBps: os.length ? mean(os) : null,
     overshootP95Bps: os.length ? quantile(os, 0.95) : null,
     overshootRate: os.length ? os.filter((x) => x > 0).length / os.length : null,
+    lpLoss: usdc(r.lpLoss),
+    hedgeCost: usdc(r.hedgeCost),
+    maxDrawdown: usdc(r.maxDrawdown),
     capBindings,
     capBindingRate,
     peakDailyUtil,

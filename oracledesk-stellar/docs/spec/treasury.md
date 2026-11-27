@@ -49,14 +49,14 @@ pub struct RiskConfig {
 
 Deposits collateral into the treasury.
 
-**AUTH-1** `auth(depositor)`.
+**TR-DEPOSIT-AUTH-1** `auth(depositor)`.
 
-**PRE-1** `amount > 0` else `InvalidAmount(1)`.
+**TR-DEPOSIT-PRE-1** `amount > 0` else `InvalidAmount(1)`.
 
-**POST-1** `collateral.transfer(depositor, treasury, amount)` executed.
-**POST-2** `I[TreasuryBalance]` += `amount`.
+**TR-DEPOSIT-POST-1** `collateral.transfer(depositor, treasury, amount)` executed.
+**TR-DEPOSIT-POST-2** `I[TreasuryBalance]` += `amount`.
 
-**EVT-1** `Deposited { depositor, amount }`.
+**TR-DEPOSIT-EVT-1** `Deposited { depositor, amount }`.
 
 ---
 
@@ -64,14 +64,14 @@ Deposits collateral into the treasury.
 
 Withdraws collateral from the treasury.
 
-**AUTH-1** `auth(admin)`.
+**TR-WITHDRAW-AUTH-1** `auth(admin)`.
 
-**PRE-1** `I[TreasuryBalance] >= amount` else `InsufficientBalance(2)`.
+**TR-WITHDRAW-PRE-1** `I[TreasuryBalance] >= amount` else `InsufficientBalance(2)`.
 
-**POST-1** `collateral.transfer(treasury, recipient, amount)` executed.
-**POST-2** `I[TreasuryBalance]` -= `amount`.
+**TR-WITHDRAW-POST-1** `collateral.transfer(treasury, recipient, amount)` executed.
+**TR-WITHDRAW-POST-2** `I[TreasuryBalance]` -= `amount`.
 
-**EVT-1** `Withdrawn { recipient, amount }`.
+**TR-WITHDRAW-EVT-1** `Withdrawn { recipient, amount }`.
 
 ---
 
@@ -79,21 +79,21 @@ Withdraws collateral from the treasury.
 
 Agent creates a market (without bounty).
 
-**AUTH-1** `auth(agent)`.
+**TR-AGENT_CREATE_MARKET-AUTH-1** `auth(agent)`.
 
-**PRE-1** `P[RiskConfig(agent)]` exists else `AgentNotRegistered(3)`.
-**PRE-2** `seed_amount <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
-**PRE-3** `P[Exposure(agent, next_market_id)] + seed_amount <= P[RiskConfig(agent)].max_market` else `MarketCapExceeded(5)`.
-**PRE-4** Daily usage cap not exceeded (checked).
-**PRE-5** Treasury has sufficient balance: `I[TreasuryBalance] >= seed_amount`.
+**TR-AGENT_CREATE_MARKET-PRE-1** `P[RiskConfig(agent)]` exists else `AgentNotRegistered(3)`.
+**TR-AGENT_CREATE_MARKET-PRE-2** `seed_amount <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
+**TR-AGENT_CREATE_MARKET-PRE-3** `P[Exposure(agent, next_market_id)] + seed_amount <= P[RiskConfig(agent)].max_market` else `MarketCapExceeded(5)`.
+**TR-AGENT_CREATE_MARKET-PRE-4** Daily usage cap not exceeded (checked).
+**TR-AGENT_CREATE_MARKET-PRE-5** Treasury has sufficient balance: `I[TreasuryBalance] >= seed_amount`.
 
-**POST-1** Pre-authorizes `transfer(treasury, market_core, seed_amount)` via `authorize_as_current_contract`.
-**POST-2** Calls `market_core.create_market(...)`.
-**POST-3** `P[Exposure(agent, market_id)]` = `seed_amount`.
-**POST-4** `P[DailyUsageAmount(agent)]` += `seed_amount` (rolling cap).
-**POST-5** `I[TreasuryBalance]` -= `seed_amount`.
+**TR-AGENT_CREATE_MARKET-POST-1** Pre-authorizes `transfer(treasury, market_core, seed_amount)` via `authorize_as_current_contract`.
+**TR-AGENT_CREATE_MARKET-POST-2** Calls `market_core.create_market(...)`.
+**TR-AGENT_CREATE_MARKET-POST-3** `P[Exposure(agent, market_id)]` = `seed_amount`.
+**TR-AGENT_CREATE_MARKET-POST-4** `P[DailyUsageAmount(agent)]` += `seed_amount` (rolling cap).
+**TR-AGENT_CREATE_MARKET-POST-5** `I[TreasuryBalance]` -= `seed_amount`.
 
-**EVT-1** `MarketCreatedByAgent { agent, market_id, seed_amount }`.
+**TR-AGENT_CREATE_MARKET-EVT-1** `MarketCreatedByAgent { agent, market_id, seed_amount }`.
 
 ---
 
@@ -101,27 +101,27 @@ Agent creates a market (without bounty).
 
 Agent creates a market with a resolution bounty.
 
-**AUTH-1** `auth(agent)`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-AUTH-1** `auth(agent)`.
 
-**PRE-1** `P[RiskConfig(agent)]` exists.
-**PRE-2** `seed_amount + bounty_amount <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
-**PRE-3** Exposure cap: `P[Exposure(agent, market_id)] + seed_amount + bounty_amount <= P[RiskConfig(agent)].max_market`.
-**PRE-4** Daily usage cap: `P[DailyUsageAmount(agent)] + seed_amount + bounty_amount <= P[RiskConfig(agent)].max_daily`.
-**PRE-5** Treasury balance sufficient.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-PRE-1** `P[RiskConfig(agent)]` exists.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-PRE-2** `seed_amount + bounty_amount <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-PRE-3** Exposure cap: `P[Exposure(agent, market_id)] + seed_amount + bounty_amount <= P[RiskConfig(agent)].max_market`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-PRE-4** Daily usage cap: `P[DailyUsageAmount(agent)] + seed_amount + bounty_amount <= P[RiskConfig(agent)].max_daily`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-PRE-5** Treasury balance sufficient.
 
-**POST-1** Pre-authorizes two transfers in one `authorize_as_current_contract` vector:
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-1** Pre-authorizes two transfers in one `authorize_as_current_contract` vector:
   - `transfer(treasury, market_core, seed_amount)`.
   - `transfer(treasury, resolver, bounty_amount)`.
-**POST-2** Calls `market_core.create_market(...)` with seed_amount.
-**POST-3** Calls `resolver.fund_bounty(treasury, market_id, bounty_amount)`.
-**POST-4** `P[Exposure(agent, market_id)]` = `seed_amount + bounty_amount`.
-**POST-5** `P[DailyUsageAmount(agent)]` += `seed_amount + bounty_amount`.
-**POST-6** `I[TreasuryBalance]` -= `seed_amount + bounty_amount`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-2** Calls `market_core.create_market(...)` with seed_amount.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-3** Calls `resolver.fund_bounty(treasury, market_id, bounty_amount)`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-4** `P[Exposure(agent, market_id)]` = `seed_amount + bounty_amount`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-5** `P[DailyUsageAmount(agent)]` += `seed_amount + bounty_amount`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-POST-6** `I[TreasuryBalance]` -= `seed_amount + bounty_amount`.
 
-**EVT-1** `MarketCreatedByAgentWithBounty { agent, market_id, seed_amount, bounty_amount }`.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-EVT-1** `MarketCreatedByAgentWithBounty { agent, market_id, seed_amount, bounty_amount }`.
 
-**ERR-1** `CapExceeded(4)` if total exceeds max_trade.
-**ERR-2** `MarketCapExceeded(5)` if market exposure exceeds max_market.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-ERR-1** `CapExceeded(4)` if total exceeds max_trade.
+**TR-AGENT_CREATE_MARKET_WITH_BOUNTY-ERR-2** `MarketCapExceeded(5)` if market exposure exceeds max_market.
 
 ---
 
@@ -129,21 +129,21 @@ Agent creates a market with a resolution bounty.
 
 Agent buys shares in a market.
 
-**AUTH-1** `auth(agent)`.
+**TR-AGENT_BUY-AUTH-1** `auth(agent)`.
 
-**PRE-1** `P[RiskConfig(agent)]` exists.
-**PRE-2** `collateral_in <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
-**PRE-3** New exposure: `P[Exposure(agent, market_id)] + collateral_in <= P[RiskConfig(agent)].max_market`.
-**PRE-4** Daily usage cap not exceeded.
-**PRE-5** Treasury balance sufficient.
+**TR-AGENT_BUY-PRE-1** `P[RiskConfig(agent)]` exists.
+**TR-AGENT_BUY-PRE-2** `collateral_in <= P[RiskConfig(agent)].max_trade` else `CapExceeded(4)`.
+**TR-AGENT_BUY-PRE-3** New exposure: `P[Exposure(agent, market_id)] + collateral_in <= P[RiskConfig(agent)].max_market`.
+**TR-AGENT_BUY-PRE-4** Daily usage cap not exceeded.
+**TR-AGENT_BUY-PRE-5** Treasury balance sufficient.
 
-**POST-1** Pre-authorizes `transfer(treasury, market_core, collateral_in)`.
-**POST-2** Calls `market_core.buy(agent, market_id, outcome, collateral_in, min_shares_out)`.
-**POST-3** `P[Exposure(agent, market_id)]` += `collateral_in`.
-**POST-4** `P[DailyUsageAmount(agent)]` += `collateral_in`.
-**POST-5** `I[TreasuryBalance]` -= `collateral_in`.
+**TR-AGENT_BUY-POST-1** Pre-authorizes `transfer(treasury, market_core, collateral_in)`.
+**TR-AGENT_BUY-POST-2** Calls `market_core.buy(agent, market_id, outcome, collateral_in, min_shares_out)`.
+**TR-AGENT_BUY-POST-3** `P[Exposure(agent, market_id)]` += `collateral_in`.
+**TR-AGENT_BUY-POST-4** `P[DailyUsageAmount(agent)]` += `collateral_in`.
+**TR-AGENT_BUY-POST-5** `I[TreasuryBalance]` -= `collateral_in`.
 
-**EVT-1** `AgentBought { agent, market_id, outcome, collateral_in }`.
+**TR-AGENT_BUY-EVT-1** `AgentBought { agent, market_id, outcome, collateral_in }`.
 
 ---
 
@@ -151,13 +151,13 @@ Agent buys shares in a market.
 
 Closes an agent's position in a market (bookkeeping; exposure not freed).
 
-**AUTH-1** `auth(admin)` or design choice TBD.
+**TR-CLOSE_TRADE-AUTH-1** `auth(admin)` or design choice TBD.
 
-**PRE-1** `P[Exposure(agent, market_id)]` > `0` else `NoExposure(6)`.
+**TR-CLOSE_TRADE-PRE-1** `P[Exposure(agent, market_id)]` > `0` else `NoExposure(6)`.
 
-**POST-1** `P[Exposure(agent, market_id)]` remains unchanged (design choice: not freed).
+**TR-CLOSE_TRADE-POST-1** `P[Exposure(agent, market_id)]` remains unchanged (design choice: not freed).
 
-**EVT-1** `TradeClosed { agent, market_id }`.
+**TR-CLOSE_TRADE-EVT-1** `TradeClosed { agent, market_id }`.
 
 **NOTES** Exposure is never freed; it counts against caps until `close_trade` is called (design choice for conservative risk model).
 
@@ -167,13 +167,13 @@ Closes an agent's position in a market (bookkeeping; exposure not freed).
 
 Agent redeems a finalized market position.
 
-**AUTH-1** `auth(agent)` or admin.
+**TR-REDEEM-AUTH-1** `auth(agent)` or admin.
 
-**PRE-1** Market status == `Finalized`.
+**TR-REDEEM-PRE-1** Market status == `Finalized`.
 
-**POST-1** Calls `market_core.redeem(agent, market_id)`.
+**TR-REDEEM-POST-1** Calls `market_core.redeem(agent, market_id)`.
 
-**EVT-1** `Redeemed { agent, market_id, payout }`.
+**TR-REDEEM-EVT-1** `Redeemed { agent, market_id, payout }`.
 
 ---
 
@@ -181,13 +181,13 @@ Agent redeems a finalized market position.
 
 Agent claims LP fees and pool remainder for a finalized market.
 
-**AUTH-1** `auth(agent)` or admin.
+**TR-CLAIM_POOL_REMAINDER-AUTH-1** `auth(agent)` or admin.
 
-**PRE-1** Market status == `Finalized`.
+**TR-CLAIM_POOL_REMAINDER-PRE-1** Market status == `Finalized`.
 
-**POST-1** Calls `market_core.claim_pool_remainder(agent, market_id)`.
+**TR-CLAIM_POOL_REMAINDER-POST-1** Calls `market_core.claim_pool_remainder(agent, market_id)`.
 
-**EVT-1** `PoolRemainderClaimed { agent, market_id, amount }`.
+**TR-CLAIM_POOL_REMAINDER-EVT-1** `PoolRemainderClaimed { agent, market_id, amount }`.
 
 ---
 
@@ -195,14 +195,14 @@ Agent claims LP fees and pool remainder for a finalized market.
 
 Sweeps protocol fees from a market to the treasury.
 
-**AUTH-1** `auth(admin)` or permissionless (design choice).
+**TR-COLLECT_MARKET_FEES-AUTH-1** `auth(admin)` or permissionless (design choice).
 
-**PRE-1** Market exists and has accrued fees.
+**TR-COLLECT_MARKET_FEES-PRE-1** Market exists and has accrued fees.
 
-**POST-1** Calls `market_core.sweep_fees(market_id)`.
-**POST-2** Treasury receives fees; balance updated.
+**TR-COLLECT_MARKET_FEES-POST-1** Calls `market_core.sweep_fees(market_id)`.
+**TR-COLLECT_MARKET_FEES-POST-2** Treasury receives fees; balance updated.
 
-**EVT-1** `FeesCollected { market_id, amount }`.
+**TR-COLLECT_MARKET_FEES-EVT-1** `FeesCollected { market_id, amount }`.
 
 ---
 
@@ -210,9 +210,9 @@ Sweeps protocol fees from a market to the treasury.
 
 View: returns the current daily usage for an agent.
 
-**PRE-1** No preconditions.
+**TR-DAILY_USAGE-PRE-1** No preconditions.
 
-**POST-1** Returns `{used: amount, max: P[RiskConfig(agent)].max_daily, remaining}` or zero if no config.
+**TR-DAILY_USAGE-POST-1** Returns `{used: amount, max: P[RiskConfig(agent)].max_daily, remaining}` or zero if no config.
 
 **NOTES** Rolls over after `DAY_SECONDS` from the last reset timestamp.
 

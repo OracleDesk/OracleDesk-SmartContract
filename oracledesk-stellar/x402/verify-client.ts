@@ -151,3 +151,54 @@ export function detectSuspiciousTrace(trace: any): string[] {
 
   return issues;
 }
+// ── #330 Signed delivery receipts ─────────────────────────────────────────
+
+export {
+  decodeReceipt,
+  verifyReceipt,
+  type ReceiptFields,
+  type ReceiptKeySet,
+  type VerifyResult,
+} from "./receipt.js";
+import type { ReceiptKeySet } from "./receipt.js";
+
+/** Path the server publishes its receipt key set at. */
+export const RECEIPT_KEYS_PATH = "/.well-known/oracledesk-x402-keys.json";
+
+const keySetCache = new Map<string, Promise<ReceiptKeySet>>();
+
+function isLoopback(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname.endsWith(".localhost")
+  );
+}
+
+/**
+ * Fetches (and caches per origin) a server's published receipt key set.
+ * Refuses plain HTTP outside localhost: a key set fetched over an
+ * unauthenticated channel could be swapped for an attacker's keys.
+ */
+export function fetchKeySet(
+  baseUrl: string,
+  opts: { fetchImpl?: typeof fetch; refresh?: boolean } = {},
+): Promise<ReceiptKeySet> {
+  const url = new URL(RECEIPT_KEYS_PATH, baseUrl);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname)))
+    return Promise.reject(new Error("receipt key set must be fetched over https"));
+  const origin = url.origin;
+  const cached = keySetCache.get(origin);
+  if (cached && !opts.refresh) return cached;
+  const pending = (async () => {
+    const res = await (opts.fetchImpl ?? fetch)(url.toString());
+    if (!res.ok) throw new Error(`key set fetch failed: HTTP ${res.status}`);
+    const body = (await res.json()) as ReceiptKeySet;
+    if (!body || !Array.isArray(body.keys)) throw new Error("malformed key set");
+    return body;
+  })();
+  keySetCache.set(origin, pending);
+  pending.catch(() => keySetCache.delete(origin));
+  return pending;
+}

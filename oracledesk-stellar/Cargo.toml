@@ -11,6 +11,8 @@ members = [
     "contracts/test-oracle",
     "contracts/adversarial-mocks",
     "contracts/integration-tests",
+    "contracts/outcome-token",
+    "contracts/outcome-token-factory",
 ]
 resolver = "2"
 
