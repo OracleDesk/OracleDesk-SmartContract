@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "node init && tsc --noEmit",
     "test": "node --test test/plan.test.ts test/record.test.ts",
     "plan": "tsx src/cli.ts plan",
     "apply": "tsx src/cli.ts apply",

@@ -280,6 +280,7 @@ export class MemoryPaymentLedger implements PaymentLedger {
       .sort((a, b) => a.updatedAt - b.updatedAt)
       .slice(0, limit)
       .map((e) => structuredClone(e));
+  }
   async countByState() {
     const counts: Partial<Record<PaymentState, number>> = {};
     for (const e of this.entries.values())
@@ -381,6 +382,7 @@ export class SqlitePaymentLedger implements PaymentLedger {
       )
       .all(...states, Date.now() - olderThanMs, limit) as { entry: string }[];
     return rows.map((r) => JSON.parse(r.entry) as PaymentEntry);
+  }
   async countByState() {
     // Index-only GROUP BY over `payments_state`; run on scrape only.
     const rows = this.db

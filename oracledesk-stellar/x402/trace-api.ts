@@ -138,6 +138,19 @@ export interface TraceApiOptions {
   quote?: (traceId: string) => string;
   listCacheSize?: number;
   paymentsDisabled?: boolean;
+  /**
+   * Seconds after settlement during which the same payment can re-download
+   * the trace, even past the payment's own `expiresAt`
+   * (`X402_REDELIVERY_WINDOW_SECS`, default 900). Afterwards an undelivered
+   * payment is refunded (refunds.ts).
+   */
+  redeliveryWindowSecs?: number;
+  /** #328: structured logger; defaults to the shared redacting pino logger. */
+  logger?: Logger;
+  /** #328: Prometheus metrics; a private registry is created when omitted. */
+  metrics?: X402Metrics;
+  /** #330: when set, every settled payment gets a signed delivery receipt. */
+  receiptSigner?: ReceiptSigner;
 }
 
 const ACTION_LABELS = new Set([
@@ -168,19 +181,6 @@ function parseMarket(value: unknown): string | undefined {
 }
 function parseAgent(value: unknown): string | undefined {
   return typeof value === "string" && /^G[A-Z2-7]+$/.test(value) ? value : undefined;
-  /**
-   * Seconds after settlement during which the same payment can re-download
-   * the trace, even past the payment's own `expiresAt`
-   * (`X402_REDELIVERY_WINDOW_SECS`, default 900). Afterwards an undelivered
-   * payment is refunded (refunds.ts).
-   */
-  redeliveryWindowSecs?: number;
-  /** #328: structured logger; defaults to the shared redacting pino logger. */
-  logger?: Logger;
-  /** #328: Prometheus metrics; a private registry is created when omitted. */
-  metrics?: X402Metrics;
-  /** #330: when set, every settled payment gets a signed delivery receipt. */
-  receiptSigner?: ReceiptSigner;
 }
 
 const REFUNDED_STATES = new Set(["refund_pending", "refunding", "refunded"]);
@@ -425,7 +425,6 @@ export function createTraceApi(options: TraceApiOptions): Express {
     throw new Error(
       "traceLoadTimeoutMs must be positive and below half maxTimeoutSeconds",
     );
-  const ledger = options.ledger ?? new MemoryPaymentLedger();
   const redeliveryWindowMs = (options.redeliveryWindowSecs ?? 900) * 1000;
   if (!Number.isFinite(redeliveryWindowMs) || redeliveryWindowMs < 0)
     throw new Error("redeliveryWindowSecs must be a non-negative number");

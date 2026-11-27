@@ -316,6 +316,10 @@ for (const [name, make] of [
       );
     } finally {
       Date.now = realNow;
+      ledger.close();
+    }
+  });
+
 for (const kind of ["memory", "sqlite"])
   test(`${kind}: settled transition stores receipt and settledAt atomically (#330)`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "x402-ledger-"));

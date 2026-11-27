@@ -214,4 +214,3 @@ export function verifyEd25519Signature(
     return false;
   }
 }
-

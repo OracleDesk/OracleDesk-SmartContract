@@ -1,0 +1,32 @@
+name: label-sync
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - ".github/labels.yml"
+      - ".github/workflows/label-sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: label-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Fork PRs never reach this workflow (push/workflow_dispatch only), so the
+    # write-scoped token is never exposed to untrusted code.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply labels from .github/labels.yml
+        uses: EndBug/label-sync@v2
+        with:
+          config-file: .github/labels.yml
+          delete-other-labels: false
+          token: ${{ secrets.GITHUB_TOKEN }}
